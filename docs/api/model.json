@@ -229,6 +229,14 @@
       "doc": "Releases a prepared statement, reporting whether the id was one."
     },
     {
+      "id": "zu::Connection::duplicate",
+      "kind": "method",
+      "name": "duplicate",
+      "of": "zu::Connection",
+      "signature": "fn duplicate(&self) -> Result<Connection>",
+      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
+    },
+    {
       "id": "zu::Connection::execute",
       "kind": "method",
       "name": "execute",
@@ -349,6 +357,14 @@
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
     },
     {
+      "id": "zu::Connection::table_name",
+      "kind": "method",
+      "name": "table_name",
+      "of": "zu::Connection",
+      "signature": "fn table_name(&self, table: u32) -> Option<&str>",
+      "doc": "What a table id is called, or nothing when no table has that id.\n\nA node value is a table and a row offset and an edge value is a\ntable and two of them, because neither part identifies anything\non its own: two tables both number their rows from zero. The\nnumber is what the engine passes around and the name is what a\nuser asked about, so a binding that hands a node value out has\nto be able to turn one into the other, and until now the only\nway was to reach past this type into the session and read the\ncatalog. Node and rel tables share one id space, so this is one\ncall and not two.\n\nThe name is borrowed from the catalog, which the next statement\nthat creates or drops a table replaces, so a caller keeping one\npast the next statement copies it."
+    },
+    {
       "id": "zu::Connection::unregister",
       "kind": "method",
       "name": "unregister",
@@ -394,6 +410,30 @@
       "of": "zu::Database",
       "signature": "fn create_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
       "doc": "[`Database::create`] with a configuration."
+    },
+    {
+      "id": "zu::Database::is_memory",
+      "kind": "method",
+      "name": "is_memory",
+      "of": "zu::Database",
+      "signature": "fn is_memory(&self) -> bool",
+      "doc": "Whether this database is the kind that goes away with the\nprocess. A caller that offers to back one up, or warns before\nclosing one, needs to be able to ask."
+    },
+    {
+      "id": "zu::Database::memory",
+      "kind": "method",
+      "name": "memory",
+      "of": "zu::Database",
+      "signature": "fn memory() -> Result<Database>",
+      "doc": "Creates a database that never touches the filesystem, with the\ndefault configuration.\n\nThe blocks a file would hold are held in memory instead, and the\nlog beside it too, so everything above this point runs unchanged:\nthe same headers, the same log, the same fold and the same\nrecovery, on bytes that go away when the last handle does. That\nis what makes it worth having for a test or a scratch load and\nwhat makes it useless for anything that has to survive the\nprocess.\n\nEvery call makes a database of its own. Two of them share\nnothing, and cloning one, or connecting to it twice, is what\ngets two views of the same graph."
+    },
+    {
+      "id": "zu::Database::memory_with",
+      "kind": "method",
+      "name": "memory_with",
+      "of": "zu::Database",
+      "signature": "fn memory_with(config: Config) -> Result<Database>",
+      "doc": "[`Database::memory`] with a configuration.\n\n`read_only` is refused for the same reason [`Database::create`]\nrefuses it: a fresh database nothing may write to is one that\nstays empty forever, and here there is not even a file somebody\nelse could have filled."
     },
     {
       "id": "zu::Database::open",
@@ -2098,6 +2138,14 @@
       "doc": "Nanoseconds since midnight in the offset's own day, and the\noffset from UTC in minutes."
     },
     {
+      "id": "zu::Temporal::between",
+      "kind": "method",
+      "name": "between",
+      "of": "zu::Temporal",
+      "signature": "fn between(from: Temporal, to: Temporal, kind: DurationKind) -> Option<Temporal>",
+      "doc": "The duration from `from` to `to`, of the kind asked for, or\n`None` when the two are not two instants of one shape or the\nanswer leaves the calendar.\n\nThis is what `DURATION_BETWEEN` answers and what a minus\nbetween two instants answers, so the operator and the function\ncannot drift apart.\n\nThe two operands have to be the same shape. A date and a time\nhave no length between them, and a local datetime and a zoned\none have none either, because a local value names a wall clock\nand not an instant, so the length would depend on a zone nobody\nwrote.\n\nA day-time answer is a count of nanoseconds and needs no\ncalendar. A year-month answer is the largest count of whole\nmonths that does not carry `from` past `to`, which is stated\nagainst zu's own month addition rather than against a\ncomparison of day numbers. The two readings differ: 31 March to\n30 April is one month here, because 31 March plus one month is\n30 April and lands exactly on it, and is nought under a rule\nthat compares the days of the month first. Stating it against\nthe addition is what makes `from + DURATION_BETWEEN(from, to)`\nland at or before `to` and one month more overshoot, and a law\nthat holds is worth more than agreement with a rule that does\nnot.\n\nA backwards answer truncates toward nought the same way, so the\ntwo directions are not mirror images when a month is clipped."
+    },
+    {
       "id": "zu::Temporal::logical_type",
       "kind": "method",
       "name": "logical_type",
@@ -2120,6 +2168,14 @@
       "of": "zu::Temporal",
       "signature": "fn parse_any(text: &str) -> Option<Temporal>",
       "doc": "The value `text` spells when the type is not written out, which\nis what a property in a fixture and a value read back from a\ncolumn both need.\n\nThe shape decides: a leading `P` is a duration, a `T` or a space\nin the middle is a datetime, a colon is a time, and a dash is a\ndate."
+    },
+    {
+      "id": "zu::Temporal::parse_sql_interval",
+      "kind": "method",
+      "name": "parse_sql_interval",
+      "of": "zu::Temporal",
+      "signature": "fn parse_sql_interval(text: &str, qualifier: &IntervalQualifier) -> Option<Temporal>",
+      "doc": "The duration `text` spells when it is written the way SQL\nwrites one, `INTERVAL '3 04:05:06' DAY TO SECOND`, with the\nqualifier already read.\n\nThe qualifier is not decoration. It is the whole of what says\nhow to read the string, because `'1-2'` is a year and two\nmonths under `YEAR TO MONTH` and is nothing at all under `DAY`,\nand `'3'` is three of whichever single field was named. So this\nreads the fields the qualifier lists, in order, and refuses\nanything the qualifier did not ask for.\n\nThe leading field is unbounded and the ones behind it are not:\n`'25' HOUR` is twenty five hours, and `'1 25:00:00' DAY TO\nSECOND` is not a day and an hour, because a written hour that\nfollows a written day has 24 of its own and the standard says\nso. A number that runs over its field is refused rather than\ncarried, since carrying it would answer a question the\nstatement did not ask."
     },
     {
       "id": "zu::ZuError",
@@ -2619,6 +2675,14 @@
       "doc": "Releases a prepared statement, reporting whether the id was one."
     },
     {
+      "id": "zu::db::Connection::duplicate",
+      "kind": "method",
+      "name": "duplicate",
+      "of": "zu::db::Connection",
+      "signature": "fn duplicate(&self) -> Result<Connection>",
+      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
+    },
+    {
       "id": "zu::db::Connection::execute",
       "kind": "method",
       "name": "execute",
@@ -2739,6 +2803,14 @@
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
     },
     {
+      "id": "zu::db::Connection::table_name",
+      "kind": "method",
+      "name": "table_name",
+      "of": "zu::db::Connection",
+      "signature": "fn table_name(&self, table: u32) -> Option<&str>",
+      "doc": "What a table id is called, or nothing when no table has that id.\n\nA node value is a table and a row offset and an edge value is a\ntable and two of them, because neither part identifies anything\non its own: two tables both number their rows from zero. The\nnumber is what the engine passes around and the name is what a\nuser asked about, so a binding that hands a node value out has\nto be able to turn one into the other, and until now the only\nway was to reach past this type into the session and read the\ncatalog. Node and rel tables share one id space, so this is one\ncall and not two.\n\nThe name is borrowed from the catalog, which the next statement\nthat creates or drops a table replaces, so a caller keeping one\npast the next statement copies it."
+    },
+    {
       "id": "zu::db::Connection::unregister",
       "kind": "method",
       "name": "unregister",
@@ -2783,6 +2855,30 @@
       "of": "zu::db::Database",
       "signature": "fn create_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
       "doc": "[`Database::create`] with a configuration."
+    },
+    {
+      "id": "zu::db::Database::is_memory",
+      "kind": "method",
+      "name": "is_memory",
+      "of": "zu::db::Database",
+      "signature": "fn is_memory(&self) -> bool",
+      "doc": "Whether this database is the kind that goes away with the\nprocess. A caller that offers to back one up, or warns before\nclosing one, needs to be able to ask."
+    },
+    {
+      "id": "zu::db::Database::memory",
+      "kind": "method",
+      "name": "memory",
+      "of": "zu::db::Database",
+      "signature": "fn memory() -> Result<Database>",
+      "doc": "Creates a database that never touches the filesystem, with the\ndefault configuration.\n\nThe blocks a file would hold are held in memory instead, and the\nlog beside it too, so everything above this point runs unchanged:\nthe same headers, the same log, the same fold and the same\nrecovery, on bytes that go away when the last handle does. That\nis what makes it worth having for a test or a scratch load and\nwhat makes it useless for anything that has to survive the\nprocess.\n\nEvery call makes a database of its own. Two of them share\nnothing, and cloning one, or connecting to it twice, is what\ngets two views of the same graph."
+    },
+    {
+      "id": "zu::db::Database::memory_with",
+      "kind": "method",
+      "name": "memory_with",
+      "of": "zu::db::Database",
+      "signature": "fn memory_with(config: Config) -> Result<Database>",
+      "doc": "[`Database::memory`] with a configuration.\n\n`read_only` is refused for the same reason [`Database::create`]\nrefuses it: a fresh database nothing may write to is one that\nstays empty forever, and here there is not even a file somebody\nelse could have filled."
     },
     {
       "id": "zu::db::Database::open",
@@ -3910,7 +4006,7 @@
       "name": "columnar",
       "of": "zu::query::QueryResult",
       "signature": "fn columnar(&self) -> Result<Columns, MixedColumn>",
-      "doc": "This result read down its columns.\n\nTwo passes over the rows in row order, both of them sequential:\nthe first settles each column's type, the second fills each\ncolumn's buffer. Not two passes per column. A client that wanted\nArrow used to walk the result once per column to infer and once\nper column per batch to gather, which on a wide result is a\nmultiple of this and on any result is strided.\n\nFails only where a column's rows are types no single column\nholds, and says which column, which row, and what the two types\nwere. Every other refusal belongs to the client, because the\nformat decides it: a time with an offset has no Arrow type and\nthat is Arrow's fact rather than the engine's.\n\nThe buffers are owned and the complex columns borrow, so the\nresult stays readable afterwards and a client may ask twice."
+      "doc": "This result read down its columns.\n\nTwo passes over the rows in row order, both of them sequential:\nthe first settles each column's type, the second fills each\ncolumn's buffer. Not two passes per column. A client that wanted\nArrow used to walk the result once per column to infer and once\nper column per batch to gather, which on a wide result is a\nmultiple of this and on any result is strided.\n\nFails only where a column's rows are types no single column\nholds, and says which column, which row, and what the two types\nwere. Every other refusal belongs to the client, because the\nformat decides it: a time with an offset has no Arrow type and\nthat is Arrow's fact rather than the engine's.\n\nThe buffers are owned and the complex columns borrow, so the\nresult stays readable afterwards and a client may ask twice.\n\nA sink that filled the columns itself is answered from those and\nnothing here runs, which is the case that matters: it is the\nplain projection, it is what an export asks for, and it is the\none where the rows are never built at all."
     },
     {
       "id": "zu::query::QueryResult::columns",
@@ -3918,6 +4014,22 @@
       "name": "columns",
       "of": "zu::query::QueryResult",
       "signature": "Vec<String>"
+    },
+    {
+      "id": "zu::query::QueryResult::held",
+      "kind": "method",
+      "name": "held",
+      "of": "zu::query::QueryResult",
+      "signature": "fn held(columns: Vec<String>, held: Held) -> Self",
+      "doc": "The result of a statement whose sink filled columns."
+    },
+    {
+      "id": "zu::query::QueryResult::into_columns",
+      "kind": "method",
+      "name": "into_columns",
+      "of": "zu::query::QueryResult",
+      "signature": "fn into_columns(self) -> Result<Held, QueryResult>",
+      "doc": "The buffers the sink filled, taken rather than lent.\n\n[`QueryResult::columnar`] copies them, and has to: it hands back a\nview of a result that stays readable, so the buffer behind the view\nis still the result's and cannot be given away. That copy is a\nmemcpy of bytes that are already contiguous and already the right\nshape, which is cheap next to what it replaced and not cheap next\nto nothing. A caller turning the whole answer into Arrow and\nthrowing the result away is paying it for no reason.\n\nSo this takes the result by value and gives up its buffers. What\ncomes back is what the executor wrote, and an Arrow array built on\none of them holds the executor's own allocation rather than a copy\nof it, which is what makes an export of a hundred million integers\ncost the pointer and not the eight hundred megabytes.\n\nA result whose rows were built rather than filled has no buffers to\ngive, and comes back untouched rather than converted, because the\nconversion for that shape is [`QueryResult::columnar`] and it\nallocates the buffers fresh anyway, so there is nothing to save and\nno reason for this to have two answers.\n\n# Errors\n\nThe result itself, when the sink built rows instead of columns."
     },
     {
       "id": "zu::query::QueryResult::iter",
@@ -3963,7 +4075,7 @@
       "kind": "field",
       "name": "rows",
       "of": "zu::query::QueryResult",
-      "signature": "Vec<Vec<Value>>"
+      "signature": "Rows"
     },
     {
       "id": "zu::query::QueryResult::status",
@@ -4292,11 +4404,18 @@
       "doc": "Parses and binds one query against a zu1 catalog.\n\nThe epoch the schema is stamped with is zero, and it can be: a\ncatalog on its own is not a snapshot, and nothing here runs, so no\ngraph reference this binds ever reaches a caller."
     },
     {
+      "id": "zu::query::check",
+      "kind": "function",
+      "name": "check",
+      "signature": "fn check(source: &str) -> zu_common::Result<()>",
+      "doc": "Whether the text is a statement at all, without a catalog and\nwithout a file.\n\nThis is the front end and nothing behind it, which is what an editor\nwith no database open can still say something true about. A name it\ncannot check is a name it does not look at: `MATCH (p:Person)` parses\nwhether or not a `Person` exists anywhere, so the answer is either a\nsyntax error at a place in the text or nothing. Everything past the\nparser needs a catalog, and [`bind`] is where that starts."
+    },
+    {
       "id": "zu::query::column",
       "kind": "module",
       "name": "column",
       "source": "zu_query::column",
-      "doc": "A result read down its columns instead of across its rows.\n\nEvery client that hands a result to something else hands it over as\ncolumns. Arrow is columns, pandas is columns, polars is columns, and\nthe C ABI's chunked read is columns. A result is [`Vec<Vec<Value>>`],\nso each of those clients has been writing the same transpose, and\nwriting it badly: `zu-python` walked the whole result once per column\nto decide the column's type and again per batch to gather the values,\nwhich on a million rows of three columns is six strided passes over\nthirty two byte cells and a `Vec` of pointers per batch per column.\n`docs/clients/duckdb.md` measured what that costs. Twenty times\nDuckDB, for the same bytes in the same layout at the other end.\n\nThis is the transpose written once, in the engine, where the next\nchange makes it free. Two passes over the rows in row order: one to\nsettle each column's type, one to fill each column's buffer. Not two\nper column, two in total, and both of them sequential over memory the\nresult already had hot. The buffers that come out are Arrow's own\nlayouts, so a client's remaining job is to name them rather than to\ncopy them: a `Vec<i64>` becomes an `Int64Array` by moving, offsets\nand bytes become a `StringArray` by moving, and a validity bitmap is\nArrow's null buffer with the same bit order and the same meaning of\nset.\n\nIt is a transpose because the sink still flattens. `crates/zu-vector`\nis the vector layer the executor already computes in, and the one\nplace the vectors die is [`SinkState`], which fills a row at a time\nout of them. When that changes, [`QueryResult::columnar`] stops\nwalking anything and starts handing back the buffers the executor\nfilled, and no client changes a line. That is the whole reason the\nanswer is shaped like this and lives here rather than in a binding.\n\n[`SinkState`]: ../../zu_exec/sink/struct.SinkState.html"
+      "doc": "A result read down its columns instead of across its rows.\n\nEvery client that hands a result to something else hands it over as\ncolumns. Arrow is columns, pandas is columns, polars is columns, and\nthe C ABI's chunked read is columns. A result is [`Vec<Vec<Value>>`],\nso each of those clients has been writing the same transpose, and\nwriting it badly: `zu-python` walked the whole result once per column\nto decide the column's type and again per batch to gather the values,\nwhich on a million rows of three columns is six strided passes over\nthirty two byte cells and a `Vec` of pointers per batch per column.\n`docs/clients/duckdb.md` measured what that costs. Twenty times\nDuckDB, for the same bytes in the same layout at the other end.\n\nThis is the transpose written once, in the engine, where the next\nchange makes it free. Two passes over the rows in row order: one to\nsettle each column's type, one to fill each column's buffer. Not two\nper column, two in total, and both of them sequential over memory the\nresult already had hot. The buffers that come out are Arrow's own\nlayouts, so a client's remaining job is to name them rather than to\ncopy them: a `Vec<i64>` becomes an `Int64Array` by moving, offsets\nand bytes become a `StringArray` by moving, and a validity bitmap is\nArrow's null buffer with the same bit order and the same meaning of\nset.\n\nThat was a transpose because the sink used to flatten.\n`crates/zu-vector` is the vector layer the executor computes in, and\nthe place the vectors died was the sink, which filled a row at a time\nout of them. It does not any more: on a plan with nothing above the\nprojection the sink fills [`Held`] columns straight out of the\nvectors, [`QueryResult::columnar`] hands those buffers back without\nwalking anything, and the rows are built only if somebody asks for\nthem. No client changed a line. That is the whole reason the answer\nis shaped like this and lives here rather than in a binding.\n\nThe walk below is still what answers for every other plan, because a\nsort or a dedup or a group is a step over rows and the sink hands\nthose on as rows."
     },
     {
       "id": "zu::query::column::Column",
@@ -4634,6 +4753,127 @@
       "doc": "Rows in the result, which is every column's length and is also\nthe answer for a result with no columns at all."
     },
     {
+      "id": "zu::query::column::Held",
+      "kind": "struct",
+      "name": "Held",
+      "doc": "A whole result the executor filled down its columns, owning every\nbuffer in it.\n\n[`Columns`] is the same answer borrowed: its complex arm points at\nvalues that live in a [`QueryResult`], which is what lets the walk\nbelow hand back node and list columns without cloning them. A sink\nthat filled the buffers itself has nothing to point at, so this is\nthe shape it keeps them in, and [`Held::borrow`] is the view a client\nreads.\n\nThe arms are the ones a projection produces: a stored column is an\ninteger, a real or a string, a row id is an integer, and everything\nelse a RETURN item can name is one value at a time. Dates and\ndurations have buffers in [`ColumnData`] and no arm here on purpose,\nbecause the only way one reaches a projection in this executor is as\na constant, and a constant column that went through a buffer and\nback would have to be told which of its rows carried which offset."
+    },
+    {
+      "id": "zu::query::column::Held::borrow",
+      "kind": "method",
+      "name": "borrow",
+      "of": "zu::query::column::Held",
+      "signature": "fn borrow(&self) -> Columns",
+      "doc": "This answer as the borrowed view a client reads.\n\nThe flat buffers are copied and the complex ones are borrowed,\nwhich is the one copy left on the export path: a memcpy of the\nbytes that are already contiguous and already the right shape,\nagainst the two strided walks of a row vector this replaced. It\nis here because a caller is allowed to ask twice, and it goes\nwhen a caller says it will not: [`QueryResult::into_columns`]\ntakes the result by value and hands these buffers over instead\nof copying them."
+    },
+    {
+      "id": "zu::query::column::Held::columns",
+      "kind": "field",
+      "name": "columns",
+      "of": "zu::query::column::Held",
+      "signature": "Vec<HeldColumn>"
+    },
+    {
+      "id": "zu::query::column::Held::names",
+      "kind": "method",
+      "name": "names",
+      "of": "zu::query::column::Held",
+      "signature": "fn names(&self) -> Vec<String>",
+      "doc": "The column names, which are the result's own."
+    },
+    {
+      "id": "zu::query::column::Held::rows",
+      "kind": "field",
+      "name": "rows",
+      "of": "zu::query::column::Held",
+      "signature": "usize",
+      "doc": "Rows in the result, which is every column's length."
+    },
+    {
+      "id": "zu::query::column::HeldColumn",
+      "kind": "struct",
+      "name": "HeldColumn",
+      "doc": "One column of a [`Held`] result."
+    },
+    {
+      "id": "zu::query::column::HeldColumn::data",
+      "kind": "field",
+      "name": "data",
+      "of": "zu::query::column::HeldColumn",
+      "signature": "HeldData"
+    },
+    {
+      "id": "zu::query::column::HeldColumn::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::query::column::HeldColumn",
+      "signature": "String"
+    },
+    {
+      "id": "zu::query::column::HeldColumn::ty",
+      "kind": "field",
+      "name": "ty",
+      "of": "zu::query::column::HeldColumn",
+      "signature": "ColumnType"
+    },
+    {
+      "id": "zu::query::column::HeldColumn::validity",
+      "kind": "field",
+      "name": "validity",
+      "of": "zu::query::column::HeldColumn",
+      "signature": "Option<Validity>",
+      "doc": "Absent when every row has a value."
+    },
+    {
+      "id": "zu::query::column::HeldData",
+      "kind": "enum",
+      "name": "HeldData",
+      "doc": "The buffer one [`HeldColumn`] holds, in the layouts [`ColumnData`]\ndescribes."
+    },
+    {
+      "id": "zu::query::column::HeldData::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::query::column::HeldData",
+      "signature": "Bool { bits: Vec<u8> }"
+    },
+    {
+      "id": "zu::query::column::HeldData::Complex",
+      "kind": "variant",
+      "name": "Complex",
+      "of": "zu::query::column::HeldData",
+      "signature": "Complex(Vec<zu_query::exec::Value>)",
+      "doc": "The values themselves, for nodes and for anything else no buffer\ncovers."
+    },
+    {
+      "id": "zu::query::column::HeldData::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::query::column::HeldData",
+      "signature": "Float(Vec<f64>)"
+    },
+    {
+      "id": "zu::query::column::HeldData::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::query::column::HeldData",
+      "signature": "Int(Vec<i64>)"
+    },
+    {
+      "id": "zu::query::column::HeldData::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::query::column::HeldData",
+      "signature": "Null"
+    },
+    {
+      "id": "zu::query::column::HeldData::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::query::column::HeldData",
+      "signature": "Str(StrColumn)"
+    },
+    {
       "id": "zu::query::column::MixedColumn",
       "kind": "struct",
       "name": "MixedColumn",
@@ -4752,6 +4992,14 @@
       "name": "offsets",
       "of": "zu::query::column::StrColumn",
       "signature": "Offsets"
+    },
+    {
+      "id": "zu::query::column::StrColumn::span",
+      "kind": "method",
+      "name": "span",
+      "of": "zu::query::column::StrColumn",
+      "signature": "fn span(&self, at: usize) -> (usize, usize)",
+      "doc": "Where row `at` starts and ends in the bytes."
     },
     {
       "id": "zu::query::column::Validity",
@@ -4938,6 +5186,22 @@
       "doc": "A graph reference value naming one graph in the catalog (GV60),\nor `42002` when the catalog has no such graph.\n\nThis is where a graph reference comes from. GQL has no literal\nthat writes one and there is no expression yet that returns one\neither, so the engine hands them out: a caller resolves a name\nonce, holds the handle, and passes it to as many statements as\nit likes."
     },
     {
+      "id": "zu::session::Session::handle",
+      "kind": "method",
+      "name": "handle",
+      "of": "zu::session::Session",
+      "signature": "fn handle(&self) -> &Arc<FileHandle>",
+      "doc": "The file this session reads through, shared with every other\nsession this process has on the same file.\n\nIt is handed out so that a caller holding one session can open\nanother beside it without going back to the path:\n[`Session::attached`] takes exactly this and forks a descriptor\noff it. What the two share is the write side and the caches\nunder it; plans, readers and the interrupt are per session."
+    },
+    {
+      "id": "zu::session::Session::home_graph_ref",
+      "kind": "method",
+      "name": "home_graph_ref",
+      "of": "zu::session::Session",
+      "signature": "fn home_graph_ref(&mut self) -> Result<Value>",
+      "doc": "A graph reference on the graph this session started in, which\nis what `HOME_PROPERTY_GRAPH` hands back. It is the working\ngraph until something moves the working graph, and the two are\nseparate calls for the same reason the two words are separate\nwords: a caller that wants to go back has to be able to say so."
+    },
+    {
       "id": "zu::session::Session::idle",
       "kind": "method",
       "name": "idle",
@@ -4960,6 +5224,14 @@
       "of": "zu::session::Session",
       "signature": "fn interrupt(&self) -> Interrupt",
       "doc": "The handle a statement on this session can be stopped through.\n\nOne handle for the life of the session, so a caller can take it\nonce and keep it. It is raised from another thread while a\nstatement runs, which is the only time it means anything: the\nstatement stops at the next boundary the executor checks and\nanswers [`ZuError::Interrupted`], and this session is exactly as\nit was, plans and readers included. Clear it before a statement\nrather than after, so a stop that arrived while nothing was\nrunning cannot end the next one."
+    },
+    {
+      "id": "zu::session::Session::memory",
+      "kind": "method",
+      "name": "memory",
+      "of": "zu::session::Session",
+      "signature": "fn memory() -> Result<Session>",
+      "doc": "A session on a database that never touches the filesystem: the\nblocks a file would hold, and the log beside it, held in memory\nand gone when this session is. It is what the shell opens when\nnobody named a file, and what a caller wanting a graph rather\nthan a directory reaches for."
     },
     {
       "id": "zu::session::Session::on",
@@ -5808,7 +6080,7 @@
       "kind": "field",
       "name": "cells",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::CellPatch>>",
+      "signature": "zu_common::IdMap<u32, std::sync::Arc<zu::zu1::props::CellPatch>>",
       "doc": "New values, by table."
     },
     {
@@ -5816,7 +6088,7 @@
       "kind": "field",
       "name": "edges",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::graph::EdgePatch>>",
+      "signature": "zu_common::IdMap<u32, std::sync::Arc<zu::zu1::graph::EdgePatch>>",
       "doc": "Edges added and edges taken away, by rel table."
     },
     {
@@ -5824,7 +6096,7 @@
       "kind": "field",
       "name": "gone",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<[u64]>>",
+      "signature": "zu_common::IdMap<u32, std::sync::Arc<[u64]>>",
       "doc": "Rows taken away, by table, ascending. A delete moves nothing:\nthe offsets stay where they are and the fold writes them into\nthe table's tombstone chain, so what the patch carries is what\nthe chain would have held."
     },
     {
@@ -5847,7 +6119,7 @@
       "kind": "field",
       "name": "marks",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::LabelPatch>>",
+      "signature": "zu_common::IdMap<u32, std::sync::Arc<zu::zu1::props::LabelPatch>>",
       "doc": "The labels rows are left carrying, by table. A label is not a\ncolumn, so there is no cell to lay a value over: what is kept is\nthe whole word, composed where the commit was taken."
     },
     {
@@ -5862,7 +6134,7 @@
       "kind": "field",
       "name": "rows",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::RowPatch>>",
+      "signature": "zu_common::IdMap<u32, std::sync::Arc<zu::zu1::props::RowPatch>>",
       "doc": "New rows, by table, node tables and rel tables alike. A rel\ntable's are the property rows of the edges in `edges`, under\nthe ordinals those took. A node table's are rows of the table\nitself, so they move the count every reader is bounded by, and\neverything that reads a bound reads it through this."
     },
     {
@@ -7655,6 +7927,14 @@
       "doc": "Creates a new database file. Fails if `path` already exists, so an\nexisting database is never silently clobbered."
     },
     {
+      "id": "zu::zu1::file::Zu1File::create_in",
+      "kind": "method",
+      "name": "create_in",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn create_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self>",
+      "doc": "[`Self::create`] somewhere other than the filesystem. The vfs is\nkept, so the sidecar log and every reopened handle land in the\nsame place this one did."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::create_on",
       "kind": "method",
       "name": "create_on",
@@ -7759,6 +8039,14 @@
       "doc": "Opens an existing database: read 12 KiB, validate the file header,\nand adopt the valid database header with the highest epoch."
     },
     {
+      "id": "zu::zu1::file::Zu1File::open_in",
+      "kind": "method",
+      "name": "open_in",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn open_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self>",
+      "doc": "[`Self::open`] somewhere other than the filesystem."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::open_on",
       "kind": "method",
       "name": "open_on",
@@ -7773,6 +8061,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn open_read_only(path: &Path) -> Result<Self>",
       "doc": "Opens an existing database on a descriptor the operating system\nwill not let this process write through. Every path that would\nhave written refuses first, with the name of the database in the\nerror, so a caller that asked for a read-only handle and then\nwrote learns which promise it broke rather than which syscall\nfailed."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::open_read_only_in",
+      "kind": "method",
+      "name": "open_read_only_in",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn open_read_only_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self>",
+      "doc": "[`Self::open_read_only`] somewhere other than the filesystem."
     },
     {
       "id": "zu::zu1::file::Zu1File::path",
@@ -7917,6 +8213,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn unpublished_blocks(&self) -> u64",
       "doc": "Blocks allocated since the last checkpoint. A writer that folds\nwithout publishing watches this, because until it publishes\nnothing it freed can be handed back out and the file grows by\neverything the folds rewrote."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::vfs",
+      "kind": "method",
+      "name": "vfs",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn vfs(&self) -> &Arc<dyn Vfs>",
+      "doc": "Where this handle's files come from, which is the other half of\nwhat naming the sidecar takes: the name says where beside the\ndatabase it goes, and this says which world that name is in."
     },
     {
       "id": "zu::zu1::file::Zu1File::write_block",
@@ -10565,7 +10869,7 @@
       "id": "zu::zu1::vfs",
       "kind": "module",
       "name": "vfs",
-      "doc": "The file shim under the storage layer.\n\n[`Zu1File`](crate::file::Zu1File) and [`Wal`](crate::wal::Wal) do\ntheir I/O through [`VfsFile`], whose methods are exactly the\nsyscalls the engine issues: positioned reads and writes, length\nchanges, and the two sync flavors. Production code runs on\n[`RealFile`], a thin pass-through. The crash harness runs on\n[`RecordingFile`], which logs every mutating call before forwarding\nit, so a test can cut the log at any syscall boundary, rebuild the\nfile image a crash at that point could leave, and check recovery\nagainst it. Reads are not logged; a crash cannot lose a read."
+      "doc": "The file shim under the storage layer.\n\n[`Zu1File`](crate::file::Zu1File) and [`Wal`](crate::wal::Wal) do\ntheir I/O through [`VfsFile`], whose methods are exactly the\nsyscalls the engine issues: positioned reads and writes, length\nchanges, and the two sync flavors. Production code runs on\n[`RealFile`], a thin pass-through. The crash harness runs on\n[`RecordingFile`], which logs every mutating call before forwarding\nit, so a test can cut the log at any syscall boundary, rebuild the\nfile image a crash at that point could leave, and check recovery\nagainst it. Reads are not logged; a crash cannot lose a read.\n\n[`Vfs`] is the other half: where [`VfsFile`] is one open file, a\n[`Vfs`] is where files come from. A database is not one file but\ntwo, the base and the sidecar log, and the second is opened by name\nfrom the first's path long after the first was opened. So a database\nthat lives somewhere other than the filesystem cannot be a handle\npassed in at the open; it has to be a thing that answers a path.\n[`RealVfs`] is the filesystem and is what every open uses unless it\nwas told otherwise. [`MemVfs`] is a map from path to bytes, which is\nwhat a database with no file on disk is made of."
     },
     {
       "id": "zu::zu1::vfs::IoEvent",
@@ -10622,6 +10926,33 @@
       "doc": "The shared log a workload's recording files append to."
     },
     {
+      "id": "zu::zu1::vfs::MemFile",
+      "kind": "struct",
+      "name": "MemFile",
+      "doc": "One file of a [`MemVfs`], which is a vector of bytes and a promise\nabout whether this handle may write to it.\n\nThe handles on one file share the bytes, because two handles on one\nfile share the file. That is what makes a fork for reading see what\nthe write side put there, which on a real filesystem the kernel does\nand here has to be said."
+    },
+    {
+      "id": "zu::zu1::vfs::MemVfs",
+      "kind": "struct",
+      "name": "MemVfs",
+      "doc": "A filesystem made of memory: a map from path to bytes.\n\nOne of these is one database, because a database is a base file and\na sidecar log and the two have to find each other by name. Nothing\nhere is written anywhere, so nothing here survives the process, and\nthe last handle going away is what frees it.\n\nThe paths are still paths. A memory database is opened under a name\nof its own so that the write side, which is registered per path per\nprocess, keeps working exactly as it does for a file: two memory\ndatabases are two names and never meet, and two connections to one\nare one name and share a writer."
+    },
+    {
+      "id": "zu::zu1::vfs::MemVfs::bytes",
+      "kind": "method",
+      "name": "bytes",
+      "of": "zu::zu1::vfs::MemVfs",
+      "signature": "fn bytes(&self) -> u64",
+      "doc": "How many bytes this filesystem is holding, across every file in\nit. What a caller who asked for a database in memory would want\nto know about the memory."
+    },
+    {
+      "id": "zu::zu1::vfs::MemVfs::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::zu1::vfs::MemVfs",
+      "signature": "fn new() -> MemVfs"
+    },
+    {
       "id": "zu::zu1::vfs::RealFile",
       "kind": "struct",
       "name": "RealFile",
@@ -10660,6 +10991,20 @@
       "doc": "Opens an existing file for reading and writing."
     },
     {
+      "id": "zu::zu1::vfs::RealVfs",
+      "kind": "struct",
+      "name": "RealVfs",
+      "doc": "The filesystem, which is where a database lives unless it was told\notherwise."
+    },
+    {
+      "id": "zu::zu1::vfs::RealVfs::shared",
+      "kind": "method",
+      "name": "shared",
+      "of": "zu::zu1::vfs::RealVfs",
+      "signature": "fn shared() -> Arc<dyn Vfs>",
+      "doc": "The one every open uses when nobody passed one in."
+    },
+    {
       "id": "zu::zu1::vfs::RecordingFile",
       "kind": "struct",
       "name": "RecordingFile",
@@ -10671,6 +11016,62 @@
       "name": "new",
       "of": "zu::zu1::vfs::RecordingFile",
       "signature": "fn new(inner: RealFile, id: IoFile, log: IoLog) -> Self"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs",
+      "kind": "trait",
+      "name": "Vfs",
+      "doc": "Where files come from.\n\nThe four opens are the four the engine issues, named for what they\npromise rather than for the flags they would pass: a create that\nrefuses to clobber, a read-write open of something that is already\nthere, a read-only one, and the log's open-or-create. `exists` and\n`remove` are the two questions asked about a file without opening\nit, both of them about the sidecar log.\n\nImplementations are shared by every handle on a database, so this is\n`Send + Sync` and takes `&self`."
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::create_new",
+      "kind": "method",
+      "name": "create_new",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn create_new(&self, path: &Path) -> Result<Box<dyn VfsFile>>"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::durable",
+      "kind": "method",
+      "name": "durable",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn durable(&self) -> bool",
+      "doc": "Whether what this hands back survives the process. A database on\none that says no has nothing to recover after a crash, and the\nwork done to make it recoverable is work nobody will collect."
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::exists",
+      "kind": "method",
+      "name": "exists",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn exists(&self, path: &Path) -> bool"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::open_or_create",
+      "kind": "method",
+      "name": "open_or_create",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn open_or_create(&self, path: &Path) -> Result<Box<dyn VfsFile>>"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::open_r",
+      "kind": "method",
+      "name": "open_r",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn open_r(&self, path: &Path) -> Result<Box<dyn VfsFile>>"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::open_rw",
+      "kind": "method",
+      "name": "open_rw",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn open_rw(&self, path: &Path) -> Result<Box<dyn VfsFile>>"
+    },
+    {
+      "id": "zu::zu1::vfs::Vfs::remove",
+      "kind": "method",
+      "name": "remove",
+      "of": "zu::zu1::vfs::Vfs",
+      "signature": "fn remove(&self, path: &Path) -> Result<()>"
     },
     {
       "id": "zu::zu1::vfs::VfsFile",
@@ -10809,11 +11210,19 @@
       "doc": "Opens the log at `path`, creating it when missing, and truncates\nthe torn tail so the next append starts at the last intact\nframe. Crashing mid-append leaves a frame that fails its length\nor crc check; everything before it is kept."
     },
     {
+      "id": "zu::zu1::wal::Wal::open_in",
+      "kind": "method",
+      "name": "open_in",
+      "of": "zu::zu1::wal::Wal",
+      "signature": "fn open_in(vfs: &Arc<dyn Vfs>, path: &Path) -> Result<Self>",
+      "doc": "[`Self::open`] somewhere other than the filesystem, for a log\nthat belongs to a database that is not on disk either."
+    },
+    {
       "id": "zu::zu1::wal::Wal::open_on",
       "kind": "method",
       "name": "open_on",
       "of": "zu::zu1::wal::Wal",
-      "signature": "fn open_on(file: Box<dyn VfsFile>, path: &Path) -> Result<Self>",
+      "signature": "fn open_on(file: Box<dyn VfsFile>) -> Result<Self>",
       "doc": "[`Self::open`] on an explicit file handle; the crash harness\npasses a recording one."
     },
     {

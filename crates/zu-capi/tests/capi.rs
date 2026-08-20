@@ -13,33 +13,33 @@ use zu::{
     ZU_FRAME_PLAIN, ZU_SEVERITY_EXCEPTION, ZU_SEVERITY_WARNING, ZU_TEMPORAL_DATE,
     ZU_TEMPORAL_DURATION_DAY_TIME, ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME,
     ZU_TEMPORAL_LOCAL_TIME, ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT,
-    ZU_TYPE_LIST, ZU_TYPE_NODE, ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuAppender, ZuConfig,
-    ZuConn, ZuDatabase, ZuError, ZuFrame, ZuLoader, ZuResult, ZuStatus, ZuStmt, ZuValue,
-    zu_append_bool, zu_append_bytes, zu_append_end_row, zu_append_f64, zu_append_i64,
-    zu_append_str_z, zu_append_temporal, zu_appender_buffered, zu_appender_close,
+    ZU_TYPE_LIST, ZU_TYPE_NODE, ZU_TYPE_NULL, ZU_TYPE_REL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL,
+    ZuAppender, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuFrame, ZuLoader, ZuResult, ZuStatus,
+    ZuStmt, ZuValue, zu_append_bool, zu_append_bytes, zu_append_end_row, zu_append_f64,
+    zu_append_i64, zu_append_str_z, zu_append_temporal, zu_appender_buffered, zu_appender_close,
     zu_appender_col_name, zu_appender_cols, zu_appender_committed, zu_appender_discard,
     zu_appender_flush, zu_appender_free, zu_appender_open, zu_appender_open_z, zu_begin,
     zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal,
     zu_bind_temporal_z, zu_commit, zu_config_init, zu_config_set_z, zu_conn_close,
     zu_conn_duplicate, zu_conn_in_transaction, zu_conn_interrupt, zu_conn_register,
     zu_conn_registered_count, zu_conn_registered_name, zu_conn_rows_read, zu_conn_set_progress,
-    zu_conn_unregister_z, zu_connect, zu_create, zu_create_z, zu_database_close,
-    zu_database_create_z, zu_database_is_memory, zu_database_memory, zu_database_open_z,
-    zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt, zu_error_free,
-    zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable, zu_error_severity,
-    zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool, zu_frame_col_float,
-    zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free, zu_frame_new,
-    zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
-    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
-    zu_loader_table, zu_loader_table_z, zu_memory, zu_open, zu_open_z, zu_prepare, zu_prepare_z,
-    zu_query, zu_query_z, zu_result_arrow, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
-    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
+    zu_conn_table_name, zu_conn_unregister_z, zu_connect, zu_create, zu_create_z,
+    zu_database_close, zu_database_create_z, zu_database_is_memory, zu_database_memory,
+    zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
+    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
+    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool,
+    zu_frame_col_float, zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free,
+    zu_frame_new, zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
+    zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
+    zu_loader_free, zu_loader_table, zu_loader_table_z, zu_memory, zu_open, zu_open_z, zu_prepare,
+    zu_prepare_z, zu_query, zu_query_z, zu_result_arrow, zu_result_cell, zu_result_cell_str,
+    zu_result_cell_type, zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
     zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
     zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
     zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_gqlstatus, zu_result_notice,
     zu_result_notices, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
-    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
-    zu_value_type, zu_version,
+    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_rel, zu_value_str,
+    zu_value_temporal, zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -4329,6 +4329,77 @@ fn one_description_registers_on_two_connections_over_the_same_memory() {
         zu_conn_close(second);
     }
     assert_eq!(freed.load(Ordering::Acquire), 1);
+}
+
+/// A node value and an edge value name their tables, which is the one
+/// thing a C host holding either could not do before: the value carries
+/// an id and the id means nothing without the catalog.
+#[test]
+fn a_table_id_from_a_node_or_an_edge_can_be_named() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("named.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(
+            conn,
+            "MATCH (a:person)-[e:follows]->(b:person) RETURN a AS n, e AS r LIMIT 1",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 1);
+
+        let node = cell(result, 0, 0);
+        assert_eq!(zu_value_type(node), ZU_TYPE_NODE);
+        let (mut nodes, mut offset) = (u32::MAX, u64::MAX);
+        assert_eq!(zu_value_node(node, &mut nodes, &mut offset), ZuStatus::Ok);
+
+        let edge = cell(result, 0, 1);
+        assert_eq!(zu_value_type(edge), ZU_TYPE_REL);
+        let (mut rels, mut src, mut dst) = (u32::MAX, u64::MAX, u64::MAX);
+        assert_eq!(
+            zu_value_rel(edge, &mut rels, &mut src, &mut dst),
+            ZuStatus::Ok
+        );
+
+        // One id space, so the two kinds come back from one call, and
+        // the ids differ because a node table and a rel table are never
+        // the same table.
+        assert_ne!(nodes, rels);
+        let mut len = 0usize;
+        let name = zu_conn_table_name(conn, nodes, &mut len);
+        assert!(!name.is_null());
+        assert_eq!(len, 6);
+        assert_eq!(CStr::from_ptr(name).to_str().expect("utf-8"), "person");
+
+        // Asking again replaces what the last answer pointed at, which
+        // is why the header says the answer is good until the next
+        // call: a host that wants both names copies the first.
+        let name = zu_conn_table_name(conn, rels, &mut len);
+        assert!(!name.is_null());
+        assert_eq!(len, 7);
+        assert_eq!(CStr::from_ptr(name).to_str().expect("utf-8"), "follows");
+
+        // The length may be dropped by a host that is happy to walk to
+        // the NUL, since unlike a registered name this one has one.
+        assert_eq!(
+            CStr::from_ptr(zu_conn_table_name(conn, nodes, ptr::null_mut()))
+                .to_str()
+                .expect("utf-8"),
+            "person"
+        );
+
+        // No table has that id, and no handle at all: nothing to say in
+        // either case, and neither is an error worth an error handle.
+        let mut len = 9usize;
+        assert!(zu_conn_table_name(conn, u32::MAX, &mut len).is_null());
+        assert_eq!(len, 0, "the length is written on every path");
+        assert!(zu_conn_table_name(ptr::null_mut(), nodes, ptr::null_mut()).is_null());
+
+        zu_result_free(result);
+        zu_conn_close(conn);
+    }
 }
 
 /// The names, walked the way a host walks them: the count refreshes the

@@ -118,7 +118,20 @@ impl Epochs {
 
     /// The oldest epoch any session is still working in. Everything
     /// strictly older than this is unreachable.
+    ///
+    /// The fence is half of a pair with the one in [`Slotted::protect`],
+    /// and it is what makes the answer mean anything. A caller gets here
+    /// after publishing whatever it wants the sessions to see, and a
+    /// session announces before it reads. Without the fences those are a
+    /// store and a load on each side with nothing between them, so both
+    /// sides may miss the other: the scan reads a slot that has not
+    /// announced yet and calls the epoch drained, while the session that
+    /// was about to announce goes on reading what the caller has already
+    /// replaced. With them the two orders cannot both come out that way,
+    /// so either the scan sees the announcement and waits, or the
+    /// session sees the publication and takes the new one (#465).
     pub fn safe_epoch(&self) -> u64 {
+        std::sync::atomic::fence(Ordering::SeqCst);
         let mut safe = self.current();
         let claimed = self.claimed.load(Ordering::Acquire);
         for slot in &self.slots[..claimed] {
@@ -293,11 +306,28 @@ impl<'a> Slotted<'a> {
 
     /// Announces the current epoch. Every operation that dereferences
     /// an address opens with this.
+    ///
+    /// The announcement is a swap and not a store, and the ordering is
+    /// sequential and not release, because everything this session is
+    /// about to read is something another thread may be in the middle of
+    /// replacing and the announcement is the only thing telling that
+    /// thread to wait. A plain store may still be sitting in this core's
+    /// store buffer while the reads that follow it are already running,
+    /// which is the one reordering x86 allows and the one that matters
+    /// here: the scan in [`Epochs::safe_epoch`] would see a slot that
+    /// has not announced, call the epoch drained, and free a table this
+    /// session is about to walk into (#465). A swap is a locked
+    /// instruction, so it drains the buffer as part of doing the store,
+    /// which costs less than a store and a separate fence.
+    ///
+    /// The epoch it announces can be one behind by the time it lands,
+    /// and that is fine: an epoch older than the truth holds reclamation
+    /// back rather than letting it run early.
     #[inline]
     pub fn protect(&self) {
         self.epochs.slots[self.slot]
             .epoch
-            .store(self.epochs.current(), Ordering::Release);
+            .swap(self.epochs.current(), Ordering::SeqCst);
     }
 
     /// Stands down, so nothing this session did holds reclamation up.

@@ -343,7 +343,6 @@ impl Log {
         // The pages go back after the boundary moves, so a session that
         // was already walking a chain either sees the old boundary and
         // real bytes, or the new one and stops before it asks.
-        self.epochs.bump();
         for page in page_of(from)..page_of(upto) {
             let stale = self.pages[page].swap(std::ptr::null_mut(), Ordering::AcqRel);
             if !stale.is_null() {
@@ -356,7 +355,7 @@ impl Log {
                 }));
             }
         }
-        self.epochs.drain();
+        self.retire_pages();
         // Never the first block: it holds the marker, and a hole there
         // would zero the very thing that says where the log starts.
         let floor = from.max(file::BLOCK);
@@ -562,6 +561,22 @@ impl Log {
                 }));
             }
         }
+        self.retire_pages();
+    }
+
+    /// Moves the epoch on and runs whatever that let go of.
+    ///
+    /// The bump comes after the pointers are retired and not before, and
+    /// that order is the whole of it. An action is queued in the epoch
+    /// that was current when its page was taken out of the table, and it
+    /// runs once every session has announced a later one, so without a
+    /// bump behind it there is no later one to announce and the action
+    /// waits forever. Both eviction sites used to leave that bump to
+    /// whoever came next, and the only site that did one was compaction,
+    /// so a database with `memory_pages` set and compaction off evicted
+    /// pages out of the table and never gave a single one back.
+    fn retire_pages(&self) {
+        self.epochs.bump();
         self.epochs.drain();
     }
 
@@ -935,7 +950,7 @@ impl Drop for Log {
         // Nothing is running by the time a log drops, so the deferred
         // frees can retire unconditionally and the resident pages go
         // back directly.
-        self.epochs.drain();
+        self.epochs.retire_all();
         for slot in &self.pages {
             let page = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
             if !page.is_null() {
@@ -1073,6 +1088,49 @@ mod tests {
     /// rather than fails if it regresses: the reader here does not stand
     /// down until the commit has already returned, so a commit that
     /// waited for the epoch to turn over would never return at all.
+    /// `memory_pages` is a promise about memory and not about the page
+    /// table. Taking a page out of the table and leaving its four
+    /// megabytes queued behind an epoch that never moves keeps the
+    /// promise on paper and breaks it everywhere it matters.
+    #[test]
+    fn an_evicted_page_gives_its_memory_back() {
+        let (_dir, log) = log(3);
+        let session = Slotted::new(&log.epochs);
+        let value = vec![0xABu8; 8192];
+        for i in 0..3000u32 {
+            log.append(
+                &session,
+                0,
+                u64::from(i) + 1,
+                &i.to_be_bytes(),
+                &value,
+                false,
+                record::KIND_VALUE,
+            )
+            .expect("append");
+            session.protect();
+            session.unprotect();
+            log.flush_once().expect("flush");
+            log.opened_page(page_of(log.tail()));
+        }
+        let resident = log
+            .pages
+            .iter()
+            .filter(|p| !p.load(Ordering::Acquire).is_null())
+            .count();
+        assert!(page_of(log.head()) > 0, "nothing was evicted");
+        assert_eq!(
+            log.epochs.pending(),
+            0,
+            "{} pages left the table and {resident} are still in it, but their memory was never freed",
+            page_of(log.head())
+        );
+        assert!(
+            resident <= 4,
+            "the page table holds {resident} pages against a memory budget of 3"
+        );
+    }
+
     #[test]
     fn a_durable_commit_does_not_wait_for_a_reader() {
         let (_dir, log) = log(usize::MAX);

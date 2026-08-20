@@ -175,6 +175,31 @@ impl Epochs {
         }
     }
 
+    /// Runs every deferred action whatever epoch it was queued in.
+    ///
+    /// Only for a caller that knows nothing is running, which in
+    /// practice is a log being dropped. [`Epochs::drain`] cannot do this
+    /// job: an action queued in the current epoch is never older than
+    /// the safe epoch, so a queue that was filled after the last bump
+    /// would go to the allocator unfreed.
+    pub fn retire_all(&self) {
+        let queued: Vec<_> = self
+            .deferred
+            .lock()
+            .expect("zu2 epoch queue")
+            .drain(..)
+            .collect();
+        for (_, action) in queued {
+            action();
+        }
+    }
+
+    /// Deferred actions that have not run yet.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.deferred.lock().expect("zu2 epoch queue").len()
+    }
+
     /// Blocks until every session that was inside an operation when
     /// this was called has left it.
     ///
@@ -322,6 +347,23 @@ mod tests {
         epochs.bump();
         epochs.drain();
         assert_eq!(ran.load(Ordering::Acquire), 1, "never retired");
+    }
+
+    #[test]
+    fn retire_all_runs_what_a_drain_cannot() {
+        let epochs = Epochs::new(4);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&ran);
+        epochs.defer(Box::new(move || {
+            flag.fetch_add(1, Ordering::Release);
+        }));
+        // Queued in the current epoch, so it is not older than the safe
+        // epoch and no drain will ever take it.
+        epochs.drain();
+        assert_eq!(ran.load(Ordering::Acquire), 0, "a drain took it");
+        epochs.retire_all();
+        assert_eq!(ran.load(Ordering::Acquire), 1, "it was dropped on the floor");
+        assert_eq!(epochs.pending(), 0);
     }
 
     #[test]

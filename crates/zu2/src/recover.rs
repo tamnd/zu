@@ -29,12 +29,18 @@
 //! and until it exists a scan of a young log is fast and a wrong
 //! checkpoint is worse than no checkpoint.
 
-use crate::addr::{Address, FIRST, PAGE_SIZE, page_of, page_start};
+use std::collections::BTreeSet;
+
+use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::db::{Core, restore_pages};
 use crate::error::Result;
 use crate::graph;
 use crate::index::{self, EMPTY, Index, SLOTS};
 use crate::record::{self, RecordRef};
+
+/// Pages the scan changed a record in, which have to go back to the
+/// file before anything can evict them. See [`install`].
+type Rewritten = BTreeSet<usize>;
 
 /// Rebuilds the index from the file and leaves the log ready to append.
 pub fn replay(core: &Core) -> Result<()> {
@@ -44,16 +50,69 @@ pub fn replay(core: &Core) -> Result<()> {
     // since a hole reads as zeros and a page of zeros is skipped the
     // same way page padding is, but it would restore every punched page
     // into memory to learn that.
-    let mut address = core.log.begin().max(FIRST);
-    // Where the last record the scan accepted ended, which is where the
-    // next append goes. Not the same as where the scan stops: the file
-    // can be longer than the log, either because a page ends in padding
-    // or because the write path had provisioned blocks past the tail
-    // that the run did not live to use, and appending after those would
-    // leave a hole and lose the room.
-    let mut end = address;
+    let from = core.log.begin().max(FIRST);
+    // What the file holds, before anything is built out of it. Records
+    // are an upper bound on keys, and a table sized against them is a
+    // table the scan can put nearly every record straight into. See
+    // [`install`] for what a table of the wrong size costs, and
+    // [`crate::index::Index::presize`] for what this leaves alone.
+    let mut records = 0usize;
+    walk(core, from, len, |_, _| {
+        records += 1;
+        Ok(())
+    })?;
+    core.index.presize(records.div_ceil(4));
+
+    let mut rewritten = Rewritten::new();
     let mut version = 0u64;
-    let mut records = 0u64;
+    let end = walk(core, from, len, |header, address| {
+        if header.kind() == record::KIND_EDGE {
+            // Edge records are not keyed, so nothing goes in the index.
+            // A remove that replays after the add it cancels lands the
+            // same way it did the first time, because the log is in
+            // commit order.
+            // SAFETY: the walk bounded the lengths against the page and
+            // nothing else is running.
+            graph::replay_edge(core, unsafe { header.value_unchecked() })?;
+        } else {
+            if header.kind() == record::KIND_VERTEX {
+                // A node with no edges yet would otherwise leave no
+                // trace, and the next allocation would hand its id out
+                // again.
+                // SAFETY: as above.
+                graph::replay_node(core, unsafe { header.value_unchecked() });
+            }
+            install(core, header, address, &mut rewritten);
+        }
+        version = version.max(header.version());
+        Ok(())
+    })?;
+    core.log.resume_at(end);
+    core.set_version(version);
+    for page in rewritten {
+        let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+        core.log.rewrite_page(page, bytes)?;
+    }
+    Ok(())
+}
+
+/// Reads the records the file holds, in the order they were written,
+/// and hands each one to `visit`. Returns where the last accepted record
+/// ended, which is where the next append goes.
+///
+/// That is not the same as where the walk stops. The file can be longer
+/// than the log, either because a page ends in padding or because the
+/// write path had provisioned blocks past the tail that the run did not
+/// live to use, and appending after those would leave a hole and lose
+/// the room.
+fn walk(
+    core: &Core,
+    from: Address,
+    len: u64,
+    mut visit: impl FnMut(RecordRef<'_>, Address) -> Result<()>,
+) -> Result<Address> {
+    let mut address = from;
+    let mut end = from;
     while address < len {
         let page = page_of(address);
         let base = core.log.resident(address);
@@ -90,23 +149,7 @@ pub fn replay(core: &Core) -> Result<()> {
             } else if size > room || !header.intact() {
                 break;
             } else {
-                if header.kind() == record::KIND_EDGE {
-                    // Edge records are not keyed, so nothing goes in the
-                    // index. A remove that replays after the add it
-                    // cancels lands the same way it did the first time,
-                    // because the log is in commit order.
-                    graph::replay_edge(core, header.value_unchecked())?;
-                } else {
-                    if header.kind() == record::KIND_VERTEX {
-                        // A node with no edges yet would otherwise
-                        // leave no trace, and the next allocation would
-                        // hand its id out again.
-                        graph::replay_node(core, header.value_unchecked());
-                    }
-                    install(core, header, address);
-                }
-                version = version.max(header.version());
-                records += 1;
+                visit(header, address)?;
                 Some(size)
             }
         };
@@ -124,20 +167,43 @@ pub fn replay(core: &Core) -> Result<()> {
             }
         }
     }
-    let _ = records;
-    core.log.resume_at(end);
-    core.set_version(version);
-    Ok(())
+    Ok(end)
 }
 
 /// Puts one record's address into the index, by the same rules the
-/// write path uses so that a recovered table behaves like a written
-/// one. Single threaded, so no compare and swap and no tentative bit.
-fn install(core: &Core, header: RecordRef<'_>, address: Address) {
+/// write path uses so that a recovered table behaves like a written one.
+/// Single threaded, so no compare and swap and no tentative bit.
+///
+/// The one thing it does that the write path does not is move a link.
+/// An entry names the head of a chain, and everything that entry can
+/// reach is reached through it, so a record that takes a slot over has
+/// to point at what the slot held or the keys behind it stop existing.
+/// The write path gets that for free: it appends the record after
+/// reading the entry, so the link is right by construction. The scan
+/// has records that were written under whatever table that run had, and
+/// the table it is filling is a different one whenever the run grew or
+/// the reopen asked for a different `index_buckets`. A link that points
+/// somewhere else is therefore not a rare case, and installing on top of
+/// it was silent loss: keys that were acknowledged and made durable came
+/// back missing, with nothing in the file wrong (#462).
+///
+/// So the scan repairs the link instead, which it may do because it is
+/// alone with the file and because a record's chain pointer means
+/// nothing outside the table it was built for. Nearly every record still
+/// points where it should, `presize` is what keeps it that way, and a
+/// record that already points at the right place is left untouched.
+///
+/// The pages that did change go back to the file at the end of the scan,
+/// because a repair that only happened in memory lasts until the first
+/// eviction and then the old bytes come back off the device. That write
+/// is not torn write safe yet (#463).
+fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut Rewritten) {
     let key = header.key();
     let hash = index::hash(key);
     let tag = Index::tag(hash);
-    let bucket = core.index.bucket(hash);
+    // No migration can be in flight: the flusher that would start one is
+    // not running yet, and this is the only thread there is.
+    let bucket = core.index.live().bucket(hash);
     let mut empty = None;
     for i in 0..SLOTS {
         let entry = bucket.slots[i].load(std::sync::atomic::Ordering::Relaxed);
@@ -150,12 +216,13 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address) {
         if index::tag_of(entry) != tag && !index::is_foreign(entry) {
             continue;
         }
-        if let Some(installed) = chain_version(core, index::address_of(entry), key) {
+        if let Some(installed) = chain_version(core, entry, key) {
             // Not greater than: a pass that copies a copy leaves two
             // records carrying the same version, and the higher address
             // is the one that is still there after the region below it
             // goes.
             if header.version() >= installed {
+                relink(header, address, index::address_of(entry), rewritten);
                 bucket.slots[i].store(
                     index::entry(tag, address, index::is_foreign(entry)),
                     std::sync::atomic::Ordering::Relaxed,
@@ -164,20 +231,44 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address) {
             return;
         }
     }
+    // Past the loop is a key the table has not seen, whichever way it
+    // goes in, and the count is what the table sizes itself against once
+    // the flusher starts.
+    core.index.note_key();
     if let Some(i) = empty {
+        // Nothing was reachable through an empty slot, so the record
+        // starts a chain rather than extending one.
+        relink(header, address, NULL, rewritten);
         bucket.slots[i].store(
             index::entry(tag, address, false),
             std::sync::atomic::Ordering::Relaxed,
         );
         return;
     }
-    // The bucket was full when this record was written too, so it
-    // displaced an entry then and it displaces one now.
+    // A full bucket, so the record takes an entry over and carries what
+    // it held. The slot is the one the write path would have picked, not
+    // because it has to be but because a scan that lands where the
+    // writes landed leaves less to repair.
     let i = tag as usize % SLOTS;
+    let victim = index::address_of(bucket.slots[i].load(std::sync::atomic::Ordering::Relaxed));
+    relink(header, address, victim, rewritten);
     bucket.slots[i].store(
         index::entry(tag, address, true),
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// Points a record at what the entry it is taking over holds, unless it
+/// points there already, and remembers the page so that it goes back to
+/// the file before anything can evict it.
+fn relink(header: RecordRef<'_>, address: Address, previous: Address, rewritten: &mut Rewritten) {
+    if header.previous() == previous {
+        return;
+    }
+    // SAFETY: recovery is single threaded and the record was read out of
+    // a resident page, which is a page that can be written back.
+    unsafe { header.relink(previous) };
+    rewritten.insert(page_of(address));
 }
 
 /// The version of the record this chain holds for `key`, or `None` when
@@ -186,7 +277,9 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address) {
 /// below it there is nothing left to find.
 ///
 /// The first match is the answer, because a chain runs newest first.
-fn chain_version(core: &Core, mut address: Address, key: &[u8]) -> Option<u64> {
+fn chain_version(core: &Core, entry: u64, key: &[u8]) -> Option<u64> {
+    let mut address = index::address_of(entry);
+    let foreign = index::is_foreign(entry);
     let floor = core.log.begin();
     while address >= floor && address != crate::addr::NULL {
         let base = core.log.resident(address);
@@ -202,6 +295,12 @@ fn chain_version(core: &Core, mut address: Address, key: &[u8]) -> Option<u64> {
             }
             r.previous()
         };
+        if !foreign {
+            // The same rule the read path uses: an entry without the
+            // bit answers for the key at its head and the scan has to
+            // read it the way a lookup will.
+            return None;
+        }
         address = previous;
     }
     None

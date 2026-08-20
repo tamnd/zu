@@ -399,7 +399,11 @@ mod tests {
         epochs.drain();
         assert_eq!(ran.load(Ordering::Acquire), 0, "a drain took it");
         epochs.retire_all();
-        assert_eq!(ran.load(Ordering::Acquire), 1, "it was dropped on the floor");
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            1,
+            "it was dropped on the floor"
+        );
         assert_eq!(epochs.pending(), 0);
     }
 

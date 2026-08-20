@@ -263,6 +263,35 @@ impl<'a> RecordRef<'a> {
         true
     }
 
+    /// Points the record at a different prior record and refreshes the
+    /// checksum, so a scan that reads it later still accepts it.
+    ///
+    /// Recovery only. The live path never moves a link: a chain is only
+    /// ever extended at its head, by a record whose address nobody has
+    /// seen yet, which is what lets a reader walk one without a latch.
+    /// Recovery has no readers to race and a reason the live path does
+    /// not have, which [`crate::recover::install`] explains.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts it is the only thread that can see this
+    /// record, and that the record is in a page it can write back.
+    pub unsafe fn relink(&self, previous: Address) {
+        // SAFETY: the contract covers the whole record, and the caller
+        // has said nothing else is looking at it.
+        unsafe {
+            self.base.cast::<u64>().cast_mut().write(previous);
+            let crc = checksum(
+                previous,
+                self.version_cell().load(Ordering::Relaxed),
+                self.lengths(),
+                self.key(),
+                self.value_unchecked(),
+            );
+            self.base.add(24).cast::<u32>().cast_mut().write(crc);
+        }
+    }
+
     /// Whether the record's checksum holds. Recovery asks; the read
     /// path does not.
     pub fn intact(&self) -> bool {

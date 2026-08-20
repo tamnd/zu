@@ -12,6 +12,7 @@
 //! already whole; a swap that loses simply retries, and the record it
 //! wrote becomes unreachable bytes that compaction reclaims later.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,10 +22,28 @@ use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::epoch::Slotted;
 use crate::error::{Error, Result};
 use crate::graph::Graph;
-use crate::index::{self, Bucket, EMPTY, Index, SLOTS};
+use crate::index::{self, Bucket, Claim, EMPTY, Index, Migration, SLOTS};
 use crate::log::{self, Durability, Log};
 use crate::record::{self, RecordRef};
 use crate::{compact, file, recover};
+
+/// Records a split reads out of one chain before it gives up on
+/// splitting that bucket by key and carries it over whole.
+///
+/// The walk is what turns displaced keys back into keys with entries,
+/// and it is bounded because the chain it walks holds every version of
+/// every key in the bucket that compaction has not reclaimed yet, not
+/// just the live ones. A hot key rewritten ten thousand times between
+/// two compaction passes would otherwise make the doubling pay for all
+/// ten thousand.
+const SPLIT_WALK_LIMIT: usize = 1024;
+
+/// The record a split has settled on for one key.
+#[derive(Clone, Copy)]
+struct Placed {
+    address: Address,
+    version: u64,
+}
 
 /// How a database is sized and how durable it is.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +54,15 @@ pub struct Options {
     /// entries per bucket, and the table should be under half full, so
     /// records / 4 is a reasonable hint.
     pub index_buckets: usize,
+    /// Whether the index doubles when it passes half full. On, because a
+    /// hint is a hint and a database that outgrows one should not start
+    /// paying a log dereference per lookup for it.
+    ///
+    /// Off pins the table at `index_buckets` however many keys arrive,
+    /// which is what a measurement of what crowding costs needs, and
+    /// what a caller who knows its key count exactly can use to keep the
+    /// pointer indirection off its read path.
+    pub grow_index: bool,
     /// Slots in the page table, which caps the log at
     /// `max_pages * 4 MiB`.
     pub max_pages: usize,
@@ -79,6 +107,7 @@ impl Default for Options {
         Self {
             durability: Durability::Durable,
             index_buckets: 1 << 16,
+            grow_index: true,
             max_pages: 1 << 16,
             mutable_pages: 4,
             memory_pages: usize::MAX,
@@ -244,7 +273,7 @@ impl Db {
                 options.sessions,
                 options.provision_bytes,
             ),
-            index: Index::new(options.index_buckets),
+            index: Index::new(options.index_buckets, !options.grow_index),
             graph: Graph::new(options.max_nodes),
             version: AtomicU64::new(0),
             durability: options.durability,
@@ -383,8 +412,46 @@ impl Db {
     }
 
     /// Entries in use, for reporting the load factor a run happened at.
+    ///
+    /// Under an epoch because a doubling retires the table it grew out
+    /// of, and a caller counting entries is walking one.
     pub fn index_occupancy(&self) -> usize {
-        self.core.index.occupancy()
+        let Ok(session) = self.core.maintenance_session() else {
+            return 0;
+        };
+        session.slot.protect();
+        let entries = self.core.index.occupancy();
+        session.slot.unprotect();
+        entries
+    }
+
+    /// Buckets in the index as it stands, which is the size it was
+    /// opened with doubled once per [`Db::index_grows`].
+    pub fn index_buckets(&self) -> usize {
+        let Ok(session) = self.core.maintenance_session() else {
+            return 0;
+        };
+        session.slot.protect();
+        let buckets = self.core.index.buckets();
+        session.slot.unprotect();
+        buckets
+    }
+
+    /// Times the index has doubled since the database was opened. A run
+    /// that reports more than a couple of these was sized well short of
+    /// what it loaded.
+    pub fn index_grows(&self) -> u64 {
+        self.core.index.grows()
+    }
+
+    /// Whether a doubling is in flight right now. A caller that wants a
+    /// count of anything in the index wants this to be false first, or it
+    /// is counting a table halfway through being replaced.
+    ///
+    /// No epoch here, unlike its neighbours: this reads the pointer and
+    /// does not make a reference out of it.
+    pub fn index_resizing(&self) -> bool {
+        self.core.index.resizing()
     }
 }
 
@@ -422,8 +489,42 @@ fn maintain(core: &Core, options: Options) {
                 return;
             }
         }
+        if let Err(error) = resize_index(core)
+            && !matches!(error, Error::NoSessions { .. })
+        {
+            debug_assert!(false, "zu2 index: {error}");
+            return;
+        }
         core.log.wait_for_work();
     }
+}
+
+/// Doubles the index when it has passed the load factor it grows at,
+/// and finishes off a doubling that the traffic left half done.
+///
+/// The grow happens here rather than on the write path that noticed,
+/// because it waits for every operation that is running and a writer
+/// that waited for its peers would be waiting inside its own epoch. This
+/// thread holds none, which is what makes the wait terminate.
+///
+/// Finishing is not just tidying. A migration holds the whole old table
+/// until its last bucket is drained, and a key nobody touches never
+/// drains itself, so a table that doubled once against a workload with a
+/// cold half would hold that half forever and never be allowed to double
+/// again.
+fn resize_index(core: &Core) -> Result<()> {
+    if core.index.wants_growth() {
+        core.index.grow(core.epochs());
+    }
+    if !core.index.resizing() {
+        return Ok(());
+    }
+    let mut session = core.maintenance_session()?;
+    session.drain_index()?;
+    // Outside the epoch this time, so the table the last drain retired
+    // can actually go back.
+    core.epochs().drain();
+    Ok(())
 }
 
 /// One compaction pass plus the decision about when the next one runs.
@@ -483,7 +584,7 @@ pub struct Session<'a> {
     scratch: Vec<u64>,
 }
 
-impl Session<'_> {
+impl<'a> Session<'a> {
     /// What this session is attached to. The graph plane reaches the
     /// log and the adjacency through here.
     pub fn core_ref(&self) -> &Core {
@@ -533,8 +634,28 @@ impl Session<'_> {
         Ok(self.scratch.as_ptr().cast())
     }
 
-    /// Walks a chain looking for `key`, comparing keys at every step
-    /// because a chain can hold records of other keys.
+    /// What an entry has to say about `key`: the address of its newest
+    /// record, or nothing.
+    ///
+    /// The foreign bit is what says how far to look. An entry that has
+    /// it walks its whole chain, comparing keys at every step, because
+    /// displacement put keys under it that have nowhere else to be
+    /// found. An entry without it answers for the key at its head record
+    /// and for nothing else, and the records below that head are the
+    /// same key's older versions as far as this entry is concerned.
+    ///
+    /// That is not the same as saying the chain holds one key. A split
+    /// names a record out of a chain it is taking apart, and the records
+    /// under that one stay where they were, so a placed entry very often
+    /// has other keys below it. Those keys got entries of their own from
+    /// the same split, which is why this may stop at the head and why it
+    /// has to: walking on would let a lookup answer for a key out of an
+    /// entry that is not the key's own, and the write path swings the
+    /// entry it found the key through. Two keys with the same fourteen
+    /// bit tag in one bucket was enough to make an update to one of them
+    /// take the other's entry over and bury it, and the next split then
+    /// read the cleared foreign bit as licence to stop at the head and
+    /// never saw the buried key again (#466).
     ///
     /// The walk stops at the log's begin address, not at [`NULL`].
     /// Everything below begin has been compacted away, and a chain only
@@ -543,7 +664,9 @@ impl Session<'_> {
     /// floor once per walk rather than per step is deliberate: begin
     /// only rises, so a stale floor costs at worst a step into a page of
     /// zeros, which ends the walk anyway.
-    fn chain_find(&mut self, mut address: Address, key: &[u8]) -> Result<Option<Address>> {
+    fn chain_find(&mut self, entry: u64, key: &[u8]) -> Result<Option<Address>> {
+        let mut address = index::address_of(entry);
+        let foreign = index::is_foreign(entry);
         let floor = self.core.log.begin();
         while address >= floor && address != NULL {
             let base = self.locate(address)?;
@@ -557,9 +680,291 @@ impl Session<'_> {
                 }
                 r.previous()
             };
+            if !foreign {
+                return Ok(None);
+            }
             address = found;
         }
         Ok(None)
+    }
+
+    /// The bucket `hash` belongs in, with the old table drained into it
+    /// first when the index is doubling.
+    ///
+    /// The epoch has to be held before this is called, and this is what
+    /// every operation calls first. Both of those matter. The epoch is
+    /// what keeps the table alive under the reference this hands back,
+    /// and being first is what makes it safe for this to stand the epoch
+    /// down and take it again: the operation has read nothing yet, so
+    /// there is nothing for it to have to reread.
+    fn bucket_of(&mut self, hash: u64) -> Result<&'a Bucket> {
+        let core = self.core;
+        loop {
+            // The live table is read before the migration and not after.
+            // A grow publishes the migration first, so a caller that saw
+            // the new table sees the migration too, and a caller that
+            // sees no migration is holding a table nothing is draining.
+            let live = core.index.live();
+            let Some(migration) = core.index.pending() else {
+                return Ok(live.bucket(hash));
+            };
+            if !migration.open() {
+                // A grow has published a table it has not started
+                // filling, and is waiting for the operations that were
+                // already running before it lets anyone fill it. This
+                // one might be one of those, so it stands down rather
+                // than spinning inside the epoch the grower is waiting
+                // on, which would be a wait on itself.
+                self.slot.unprotect();
+                std::hint::spin_loop();
+                self.slot.protect();
+                continue;
+            }
+            self.drain_bucket(migration, migration.source(hash))?;
+            // Not `live`: this may have been the operation that saw the
+            // old table, and after the drain the new one is the answer.
+            let filled = core.index.live();
+            match core.index.pending() {
+                // The same doubling is still running, so the table it is
+                // filling is the live one and this key's bucket in it has
+                // just been drained.
+                Some(pending) if std::ptr::eq(pending, migration) => {
+                    return Ok(filled.bucket(hash));
+                }
+                // It finished, and nothing has started since.
+                None => return Ok(filled.bucket(hash)),
+                // It finished and the next one started, which is what a
+                // table several doublings behind its key set does: the
+                // drain that ends one doubling is what lets the next one
+                // begin, and this operation may be the one that ended it.
+                // The bucket this was about to hand back is in the table
+                // that is now being drained, and a write into it lands
+                // where the split has already been.
+                Some(_) => continue,
+            }
+        }
+    }
+
+    /// Splits whatever of the old table the traffic has not, one bucket
+    /// per epoch so a reader never waits on the whole of it.
+    pub(crate) fn drain_index(&mut self) -> Result<()> {
+        let mut from = 0;
+        loop {
+            self.slot.protect();
+            let more = (|| -> Result<bool> {
+                let Some(migration) = self.core.index.pending() else {
+                    return Ok(false);
+                };
+                if !migration.open() {
+                    return Ok(false);
+                }
+                let Some(source) = migration.unfinished(from) else {
+                    return Ok(false);
+                };
+                from = source + 1;
+                self.drain_bucket(migration, source)?;
+                Ok(true)
+            })();
+            self.slot.unprotect();
+            if !more? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Makes sure one old bucket has been split into the two new ones it
+    /// feeds, doing it here if nobody else has.
+    fn drain_bucket(&mut self, migration: &Migration, source: usize) -> Result<()> {
+        match migration.claim(source) {
+            Claim::Done => return Ok(()),
+            Claim::Busy => {
+                migration.wait(source);
+                return Ok(());
+            }
+            Claim::Mine => {}
+        }
+        match self.split_bucket(migration, source) {
+            Ok(()) => {
+                if migration.finish(source) {
+                    self.core.index.retire(self.core.epochs(), migration);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // The claim comes off and the bucket goes back on the
+                // list. Nothing was written, so a later caller sees the
+                // bucket exactly as this one found it.
+                migration.release(source);
+                Err(error)
+            }
+        }
+    }
+
+    /// Splits one old bucket into the two new ones.
+    ///
+    /// The caller owns the bucket, and owning it means owning both of
+    /// its destinations too, because no other hash reaches them. So the
+    /// installs are plain stores into slots nobody else can be looking
+    /// at until the bucket is published as done.
+    ///
+    /// Every read happens before every write. A log read can fail, an
+    /// entry can have left memory and have to come back off the device,
+    /// and a half split bucket is not something a retry could sort out:
+    /// the entries already installed have no mark on them saying so, and
+    /// installing them twice would put one key in the index twice. So
+    /// the whole answer is worked out first and written after, which
+    /// leaves a failure looking like nothing happened.
+    ///
+    /// The bit the split turns on is a low bit of the hash and the tag
+    /// is the top fourteen, so an entry cannot say which side it goes to
+    /// and the split has to read the log. A chain with one key in it
+    /// costs one dereference. A chain with several, which is what the
+    /// foreign bit marks, is walked, and the keys in it come out with an
+    /// entry each rather than staying displaced. That is the whole point
+    /// of doing it this way: a bucket that was crowded enough to
+    /// displace is exactly the bucket a doubling is supposed to fix, and
+    /// carrying the chain over whole would leave it crowded in two
+    /// places instead of one.
+    ///
+    /// Placed entries are not foreign, and that is a statement about the
+    /// entry rather than about the chain: the records under a placed one
+    /// stay where they were, other keys and all, and what the cleared
+    /// bit says is that this entry answers for the key at its head and
+    /// for nothing else. Every key that was under it got an entry of its
+    /// own from this same pass, so nothing is left only reachable
+    /// through somebody else's head. [`Session::chain_find`] is the
+    /// other half of that and #466 is what it cost when the two halves
+    /// disagreed.
+    fn split_bucket(&mut self, migration: &Migration, source: usize) -> Result<()> {
+        let old = migration.old().at(source);
+        let floor = self.core.log.begin();
+        let mut entries = Vec::with_capacity(SLOTS);
+        // Key to the record for it this bucket is going to name.
+        let mut keys: HashMap<Vec<u8>, Placed> = HashMap::new();
+        // Key, address and version of one chain, head first. Kept across
+        // the eight slots so a doubling allocates per bucket rather than
+        // per chain.
+        let mut chain: Vec<(Vec<u8>, Address, u64)> = Vec::new();
+        let mut whole = true;
+        for i in 0..SLOTS {
+            let entry = old.slots[i].load(Ordering::Acquire);
+            // A tentative claim cannot be here. It is set and cleared
+            // inside one protected region, and the grower waited for
+            // every one of those to end before it opened the migration.
+            if entry == EMPTY || index::is_tentative(entry) {
+                continue;
+            }
+            let address = index::address_of(entry);
+            if address < floor {
+                // Compaction has passed this entry by, so a lookup
+                // reaching it stops at the floor and reads nothing. It
+                // is already invisible and carrying it over would only
+                // take a slot in the new table.
+                continue;
+            }
+            entries.push(entry);
+            if !whole {
+                // The bucket is going over as it stands, so the rest of
+                // the reads would only be to fill a list nothing will
+                // look at. The entries still have to be collected, which
+                // is why this carries on round the loop.
+                continue;
+            }
+            chain.clear();
+            let mut at = address;
+            while at >= floor && at != NULL {
+                if chain.len() == SPLIT_WALK_LIMIT {
+                    // A chain long enough to cost more than the split is
+                    // worth. What has been read so far cannot be used,
+                    // because the split only gets to drop a key when it
+                    // knows the key is somewhere else, so this bucket
+                    // goes over whole instead.
+                    whole = false;
+                    break;
+                }
+                let base = self.locate(at)?;
+                // SAFETY: locate returns a whole record, valid until the
+                // next call on this session, which is why the key is
+                // copied rather than borrowed.
+                let (key, previous, version) = unsafe {
+                    let r = RecordRef::new(base);
+                    (r.key().to_vec(), r.previous(), r.version())
+                };
+                chain.push((key, at, version));
+                at = previous;
+                if !index::is_foreign(entry) {
+                    // This entry answers for its head record only, so
+                    // whatever is under it belongs to entries of its
+                    // own and this walk will reach it through those.
+                    break;
+                }
+            }
+            if !whole {
+                continue;
+            }
+            for (key, address, version) in chain.drain(..) {
+                if migration.source(index::hash(&key)) != source {
+                    continue;
+                }
+                let placed = Placed { address, version };
+                let held = keys.entry(key).or_insert(placed);
+                // A key can be in more than one chain here, an older
+                // version of it displaced under somebody else while its
+                // own entry names the newest. The version says which is
+                // which; the address breaks the tie a compaction copy
+                // leaves, and it breaks it towards the copy.
+                if (placed.version, placed.address) > (held.version, held.address) {
+                    *held = placed;
+                }
+            }
+        }
+
+        // Keys from another bucket are in here whenever an earlier split
+        // had to carry a chain over whole, and they are dropped rather
+        // than placed: the bucket they belong to has them too, and two
+        // buckets naming one key is the one thing the index may not do.
+        let mut low = Vec::with_capacity(keys.len());
+        let mut high = Vec::with_capacity(keys.len());
+        for (key, held) in &keys {
+            let hash = index::hash(key);
+            let placed = index::entry(Index::tag(hash), held.address, false);
+            if migration.low_side(hash) {
+                low.push(placed);
+            } else {
+                high.push(placed);
+            }
+        }
+
+        let live = self.core.index.live();
+        self.fill(live.at(source), &low, &entries, whole);
+        self.fill(
+            live.at(source + migration.old().len()),
+            &high,
+            &entries,
+            whole,
+        );
+        Ok(())
+    }
+
+    /// Puts one side of a split into its bucket, either as an entry per
+    /// key or, when that will not fit, as the old bucket copied over.
+    ///
+    /// The copy is always correct and never helps. Every key the old
+    /// bucket reached is still reachable through it, which is why it is
+    /// the fallback, and both sides get one, which is why it leaves the
+    /// crowding where it was. It happens when a side has more distinct
+    /// keys than a bucket has slots, and the next doubling halves that,
+    /// so a table that starts far too small works its way out over a few
+    /// passes rather than being stuck.
+    fn fill(&self, bucket: &Bucket, placed: &[u64], entries: &[u64], whole: bool) {
+        let source = if whole && placed.len() <= SLOTS {
+            placed
+        } else {
+            entries
+        };
+        for (slot, entry) in source.iter().enumerate() {
+            bucket.slots[slot].store(*entry, Ordering::Release);
+        }
     }
 
     /// Finds the newest record for `key`, and which entry named it.
@@ -577,7 +982,7 @@ impl Session<'_> {
             if index::tag_of(entry) != tag && !index::is_foreign(entry) {
                 continue;
             }
-            if let Some(address) = self.chain_find(index::address_of(entry), key)? {
+            if let Some(address) = self.chain_find(entry, key)? {
                 return Ok(Some((i, address)));
             }
         }
@@ -587,10 +992,11 @@ impl Session<'_> {
     /// Reads the newest value for `key` into `out`.
     pub fn read(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool> {
         let hash = index::hash(key);
-        let bucket = self.core.index.bucket(hash);
         let tag = Index::tag(hash);
         self.slot.protect();
-        let answer = self.read_protected(bucket, tag, key, out);
+        let answer = self
+            .bucket_of(hash)
+            .and_then(|bucket| self.read_protected(bucket, tag, key, out));
         self.slot.unprotect();
         answer
     }
@@ -627,10 +1033,12 @@ impl Session<'_> {
     /// Removes `key`. Returns whether it was there.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let hash = index::hash(key);
-        let bucket = self.core.index.bucket(hash);
         let tag = Index::tag(hash);
         self.slot.protect();
-        let existed = self.lookup(bucket, tag, key).map(|f| f.is_some());
+        let existed = self
+            .bucket_of(hash)
+            .and_then(|bucket| self.lookup(bucket, tag, key))
+            .map(|f| f.is_some());
         self.slot.unprotect();
         let existed = existed?;
         self.write(key, &[], true, record::KIND_VALUE)?;
@@ -648,13 +1056,13 @@ impl Session<'_> {
         mut make: impl FnMut(Option<&[u8]>, &mut Vec<u8>),
     ) -> Result<()> {
         let hash = index::hash(key);
-        let bucket = self.core.index.bucket(hash);
         let tag = Index::tag(hash);
         self.slot.protect();
-        let found = self.lookup(bucket, tag, key);
+        let entered = self.bucket_of(hash);
         let mut current = Vec::new();
         let outcome = (|| -> Result<Option<Address>> {
-            let found = found?;
+            let bucket = entered?;
+            let found = self.lookup(bucket, tag, key)?;
             let present = match found {
                 Some((_, address)) => {
                     let base = self.locate(address)?;
@@ -688,10 +1096,11 @@ impl Session<'_> {
         kind: u32,
     ) -> Result<()> {
         let hash = index::hash(key);
-        let bucket = self.core.index.bucket(hash);
         let tag = Index::tag(hash);
         self.slot.protect();
-        let outcome = self.install(bucket, tag, key, value, tombstone, kind);
+        let outcome = self
+            .bucket_of(hash)
+            .and_then(|bucket| self.install(bucket, tag, key, value, tombstone, kind));
         self.slot.unprotect();
         let end = outcome?;
         self.finish(end)
@@ -737,7 +1146,7 @@ impl Session<'_> {
                 if index::tag_of(entry) != tag && !index::is_foreign(entry) {
                     continue;
                 }
-                if let Some(address) = self.chain_find(index::address_of(entry), key)? {
+                if let Some(address) = self.chain_find(entry, key)? {
                     found = Some((i, entry, address));
                     break;
                 }
@@ -836,6 +1245,7 @@ impl Session<'_> {
                     }
                 };
                 bucket.slots[i].store(index::entry(tag, fresh, false), Ordering::Release);
+                self.core.index.note_key();
                 return Ok(Some(fresh + size));
             }
 
@@ -863,6 +1273,7 @@ impl Session<'_> {
                 .compare_exchange(entry, replacement, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.core.index.note_key();
                 return Ok(Some(fresh + size));
             }
         }
@@ -905,10 +1316,11 @@ impl Session<'_> {
         version: u64,
     ) -> Result<bool> {
         let hash = index::hash(key);
-        let bucket = self.core.index.bucket(hash);
         let tag = Index::tag(hash);
         self.slot.protect();
+        let entered = self.bucket_of(hash);
         let outcome = (|| -> Result<bool> {
+            let bucket = entered?;
             loop {
                 let mut found = None;
                 for i in 0..SLOTS {
@@ -919,7 +1331,7 @@ impl Session<'_> {
                     if index::tag_of(entry) != tag && !index::is_foreign(entry) {
                         continue;
                     }
-                    if let Some(address) = self.chain_find(index::address_of(entry), key)? {
+                    if let Some(address) = self.chain_find(entry, key)? {
                         found = Some((i, entry, address));
                         break;
                     }
@@ -1037,11 +1449,14 @@ mod tests {
     use super::*;
 
     /// One bucket, so every key in the test lands in it and the eighth
-    /// insert is the one that finds it full.
+    /// insert is the one that finds it full. Growth off, because a table
+    /// that doubles is a table that stops being one bucket, and what
+    /// these are about is what happens inside one.
     fn one_bucket() -> Options {
         Options {
             durability: Durability::Async,
             index_buckets: 1,
+            grow_index: false,
             max_pages: 8,
             max_nodes: 1 << 10,
             compact_below: 0,
@@ -1053,7 +1468,7 @@ mod tests {
     /// Which slots of a bucket reach `key`, and the version of the
     /// record each of them reaches it at.
     fn reachers(core: &Core, key: &[u8]) -> Vec<(usize, u64)> {
-        let bucket = core.index.bucket(index::hash(key));
+        let bucket = core.index.live().bucket(index::hash(key));
         let mut session = core.session();
         let mut found = Vec::new();
         for i in 0..SLOTS {
@@ -1061,10 +1476,7 @@ mod tests {
             if entry == EMPTY || index::is_tentative(entry) {
                 continue;
             }
-            if let Some(address) = session
-                .chain_find(index::address_of(entry), key)
-                .expect("chain find")
-            {
+            if let Some(address) = session.chain_find(entry, key).expect("chain find") {
                 let base = session.locate(address).expect("locate");
                 // SAFETY: locate returns a whole record and nothing is
                 // writing to this database by the time this runs.
@@ -1128,6 +1540,117 @@ mod tests {
     }
 
     #[test]
+    fn an_update_leaves_the_entry_of_another_key_alone() {
+        // #466. A split gives every key it finds an entry of its own and
+        // clears the foreign bit on all of them, which says that each
+        // one answers for the key at its head record and for nothing
+        // else. Two of those keys can share a fourteen bit tag, and then
+        // a scan looking for the lower one meets the upper one's entry
+        // first. Walking through that entry found the key, and the write
+        // path swings whatever entry it found the key through, so the
+        // update took the other key's slot over and buried it under a
+        // head that is not its own. The next split then read the cleared
+        // bit as licence to stop at the head and never saw the buried
+        // key again, which is a silent loss and the reason the read path
+        // stops at the head too.
+        //
+        // The bucket here is written by hand into the shape a split
+        // leaves, because reaching it through a real doubling needs the
+        // two keys to survive together to the same split and that is a
+        // matter of luck rather than of arrangement.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(&dir.path().join("t.zu2"), one_bucket()).expect("create");
+
+        // Two keys with one tag, and eight more with tags of their own
+        // to fill the bucket before either of them arrives.
+        let mut seen: HashMap<u64, usize> = HashMap::new();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut pair = None;
+        for i in 0..100_000u64 {
+            let key = format!("k{i:09}").into_bytes();
+            let tag = Index::tag(index::hash(&key));
+            if let Some(&first) = seen.get(&tag) {
+                pair = Some((keys[first].clone(), key));
+                break;
+            }
+            seen.insert(tag, keys.len());
+            keys.push(key);
+        }
+        let (under, over) = pair.expect("two keys with one tag");
+        let tag = Index::tag(index::hash(&under));
+        let fill: Vec<Vec<u8>> = keys
+            .iter()
+            .filter(|key| Index::tag(index::hash(key)) != tag)
+            .take(SLOTS)
+            .cloned()
+            .collect();
+        assert_eq!(fill.len(), SLOTS, "not enough keys before the collision");
+
+        let mut session = db.session();
+        for key in &fill {
+            session.upsert(key, &[b'x'; 64]).expect("fill");
+        }
+        // Both of the pair arrive at a full bucket, so each takes over
+        // slot tag % SLOTS and chains behind what it found there. That
+        // puts over on top of under on top of a filler.
+        session.upsert(&under, b"under").expect("under");
+        session.upsert(&over, b"over").expect("over");
+
+        let bucket = db.core.index.live().bucket(index::hash(&under));
+        let crowded = bucket.slots[tag as usize % SLOTS].load(Ordering::Acquire);
+        let over_at = session
+            .chain_find(crowded, &over)
+            .expect("chain find")
+            .expect("over is in the chain");
+        let under_at = session
+            .chain_find(crowded, &under)
+            .expect("chain find")
+            .expect("under is in the chain");
+
+        // The bucket as a split leaves it: one entry per key, naming
+        // that key's newest record, none of them foreign. The fillers go
+        // to the other side of the split, which is why their slots go
+        // empty. What matters is that over's entry sits below under's,
+        // so a scan for under meets over's first.
+        for i in 0..SLOTS {
+            bucket.slots[i].store(EMPTY, Ordering::Release);
+        }
+        bucket.slots[0].store(index::entry(tag, over_at, false), Ordering::Release);
+        bucket.slots[1].store(index::entry(tag, under_at, false), Ordering::Release);
+
+        // A value of a different length, so the update has to write a
+        // record and swing an entry rather than settle in place.
+        session.upsert(&under, b"under again").expect("update");
+        drop(session);
+
+        assert_eq!(
+            index::address_of(bucket.slots[0].load(Ordering::Acquire)),
+            over_at,
+            "the update took over the entry of the other key with the same tag"
+        );
+        assert_eq!(
+            reachers(&db.core, &over).len(),
+            1,
+            "over is not reachable through an entry of its own any more"
+        );
+        assert_eq!(
+            reachers(&db.core, &under).len(),
+            1,
+            "under came out of the update with two entries"
+        );
+
+        let mut session = db.session();
+        let mut out = Vec::new();
+        assert!(session.read(&over, &mut out).expect("read"), "over is gone");
+        assert_eq!(out, b"over".to_vec());
+        assert!(
+            session.read(&under, &mut out).expect("read"),
+            "under is gone"
+        );
+        assert_eq!(out, b"under again".to_vec());
+    }
+
+    #[test]
     fn a_failed_append_gives_the_slot_back() {
         // The other half of #454. An append between claiming a slot and
         // storing the entry can fail, and a slot left tentative is one
@@ -1172,7 +1695,7 @@ mod tests {
             session.upsert(&spare, &[b'x'; 1000]).is_err(),
             "the log had room after all"
         );
-        let bucket = db.core.index.bucket(index::hash(&spare));
+        let bucket = db.core.index.live().bucket(index::hash(&spare));
         for i in 0..SLOTS {
             let entry = bucket.slots[i].load(Ordering::Acquire);
             assert!(

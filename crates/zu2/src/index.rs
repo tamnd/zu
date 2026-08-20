@@ -22,8 +22,45 @@
 //! not, so a displaced key is still found; entries without it are
 //! walked only on a tag match, which is the common case and the fast
 //! one. The bit is sticky, because a chain never gives records back.
+//!
+//! ## Growing
+//!
+//! A displaced key costs a log dereference per lookup, so a table that
+//! is four times too small turns a point read into four random reads
+//! and the whole argument for the design goes with it. The table
+//! doubles rather than letting that happen, at half full, which is
+//! before displacement starts rather than after.
+//!
+//! Doubling is FASTER's split, and the shape here is the same: a bucket
+//! `b` of the old table feeds exactly two buckets of the new one, `b`
+//! and `b + old_len`, because the index is the low bits of the hash and
+//! doubling looks at one more of them. Nothing else in the table feeds
+//! those two, so a split is a local operation and the migration of one
+//! bucket needs no lock beyond that bucket.
+//!
+//! What is different is the collision chain. The bit that decides which
+//! side an entry goes to is not in the entry, and cannot be: the entry
+//! is 14 bits of tag and 48 of address with nothing spare. So the split
+//! reads one record per entry and takes the side from the key it finds,
+//! which is one dereference per entry and not one per record. A foreign
+//! entry names a chain of more than one key and there is no single side
+//! for it, so it goes to both, which is correct because a key reaches
+//! only ever one of the two buckets and each side maintains its own
+//! copy from then on. Growing at half full is what keeps that case
+//! rare.
+//!
+//! Migration is per bucket and lazy: an operation drains the old bucket
+//! its key came from before it touches the new table, and the
+//! background thread drains whatever the traffic did not. A grow
+//! publishes the new table and then waits for the operations that were
+//! already running, because those are the ones that may still be
+//! holding a reference into the old table, and nothing migrates until
+//! that wait returns.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+use crate::epoch::Epochs;
 
 /// Entries in one bucket, which is one cacheline.
 pub const SLOTS: usize = 8;
@@ -36,6 +73,10 @@ const ADDRESS_MASK: u64 = (1 << 48) - 1;
 
 /// The entry an empty slot holds.
 pub const EMPTY: u64 = 0;
+
+/// Keys per slot at which the table doubles. Half full, so the split
+/// happens before a bucket has to displace anything rather than after.
+const GROW_AT_PERCENT: usize = 50;
 
 #[inline]
 pub const fn entry(tag: u64, address: u64, foreign: bool) -> u64 {
@@ -82,26 +123,20 @@ impl Default for Bucket {
     }
 }
 
-pub struct Index {
+/// A power of two array of buckets and the mask that picks one.
+pub struct Table {
     buckets: Box<[Bucket]>,
     mask: usize,
 }
 
-impl Index {
-    /// Sizes the table to at least `buckets`, rounded up to a power of
-    /// two. Sizing is a hint from the caller in this version; growing
-    /// under an exclusive epoch is a later milestone, and until then a
-    /// table that fills simply chains in the log.
-    pub fn new(buckets: usize) -> Self {
-        let count = buckets.max(1).next_power_of_two();
+#[allow(clippy::len_without_is_empty)]
+impl Table {
+    fn new(count: usize) -> Self {
+        let count = count.max(1).next_power_of_two();
         Self {
             buckets: (0..count).map(|_| Bucket::default()).collect(),
             mask: count - 1,
         }
-    }
-
-    pub fn buckets(&self) -> usize {
-        self.buckets.len()
     }
 
     #[inline]
@@ -111,15 +146,19 @@ impl Index {
         &self.buckets[hash as usize & self.mask]
     }
 
-    /// The tag for a hash: 14 bits off the top, independent of the bits
-    /// the bucket index used.
     #[inline]
-    pub const fn tag(hash: u64) -> u64 {
-        (hash >> 50) & TAG_MASK
+    pub fn at(&self, index: usize) -> &Bucket {
+        &self.buckets[index & self.mask]
     }
 
-    /// How many entries are in use, for tests and for reporting the
-    /// load factor a benchmark ran at.
+    /// Buckets in the table. A table always has at least one, which is
+    /// why there is no `is_empty` next to it.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// How many entries are in use.
     pub fn occupancy(&self) -> usize {
         self.buckets
             .iter()
@@ -130,6 +169,347 @@ impl Index {
                     .count()
             })
             .sum()
+    }
+}
+
+/// What a caller found when it tried to take a bucket's migration.
+pub enum Claim {
+    /// Somebody already did it.
+    Done,
+    /// This caller owns it and has to finish it.
+    Mine,
+    /// Somebody else is doing it right now.
+    Busy,
+}
+
+const TODO: u8 = 0;
+const BUSY: u8 = 1;
+const MOVED: u8 = 2;
+
+/// A doubling in progress: the table being drained and how far along
+/// each of its buckets is.
+pub struct Migration {
+    old: *mut Table,
+    state: Box<[AtomicU8]>,
+    left: AtomicUsize,
+    /// Set once the grower's wait for the already running operations
+    /// has returned. Nothing migrates before that, because until then
+    /// there may be an operation holding a reference into the old
+    /// table.
+    open: AtomicBool,
+}
+
+// SAFETY: `old` is only read, through `Migration::old`, and the table
+// it points at is immutable for the life of the migration.
+unsafe impl Send for Migration {}
+// SAFETY: as above.
+unsafe impl Sync for Migration {}
+
+impl Migration {
+    /// The table being drained.
+    ///
+    /// # Safety of the reference
+    /// Valid while the caller's epoch is held. A finished migration is
+    /// retired with its table, so a caller outside an epoch has nothing
+    /// keeping either alive.
+    #[inline]
+    pub fn old(&self) -> &Table {
+        // SAFETY: the pointer came from a Box that this struct owns and
+        // that outlives it, and nothing writes through it.
+        unsafe { &*self.old }
+    }
+
+    /// Whether migration may begin.
+    #[inline]
+    pub fn open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Which old bucket a hash's new bucket has to be drained from.
+    #[inline]
+    pub fn source(&self, hash: u64) -> usize {
+        hash as usize & self.old().mask
+    }
+
+    pub fn claim(&self, source: usize) -> Claim {
+        match self.state[source].compare_exchange(TODO, BUSY, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Claim::Mine,
+            Err(MOVED) => Claim::Done,
+            Err(_) => Claim::Busy,
+        }
+    }
+
+    /// Whether a hash goes to the lower of the two buckets its old one
+    /// feeds. Doubling looks at one more low bit of the hash and the old
+    /// length is exactly that bit, so this is the whole of the split
+    /// decision.
+    #[inline]
+    pub fn low_side(&self, hash: u64) -> bool {
+        hash as usize & self.old().len() == 0
+    }
+
+    /// Gives a claimed bucket back unmigrated, for a caller that could
+    /// not finish. The count is untouched because it was never counted.
+    pub fn release(&self, source: usize) {
+        self.state[source].store(TODO, Ordering::Release);
+    }
+
+    /// Publishes a bucket as migrated. Returns whether it was the last
+    /// one, which is the caller's cue to retire the whole migration.
+    pub fn finish(&self, source: usize) -> bool {
+        self.state[source].store(MOVED, Ordering::Release);
+        self.left.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Spins until whoever owns this bucket has published it. The owner
+    /// is doing log reads and is not waiting on anything, so the wait
+    /// is bounded by those reads.
+    pub fn wait(&self, source: usize) {
+        while self.state[source].load(Ordering::Acquire) != MOVED {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The next bucket that still has to be drained, for the background
+    /// thread to finish what the traffic did not touch.
+    pub fn unfinished(&self, from: usize) -> Option<usize> {
+        (from..self.state.len()).find(|&i| self.state[i].load(Ordering::Acquire) != MOVED)
+    }
+}
+
+pub struct Index {
+    /// The table every operation uses. A raw pointer because a grow
+    /// replaces it and the one it replaced has to outlive the
+    /// operations that already loaded it.
+    live: AtomicPtr<Table>,
+    /// The doubling in progress, null at rest.
+    migrating: AtomicPtr<Migration>,
+    /// Distinct keys the index has been told about, which is what the
+    /// load factor is against. It only rises: a delete writes a
+    /// tombstone rather than taking an entry out, so nothing here comes
+    /// back, and a table sized for the keys a database has held is the
+    /// right size for the ones it holds.
+    keys: AtomicUsize,
+    /// Doublings since the database was opened.
+    grows: AtomicU64,
+    /// One grower at a time.
+    growing: Mutex<()>,
+    /// Set when the caller sized the table itself and wants it left
+    /// that way, which is what a test that is about crowding needs.
+    fixed: bool,
+}
+
+impl Index {
+    /// Sizes the table to at least `buckets`, rounded up to a power of
+    /// two. `fixed` leaves it at that size whatever the load factor
+    /// does.
+    pub fn new(buckets: usize, fixed: bool) -> Self {
+        Self {
+            live: AtomicPtr::new(Box::into_raw(Box::new(Table::new(buckets)))),
+            migrating: AtomicPtr::new(std::ptr::null_mut()),
+            keys: AtomicUsize::new(0),
+            grows: AtomicU64::new(0),
+            growing: Mutex::new(()),
+            fixed,
+        }
+    }
+
+    /// Swaps in a table of at least `buckets`, before there is anything
+    /// in the one it replaces.
+    ///
+    /// Recovery only, and it is not a resize: there is nothing to move
+    /// and nobody to protect against. A scan that knows how many records
+    /// the file holds knows roughly how many keys it is about to install
+    /// and can build the table for them in one go, rather than filling a
+    /// table sized by a hint and making the flusher double it a few times
+    /// afterwards. It also saves the scan the link repair that a table of
+    /// the wrong shape costs, which [`crate::recover`] explains.
+    ///
+    /// A fixed index keeps the size it was asked for, and so does one
+    /// that was asked for more than this.
+    pub fn presize(&self, buckets: usize) {
+        debug_assert_eq!(self.keys(), 0, "presize after the table has keys in it");
+        if self.fixed || buckets <= self.buckets() {
+            return;
+        }
+        let fresh = Box::into_raw(Box::new(Table::new(buckets)));
+        let old = self.live.swap(fresh, Ordering::Release);
+        // SAFETY: nothing else is running, so nothing holds a reference
+        // to the table being replaced.
+        drop(unsafe { Box::from_raw(old) });
+    }
+
+    /// The table in use.
+    ///
+    /// # Safety of the reference
+    /// Valid while the caller's epoch is held, for the same reason a
+    /// log page pointer is: a grow retires the table it replaced rather
+    /// than freeing it, and the epoch is what says when the retirement
+    /// can run.
+    #[inline]
+    pub fn live(&self) -> &Table {
+        // SAFETY: the pointer is never null and the table it names is
+        // retired through the epoch queue, not freed.
+        unsafe { &*self.live.load(Ordering::Acquire) }
+    }
+
+    /// The doubling in progress, if there is one. Read after
+    /// [`Index::live`] and not before: the migration is published
+    /// first, so a caller that saw the new table also sees this.
+    #[inline]
+    pub fn pending(&self) -> Option<&Migration> {
+        let pointer = self.migrating.load(Ordering::Acquire);
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: as `live`, retired through the epoch queue.
+        Some(unsafe { &*pointer })
+    }
+
+    /// Whether a doubling is in flight. This one reads the pointer
+    /// without making a reference out of it, so it is the one a caller
+    /// outside an epoch is allowed to ask.
+    #[inline]
+    pub fn resizing(&self) -> bool {
+        !self.migrating.load(Ordering::Acquire).is_null()
+    }
+
+    #[inline]
+    pub fn buckets(&self) -> usize {
+        self.live().len()
+    }
+
+    /// Doublings since the database was opened.
+    pub fn grows(&self) -> u64 {
+        self.grows.load(Ordering::Relaxed)
+    }
+
+    /// Distinct keys the index has been told about.
+    pub fn keys(&self) -> usize {
+        self.keys.load(Ordering::Relaxed)
+    }
+
+    /// Counts a key the index had not seen before.
+    #[inline]
+    pub fn note_key(&self) {
+        self.keys.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the table has passed the load factor it doubles at.
+    pub fn wants_growth(&self) -> bool {
+        if self.fixed || !self.migrating.load(Ordering::Acquire).is_null() {
+            return false;
+        }
+        let slots = self.live().len() * SLOTS;
+        self.keys() * 100 >= slots * GROW_AT_PERCENT
+    }
+
+    /// Doubles the table and opens the migration into it.
+    ///
+    /// The caller must not be inside an epoch, because this waits for
+    /// every operation that is.
+    pub fn grow(&self, epochs: &Epochs) -> bool {
+        if self.fixed {
+            return false;
+        }
+        let Ok(_one) = self.growing.try_lock() else {
+            return false;
+        };
+        if !self.migrating.load(Ordering::Acquire).is_null() {
+            return false;
+        }
+        let old = self.live.load(Ordering::Acquire);
+        // SAFETY: the live pointer is never null.
+        let count = unsafe { &*old }.len();
+        let fresh = Box::into_raw(Box::new(Table::new(count * 2)));
+        let migration = Box::into_raw(Box::new(Migration {
+            old,
+            state: (0..count).map(|_| AtomicU8::new(TODO)).collect(),
+            left: AtomicUsize::new(count),
+            open: AtomicBool::new(false),
+        }));
+        // The migration goes out before the table it drains into, so an
+        // operation that sees the new table also sees that the old one
+        // still has to be emptied into it.
+        self.migrating.store(migration, Ordering::Release);
+        self.live.store(fresh, Ordering::Release);
+        // An operation that was already running may hold a reference
+        // into the old table, and the split rewrites what it would be
+        // reading. One that arrives now finds the migration closed and
+        // stands down and comes back, which is what keeps this wait
+        // from waiting on the very operations it let through.
+        epochs.wait_for_quiescence();
+        // SAFETY: the box was just leaked here and nothing has retired
+        // it, because a migration is only retired once it is finished
+        // and it cannot finish before it opens.
+        unsafe { &*migration }.open.store(true, Ordering::Release);
+        self.grows.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Retires a finished migration and the table it drained.
+    ///
+    /// The bump is what lets the epoch the retirement was queued in
+    /// pass. Without it the free waits for a later epoch that nothing
+    /// else would produce, which is the shape of #458.
+    pub fn retire(&self, epochs: &Epochs, migration: &Migration) {
+        let pointer = migration as *const Migration as *mut Migration;
+        if self
+            .migrating
+            .compare_exchange(
+                pointer,
+                std::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let retired = pointer as usize;
+        epochs.defer(Box::new(move || {
+            // SAFETY: the epoch has passed, so no operation still holds
+            // a reference into either the migration or the table it
+            // drained, and both were leaked from a Box.
+            unsafe {
+                let migration = Box::from_raw(retired as *mut Migration);
+                drop(Box::from_raw(migration.old));
+            }
+        }));
+        epochs.bump();
+        epochs.drain();
+    }
+
+    /// How many entries are in use, for tests and for reporting the
+    /// load factor a benchmark ran at.
+    pub fn occupancy(&self) -> usize {
+        self.live().occupancy()
+    }
+
+    /// The tag for a hash: 14 bits off the top, independent of the bits
+    /// the bucket index used.
+    #[inline]
+    pub const fn tag(hash: u64) -> u64 {
+        (hash >> 50) & TAG_MASK
+    }
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        let migrating = self.migrating.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !migrating.is_null() {
+            // SAFETY: nothing is running by the time an index drops, so
+            // whatever the epoch queue would have freed can go now.
+            unsafe {
+                let migration = Box::from_raw(migrating);
+                drop(Box::from_raw(migration.old));
+            }
+        }
+        let live = self.live.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !live.is_null() {
+            // SAFETY: leaked from a Box in `new` or `grow`.
+            unsafe { drop(Box::from_raw(live)) };
+        }
     }
 }
 
@@ -188,11 +568,55 @@ mod tests {
         assert_eq!(std::mem::align_of::<Bucket>(), 64);
     }
 
+    /// The property the whole split rests on: doubling the table sends
+    /// a bucket to exactly two, and nothing else arrives in either.
+    #[test]
+    fn a_bucket_splits_into_two_and_only_two() {
+        let old = Table::new(1 << 8);
+        let new = Table::new(1 << 9);
+        let mut sides = std::collections::HashMap::new();
+        for i in 0..1u64 << 16 {
+            let h = hash(&i.to_be_bytes());
+            let before = h as usize & old.mask;
+            let after = h as usize & new.mask;
+            sides.entry(before).or_insert_with(Vec::new).push(after);
+        }
+        for (before, after) in sides {
+            let mut seen: Vec<usize> = after;
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), 2, "bucket {before} went to {seen:?}");
+            assert_eq!(seen[0], before);
+            assert_eq!(seen[1], before + old.len());
+        }
+    }
+
+    #[test]
+    fn a_fixed_index_never_wants_to_grow() {
+        let index = Index::new(1, true);
+        for _ in 0..1000 {
+            index.note_key();
+        }
+        assert!(!index.wants_growth());
+    }
+
+    #[test]
+    fn an_index_wants_to_grow_at_half_full() {
+        let index = Index::new(1 << 4, false);
+        let slots = index.buckets() * SLOTS;
+        for _ in 0..slots / 2 - 1 {
+            index.note_key();
+        }
+        assert!(!index.wants_growth(), "grew before it was half full");
+        index.note_key();
+        assert!(index.wants_growth(), "did not grow at half full");
+    }
+
     #[test]
     fn the_hash_spreads_ycsb_keys_over_buckets_and_tags() {
         // The keys a YCSB load actually generates, which are the ones
         // that have to spread: a fixed prefix and an ascending number.
-        let index = Index::new(1 << 12);
+        let index = Index::new(1 << 12, true);
         let mut counts = vec![0u32; index.buckets()];
         let mut tags = std::collections::HashSet::new();
         let keys = 1 << 15;

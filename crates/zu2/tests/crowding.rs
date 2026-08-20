@@ -26,6 +26,10 @@ fn options(buckets: usize) -> Options {
         // Off, so what is measured is the index and not what a
         // compaction happened to have rewritten.
         compact_below: 0,
+        // Also off, because crowding is the subject and a table that
+        // doubles until it is comfortable has none of it to measure.
+        // Growth across a crowded table is Z9's own tests.
+        grow_index: false,
         ..Options::default()
     }
 }

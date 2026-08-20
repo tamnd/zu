@@ -680,6 +680,29 @@ impl Log {
         Ok(())
     }
 
+    /// Writes a page of memory back over the file.
+    ///
+    /// The flusher cannot do this. Its frontier only moves forward, so
+    /// a page it has already written is a page it will never look at
+    /// again, and a record changed down there would sit in memory until
+    /// an eviction dropped it and the old bytes came back off the disk.
+    /// Recovery is the only thing that changes a record that has
+    /// already been written, and this is how it makes that stick.
+    pub fn rewrite_page(&self, page: usize, len: usize) -> Result<()> {
+        let base = self.page_ptr(page);
+        if base.is_null() {
+            return Err(Error::Malformed {
+                address: page_start(page),
+                why: "page left memory before it was written back",
+            });
+        }
+        // SAFETY: the page is resident and len is bounded by the caller
+        // to the page size.
+        let bytes = unsafe { std::slice::from_raw_parts(base, len) };
+        file::write_all_at(&self.file, bytes, page_start(page))?;
+        Ok(())
+    }
+
     /// The file's length, which bounds the recovery scan.
     pub fn file_len(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())

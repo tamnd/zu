@@ -23,10 +23,12 @@ use zu_json::Json;
 mod complete;
 mod conformance;
 mod corpus;
+mod format;
 mod help;
 mod highlight;
 mod keys;
 mod line;
+mod lsp;
 mod meta;
 mod page;
 mod repl;
@@ -91,6 +93,7 @@ fn main() -> ExitCode {
         },
         Some("query") => query_command(&args[1..]),
         Some("shell") => shell::shell_command(&args[1..]),
+        Some("lsp") => lsp::lsp_command(&args[1..]),
         Some("conformance") => conformance::conformance_command(&args[1..]),
         Some("corpus") => corpus::corpus_command(&args[1..]),
         Some("verify") => verify_command(&args[1..]),

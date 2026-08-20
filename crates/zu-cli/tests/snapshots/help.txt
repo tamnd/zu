@@ -5,6 +5,7 @@ usage: zu <command> [arguments]
 
   shell        open an interactive session on a file, or on nothing
   query        run one statement and print the result
+  lsp          speak the language server protocol, for an editor
   copy         bulk load an edge list, or a whole dataset, into a new file
   convert      rewrite an edge list in another format, or a database in another engine
   verify       walk every checksum and cross-check the structure

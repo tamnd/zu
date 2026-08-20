@@ -44,6 +44,28 @@ impl Names {
     }
 }
 
+/// Which of the three places a candidate came from.
+///
+/// The shell throws this away: a list under a prompt is a list of
+/// words, and a word that is a label rather than a table looks the same
+/// on the way in. An editor shows it as the icon beside the name, which
+/// is the one place the distinction is worth carrying, so it is carried
+/// here and dropped there rather than worked out twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum What {
+    Label,
+    Property,
+    Table,
+    Keyword,
+}
+
+/// One name worth offering, and what it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) name: String,
+    pub(crate) what: What,
+}
+
 /// What a tab did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Completion {
@@ -55,14 +77,60 @@ pub(crate) struct Completion {
     pub(crate) list: Vec<String>,
 }
 
+/// Every name worth offering for the word ending at `cursor`.
+///
+/// An empty prefix is a real question here and not the do-nothing it is
+/// under a prompt: an editor asked to complete on nothing shows the
+/// whole list and lets the user keep typing, which is a scroll and not
+/// a screenful of noise. [`complete`] is the one that decides a bare tab
+/// does nothing, because that is a decision about a terminal.
+pub(crate) fn candidates(text: &str, cursor: usize, names: &Names) -> Vec<Candidate> {
+    if matches!(highlight::kind_at(text, cursor), Kind::Text | Kind::Comment) {
+        return Vec::new();
+    }
+    let start = word_start(text, cursor);
+    let prefix = &text[start..cursor];
+    let before = text[..start].chars().next_back();
+    let mut all = match before {
+        Some(':') => tagged(&names.labels, prefix, What::Label),
+        // A dot after a digit is a decimal point, and 1.5 is not a
+        // property of 1. The dot is one byte, so what is in front of it
+        // is what is in front of the word minus that byte.
+        Some('.') if !ends_in_digit(&text[..start - 1]) => {
+            tagged(&names.properties, prefix, What::Property)
+        }
+        Some('.') => Vec::new(),
+        // A parameter is named by whoever runs the statement, so the
+        // shell has nothing to offer and says so rather than offering
+        // keywords for a word that cannot be one.
+        Some('$') => Vec::new(),
+        _ => {
+            let mut all = tagged(&names.tables, prefix, What::Table);
+            all.extend(keywords(prefix).into_iter().map(|name| Candidate {
+                name,
+                what: What::Keyword,
+            }));
+            all
+        }
+    };
+    // A name the file has and the language also has is offered once, as
+    // the file's, because the file is the half the user cannot look up.
+    all.sort_by(|a, b| a.name.cmp(&b.name).then(a.what.cmp(&b.what)));
+    all.dedup_by(|a, b| a.name == b.name);
+    all
+}
+
+/// The start of the word `candidates` answered about, which is what an
+/// editor replaces when the user picks one.
+pub(crate) fn replaced(text: &str, cursor: usize) -> usize {
+    word_start(text, cursor)
+}
+
 /// The completion for the word ending at `cursor`.
 pub(crate) fn complete(text: &str, cursor: usize, names: &Names) -> Completion {
     // Inside a string or a comment there is no name to complete, and a
     // shell that offered SHORTEST inside a comment would be offering to
     // edit prose.
-    if matches!(highlight::kind_at(text, cursor), Kind::Text | Kind::Comment) {
-        return Completion::default();
-    }
     let start = word_start(text, cursor);
     let prefix = &text[start..cursor];
     if prefix.is_empty() {
@@ -71,26 +139,10 @@ pub(crate) fn complete(text: &str, cursor: usize, names: &Names) -> Completion {
         // nothing.
         return Completion::default();
     }
-    let before = text[..start].chars().next_back();
-    let candidates = match before {
-        Some(':') => matching(&names.labels, prefix),
-        // A dot after a digit is a decimal point, and 1.5 is not a
-        // property of 1. The dot is one byte, so what is in front of it
-        // is what is in front of the word minus that byte.
-        Some('.') if !ends_in_digit(&text[..start - 1]) => matching(&names.properties, prefix),
-        Some('.') => Vec::new(),
-        // A parameter is named by whoever runs the statement, so the
-        // shell has nothing to offer and says so rather than offering
-        // keywords for a word that cannot be one.
-        Some('$') => Vec::new(),
-        _ => {
-            let mut all = matching(&names.tables, prefix);
-            all.extend(keywords(prefix));
-            all.sort();
-            all.dedup();
-            all
-        }
-    };
+    let candidates: Vec<String> = candidates(text, cursor, names)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     if candidates.is_empty() {
         return Completion::default();
     }
@@ -146,12 +198,15 @@ pub(crate) fn grid(list: &[String], width: usize) -> String {
 }
 
 /// The names that start with `prefix`, ignoring case, spelled the way
-/// the file spells them.
-fn matching(names: &[String], prefix: &str) -> Vec<String> {
+/// the file spells them, each carrying where it came from.
+fn tagged(names: &[String], prefix: &str, what: What) -> Vec<Candidate> {
     names
         .iter()
         .filter(|name| starts_with(name, prefix))
-        .cloned()
+        .map(|name| Candidate {
+            name: name.clone(),
+            what,
+        })
         .collect()
 }
 

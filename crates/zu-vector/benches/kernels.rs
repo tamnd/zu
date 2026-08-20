@@ -317,6 +317,36 @@ fn main() {
         failed = true;
     }
 
+    // The two argument half of the same library. A remainder of two
+    // whole numbers is the cheap one of the three and is the one that
+    // says what the kernel costs rather than what the hardware charges
+    // for a power: the divisors here are all above nought, so the fold
+    // clears the chunk and the loop is one instruction per row.
+    let divisors: Vec<i64> = (0..VECTOR as i64).map(|i| i % 97 + 1).collect();
+    let dvs = ValueVector::flat_from(&mut arena, PhysType::Int64, &divisors);
+    let per_sec_mod = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::pair(
+                &mut arith_scratch,
+                kernels::MathPair::Mod,
+                black_box(&v),
+                black_box(&dvs),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let mod_grows = per_sec_mod * VECTOR as f64 / 1e9;
+    println!("math_i64_mod: {mod_grows:.2} G rows/s (target 1)");
+    if let Some(floor) = budgets.get("vec_math_pair_grows_s")
+        && mod_grows < floor
+    {
+        println!("GATE FAIL vec_math_pair_grows_s: {mod_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
     // Dict-code equality vs the path it replaces: owned Strings compared
     // per row, which is what a Vec<Value::Str> column does today. The
     // gate is the ratio, both sides run the same logical rows.

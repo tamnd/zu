@@ -237,6 +237,276 @@ pub fn unary(
     Ok(out)
 }
 
+/// One of the numeric functions over two numbers: POWER, LOG and MOD
+/// under its function spelling.
+///
+/// MOD is here rather than on the arithmetic kernel it shares its
+/// answers with because the two spellings do not share their words: the
+/// operator reports a remainder that does not fit the way the operator
+/// does, and the function reports it as the function. A statement
+/// cannot tell which engine answered it, so it must not be able to tell
+/// which kernel did either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MathPair {
+    Power,
+    Log,
+    Mod,
+}
+
+impl MathPair {
+    fn name(self) -> &'static str {
+        match self {
+            MathPair::Power => "power",
+            MathPair::Log => "log",
+            MathPair::Mod => "mod",
+        }
+    }
+
+    /// The type the answers land in. Both arguments have to be the one
+    /// type already, the compiler having moved a written number into
+    /// the column's type before it gets here.
+    pub fn answer_type(self, l: PhysType, r: PhysType) -> Option<PhysType> {
+        if l != r {
+            return None;
+        }
+        match (self, l) {
+            // A remainder of two whole numbers is a whole number, which
+            // is the operator's rule and so the function's.
+            (MathPair::Mod, PhysType::Int64) => Some(PhysType::Int64),
+            (_, PhysType::Int64 | PhysType::Float64) => Some(PhysType::Float64),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate `op(l, r)` into a new flat vector.
+///
+/// These are the expensive ones, a power and a logarithm each costing
+/// tens of instructions, so the order here is the other way round from
+/// the kernel above: the answers are computed first and the conditions
+/// are read off the answers. A power that left the range is an infinity
+/// sitting in the output, and finding it is a pass over the numbers the
+/// loop just wrote rather than a second power per row.
+pub fn pair(
+    arena: &mut MorselArena,
+    op: MathPair,
+    l: &ValueVector,
+    r: &ValueVector,
+    sel: Option<&SelVector>,
+) -> Result<ValueVector> {
+    debug_assert_eq!(l.len, r.len);
+    if matches!(l.encoding, VecEncoding::Dict { .. })
+        || matches!(r.encoding, VecEncoding::Dict { .. })
+    {
+        return Err(ZuError::InvalidArgument(
+            "numeric functions on dict vectors: materialize first".into(),
+        ));
+    }
+    let Some(answer) = op.answer_type(l.phys, r.phys) else {
+        return Err(ZuError::InvalidArgument(format!(
+            "no {}() kernel for {:?} and {:?}",
+            op.name(),
+            l.phys,
+            r.phys
+        )));
+    };
+    let len = l.len as usize;
+    let mut out = ValueVector::flat_uninit(arena, answer, len);
+    match answer {
+        PhysType::Int64 => {
+            let dst = out.values_mut::<i64>();
+            for (i, slot) in dst[..len].iter_mut().enumerate() {
+                let (x, y) = (at_i64(l, i), at_i64(r, i));
+                // A divisor of nought is remapped to one so the
+                // hardware cannot trap on a row nobody selected, which
+                // is what the arithmetic kernel does and for the same
+                // reason.
+                *slot = x.wrapping_rem(if y == 0 { 1 } else { y });
+            }
+        }
+        _ => {
+            let dst = out.values_mut::<f64>();
+            for (i, slot) in dst[..len].iter_mut().enumerate() {
+                *slot = apply_pair(op, arg_f64(l, i), arg_f64(r, i));
+            }
+        }
+    }
+    verify_pair(op, l, r, &out, sel, len)?;
+    // NULL in, NULL out, which for two arguments is null where either
+    // of them was.
+    out.validity = merged_validity(arena, l, r, len);
+    Ok(out)
+}
+
+/// The answer over two approximate numbers, computed for every row
+/// whatever the conditions say, since nothing here traps.
+#[inline(always)]
+fn apply_pair(op: MathPair, x: f64, y: f64) -> f64 {
+    match op {
+        MathPair::Power => x.powf(y),
+        // LOG takes the base first and the number second, which is the
+        // order ISO 20.22 writes it in.
+        MathPair::Log => y.log(x),
+        MathPair::Mod => x % y,
+    }
+}
+
+/// Raises what the row engine raises for the first selected row with no
+/// answer, reading the answers the loop already wrote.
+fn verify_pair(
+    op: MathPair,
+    l: &ValueVector,
+    r: &ValueVector,
+    out: &ValueVector,
+    sel: Option<&SelVector>,
+    len: usize,
+) -> Result<()> {
+    if !risky_pair(op, l, r, out, len) {
+        return Ok(());
+    }
+    let visit = |i: usize| -> Result<()> {
+        if !l.is_valid(i) || !r.is_valid(i) {
+            return Ok(());
+        }
+        if out.phys == PhysType::Int64 {
+            let (x, y) = (at_i64(l, i), at_i64(r, i));
+            if y == 0 {
+                return Err(ZuError::gql(codes::C22012, "division by zero".to_string()));
+            }
+            return x.checked_rem(y).map(|_| ()).ok_or_else(|| {
+                out_of_range(op.name(), format!("of {x} and {y} does not fit an integer"))
+            });
+        }
+        one_pair(op, arg_f64(l, i), arg_f64(r, i), out.values::<f64>()[i])
+    };
+    match sel {
+        Some(sel) => {
+            for &row in sel.as_slice() {
+                visit(row as usize)?;
+            }
+        }
+        None => {
+            for i in 0..len {
+                visit(i)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the folds leave any row that could have no answer.
+fn risky_pair(
+    op: MathPair,
+    l: &ValueVector,
+    r: &ValueVector,
+    out: &ValueVector,
+    len: usize,
+) -> bool {
+    if out.phys == PhysType::Int64 {
+        // A remainder is a condition where the divisor is nought, and
+        // the one pair of whole numbers whose remainder does not fit is
+        // the bottom integer by minus one, so the divisor's own span
+        // answers for the chunk.
+        let (lo, hi) = span(r, len);
+        return (lo <= 0.0 && hi >= 0.0) || (lo <= -1.0 && hi >= -1.0);
+    }
+    // An answer that left the range is an infinity in the output, and
+    // finding one is a pass over what the loop wrote. It is the only
+    // fold POWER has, its other conditions being about the pair rather
+    // than about either column.
+    if !all_finite(out, len) {
+        return true;
+    }
+    let (lo, hi) = span(l, len);
+    match op {
+        // Nought to a negative power and a negative number to a
+        // fraction are the two the standard names, and both need a base
+        // that is not above nought.
+        MathPair::Power => lo <= 0.0,
+        // A base is a base when it is above nought and is not one, so a
+        // column entirely above one, or entirely between nought and
+        // one, holds no base that is not. The number the logarithm is
+        // taken of has to be above nought as well.
+        MathPair::Log => {
+            let base = lo > 1.0 || (lo > 0.0 && hi < 1.0);
+            !base || span(r, len).0 <= 0.0
+        }
+        MathPair::Mod => {
+            let (lo, hi) = span(r, len);
+            lo <= 0.0 && hi >= 0.0
+        }
+    }
+}
+
+/// What one row of the two argument functions raises, or `Ok` where it
+/// has an answer, in the row engine's words.
+fn one_pair(op: MathPair, x: f64, y: f64, answer: f64) -> Result<()> {
+    match op {
+        MathPair::Mod if y == 0.0 => {
+            return Err(ZuError::gql(codes::C22012, "division by zero".to_string()));
+        }
+        MathPair::Power if x == 0.0 && y < 0.0 => {
+            return Err(ZuError::gql(
+                codes::C2201F,
+                "power() has no answer for nought raised to a negative power".to_string(),
+            ));
+        }
+        MathPair::Power if x < 0.0 && y.fract() != 0.0 && y.is_finite() => {
+            return Err(ZuError::gql(
+                codes::C2201F,
+                format!("power() has no answer for {x} raised to {y}, which is not whole"),
+            ));
+        }
+        MathPair::Log if x <= 0.0 || x == 1.0 => {
+            return Err(ZuError::gql(
+                codes::C2201E,
+                format!("log() has no answer in base {x}"),
+            ));
+        }
+        MathPair::Log if y <= 0.0 => {
+            return Err(ZuError::gql(
+                codes::C2201E,
+                format!("log() has no answer for {y}, which is not above nought"),
+            ));
+        }
+        _ => {}
+    }
+    if answer.is_finite() || !x.is_finite() || !y.is_finite() {
+        Ok(())
+    } else {
+        Err(out_of_range(
+            op.name(),
+            format!("of {x} and {y} is outside the range of a float"),
+        ))
+    }
+}
+
+/// Whether every answer in the output is a number a double holds.
+fn all_finite(out: &ValueVector, len: usize) -> bool {
+    out.values::<f64>()[..len].iter().all(|x| x.is_finite())
+}
+
+/// The validity of an answer over two arguments, which is null where
+/// either of them was null and carries no bitmap where neither did.
+fn merged_validity(
+    arena: &mut MorselArena,
+    l: &ValueVector,
+    r: &ValueVector,
+    len: usize,
+) -> Option<Bitmap> {
+    if l.validity.is_none() && r.validity.is_none() {
+        return None;
+    }
+    let mut copy = Bitmap::new_in(arena, len, true);
+    if let Some(valid) = l.validity.as_ref() {
+        copy.and_with(valid);
+    }
+    if let Some(valid) = r.validity.as_ref() {
+        copy.and_with(valid);
+    }
+    Some(copy)
+}
+
 /// The answer over a whole number, which is a whole number.
 ///
 /// The two shapes that can have no answer wrap here rather than
@@ -348,10 +618,13 @@ fn check(op: MathOp, v: &ValueVector, sel: Option<&SelVector>, len: usize) -> Re
                 let x = at_i64(v, i);
                 match op {
                     MathOp::Abs => x.checked_abs().map(|_| ()).ok_or_else(|| {
-                        out_of_range(op, format!("of {x} is one past the top of an integer"))
+                        out_of_range(
+                            op.name(),
+                            format!("of {x} is one past the top of an integer"),
+                        )
                     }),
                     MathOp::Round(digits) => rounded_int(x, digits).map(|_| ()).ok_or_else(|| {
-                        out_of_range(op, format!("of {x} to {digits} digits does not fit"))
+                        out_of_range(op.name(), format!("of {x} to {digits} digits does not fit"))
                     }),
                     _ => Ok(()),
                 }
@@ -452,7 +725,7 @@ fn one_real(op: MathOp, x: f64) -> Result<()> {
         }
         MathOp::Asin | MathOp::Acos if !(-1.0..=1.0).contains(&x) && x.is_finite() => {
             return Err(out_of_range(
-                op,
+                op.name(),
                 format!("has no answer for {x}, which is outside minus one to one"),
             ));
         }
@@ -463,7 +736,7 @@ fn one_real(op: MathOp, x: f64) -> Result<()> {
         Ok(())
     } else {
         Err(out_of_range(
-            op,
+            op.name(),
             format!("of {x} is outside the range of a float"),
         ))
     }
@@ -471,8 +744,8 @@ fn one_real(op: MathOp, x: f64) -> Result<()> {
 
 /// `22003 data exception, numeric value out of range`, named the way the
 /// row engine names it.
-fn out_of_range(op: MathOp, detail: String) -> ZuError {
-    ZuError::gql(codes::C22003, format!("{}() {detail}", op.name()))
+fn out_of_range(name: &str, detail: String) -> ZuError {
+    ZuError::gql(codes::C22003, format!("{name}() {detail}"))
 }
 
 /// The bits every value in the vector fits inside, as the OR of what
@@ -848,6 +1121,177 @@ mod tests {
         assert!(
             raised(out).starts_with("22003: round() of "),
             "the row engine's condition"
+        );
+    }
+
+    /// A remainder of two whole numbers is a whole number, and a power
+    /// or a logarithm of them is not, which is the one place the two
+    /// argument functions disagree about the type of an answer.
+    #[test]
+    fn a_remainder_stays_exact_and_the_other_two_do_not() {
+        let mut arena = MorselArena::new();
+        let l = ints(&mut arena, &[7, -7, 8]);
+        let r = ints(&mut arena, &[3, 3, 2]);
+        let out = pair(&mut arena, MathPair::Mod, &l, &r, None).unwrap();
+        assert_eq!(out.phys, PhysType::Int64);
+        assert_eq!(out.values::<i64>(), &[1, -1, 0]);
+
+        let out = pair(&mut arena, MathPair::Power, &l, &r, None).unwrap();
+        assert_eq!(out.phys, PhysType::Float64);
+        assert_eq!(out.values::<f64>(), &[343.0, -343.0, 64.0]);
+
+        let base = ints(&mut arena, &[2, 2, 2]);
+        let of = ints(&mut arena, &[8, 4, 1]);
+        let out = pair(&mut arena, MathPair::Log, &base, &of, None).unwrap();
+        assert_eq!(out.values::<f64>(), &[3.0, 2.0, 0.0]);
+    }
+
+    /// The remainder of an approximate number keeps the sign of the
+    /// dividend, which is what the operator answers and so what the
+    /// function has to.
+    #[test]
+    fn an_approximate_remainder_keeps_the_sign_of_the_dividend() {
+        let mut arena = MorselArena::new();
+        let l = floats(&mut arena, &[7.5, -7.5]);
+        let r = floats(&mut arena, &[2.0, 2.0]);
+        let out = pair(&mut arena, MathPair::Mod, &l, &r, None).unwrap();
+        assert_eq!(out.values::<f64>(), &[1.5, -1.5]);
+    }
+
+    /// A divisor of nought has no remainder, whichever type the two
+    /// sides hold, and the one pair of whole numbers whose remainder
+    /// does not fit says so as the function rather than as the
+    /// operator.
+    #[test]
+    fn a_remainder_with_no_answer_raises() {
+        let mut arena = MorselArena::new();
+        let l = ints(&mut arena, &[7, 1]);
+        let r = ints(&mut arena, &[3, 0]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Mod, &l, &r, None)),
+            "22012: division by zero"
+        );
+
+        let l = floats(&mut arena, &[7.0, 1.0]);
+        let r = floats(&mut arena, &[3.0, 0.0]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Mod, &l, &r, None)),
+            "22012: division by zero"
+        );
+
+        let l = ints(&mut arena, &[i64::MIN]);
+        let r = ints(&mut arena, &[-1]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Mod, &l, &r, None)),
+            "22003: mod() of -9223372036854775808 and -1 does not fit an integer"
+        );
+    }
+
+    /// Nought to a negative power and a negative number to a fraction
+    /// are the two the standard names, and both of them are conditions
+    /// about the pair rather than about either column.
+    #[test]
+    fn a_power_with_no_answer_raises() {
+        let mut arena = MorselArena::new();
+        let l = floats(&mut arena, &[2.0, 0.0]);
+        let r = floats(&mut arena, &[3.0, -1.0]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Power, &l, &r, None)),
+            "2201F: power() has no answer for nought raised to a negative power"
+        );
+
+        let l = floats(&mut arena, &[2.0, -2.0]);
+        let r = floats(&mut arena, &[3.0, 0.5]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Power, &l, &r, None)),
+            "2201F: power() has no answer for -2 raised to 0.5, which is not whole"
+        );
+
+        // A negative number to a whole power has an answer, so the
+        // fold that let the walk happen must not be the answer itself.
+        let l = floats(&mut arena, &[-2.0]);
+        let r = floats(&mut arena, &[3.0]);
+        let out = pair(&mut arena, MathPair::Power, &l, &r, None).unwrap();
+        assert_eq!(out.values::<f64>(), &[-8.0]);
+    }
+
+    /// A base is a base when it is above nought and is not one, and the
+    /// number a logarithm is taken of has to be above nought as well.
+    #[test]
+    fn a_logarithm_outside_its_domain_raises() {
+        let mut arena = MorselArena::new();
+        let base = floats(&mut arena, &[2.0, 1.0]);
+        let of = floats(&mut arena, &[8.0, 8.0]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Log, &base, &of, None)),
+            "2201E: log() has no answer in base 1"
+        );
+
+        let base = floats(&mut arena, &[2.0, 2.0]);
+        let of = floats(&mut arena, &[8.0, 0.0]);
+        assert_eq!(
+            raised(pair(&mut arena, MathPair::Log, &base, &of, None)),
+            "2201E: log() has no answer for 0, which is not above nought"
+        );
+    }
+
+    /// An answer that left the range of a float is an infinity sitting
+    /// in the output, which is the fold the power has and the reason
+    /// this kernel computes first and reads the conditions after.
+    #[test]
+    fn a_power_past_the_top_of_a_float_raises() {
+        let mut arena = MorselArena::new();
+        let l = floats(&mut arena, &[1.0e300]);
+        let r = floats(&mut arena, &[2.0]);
+        assert!(
+            raised(pair(&mut arena, MathPair::Power, &l, &r, None))
+                .starts_with("22003: power() of "),
+        );
+    }
+
+    /// A row the selection dropped and a row holding a null are not
+    /// conditions, which is what lets one of these stand in a filter.
+    #[test]
+    fn a_pair_skips_what_nobody_asked_about() {
+        let mut arena = MorselArena::new();
+        let l = ints(&mut arena, &[7, 1, 9]);
+        let r = ints(&mut arena, &[3, 0, 2]);
+        let mut sel = SelVector::with_capacity(&mut arena, 2);
+        sel.push(0);
+        sel.push(2);
+        let out = pair(&mut arena, MathPair::Mod, &l, &r, Some(&sel)).unwrap();
+        assert_eq!(out.values::<i64>()[0], 1);
+        assert_eq!(out.values::<i64>()[2], 1);
+
+        let mut r = ints(&mut arena, &[3, 0, 2]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        r.validity = Some(valid);
+        let out = pair(&mut arena, MathPair::Mod, &l, &r, None).unwrap();
+        assert!(!out.is_valid(1), "null in, null out");
+        assert!(out.is_valid(0) && out.is_valid(2));
+    }
+
+    /// Two arguments of two types are not this kernel's, the compiler
+    /// having moved a written number into the column's type before it
+    /// gets here.
+    #[test]
+    fn the_two_arguments_hold_the_one_type() {
+        assert_eq!(
+            MathPair::Mod.answer_type(PhysType::Int64, PhysType::Int64),
+            Some(PhysType::Int64)
+        );
+        assert_eq!(
+            MathPair::Power.answer_type(PhysType::Int64, PhysType::Int64),
+            Some(PhysType::Float64)
+        );
+        assert_eq!(
+            MathPair::Mod.answer_type(PhysType::Int64, PhysType::Float64),
+            None
+        );
+        assert_eq!(
+            MathPair::Log.answer_type(PhysType::Str, PhysType::Str),
+            None
         );
     }
 }

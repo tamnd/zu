@@ -27,7 +27,9 @@ use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{
     ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
 };
-use zu_vector::{BinOp, CmpOp, ExprOp, MathOp, MorselArena, OwnedValue, PhysType, Program, Reg};
+use zu_vector::{
+    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
+};
 
 use crate::join::JoinTable;
 use crate::sip::SipFilter;
@@ -4268,11 +4270,11 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
                 Ok(Some(dst))
             }
-            // GF01 to GF03, the numeric functions of one argument.
-            // They are the numeric library's first kernels because
-            // they are the ones a filter is written over: `abs(a.x -
-            // b.x) < 3` is a scan the row engine used to take back for
-            // the sake of one call.
+            // GF01 to GF03, the numeric functions. They are the
+            // numeric library's first kernels because they are the
+            // ones a filter is written over: `abs(a.x - b.x) < 3` is a
+            // scan the row engine used to take back for the sake of
+            // one call.
             BoundExpr::Call {
                 func: Func::Math(math),
                 args,
@@ -4280,17 +4282,38 @@ impl Compiler<'_> {
                 star: false,
                 ..
             } => {
-                let Some(op) = self.math_op(*math, args) else {
+                if let Some(op) = self.math_op(*math, args) {
+                    let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                        return Ok(None);
+                    };
+                    let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                        return Ok(None);
+                    };
+                    let dst = b.push_type(ty)?;
+                    b.ops.push(ExprOp::Math { op, src, dst });
+                    return Ok(Some(dst));
+                }
+                let Some(op) = math_pair(*math, args) else {
                     return Ok(None);
                 };
-                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                let Some(l) = self.value_reg(b, &args[0], level, false)? else {
                     return Ok(None);
                 };
-                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                let Some(r) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                // The kernel answers one pair of types, so a whole
+                // number the statement wrote beside an approximate
+                // column becomes an approximate number here rather
+                // than a branch in the loop.
+                let Some((l, r)) = self.matched(b, l, r, &args[0], &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[l as usize], b.types[r as usize]) else {
                     return Ok(None);
                 };
                 let dst = b.push_type(ty)?;
-                b.ops.push(ExprOp::Math { op, src, dst });
+                b.ops.push(ExprOp::MathPair { op, l, r, dst });
                 Ok(Some(dst))
             }
             _ => Ok(None),
@@ -4397,7 +4420,7 @@ impl Compiler<'_> {
             (Math::Degrees, 1) => Some(MathOp::Degrees),
             (Math::Radians, 1) => Some(MathOp::Radians),
             // POWER, LOG and MOD take two numbers, so each of them is a
-            // second column and not this op.
+            // second column and the op below rather than this one.
             _ => None,
         }
     }
@@ -4592,6 +4615,18 @@ fn widens(from: PhysType, to: &LogicalType) -> bool {
     }
 }
 
+/// Which vector op a numeric call of two arguments is. Unlike the
+/// single argument table this one is a free function, since none of the
+/// three needs anything the compiler knows.
+fn math_pair(math: Math, args: &[BoundExpr]) -> Option<MathPair> {
+    match (math, args.len()) {
+        (Math::Power, 2) => Some(MathPair::Power),
+        (Math::Log, 2) => Some(MathPair::Log),
+        (Math::Mod, 2) => Some(MathPair::Mod),
+        _ => None,
+    }
+}
+
 /// Whether these ops hold something a row could have no answer for: a
 /// division whose divisor is not written as a number that is not
 /// nought, or a numeric function with a condition behind it.
@@ -4603,6 +4638,18 @@ fn may_raise(ops: &[ExprOp]) -> bool {
             ..
         } => !written_nonzero(&ops[..i], *r),
         ExprOp::Math { op, .. } => op.may_raise(),
+        // MOD under its function spelling is the operator's answers, so
+        // it is the operator's question too: a written divisor that is
+        // not nought has a remainder for every row. A power and a
+        // logarithm have conditions no fold over one written number
+        // settles, so both of them stand behind a filter and nowhere
+        // else.
+        ExprOp::MathPair {
+            op: MathPair::Mod,
+            r,
+            ..
+        } => !written_nonzero(&ops[..i], *r),
+        ExprOp::MathPair { .. } => true,
         _ => false,
     })
 }

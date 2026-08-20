@@ -1991,3 +1991,10 @@ vec_math_grows_s = 0.2
 # than by a branch inside the loop. Floor sits under the worst observed
 # run on the loaded vCPU hosts. Raise floors, never lower them.
 vec_math_real_grows_s = 0.2
+
+# A remainder over a 2048-row flat vector, the two argument half of the
+# same library. The answers are filled first and the conditions are read
+# off them, so the loop is one division per row and the fold that clears
+# a chunk of divisors is a single pass. Floor sits under the worst
+# observed run on the loaded vCPU hosts. Raise floors, never lower them.
+vec_math_pair_grows_s = 0.2

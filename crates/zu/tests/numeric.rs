@@ -108,6 +108,31 @@ fn the_numeric_functions_answer_the_same_on_both_engines() {
         "MATCH (p:person) RETURN acos(p.id) AS a ORDER BY a",
         "MATCH (p:person) RETURN exp(p.id * 1000) AS a ORDER BY a",
         "MATCH (p:person) RETURN cot(p.id) AS a ORDER BY a",
+        // The three that take two numbers. A remainder of two whole
+        // numbers is a whole number and the other two are floats
+        // whatever arrived, which is the one place the two argument
+        // functions disagree about the type of an answer.
+        "MATCH (p:person) RETURN mod(p.id, 3) AS a ORDER BY a",
+        "MATCH (p:person) RETURN mod(p.id * 1.5, 2) AS a ORDER BY a",
+        "MATCH (p:person) RETURN power(2, p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN power(p.id, 2) AS a ORDER BY a",
+        "MATCH (p:person) RETURN log(2, p.id + 1) AS a ORDER BY a",
+        // In a filter and behind a guard, which is where the kernel
+        // earns its keep.
+        "MATCH (p:person) WHERE mod(p.id, 2) = 0 RETURN p.id AS id ORDER BY id",
+        "MATCH (p:person) WHERE power(p.id, 2) > 9 RETURN p.id AS id ORDER BY id",
+        "MATCH (p:person) WHERE p.id > 0 AND log(2, p.id) < 2 RETURN p.id AS id ORDER BY id",
+        // Nested in each other and in the one argument half.
+        "MATCH (p:person) RETURN sqrt(power(p.id, 2)) AS a ORDER BY a",
+        "MATCH (p:person) RETURN mod(abs(p.id - 3), 2) AS a ORDER BY a",
+        // The conditions of the three, one of each kind: a divisor of
+        // nought, a base that is one, a number a logarithm has no
+        // answer for, and a negative number to a fraction.
+        "MATCH (p:person) RETURN mod(p.id, p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN log(1, p.id + 1) AS a ORDER BY a",
+        "MATCH (p:person) RETURN log(2, p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN power(p.id - 3, 0.5) AS a ORDER BY a",
+        "MATCH (p:person) RETURN power(p.id * 1.0e300, 2) AS a ORDER BY a",
     ];
 
     for source in cases {

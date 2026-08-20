@@ -797,3 +797,106 @@ cases:
       - values:
           - type: INT64
             value: "3"
+
+  - name: a-remainder-of-two-stored-integers
+    doc: ISO 20.22. MOD is the modulus operator under a name, so a remainder of two whole numbers is a whole number and carries the sign of the dividend. It is the one of the three two argument functions whose answer is exact, which is why this case can be written as values rather than as a comparison.
+    query: MATCH (n:person) RETURN mod(n.age, 7) AS m ORDER BY m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "5"
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: a-remainder-in-a-filter
+    doc: A remainder in a predicate over a stored column, which is the shape a query picking every nth row is written in and the shape that decides whether a scan is answered a chunk at a time or a row at a time.
+    query: MATCH (n:person) WHERE mod(n.age, 20) = 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-remainder-by-nought-has-no-answer
+    doc: A modulus of a nought divisor is undefined for the reason a division by nought is, and the standard gives it the same condition rather than the infinity or the NaN the hardware would answer.
+    query: MATCH (n:person) RETURN mod(n.age, n.age - 40) AS m ORDER BY m
+    raises: "22012"
+
+  - name: the-bottom-integer-has-no-remainder-by-minus-one
+    doc: The one pair of whole numbers whose remainder is not a whole number, for the reason the distance of the bottom integer from nought is not one. An engine that answers nought here has answered from the hardware rather than from the type.
+    query: MATCH (n:person) RETURN mod(n.big, -1) AS m ORDER BY m
+    raises: "22003"
+
+  - name: a-remainder-behind-a-guard-never-runs
+    doc: The same rule the division behind a guard follows. Nobody here is over a hundred, so the remainder by nought is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND mod(n.age, n.age - 40) > 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-power-of-a-stored-column
+    doc: A power answers a float whatever arrived, so a whole column comes back wider than it went in. The answer is rounded here because a square worked out through an exponential and a logarithm can land a digit either side of the whole number, and which of those an implementation does is not what this case is about.
+    query: MATCH (n:person) RETURN round(power(n.age, 2)) AS p ORDER BY p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "900.0"
+      - values:
+          - type: FLOAT64
+            value: "1600.0"
+      - values:
+          - type: FLOAT64
+            value: "1600.0"
+      - values:
+          - type: FLOAT64
+            value: "2500.0"
+
+  - name: nought-to-a-negative-power-has-no-answer
+    doc: ISO 20.22 names two pairs a power has no answer for, and this is the first: nought raised to a negative power is a division by nought written another way.
+    query: MATCH (n:person) RETURN power(n.age - 40, -1) AS p ORDER BY p
+    raises: "2201F"
+
+  - name: a-negative-number-to-a-fraction-has-no-answer
+    doc: The second pair a power has no answer for. A negative number raised to a power that is not whole is not a real number at all, and an engine that answers NaN has let a value travel that every comparison below it reads as false.
+    query: MATCH (n:person) RETURN power(n.age - 40, 0.5) AS p ORDER BY p
+    raises: "2201F"
+
+  - name: a-power-past-the-top-of-a-float-has-no-answer
+    doc: A square of a number near the top of the range leaves the range, and an engine that quietly answers infinity has given a wrong answer rather than raised a condition.
+    query: MATCH (n:person) RETURN power(n.score, 2) AS p ORDER BY p
+    raises: "22003"
+
+  - name: a-logarithm-in-a-written-base
+    doc: LOG takes the base first and the number second, which is the order ISO 20.22 writes it in. The case is a comparison rather than an equality because a logarithm in a base other than the two the library names is worked out as a ratio, and the last digit of that ratio is the implementation's to lose.
+    query: MATCH (n:person) WHERE log(2, n.age) > 5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-logarithm-in-base-one-has-no-answer
+    doc: A base of one has every power equal to one, so no number but one has a logarithm in it and one has every logarithm at once. The standard names the condition rather than leaving the answer to a division by nought inside the ratio.
+    query: MATCH (n:person) RETURN log(1, n.age) AS l ORDER BY l
+    raises: "2201E"
+
+  - name: a-logarithm-in-a-base-of-nought-has-no-answer
+    doc: A base has to be above nought as well as not be one, which is the same condition the logarithm of a number that is not above nought raises.
+    query: MATCH (n:person) RETURN log(n.age - 30, 8) AS l ORDER BY l
+    raises: "2201E"

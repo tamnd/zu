@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use crate::addr::{Address, FIRST, PAGE_SIZE, page_of, page_start};
+use crate::addr::{Address, FIRST, MAX_PAGES, PAGE_SIZE, page_of, page_start};
 use crate::epoch::{Epochs, Slotted};
 use crate::error::{Error, Result};
 use crate::{file, record};
@@ -74,6 +74,21 @@ pub enum Durability {
 /// follows from its offset.
 fn page_layout() -> Layout {
     Layout::from_size_align(PAGE_SIZE, 64).expect("zu2 page layout")
+}
+
+/// Pages per chunk of the page table.
+///
+/// A chunk is 4096 pointers, so 32 KiB of memory covering 16 GiB of
+/// log, and the array above it is 16384 pointers, so 128 KiB covering
+/// the whole 256 TiB an index entry can address. Both numbers are small
+/// enough that neither is worth a decision: the fixed 128 KiB is a
+/// thirtieth of one page, and a chunk arrives once per 16 GiB.
+const CHUNK: usize = 1 << 12;
+
+/// The chunk layout. Written as a slice rather than an array so the
+/// free side can rebuild the same `Box<[_]>` it came from.
+fn chunk_layout() -> Layout {
+    Layout::array::<AtomicPtr<u8>>(CHUNK).expect("zu2 page chunk layout")
 }
 
 /// How far past the write frontier the file is kept provisioned by
@@ -124,11 +139,33 @@ struct Flushing {
 }
 
 pub struct Log {
-    /// One slot per page, filled lazily. A null slot means the page is
-    /// not resident, which is the only test the read path makes: the
-    /// head boundary can move while a reader is mid-operation, but the
-    /// memory it is looking at cannot go away until its epoch passes.
-    pages: Box<[AtomicPtr<u8>]>,
+    /// One slot per page, filled lazily, in chunks that are themselves
+    /// filled lazily. A null slot means the page is not resident, which
+    /// is the only test the read path makes: the head boundary can move
+    /// while a reader is mid-operation, but the memory it is looking at
+    /// cannot go away until its epoch passes.
+    ///
+    /// The two levels are what stop `max_pages` from being a budget for
+    /// every byte the database will ever write. A flat table indexed by
+    /// absolute page has to be as long as the highest address the log
+    /// will ever reach, and since the tail only goes up and a page
+    /// index is never reused, that is the sum of every append rather
+    /// than the size of anything (#470). Chunked, the array of chunk
+    /// pointers covers the whole address space an index entry can name
+    /// for 128 KiB, the chunks under it arrive as the log reaches them
+    /// and leave when compaction passes them, and `max_pages` goes back
+    /// to bounding the live span the way it reads.
+    ///
+    /// A ring over the flat table would have been smaller and it is
+    /// wrong. Reclamation nulls a slot and defers the page's free to
+    /// the epoch, precisely so that a session already walking a chain
+    /// down there keeps reading real bytes until it is done. A ring
+    /// hands the slot to a new page immediately, so that session reads
+    /// the new page's bytes at the old page's offset and gets a
+    /// different record with no sign that anything happened.
+    chunks: Box<[AtomicPtr<AtomicPtr<u8>>]>,
+    /// The live span the log is allowed to reach, in pages.
+    max_pages: usize,
     /// Serialises page allocation, which happens once per 4 MiB.
     allocating: Mutex<()>,
     tail: AtomicU64,
@@ -208,9 +245,10 @@ impl Log {
         provision_bytes: u64,
     ) -> Self {
         Self {
-            pages: (0..max_pages)
+            chunks: (0..MAX_PAGES / CHUNK)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
+            max_pages: max_pages.clamp(1, MAX_PAGES),
             allocating: Mutex::new(()),
             tail: AtomicU64::new(FIRST),
             read_only: AtomicU64::new(FIRST),
@@ -344,7 +382,10 @@ impl Log {
         // was already walking a chain either sees the old boundary and
         // real bytes, or the new one and stops before it asks.
         for page in page_of(from)..page_of(upto) {
-            let stale = self.pages[page].swap(std::ptr::null_mut(), Ordering::AcqRel);
+            let Some(slot) = self.page_slot(page) else {
+                continue;
+            };
+            let stale = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
             if !stale.is_null() {
                 let retired = stale as usize;
                 self.epochs.defer(Box::new(move || {
@@ -355,6 +396,7 @@ impl Log {
                 }));
             }
         }
+        self.release_chunks(page_of(upto));
         self.retire_pages();
         // Never the first block: it holds the marker, and a hole there
         // would zero the very thing that says where the log starts.
@@ -437,28 +479,69 @@ impl Log {
         }
     }
 
+    /// The slot a page's pointer lives in, or nothing when the chunk
+    /// holding it has never been reached or has been compacted past.
+    ///
+    /// Two dependent loads on the read path where a flat table had one.
+    /// The chunk array is 128 KiB and a walk touches the same handful of
+    /// entries in it over and over, so the first load is an L1 hit in
+    /// everything but the first touch.
+    #[inline]
+    fn page_slot(&self, page: usize) -> Option<&AtomicPtr<u8>> {
+        let chunk = self.chunks.get(page / CHUNK)?;
+        let base = chunk.load(Ordering::Acquire);
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null chunk points at CHUNK initialised slots and
+        // its memory outlives every session that could have loaded the
+        // pointer, because it is freed through the epoch.
+        Some(unsafe { &*base.add(page % CHUNK) })
+    }
+
+    #[inline]
     fn page_ptr(&self, page: usize) -> *mut u8 {
-        match self.pages.get(page) {
+        match self.page_slot(page) {
             Some(slot) => slot.load(Ordering::Acquire),
             None => std::ptr::null_mut(),
         }
     }
 
-    /// Makes a page resident, allocating it if this is the first byte
-    /// anyone claimed in it. Idempotent, and the common case is one
-    /// acquire load.
-    fn ensure_page(&self, page: usize) -> Result<*mut u8> {
-        if page >= self.pages.len() {
-            return Err(Error::LogFull {
-                pages: self.pages.len(),
-            });
+    /// The slot for a page, allocating the chunk under it if this is the
+    /// first page anyone reached in that 16 GiB.
+    fn ensure_slot(&self, page: usize) -> Result<&AtomicPtr<u8>> {
+        if page >= MAX_PAGES {
+            return Err(Error::AddressSpaceFull { pages: MAX_PAGES });
         }
-        let existing = self.pages[page].load(Ordering::Acquire);
+        if let Some(slot) = self.page_slot(page) {
+            return Ok(slot);
+        }
+        let _guard = self.allocating.lock().expect("zu2 page allocation");
+        if let Some(slot) = self.page_slot(page) {
+            return Ok(slot);
+        }
+        // SAFETY: the layout is non-zero sized, and a null pointer is a
+        // valid AtomicPtr, so zeroed memory is an initialised chunk.
+        let fresh = unsafe { alloc_zeroed(chunk_layout()) }.cast::<AtomicPtr<u8>>();
+        if fresh.is_null() {
+            std::alloc::handle_alloc_error(chunk_layout());
+        }
+        self.chunks[page / CHUNK].store(fresh, Ordering::Release);
+        // SAFETY: just allocated with room for CHUNK slots.
+        Ok(unsafe { &*fresh.add(page % CHUNK) })
+    }
+
+    /// Makes a page resident, allocating it if this is the first byte
+    /// anyone claimed in it. Idempotent, and the common case is two
+    /// acquire loads.
+    fn ensure_page(&self, page: usize) -> Result<*mut u8> {
+        let slot = self.ensure_slot(page)?;
+        let existing = slot.load(Ordering::Acquire);
         if !existing.is_null() {
             return Ok(existing);
         }
         let _guard = self.allocating.lock().expect("zu2 page allocation");
-        let existing = self.pages[page].load(Ordering::Acquire);
+        let existing = slot.load(Ordering::Acquire);
         if !existing.is_null() {
             return Ok(existing);
         }
@@ -467,7 +550,7 @@ impl Log {
         if fresh.is_null() {
             std::alloc::handle_alloc_error(page_layout());
         }
-        self.pages[page].store(fresh, Ordering::Release);
+        slot.store(fresh, Ordering::Release);
         Ok(fresh)
     }
 
@@ -503,9 +586,19 @@ impl Log {
             } else {
                 observed
             };
-            if page_of(start) >= self.pages.len() {
+            if page_of(start) >= MAX_PAGES {
+                return Err(Error::AddressSpaceFull { pages: MAX_PAGES });
+            }
+            // The span and not the tail. What `max_pages` bounds is how
+            // much log there is between the compaction floor and the
+            // tail, which is a size a caller can reason about and act
+            // on, rather than a count of every page the database has
+            // ever touched (#470).
+            let span = page_of(start) - page_of(self.begin()) + 1;
+            if span > self.max_pages {
                 return Err(Error::LogFull {
-                    pages: self.pages.len(),
+                    span,
+                    max: self.max_pages,
                 });
             }
             if self
@@ -547,7 +640,15 @@ impl Log {
                 break;
             }
             self.head.store(page_start(victim + 1), Ordering::Release);
-            let stale = self.pages[victim].swap(std::ptr::null_mut(), Ordering::AcqRel);
+            // The chunk stays. Eviction only says the page is not in
+            // memory, and the addresses in it are still live and still
+            // readable off the file, so the slot has to keep being
+            // there to say null. Only compaction, which makes the
+            // addresses themselves unreachable, gives a chunk back.
+            let stale = match self.page_slot(victim) {
+                Some(slot) => slot.swap(std::ptr::null_mut(), Ordering::AcqRel),
+                None => std::ptr::null_mut(),
+            };
             if !stale.is_null() {
                 // The pointer is retired rather than freed: a reader
                 // that loaded it before the swap is still inside its
@@ -562,6 +663,76 @@ impl Log {
             }
         }
         self.retire_pages();
+    }
+
+    /// Checks that the file on disk fits the span `max_pages` allows,
+    /// and names the number that would if it does not.
+    ///
+    /// Called on the open path with the compaction floor already
+    /// resumed, so what it measures is the live span and not the file
+    /// length: a compacted file is mostly hole and its pages below
+    /// `begin` cost nothing.
+    pub fn fits_the_file(&self) -> Result<()> {
+        let len = self.file_len()?;
+        if len <= self.begin() {
+            return Ok(());
+        }
+        let needs = page_of(len - 1) - page_of(self.begin()) + 1;
+        if needs > self.max_pages {
+            return Err(Error::NeedsPages {
+                needs,
+                max: self.max_pages,
+            });
+        }
+        Ok(())
+    }
+
+    /// Pages holding memory right now, which is what `memory_pages` is
+    /// a promise about.
+    pub fn resident_pages(&self) -> usize {
+        let mut total = 0;
+        for chunk in &self.chunks {
+            let base = chunk.load(Ordering::Acquire);
+            if base.is_null() {
+                continue;
+            }
+            for i in 0..CHUNK {
+                // SAFETY: a non-null chunk holds CHUNK initialised slots
+                // and its memory is freed through the epoch.
+                if !unsafe { &*base.add(i) }.load(Ordering::Acquire).is_null() {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    /// Gives back the chunks of the page table that compaction has moved
+    /// entirely below the floor.
+    ///
+    /// Only whole chunks below `begin`, which is the one boundary that
+    /// says an address is unreachable rather than merely not in memory.
+    /// Every slot in such a chunk is already null, so the chunk carries
+    /// no page memory with it, and a reader holding a stale address down
+    /// there finds a missing chunk exactly where it used to find a null
+    /// slot: it misses, preads the hole, and the walk ends.
+    ///
+    /// Deferred like a page, and for the same reason: a session may have
+    /// loaded the chunk pointer already.
+    fn release_chunks(&self, below: usize) {
+        for index in 0..below / CHUNK {
+            let stale = self.chunks[index].swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if stale.is_null() {
+                continue;
+            }
+            let retired = stale as usize;
+            self.epochs.defer(Box::new(move || {
+                // SAFETY: the epoch has passed, so no session that could
+                // have loaded this pointer is still running, and it was
+                // allocated with exactly this layout.
+                unsafe { dealloc(retired as *mut u8, chunk_layout()) };
+            }));
+        }
     }
 
     /// Moves the epoch on and runs whatever that let go of.
@@ -993,13 +1164,23 @@ impl Drop for Log {
         // frees can retire unconditionally and the resident pages go
         // back directly.
         self.epochs.retire_all();
-        for slot in &self.pages {
-            let page = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !page.is_null() {
-                // SAFETY: allocated by ensure_page with this layout,
-                // and no session can exist at drop time.
-                unsafe { dealloc(page, page_layout()) };
+        for chunk in &self.chunks {
+            let base = chunk.swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if base.is_null() {
+                continue;
             }
+            for i in 0..CHUNK {
+                // SAFETY: a non-null chunk holds CHUNK initialised
+                // slots and nothing is running at drop time.
+                let page = unsafe { &*base.add(i) }.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                if !page.is_null() {
+                    // SAFETY: allocated by ensure_page with this layout,
+                    // and no session can exist at drop time.
+                    unsafe { dealloc(page, page_layout()) };
+                }
+            }
+            // SAFETY: allocated by ensure_slot with this layout.
+            unsafe { dealloc(base.cast::<u8>(), chunk_layout()) };
         }
     }
 }
@@ -1155,11 +1336,7 @@ mod tests {
             log.flush_once().expect("flush");
             log.opened_page(page_of(log.tail()));
         }
-        let resident = log
-            .pages
-            .iter()
-            .filter(|p| !p.load(Ordering::Acquire).is_null())
-            .count();
+        let resident = log.resident_pages();
         assert!(page_of(log.head()) > 0, "nothing was evicted");
         assert_eq!(
             log.epochs.pending(),

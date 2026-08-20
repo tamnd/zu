@@ -5,6 +5,11 @@
 //! node lookup stays two loads. Everything here is about a call or a
 //! reopen that runs into it, and about none of them costing more than
 //! the call itself.
+//!
+//! `max_pages` is at the bottom of the file and it is a different kind
+//! of number, which is what #470 turned on. It bounds the live span, so
+//! it is reached by holding too much at once and not by running for a
+//! long time.
 
 use zu2::{Db, Direction, Durability, Error, Options};
 
@@ -124,9 +129,11 @@ fn a_node_past_the_end_does_not_move_the_counter() {
     );
 }
 
-/// `max_pages` has the same shape as `max_nodes`: a ceiling picked at
-/// open time that a running database can walk into. Walking into it has
-/// to cost the writes that do not fit and nothing else.
+/// `max_pages` is not the same shape as `max_nodes`, and #470 was
+/// believing that it was. It is a ceiling on the live span, so a
+/// database that keeps its span down by compacting never reaches it
+/// however long it runs. Walking into it costs the writes that do not
+/// fit and nothing else.
 fn small_log() -> Options {
     Options {
         durability: Durability::Async,
@@ -175,5 +182,107 @@ fn a_full_log_can_still_be_made_durable() {
             session.read(&i.to_be_bytes(), &mut out).expect("read"),
             "key {i} was accepted and then lost when the log filled"
         );
+    }
+}
+
+/// #470. The page table was flat and indexed by absolute page, so a
+/// page index once used was never used again and the ceiling was on
+/// every byte the database would ever append rather than on anything it
+/// was holding. One megabyte of live data died permanently after
+/// writing eighty three, and no amount of compacting brought it back.
+///
+/// Four pages here, 16 MiB, against a live set of about a megabyte and
+/// several times 16 MiB of writes.
+#[test]
+fn a_compacted_database_outlives_its_page_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lifetime.zu2");
+    let db = Db::create(
+        &path,
+        Options {
+            durability: Durability::Async,
+            index_buckets: 1 << 12,
+            max_pages: 4,
+            mutable_pages: 1,
+            max_nodes: 1 << 10,
+            compact_below: 4 << 20,
+            ..Options::default()
+        },
+    )
+    .expect("create");
+    let mut session = db.session();
+    let value = vec![b'x'; 400];
+    let keys = 2_000u64;
+    let mut written = 0u64;
+    for round in 0..40 {
+        for i in 0..keys {
+            session
+                .upsert(format!("k{i:016}").as_bytes(), &value)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "round {round}: {e}, after writing {} MiB of a 1 MiB live set",
+                        written / (1 << 20)
+                    )
+                });
+            written += 464;
+        }
+        while db.compact().expect("compact") > 0 {}
+    }
+    assert!(
+        written > 6 * 4 * (1 << 20),
+        "the run did not write enough past the table to prove anything"
+    );
+    let mut out = Vec::new();
+    for i in 0..keys {
+        assert!(
+            session
+                .read(format!("k{i:016}").as_bytes(), &mut out)
+                .expect("read"),
+            "key {i} did not survive the compaction rounds"
+        );
+        assert_eq!(out.len(), 400);
+    }
+}
+
+/// A file longer than the options left room for is a sizing mistake and
+/// not a corrupt log, so it says what would open it. It used to report a
+/// full log, which is the same words the write path uses for a
+/// completely different problem.
+#[test]
+fn reopening_a_log_with_too_few_pages_names_the_number() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wide.zu2");
+    let roomy = Options {
+        max_pages: 64,
+        ..small_log()
+    };
+    {
+        let db = Db::create(&path, roomy).expect("create");
+        let mut session = db.session();
+        let value = vec![b'x'; 400];
+        for i in 0..30_000u64 {
+            session.upsert(&i.to_be_bytes(), &value).expect("upsert");
+        }
+        drop(session);
+        db.sync().expect("sync");
+    }
+    match Db::open(&path, small_log()) {
+        Err(Error::NeedsPages { needs, max }) => {
+            assert_eq!(max, 2, "it named a ceiling nobody asked for");
+            assert!(needs > max, "it asked for {needs} pages and had room for {max}");
+            let db = Db::open(
+                &path,
+                Options {
+                    max_pages: needs,
+                    ..small_log()
+                },
+            );
+            assert!(
+                db.is_ok(),
+                "it named {needs} pages and then would not open at {needs}"
+            );
+        }
+        Err(other) => panic!("wrong error for a file that does not fit: {other}"),
+        Ok(_) => panic!("it opened a file its page table had no room for"),
     }
 }

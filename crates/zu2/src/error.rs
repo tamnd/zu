@@ -19,11 +19,34 @@ pub enum Error {
     #[error("record of {size} bytes does not fit a {page} byte page")]
     RecordTooLarge { size: usize, page: usize },
 
-    /// The address space ran past the page table. Raising
-    /// [`crate::addr::MAX_PAGES`] is the fix, and it is a constant
-    /// rather than a growable table so that page lookup stays one load.
-    #[error("log is full: {pages} pages allocated")]
-    LogFull { pages: usize },
+    /// The live span of the log reached `max_pages`. This is a size:
+    /// everything from the compaction floor to the tail, so it is the
+    /// bytes the database is actually holding and not the bytes it has
+    /// written over its life. Compacting or a larger `max_pages` is the
+    /// fix.
+    ///
+    /// It used to be neither of those things. The page table was flat
+    /// and indexed by absolute page, so a page index once used was
+    /// never used again and `max_pages` bounded every byte the database
+    /// would ever append. One megabyte of live data died permanently
+    /// after eighty three megabytes of writes (#470).
+    #[error("log is full: {span} pages live, which is the {max} it was sized for")]
+    LogFull { span: usize, max: usize },
+
+    /// The tail reached [`crate::addr::MAX_PAGES`], which is what the
+    /// 48 address bits of an index entry can name. There is no option
+    /// that raises this one and no compaction that helps: addresses
+    /// only go up. Dumping and reloading is the answer, and at 256 TiB
+    /// of appends it is a long way off.
+    #[error("log reached the end of the address space at {pages} pages")]
+    AddressSpaceFull { pages: usize },
+
+    /// The file holds a log longer than the options left room for,
+    /// which is what reopening with a smaller `max_pages` than the run
+    /// that wrote it looks like. Nothing is wrong with the file, so
+    /// this names the number that would open it.
+    #[error("file needs max_pages of at least {needs}, the options gave room for {max}")]
+    NeedsPages { needs: usize, max: usize },
 
     /// A record header on the log did not parse, which during recovery
     /// bounds the durable prefix and at any other time is corruption.

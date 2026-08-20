@@ -63,8 +63,20 @@ pub struct Options {
     /// what a caller who knows its key count exactly can use to keep the
     /// pointer indirection off its read path.
     pub grow_index: bool,
-    /// Slots in the page table, which caps the log at
-    /// `max_pages * 4 MiB`.
+    /// The live span the log may reach, in 4 MiB pages, counted from the
+    /// compaction floor to the tail. A database that compacts hard
+    /// enough to keep its span under this never reaches it, however long
+    /// it runs and however much it writes: what is bounded is what the
+    /// database is holding and not what it has written.
+    ///
+    /// That distinction is #470 and it used to go the other way. The
+    /// page table was flat and indexed by absolute page, so the ceiling
+    /// landed on the highest address the log would ever reach, which is
+    /// the sum of every append. One megabyte of live data died
+    /// permanently after eighty three megabytes of writes.
+    ///
+    /// The remaining ceiling is [`crate::addr::MAX_PAGES`], 256 TiB of
+    /// appends, which is the 48 bits an index entry has for an address.
     pub max_pages: usize,
     /// Pages above the read-only boundary, which is the window an
     /// update can happen in place in.
@@ -268,6 +280,13 @@ impl Db {
         // starts: a compacted file has a hole where its first pages were.
         let begin = core.log.read_begin()?;
         core.log.resume_begin(begin);
+        // Before the replay rather than during it. A file longer than
+        // the options left room for is a sizing mistake and not a
+        // corrupt log, so it gets the number that would open it. The
+        // replay would otherwise reach the first page past the ceiling
+        // and report a full log, which is the same words for a
+        // different problem and no help at all (#470).
+        core.log.fits_the_file()?;
         recover::replay(&core)?;
         Ok(Self::start(core, options))
     }

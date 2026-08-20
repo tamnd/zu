@@ -1142,53 +1142,122 @@ pub enum TrimSide {
     Both,
 }
 
-/// The datetime value functions of ISO 20.27: the five words a statement
-/// asks the time with.
+/// The temporal value functions of ISO 20.27 and 20.29: the words a
+/// statement asks the time with, the constructors that read one out of
+/// a string, and the duration function beside them.
 ///
 /// The three CURRENT words answer in the session's displacement and the
 /// two LOCAL ones answer without a displacement at all, which is the
-/// whole of what separates them. All five are cut from one instant, so
-/// a statement holding CURRENT_DATE and CURRENT_TIMESTAMP cannot have
-/// them land on two different days.
+/// whole of what separates them. All of them are cut from one instant,
+/// so a statement holding CURRENT_DATE and CURRENT_TIMESTAMP cannot
+/// have them land on two different days.
+///
+/// The constructors are the same functions with a string in front of
+/// the instant: `DATE('2024-01-15')` reads the string and `DATE()`
+/// reads the clock, and one kernel answers both because the only
+/// difference is where the value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DatetimeFn {
+pub enum TemporalFn {
     /// The date in the session's displacement.
     CurrentDate,
     /// The time of day in it, carrying the displacement.
     CurrentTime,
     /// The instant, carrying the displacement.
     CurrentTimestamp,
-    /// The time of day with no displacement on it.
+    /// The time of day with no displacement on it. The one word of the
+    /// nine that is written both bare and with brackets, which is what
+    /// the standard's `LOCAL_TIME [ ( ... ) ]` says.
     LocalTime,
     /// The date and time of day with no displacement on it.
     LocalTimestamp,
+    /// `DATE('2024-01-15')` or `DATE()`.
+    Date,
+    /// `ZONED_TIME('10:00:00+07:00')` or `ZONED_TIME()`.
+    ZonedTime,
+    /// `ZONED_DATETIME('2024-01-15T10:00:00Z')` or `ZONED_DATETIME()`.
+    ZonedDatetime,
+    /// `LOCAL_DATETIME('2024-01-15T10:00:00')` or `LOCAL_DATETIME()`.
+    LocalDatetime,
+    /// `DURATION('P1Y2M')`, ISO 20.29. The one of these with no form
+    /// that reads the clock: a length of time is not a thing the
+    /// present moment is.
+    Duration,
 }
 
-impl DatetimeFn {
+/// Where a temporal function may write its brackets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brackets {
+    /// Never, which is the five words of ISO 20.27 that are written
+    /// bare. `CURRENT_DATE()` is a call to a function nobody defined.
+    Never,
+    /// Always, and a value inside them or nothing.
+    Always,
+    /// Either, which is `LOCAL_TIME` alone.
+    Optional,
+}
+
+impl TemporalFn {
     /// The word a statement writes for it, which is also the name the
     /// registry row carries and the plan prints.
     pub fn word(self) -> &'static str {
         match self {
-            DatetimeFn::CurrentDate => "current_date",
-            DatetimeFn::CurrentTime => "current_time",
-            DatetimeFn::CurrentTimestamp => "current_timestamp",
-            DatetimeFn::LocalTime => "local_time",
-            DatetimeFn::LocalTimestamp => "local_timestamp",
+            TemporalFn::CurrentDate => "current_date",
+            TemporalFn::CurrentTime => "current_time",
+            TemporalFn::CurrentTimestamp => "current_timestamp",
+            TemporalFn::LocalTime => "local_time",
+            TemporalFn::LocalTimestamp => "local_timestamp",
+            TemporalFn::Date => "date",
+            TemporalFn::ZonedTime => "zoned_time",
+            TemporalFn::ZonedDatetime => "zoned_datetime",
+            TemporalFn::LocalDatetime => "local_datetime",
+            TemporalFn::Duration => "duration",
         }
     }
 
     /// The temporal type the word answers, which is also the cut of the
-    /// instant it is. Every one of these is a conversion the cast rules
-    /// already state, so the five functions are five targets and one
-    /// piece of code rather than five pieces of arithmetic.
+    /// instant it is and the type a string in front of it is read as.
+    /// Every one of these is a conversion the cast rules already state,
+    /// so they are ten targets and one piece of code rather than ten
+    /// pieces of arithmetic.
+    ///
+    /// The duration target names the day-time kind and is not one: a
+    /// duration string says which kind it is, `P1Y` being months and
+    /// `P1D` nanoseconds, so the target here means read this as a
+    /// duration and the string settles the rest.
     pub fn target(self) -> LogicalType {
         match self {
-            DatetimeFn::CurrentDate => LogicalType::Date,
-            DatetimeFn::CurrentTime => LogicalType::ZonedTime,
-            DatetimeFn::CurrentTimestamp => LogicalType::ZonedDatetime,
-            DatetimeFn::LocalTime => LogicalType::LocalTime,
-            DatetimeFn::LocalTimestamp => LogicalType::LocalDatetime,
+            TemporalFn::CurrentDate | TemporalFn::Date => LogicalType::Date,
+            TemporalFn::CurrentTime | TemporalFn::ZonedTime => LogicalType::ZonedTime,
+            TemporalFn::CurrentTimestamp | TemporalFn::ZonedDatetime => LogicalType::ZonedDatetime,
+            TemporalFn::LocalTime => LogicalType::LocalTime,
+            TemporalFn::LocalTimestamp | TemporalFn::LocalDatetime => LogicalType::LocalDatetime,
+            TemporalFn::Duration => LogicalType::Duration(DurationKind::DayTime),
         }
+    }
+
+    /// Where this one's brackets may stand, which is what the parser
+    /// reads it by and the whole of what separates `CURRENT_DATE` from
+    /// `DATE(...)`.
+    pub fn brackets(self) -> Brackets {
+        match self {
+            TemporalFn::CurrentDate
+            | TemporalFn::CurrentTime
+            | TemporalFn::CurrentTimestamp
+            | TemporalFn::LocalTimestamp => Brackets::Never,
+            TemporalFn::LocalTime => Brackets::Optional,
+            TemporalFn::Date
+            | TemporalFn::ZonedTime
+            | TemporalFn::ZonedDatetime
+            | TemporalFn::LocalDatetime
+            | TemporalFn::Duration => Brackets::Always,
+        }
+    }
+
+    /// Whether the brackets may stand empty, which is every one of them
+    /// but the duration: there is a date now and a time now, and there
+    /// is no length of time now.
+    pub fn reads_the_clock(self) -> bool {
+        self != TemporalFn::Duration
     }
 }
 
@@ -1234,15 +1303,22 @@ pub enum Expr {
         chars: Option<Box<Expr>>,
         source: Box<Expr>,
     },
-    /// `CURRENT_DATE` and the four words beside it, ISO 20.27. They are
-    /// written as bare words rather than as calls, which is why they are
-    /// here and not resolved by name: the grammar gives them no
-    /// parentheses, so nothing follows the word to say it was one.
-    Datetime(DatetimeFn),
+    /// The temporal value functions of ISO 20.27 and 20.29. They are
+    /// here rather than resolved by name because where the brackets may
+    /// stand is part of each one: `CURRENT_DATE` takes none,
+    /// `DATE(...)` takes them, and `LOCAL_TIME` takes them or not. A
+    /// name resolved against the registry could not tell those apart.
+    Temporal {
+        func: TemporalFn,
+        /// The string the value is read out of, or none, which means
+        /// read the clock.
+        arg: Option<Box<Expr>>,
+    },
     /// The instant the statement is running at, which no query writes.
-    /// It is the argument the binder hands each of the five above, so
-    /// that the clock is read in one place and cut in five, and so that
-    /// every one of them in a statement answers the same instant.
+    /// It is the argument the binder hands each of the words above that
+    /// wrote no string of its own, so that the clock is read in one
+    /// place and cut in as many as ask for it, and so that every one of
+    /// them in a statement answers the same instant.
     Clock,
     /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
     /// 20.28's datetime subtraction. Written like a call and not one,

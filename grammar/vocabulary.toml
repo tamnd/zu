@@ -129,8 +129,13 @@ words = ["LEFT", "RIGHT"]
 
 [[group]]
 kind = "keyword"
-doc = "The datetime value functions of ISO 20.27, which ask what time the statement is running at. They are keywords here rather than functions because that is how they are written: the grammar gives them no parentheses, so CURRENT_DATE stands alone and CURRENT_DATE() is a call to a function nobody defined. The three CURRENT words answer in the session's time zone and the two LOCAL ones answer without a zone at all. Every one of them in a statement answers the same instant, so a query returning CURRENT_DATE beside CURRENT_TIMESTAMP cannot have them land on two different days."
+doc = "The datetime value functions of ISO 20.27 that ask what time the statement is running at. They are keywords here rather than functions because that is how four of the five are written: the grammar gives them no parentheses, so CURRENT_DATE stands alone and CURRENT_DATE() is a call to a function nobody defined. LOCAL_TIME is the one the standard writes both ways, bare or bracketed, and it is a keyword here because that is the spelling a shell colouring a half typed statement will see. The three CURRENT words answer in the session's time zone and the two LOCAL ones answer without a zone at all. Every one of them in a statement answers the same instant, so a query returning CURRENT_DATE beside CURRENT_TIMESTAMP cannot have them land on two different days."
 words = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCAL_TIME", "LOCAL_TIMESTAMP"]
+
+[[group]]
+kind = "function"
+doc = "The constructors of ISO 20.27 and the DURATION of ISO 20.29, which read a temporal value out of a string instead of out of the clock. Three of the six words are here and three are not, because a word is written once and DATE and DURATION are already type names and LOCAL_TIME is already one of the bare words above. Each takes one string, or nothing at all, and empty brackets read the clock and answer what the bare word beside them answers, so DATE() is CURRENT_DATE and ZONED_DATETIME() is CURRENT_TIMESTAMP. DURATION is the one with no empty form, there being a date now and a time now and no length of time now, and the other duration function of 20.29 is ABS, which answers the length of a duration without its sign."
+words = ["ZONED_TIME", "ZONED_DATETIME", "LOCAL_DATETIME"]
 
 [[group]]
 kind = "function"

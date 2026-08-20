@@ -6815,7 +6815,7 @@ impl AggState {
             | Func::Lower
             | Func::Trim(_)
             | Func::Cut(_)
-            | Func::Datetime(_)
+            | Func::Temporal(_)
             | Func::DurationBetween(_)
             | Func::Normalize(_)
             | Func::IsNormalized(_)

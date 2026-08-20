@@ -17,12 +17,13 @@ use zu_common::{
 };
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DatetimeFn, DeleteTarget, EdgeEnd,
+    BinaryOp, Brackets, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd,
     ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef,
     GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern,
     NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection, ProjectionItem,
     PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto,
-    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TrimSide, TxnStmt, UnaryOp, YieldItem,
+    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp,
+    YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -3770,21 +3771,29 @@ impl Parser<'_> {
         {
             return Ok(Expr::GraphRef(GraphRef::Home));
         }
-        // ISO 20.27, the datetime value functions. They are bare words
-        // and not calls, the grammar giving them no parentheses, so a
-        // statement asking what time it is writes CURRENT_DATE and
-        // nothing behind it. Reading them here takes nothing away from
-        // a query, since all five are reserved words and a variable of
-        // one of those names is a variable the standard does not allow.
+        // ISO 20.27 and 20.29, the temporal value functions. Where the
+        // brackets may stand is part of each one, which is why they are
+        // read here rather than resolved by name: CURRENT_DATE takes
+        // none, DATE(...) takes them, and LOCAL_TIME takes them or not.
+        // Reading them here takes nothing away from a query, since
+        // every one of the words is reserved and a variable of one of
+        // those names is a variable the standard does not allow.
         //
-        // A bracket behind one is left to the call path on purpose. It
-        // is a query asking for a function that does not exist, and the
-        // refusal that says so by name reads better than a refusal
-        // about a bracket that could not go where it was put.
-        if !self.at(&TokenKind::LParen)
-            && let Some(func) = datetime_word(&name)
+        // A word written with brackets it does not take, or without
+        // brackets it needs, falls through to the call path on purpose.
+        // CURRENT_DATE() is a query asking for a function that does not
+        // exist, and the refusal that says so by name reads better than
+        // one about a bracket that could not go where it was put; a
+        // bare DATE is a name, and stays one, the way it is a name in
+        // front of a date string.
+        if let Some(func) = temporal_word(&name)
+            && match func.brackets() {
+                Brackets::Never => !self.at(&TokenKind::LParen),
+                Brackets::Always => self.at(&TokenKind::LParen),
+                Brackets::Optional => true,
+            }
         {
-            return Ok(Expr::Datetime(func));
+            return self.parse_temporal_fn(func);
         }
         // ISO 20.28, the datetime subtraction. It looks like a call
         // until the closing bracket, and then a qualifier may follow
@@ -4720,6 +4729,29 @@ impl Parser<'_> {
         })
     }
 
+    /// One of the temporal value functions of ISO 20.27 and 20.29, with
+    /// the word read and its brackets, if it has any, standing.
+    ///
+    /// Empty brackets read the clock, which is what the word alone does
+    /// and is why `LOCAL_TIME` and `LOCAL_TIME()` are one function. A
+    /// duration has no such form, there being a date now and a time now
+    /// and no length of time now, so its brackets have to hold a value.
+    fn parse_temporal_fn(&mut self, func: TemporalFn) -> Result<Expr> {
+        let mut arg = None;
+        if self.eat(&TokenKind::LParen) {
+            if !self.at(&TokenKind::RParen) {
+                arg = Some(Box::new(self.parse_expr()?));
+            } else if !func.reads_the_clock() {
+                return Err(self.error(&format!(
+                    "a string for {}(), since there is no length of time now",
+                    func.word().to_uppercase()
+                )));
+            }
+            self.expect(&TokenKind::RParen)?;
+        }
+        Ok(Expr::Temporal { func, arg })
+    }
+
     /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
     /// 20.28, with the name read and the bracket standing.
     ///
@@ -4792,13 +4824,18 @@ impl Parser<'_> {
 /// names none and is an ordinary identifier. The five words are the
 /// names their rows carry, so there is one list of them and it is the
 /// one the plan prints from.
-fn datetime_word(name: &str) -> Option<DatetimeFn> {
+fn temporal_word(name: &str) -> Option<TemporalFn> {
     [
-        DatetimeFn::CurrentDate,
-        DatetimeFn::CurrentTime,
-        DatetimeFn::CurrentTimestamp,
-        DatetimeFn::LocalTime,
-        DatetimeFn::LocalTimestamp,
+        TemporalFn::CurrentDate,
+        TemporalFn::CurrentTime,
+        TemporalFn::CurrentTimestamp,
+        TemporalFn::LocalTime,
+        TemporalFn::LocalTimestamp,
+        TemporalFn::Date,
+        TemporalFn::ZonedTime,
+        TemporalFn::ZonedDatetime,
+        TemporalFn::LocalDatetime,
+        TemporalFn::Duration,
     ]
     .into_iter()
     .find(|func| func.word().eq_ignore_ascii_case(name))

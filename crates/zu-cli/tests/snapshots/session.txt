@@ -91,9 +91,9 @@ $ zu version
 zu <version>
 c abi <abi>
 zu1 format 1
-features: arrow
+features: <features>
 engines: zu1, sqlite
 
 $ zu version --format json
-{"zu":"<version>","c_abi":"<abi>","format_version":1,"features":["arrow"],"engines":["zu1","sqlite"]}
+{"zu":"<version>","c_abi":"<abi>","format_version":1,"features":<features>,"engines":["zu1","sqlite"]}
 

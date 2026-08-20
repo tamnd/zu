@@ -75,6 +75,24 @@ pub const KIND_EDGE: u32 = 1;
 /// counter without a second record per node.
 pub const KIND_VERTEX: u32 = 2;
 
+/// The rest of this page is padding, written where the allocator
+/// skipped to the next page because a record did not fit in what was
+/// left.
+///
+/// It exists so that zeros stop meaning two things. A page's leftover
+/// bytes are zeros and so is a block the device lost, and recovery read
+/// both as padding, so a hole in the middle of a page cost the rest of
+/// that page and then the scan carried on above it. What survived was a
+/// prefix with a suffix stapled on, which is exactly what the log's
+/// durability contract says cannot happen (#472).
+///
+/// A pad is a bare header. It does not say how long the gap is because
+/// it does not need to: a pad always means the rest of the page, and a
+/// length field would be a second thing to get wrong. What makes it
+/// tell itself apart from zeros is that it carries a real checksum,
+/// which an all-zero header does not.
+pub const KIND_PAD: u32 = 3;
+
 /// Bytes a record with these lengths occupies, padded so the next
 /// record starts 8 byte aligned.
 #[inline]

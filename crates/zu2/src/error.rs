@@ -48,6 +48,20 @@ pub enum Error {
     #[error("file needs max_pages of at least {needs}, the options gave room for {max}")]
     NeedsPages { needs: usize, max: usize },
 
+    /// The scan stopped at `at` and found a record that parses at
+    /// `above`, so the file has a hole in it rather than a torn tail.
+    /// Everything from `at` up is unreachable: the log is read in order
+    /// and the order is broken there.
+    ///
+    /// A torn tail is the ordinary thing and says nothing, because the
+    /// records that went missing were never acknowledged. This is the
+    /// other thing, and the records above the hole were. Opening at the
+    /// prefix and saying nothing would be a database quietly missing
+    /// keys it promised, so this is an error, and `Options::salvage`
+    /// is the way to take the prefix anyway (#472).
+    #[error("log has a hole: the scan stopped at {at} and a record parses at {above}")]
+    LogHole { at: u64, above: u64 },
+
     /// A record header on the log did not parse, which during recovery
     /// bounds the durable prefix and at any other time is corruption.
     #[error("record at {address} is malformed: {why}")]

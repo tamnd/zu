@@ -34,7 +34,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::addr::{Address, FIRST, MAX_PAGES, PAGE_SIZE, page_of, page_start};
@@ -75,6 +75,27 @@ pub enum Durability {
 fn page_layout() -> Layout {
     Layout::from_size_align(PAGE_SIZE, 64).expect("zu2 page layout")
 }
+
+/// The format a file written now carries in the top byte of its marker
+/// word.
+///
+/// One rather than zero because zero is what a file written before
+/// there was a format reads back as, and the difference matters: a
+/// padless file has no pad records, so recovery has to fall back to
+/// reading zeros as page padding and cannot tell a hole from the end of
+/// a page. Refusing to open one would have been simpler and it would
+/// throw away files that are not wrong, only older.
+pub const FORMAT: u8 = 1;
+
+/// A file with no pad records. See [`FORMAT`].
+pub const FORMAT_PADLESS: u8 = 0;
+
+/// Where the format sits in the marker word. An address is 48 bits, so
+/// the top sixteen were spare.
+const FORMAT_SHIFT: u32 = 56;
+
+/// The part of the marker word that is the address.
+const ADDRESS_MASK: u64 = (1 << FORMAT_SHIFT) - 1;
 
 /// Pages per chunk of the page table.
 ///
@@ -166,6 +187,8 @@ pub struct Log {
     chunks: Box<[AtomicPtr<AtomicPtr<u8>>]>,
     /// The live span the log is allowed to reach, in pages.
     max_pages: usize,
+    /// The format the file is written in. See [`FORMAT`].
+    format: AtomicU32,
     /// Serialises page allocation, which happens once per 4 MiB.
     allocating: Mutex<()>,
     tail: AtomicU64,
@@ -249,6 +272,7 @@ impl Log {
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             max_pages: max_pages.clamp(1, MAX_PAGES),
+            format: AtomicU32::new(u32::from(FORMAT)),
             allocating: Mutex::new(()),
             tail: AtomicU64::new(FIRST),
             read_only: AtomicU64::new(FIRST),
@@ -343,12 +367,67 @@ impl Log {
     /// punches anything. The other order would leave a reopen scanning
     /// from a page that is no longer there.
     pub fn read_begin(&self) -> Result<Address> {
+        Ok(self.read_marker()?.1)
+    }
+
+    /// Reads the format the file was written in, which a reopen adopts
+    /// before it replays. See [`Log::adopt_format`].
+    pub fn read_format(&self) -> Result<u8> {
+        Ok(self.read_marker()?.0)
+    }
+
+    /// The format the file was written in and where its log starts, out
+    /// of the one word at offset zero.
+    ///
+    /// An address is 48 bits, so the top of that word was spare and the
+    /// format goes in it. A file written before there was a format
+    /// reads back as zero, which is what [`FORMAT_PADLESS`] names.
+    fn read_marker(&self) -> Result<(u8, Address)> {
         if self.file_len()? < FIRST {
-            return Ok(FIRST);
+            return Ok((FORMAT, FIRST));
         }
         let mut marker = [0u8; 8];
         file::read_exact_at(&self.file, &mut marker, 0)?;
-        Ok(u64::from_le_bytes(marker).max(FIRST))
+        let word = u64::from_le_bytes(marker);
+        Ok(((word >> FORMAT_SHIFT) as u8, (word & ADDRESS_MASK).max(FIRST)))
+    }
+
+    /// The format this log is reading and writing.
+    #[inline]
+    pub fn format(&self) -> u8 {
+        self.format.load(Ordering::Acquire) as u8
+    }
+
+    /// Takes on the format the file was written in, which is what an
+    /// open does before it replays.
+    ///
+    /// A compaction on an older file must not stamp it with the current
+    /// format. It punches the front and leaves every page above the
+    /// floor exactly as it found them, pad records and all or none at
+    /// all, so the format is a property of the file and not of the run
+    /// that happens to have it open.
+    pub fn adopt_format(&self, format: u8) {
+        self.format.store(u32::from(format), Ordering::Release);
+    }
+
+    /// Writes the marker word: the format in the top byte and the log's
+    /// floor under it.
+    fn write_marker(&self, begin: Address) -> Result<()> {
+        let word = (u64::from(self.format()) << FORMAT_SHIFT) | begin;
+        file::write_all_at(&self.file, &word.to_le_bytes(), 0)?;
+        Ok(())
+    }
+
+    /// Stamps a fresh file with the format it is about to be written in.
+    ///
+    /// A file that never compacts never writes this word otherwise, so
+    /// without a stamp at creation a new database would be
+    /// indistinguishable from one written before the format existed,
+    /// and would be read back under the older and more forgiving rule.
+    pub fn stamp(&self) -> Result<()> {
+        self.write_marker(FIRST)?;
+        file::sync(&self.file)?;
+        Ok(())
     }
 
     /// Hands the front of the log back to the filesystem.
@@ -374,7 +453,7 @@ impl Log {
         if upto <= from {
             return Ok(0);
         }
-        file::write_all_at(&self.file, &upto.to_le_bytes(), 0)?;
+        self.write_marker(upto)?;
         file::sync(&self.file)?;
         self.begin.store(upto, Ordering::Release);
         self.head.fetch_max(upto, Ordering::AcqRel);
@@ -613,10 +692,46 @@ impl Log {
             {
                 self.ensure_page(page_of(start))?;
                 if page_of(start) != page {
+                    self.pad_out(observed, page);
                     self.opened_page(page_of(start));
                 }
                 return Ok(start);
             }
+        }
+    }
+
+    /// Marks the bytes the allocator stepped over as padding on purpose.
+    ///
+    /// The gap runs from `at` to the end of `page` and belongs to
+    /// whichever thread won the claim that moved past it, so nobody else
+    /// can be writing there. The flusher cannot have taken it either:
+    /// the session published its write frontier at `at` before it
+    /// claimed anything, so a flush is held below the gap until this
+    /// returns and `wrote` clears the frontier.
+    ///
+    /// A gap shorter than a header gets nothing, which is the one case
+    /// where zeros still stand for padding. Recovery has the same test
+    /// and reaches the same conclusion: too small to hold a record, so
+    /// there is nothing down there to have lost.
+    fn pad_out(&self, at: Address, page: usize) {
+        let room = PAGE_SIZE - (at - page_start(page)) as usize;
+        if room < record::HEADER {
+            return;
+        }
+        let base = self.page_ptr(page);
+        if base.is_null() {
+            // The page went out of memory between the claim and here,
+            // which takes an eviction of a page still being appended to
+            // and should not happen. Nothing to write to, and a missing
+            // pad costs recovery the rest of a page it can no longer
+            // read anyway.
+            return;
+        }
+        // SAFETY: the gap is inside the page, 8 byte aligned because
+        // every record size is, and owned by this thread.
+        unsafe {
+            let dst = base.add((at - page_start(page)) as usize);
+            record::write_at(dst, crate::addr::NULL, 0, &[], &[], false, record::KIND_PAD);
         }
     }
 

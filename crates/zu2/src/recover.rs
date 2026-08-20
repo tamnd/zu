@@ -17,12 +17,26 @@
 //! copy, so the two rules are the same rule.
 //!
 //! The scan stops at the first record whose checksum does not hold, and
-//! that address is the durable prefix. Padding at the end of a page is
-//! zeros, so a scan that finds a zero header there moves to the next
-//! page rather than stopping, and stops only when the file has no more
-//! pages. A torn write inside a page fails its checksum and ends the
-//! scan there, which is the behaviour that matters: everything before
-//! it was acknowledged and everything after it was not.
+//! that address is the durable prefix. A torn write inside a page fails
+//! its checksum and ends the scan there, which is the behaviour that
+//! matters: everything before it was acknowledged and everything after
+//! it was not.
+//!
+//! Padding at the end of a page used to be zeros and nothing else, so
+//! the scan read a zero header as padding and moved to the next page.
+//! That is also what a block the device lost reads as, which made the
+//! two indistinguishable: a hole cost the rest of its page and then the
+//! scan carried on above it, and what came back was a prefix with a
+//! suffix stapled on rather than a prefix (#472). The allocator now
+//! leaves a pad record where it skipped, so padding says so and carries
+//! a checksum, and zeros mean either the end of the log or damage. The
+//! scan stops on both, which is right for both: at the end there is
+//! nothing above to lose, and at a hole what is above is unreachable
+//! rather than lost.
+//!
+//! A file written before pad records existed says so in its marker word
+//! and gets the old reading, since it holds nothing the new conclusion
+//! could be drawn from.
 //!
 //! This is deliberately not a checkpoint. Concurrent Prefix Recovery
 //! (Prasaad, Chandramouli, Kossmann, SIGMOD 2019) is the model for one,
@@ -33,8 +47,9 @@ use std::collections::BTreeSet;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::db::{Core, restore_pages};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph;
+use crate::log;
 use crate::index::{self, EMPTY, Index, SLOTS};
 use crate::record::{self, RecordRef};
 
@@ -50,7 +65,10 @@ type Rewritten = BTreeSet<usize>;
 type Repairs = Vec<(Address, Address)>;
 
 /// Rebuilds the index from the file and leaves the log ready to append.
-pub fn replay(core: &Core) -> Result<()> {
+///
+/// `salvage` is [`crate::Options::salvage`]: what to do about a file
+/// that has records above where the scan stopped. See [`hole_above`].
+pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     let len = restore_pages(core)?;
     // Before anything reads a record, because a journal that is still
     // there is a reopen that died part way through writing its repairs
@@ -70,10 +88,23 @@ pub fn replay(core: &Core) -> Result<()> {
     // [`install`] for what a table of the wrong size costs, and
     // [`crate::index::Index::presize`] for what this leaves alone.
     let mut records = 0usize;
-    walk(core, from, len, |_, _| {
+    let stopped = walk(core, from, len, |_, _| {
         records += 1;
         Ok(())
     })?;
+    // Before the second walk, because the second walk is the expensive
+    // one and a file that is not going to open should not pay for it.
+    if let Some(above) = hole_above(core, stopped, len) {
+        if !salvage {
+            return Err(Error::LogHole {
+                at: stopped,
+                above,
+            });
+        }
+        core.recovered
+            .discarded
+            .store(len - stopped, std::sync::atomic::Ordering::Relaxed);
+    }
     core.index.presize(records.div_ceil(4));
 
     let mut rewritten = Rewritten::new();
@@ -125,6 +156,54 @@ pub fn replay(core: &Core) -> Result<()> {
     Ok(())
 }
 
+/// Where the file still holds a record above the address the scan
+/// stopped at, or `None` when there is nothing up there.
+///
+/// A torn tail and a hole look the same from below: the scan stops and
+/// what it read is a prefix. They are not the same thing. A torn tail is
+/// a write that was in flight when the machine went down, so nothing
+/// above it was ever acknowledged and there is nothing above it to find.
+/// A hole is bytes the device lost out of the middle of a log that was
+/// written and acknowledged, and the records above it are real and are
+/// now unreachable, because the log is read in order and the order is
+/// broken there.
+///
+/// Looking is cheap and only page starts have to be looked at. A record
+/// never straddles a page, so the allocator starts every page with one,
+/// and a page that holds anything at all holds it at its first byte.
+/// Provisioned blocks past the tail read as zeros, so a clean stop at
+/// the end of the log finds nothing, which is the case this runs in
+/// nearly every time.
+fn hole_above(core: &Core, stopped: Address, len: u64) -> Option<Address> {
+    let mut address = page_start(page_of(stopped) + 1);
+    while address < len {
+        let base = core.log.resident(address);
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: the page is resident and a page start has a whole
+        // header in it, since a page is far larger than a header. The
+        // lengths are bounded against the page before the checksum
+        // reads a byte past the header, because damage is exactly what
+        // this is looking at and damage puts any number in a length
+        // field (#438).
+        let live = unsafe {
+            let header = RecordRef::new(base);
+            let key_len = header.key_len();
+            let value_len = header.value_len();
+            let empty = key_len == 0 && value_len == 0;
+            record::size_of(key_len, value_len) <= PAGE_SIZE
+                && (!empty || header.kind() == record::KIND_PAD)
+                && header.intact()
+        };
+        if live {
+            return Some(address);
+        }
+        address = page_start(page_of(address) + 1);
+    }
+    None
+}
+
 /// Reads the records the file holds, in the order they were written,
 /// and hands each one to `visit`. Returns where the last accepted record
 /// ended, which is where the next append goes.
@@ -142,6 +221,9 @@ fn walk(
 ) -> Result<Address> {
     let mut address = from;
     let mut end = from;
+    // Read once. The format is a property of the file and it cannot
+    // change while the file is being replayed.
+    let padless = core.log.format() == log::FORMAT_PADLESS;
     while address < len {
         let page = page_of(address);
         let base = core.log.resident(address);
@@ -173,8 +255,31 @@ fn walk(
             let value_len = header.value_len();
             let size = record::size_of(key_len, value_len);
             if key_len == 0 && value_len == 0 {
-                // Either page padding or the end of the log.
-                None
+                // Zeros used to mean two things and the walk could not
+                // tell them apart, so a block the device lost read as
+                // page padding, the rest of the page went with it, and
+                // the scan carried on above the hole installing records
+                // that were never a prefix of anything (#472).
+                //
+                // A file written with pad records says which it is. A
+                // pad is a bare header with a real checksum, and zeros
+                // are neither, so zeros are now either the end of the
+                // log or damage and the walk stops on both. Stopping is
+                // the safe answer to both: at the end there is nothing
+                // above to lose, and at a hole what is above is
+                // unreachable rather than lost.
+                //
+                // A file written before pad records existed gets the
+                // old reading, because it has nothing in it to reach
+                // the new conclusion from. It keeps the old exposure
+                // too, which is the honest trade and is why the format
+                // is stamped rather than assumed.
+                let padding = padless || (header.kind() == record::KIND_PAD && header.intact());
+                if padding {
+                    None
+                } else {
+                    break;
+                }
             } else if size > room || !header.intact() {
                 break;
             } else {

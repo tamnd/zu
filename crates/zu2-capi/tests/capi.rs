@@ -679,6 +679,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
         ("uint64_t", "compact_below"),
         ("uint64_t", "sessions"),
         ("uint32_t", "fixed_index"),
+        ("uint32_t", "salvage"),
     ];
     let header = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -755,6 +756,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "compact_below" => std::mem::offset_of!(Zu2Options, compact_below),
             "sessions" => std::mem::offset_of!(Zu2Options, sessions),
             "fixed_index" => std::mem::offset_of!(Zu2Options, fixed_index),
+            "salvage" => std::mem::offset_of!(Zu2Options, salvage),
             other => panic!("{other} is in the header and this test does not know it"),
         };
         assert_eq!(got, want, "{name} is at {got} in the struct and {want} in the header");

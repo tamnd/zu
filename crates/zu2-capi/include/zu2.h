@@ -164,6 +164,12 @@ typedef struct zu2_options {
    * an older caller against a newer library gets defaults for what it
    * does not know about rather than a shifted read. */
   uint32_t fixed_index;
+  /* Nonzero opens a file with a hole in it anyway, at the prefix below
+   * the hole. Off by default, because a hole is records that were
+   * acknowledged and are now gone, and an open that says nothing about
+   * that is worse than one that fails. zu2_discarded() is how much a
+   * salvaged open threw away. */
+  uint32_t salvage;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -360,6 +366,11 @@ uint32_t zu2_index_resizing(const zu2_db *db);
  * the space column: zu2_disk_bytes says what the filesystem holds and
  * this says what the process does. */
 uint64_t zu2_resident_pages(const zu2_db *db);
+
+/* Bytes a salvaged open threw away, and zero on an open that had nothing
+ * to throw away. A salvaged database is a short database and this is how
+ * short. */
+uint64_t zu2_discarded(const zu2_db *db);
 
 /* The library version, NUL-terminated and valid forever. */
 const char *zu2_version(size_t *len);

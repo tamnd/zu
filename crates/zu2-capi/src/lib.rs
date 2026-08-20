@@ -96,6 +96,12 @@ pub struct Zu2Options {
     /// and it is the only way a caller who knows its key count exactly
     /// can keep the migration check off its read path.
     pub fixed_index: u32,
+    /// Nonzero opens a file with a hole in it anyway, at the prefix
+    /// below the hole. Off by default, because a hole is records that
+    /// were acknowledged and are now gone and an open that says nothing
+    /// about that is worse than one that fails. `zu2_discarded` is how
+    /// much a salvaged open threw away.
+    pub salvage: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -342,6 +348,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.sessions > 0 {
         options.sessions = given.sessions as usize;
+    }
+    if given.salvage != 0 {
+        options.salvage = true;
     }
     if given.fixed_index != 0 {
         options.grow_index = false;
@@ -1577,6 +1586,27 @@ pub unsafe extern "C" fn zu2_index_resizing(db: *const Zu2Db) -> u32 {
 pub unsafe extern "C" fn zu2_resident_pages(db: *const Zu2Db) -> u64 {
     match unsafe { handle(db) } {
         Some(handle) => handle.db.resident_pages() as u64,
+        None => 0,
+    }
+}
+
+/// Bytes a salvaged open threw away, and zero on an open that had
+/// nothing to throw away.
+///
+/// A file with a hole in it does not open unless `salvage` is set, and
+/// a salvaged database is a short database. This is how short, so a
+/// host can say so rather than serve a prefix as though it were whole.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_discarded(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle
+            .db
+            .recovered()
+            .discarded
+            .load(std::sync::atomic::Ordering::Relaxed),
         None => 0,
     }
 }

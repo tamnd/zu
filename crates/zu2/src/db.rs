@@ -112,6 +112,17 @@ pub struct Options {
     /// is a third of that. The default of 200 is the same rule a copying
     /// collector uses, and for the same reason.
     pub space_target_percent: u32,
+    /// Opens a file with a hole in it anyway, taking the prefix below
+    /// the hole and discarding what is above.
+    ///
+    /// Off by default, because a hole means records that were
+    /// acknowledged and made durable are gone and a database that says
+    /// nothing about that is worse than one that will not open. Turning
+    /// it on is a decision to lose them, which is the right decision
+    /// when the alternative is losing the prefix as well, and it is the
+    /// operator's to make rather than the library's. See
+    /// [`Error::LogHole`](crate::Error::LogHole).
+    pub salvage: bool,
 }
 
 impl Default for Options {
@@ -128,6 +139,7 @@ impl Default for Options {
             compact_below: 128 << 20,
             provision_bytes: log::PROVISION_CHUNK,
             space_target_percent: 200,
+            salvage: false,
         }
     }
 }
@@ -171,6 +183,10 @@ pub struct Recovered {
     pub relinked: AtomicU64,
     /// Pages that went back to the file because of those rewrites.
     pub pages: AtomicU64,
+    /// Bytes above a hole that `Options::salvage` threw away, and zero
+    /// on every open that did not have to throw anything away. A
+    /// salvaged database is a short database and this is how short.
+    pub discarded: AtomicU64,
 }
 
 /// Everything the sessions and the flusher share.
@@ -269,7 +285,14 @@ impl Db {
     /// Creates a database, failing if the file is already there.
     pub fn create(path: &Path, options: Options) -> Result<Self> {
         let handle = file::create_new(path)?;
-        Ok(Self::start(Self::assemble(handle, path, options), options))
+        let core = Self::assemble(handle, path, options);
+        // A file that never compacts never writes its marker word
+        // otherwise, and a marker of zeros is how a file written before
+        // pad records existed is recognised. Without this a brand new
+        // database would be read back under that older and more
+        // forgiving rule, which is the rule #472 is about.
+        core.log.stamp()?;
+        Ok(Self::start(core, options))
     }
 
     /// Opens a database and replays its log into the index.
@@ -280,6 +303,11 @@ impl Db {
         // starts: a compacted file has a hole where its first pages were.
         let begin = core.log.read_begin()?;
         core.log.resume_begin(begin);
+        // And what rule to read it under. An older file has no pad
+        // records in it, so a zero header there is padding and not
+        // damage, and reading it strictly would refuse most of a log
+        // that is perfectly good (#472).
+        core.log.adopt_format(core.log.read_format()?);
         // Before the replay rather than during it. A file longer than
         // the options left room for is a sizing mistake and not a
         // corrupt log, so it gets the number that would open it. The
@@ -287,7 +315,7 @@ impl Db {
         // and report a full log, which is the same words for a
         // different problem and no help at all (#470).
         core.log.fits_the_file()?;
-        recover::replay(&core)?;
+        recover::replay(&core, options.salvage)?;
         Ok(Self::start(core, options))
     }
 

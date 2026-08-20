@@ -4019,9 +4019,24 @@ impl Compiler<'_> {
                 let Some(l) = self.pred_reg(b, lhs, level)? else {
                     return Ok(None);
                 };
+                let second = b.ops.len();
                 let Some(r) = self.pred_reg(b, rhs, level)? else {
                     return Ok(None);
                 };
+                // The row engine stops at a conjunct that decided the
+                // row, so a division written behind one is a division
+                // it never runs, and `n <> 0 AND 100 / n > 5` is how a
+                // query says which rows the division is for. The
+                // program has no such order: every op runs over the
+                // whole chunk, so a divisor of nought behind the guard
+                // would raise where the query said it could not. Such a
+                // plan goes back to the row engine whole. A divisor
+                // written as a number that is not nought cannot raise,
+                // which is the other way people write it, so that shape
+                // stays here.
+                if divides(&b.ops[second..]) {
+                    return Ok(None);
+                }
                 let dst = b.push_type(PhysType::Bool)?;
                 let op = if matches!(op, BinaryOp::And) {
                     ExprOp::And { l, r, dst }
@@ -4455,6 +4470,41 @@ fn widens(from: PhysType, to: &LogicalType) -> bool {
         ) => bits.bits() >= 64,
         _ => false,
     }
+}
+
+/// Whether these ops hold a division a row could have no answer for,
+/// which is any division whose divisor is not written as a number that
+/// is not nought.
+fn divides(ops: &[ExprOp]) -> bool {
+    ops.iter().enumerate().any(|(i, op)| match op {
+        ExprOp::Binary {
+            op: BinOp::Div | BinOp::Mod,
+            r,
+            ..
+        } => !written_nonzero(&ops[..i], *r),
+        _ => false,
+    })
+}
+
+/// Whether a register was last loaded with a number that is not
+/// nought. The builder gives every op a register of its own, so the
+/// last load into one is the whole of what it holds.
+fn written_nonzero(before: &[ExprOp], reg: Reg) -> bool {
+    before
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            ExprOp::LoadConst {
+                v: OwnedValue::Int(n),
+                dst,
+            } if *dst == reg => Some(*n != 0),
+            ExprOp::LoadConst {
+                v: OwnedValue::Float(f),
+                dst,
+            } if *dst == reg => Some(*f != 0.0),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn bin_op(op: BinaryOp) -> Option<BinOp> {

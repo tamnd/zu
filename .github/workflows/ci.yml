@@ -238,6 +238,14 @@ jobs:
           cargo test -p zu-capi --all-features
       - if: matrix.os != 'windows-latest'
         run: cargo test --workspace --all-features
+      # The one build shape the two lines above cannot reach. libzu
+      # exports zu_result_arrow whether or not it was built with Arrow
+      # in it, answering ZU_UNSUPPORTED when it was not, and the test
+      # that says so only compiles on that side of the feature. A
+      # binding that loads this library by name is the caller that
+      # would find out the hard way.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p zu-capi --no-default-features
       # The point read path, where a walk reads one neighbor list rather
       # than decoding the group around it, only comes up on groups far
       # bigger than a test builds. This env asks for it on every list, so

@@ -1048,6 +1048,82 @@ int main(int argc, char **argv) {
     }
   }
 
+  /* A result handed to an Arrow consumer rather than read. This is the
+   * one place the header declares somebody else's structs, so it is the
+   * one place a layout the library and the header disagree about would
+   * be a jump through a wrong pointer, and a C compiler that is not
+   * rustc laying them out is the whole point of this file.
+   *
+   * Nothing here links Arrow. A consumer is four function pointers and
+   * a caller that calls them in order, which is what this does. */
+  {
+    zu_result *exported = NULL;
+    struct ArrowArrayStream stream;
+    struct ArrowSchema schema;
+    struct ArrowArray batch;
+    int batches = 0;
+    int64_t rows = 0;
+
+    err = NULL;
+    status = zu_query_z(first, "MATCH (a) RETURN a.id AS id", &exported, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("the query to export failed", status, err);
+    }
+    status = zu_result_arrow(first, &exported, 2, &stream, &err);
+    /* A library built without the feature says so, and says it without
+     * leaving the caller a result to free. */
+    if (status == ZU_UNSUPPORTED) {
+      if (exported != NULL) {
+        zu_conn_close(first);
+        return fail("an unsupported export left a result behind");
+      }
+    } else if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("export to arrow failed", status, err);
+    } else {
+      if (exported != NULL) {
+        zu_conn_close(first);
+        return fail("the export did not spend the result it was given");
+      }
+      if (stream.get_schema(&stream, &schema) != 0) {
+        stream.release(&stream);
+        zu_conn_close(first);
+        return fail("the stream would not say what its columns are");
+      }
+      if (schema.n_children != 1 || schema.children[0]->name == NULL ||
+          strcmp(schema.children[0]->name, "id") != 0 ||
+          strcmp(schema.children[0]->format, "l") != 0) {
+        schema.release(&schema);
+        stream.release(&stream);
+        zu_conn_close(first);
+        return fail("the exported schema is not one int64 column called id");
+      }
+      schema.release(&schema);
+      /* The end of a stream is a batch whose release is NULL, which is
+       * how the interface says there are no more without an error. */
+      for (;;) {
+        if (stream.get_next(&stream, &batch) != 0) {
+          stream.release(&stream);
+          zu_conn_close(first);
+          return fail("a batch would not come out of the stream");
+        }
+        if (batch.release == NULL) {
+          break;
+        }
+        batches++;
+        rows += batch.length;
+        batch.release(&batch);
+      }
+      if (batches != 2 || rows != 4) {
+        stream.release(&stream);
+        zu_conn_close(first);
+        return fail("four rows asked for two at a time are not two batches of four rows");
+      }
+      stream.release(&stream);
+    }
+  }
+
   /* A statement that outlives its connection answers rather than
    * following the pointer it still holds, and is still safe to close. */
   zu_stmt *stmt = NULL;
@@ -1068,8 +1144,8 @@ int main(int argc, char **argv) {
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
       "nested list, one load, one append, one warning carried alongside its rows, one watched "
-      "statement, one transaction, one frame read where it lies and handed back once, one refusal "
-      "with a place and one without\n",
+      "statement, one transaction, one frame read where it lies and handed back once, one result "
+      "handed over as arrow batches, one refusal with a place and one without\n",
       version);
   return 0;
 }

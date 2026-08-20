@@ -32,13 +32,14 @@ use zu::{
     zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
     zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
     zu_loader_table, zu_loader_table_z, zu_memory, zu_open, zu_open_z, zu_prepare, zu_prepare_z,
-    zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
-    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
-    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
-    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_gqlstatus, zu_result_notice, zu_result_notices, zu_result_rows,
-    zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64,
-    zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type, zu_version,
+    zu_query, zu_query_z, zu_result_arrow, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
+    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
+    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
+    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
+    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_gqlstatus, zu_result_notice,
+    zu_result_notices, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
+    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
+    zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -4606,6 +4607,300 @@ fn every_layout_a_host_holds_is_read_as_what_it_means() {
         zu_result_free(result);
 
         zu_frame_free(f);
+        zu_conn_close(conn);
+    }
+}
+
+/* ---- arrow ---- */
+
+/// Writes the caller's side of the C Data Interface, calls the export,
+/// and reads the stream back the way a consumer does.
+///
+/// The stream goes on this stack frame uninitialised, which is what the
+/// interface says a caller hands over, and `from_raw` takes it from
+/// there, so nothing in this file frees anything the export wrote.
+#[cfg(feature = "arrow")]
+unsafe fn exported(
+    conn: *mut ZuConn,
+    result: *mut ZuResult,
+    rows_per_batch: u64,
+) -> (
+    Vec<arrow::record_batch::RecordBatch>,
+    Arc<arrow::datatypes::Schema>,
+) {
+    use arrow::array::RecordBatchReader;
+    use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+
+    let mut handle = result;
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let mut err: *mut ZuError = ptr::null_mut();
+    let status = unsafe {
+        zu_result_arrow(
+            conn,
+            &mut handle,
+            rows_per_batch,
+            std::ptr::from_mut(&mut stream).cast::<c_void>(),
+            &mut err,
+        )
+    };
+    assert_eq!(status, ZuStatus::Ok);
+    assert!(err.is_null(), "a success left an error behind");
+    assert!(
+        handle.is_null(),
+        "the export left the caller a spent result"
+    );
+    let reader =
+        unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.expect("import the stream");
+    let schema = reader.schema();
+    let batches = reader.map(|batch| batch.expect("batch")).collect();
+    (batches, schema)
+}
+
+/// The whole point of the call: a hundred thousand rows reach a
+/// consumer as the arrays the executor filled, named, typed and cut
+/// into the batches the caller asked for, with no row built anywhere.
+#[cfg(feature = "arrow")]
+#[test]
+fn a_result_crosses_the_c_data_interface_as_batches_a_consumer_can_read() {
+    use arrow::array::{Array, Int64Array, StringArray, StructArray, UInt64Array};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("arrow.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        // No ORDER BY, because sorting builds rows and this test is
+        // about the columnar path. The ids are checked as a set.
+        let result = query(conn, "MATCH (a:person) RETURN a.id AS id, a AS p", &mut err);
+        assert_eq!(zu_result_rows(result), 97);
+
+        let (batches, schema) = exported(conn, result, 40);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "p");
+        assert_eq!(
+            batches
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [40, 40, 17],
+            "the batch size the caller asked for, and the remainder"
+        );
+
+        let mut ids: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64");
+            ids.extend(column.values().iter().copied());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..97).collect::<Vec<i64>>());
+
+        let people = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a node is a struct");
+        let names = people
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names");
+        let offsets = people
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("offsets");
+        assert_eq!(names.value(0), "person", "the catalog named the table");
+        assert!(offsets.len() == 40);
+
+        zu_conn_close(conn);
+    }
+}
+
+/// The connection is where the names come from, and a caller that has
+/// closed it or never had it still gets the result. A node column then
+/// says which table by id, which is what the catalog would have turned
+/// into a name.
+#[cfg(feature = "arrow")]
+#[test]
+fn a_null_connection_names_a_node_table_after_its_id() {
+    use arrow::array::{StringArray, StructArray};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("unnamed.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(conn, "MATCH (a:person) RETURN a AS p", &mut err);
+
+        // Closed first, so that what the export reads is only what the
+        // result carries.
+        zu_conn_close(conn);
+        let (batches, _) = exported(ptr::null_mut(), result, 0);
+        assert_eq!(batches.len(), 1, "one batch, since 0 asks for 65536");
+        assert_eq!(batches[0].num_rows(), 97);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a node is a struct")
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names");
+        assert!(
+            names.value(0).starts_with('#'),
+            "an id and not a name: {}",
+            names.value(0)
+        );
+    }
+}
+
+/// A column Arrow has no type for is refused by name rather than
+/// exported wrong, and the result is spent all the same, because its
+/// buffers were on their way out when the refusal happened.
+#[cfg(feature = "arrow")]
+#[test]
+fn a_column_arrow_has_no_type_for_is_refused_and_spends_the_result() {
+    use arrow::ffi_stream::FFI_ArrowArrayStream;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("refused.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let q = c("RETURN $v AS v");
+        let name = c("v");
+        let mut stmt: *mut ZuStmt = ptr::null_mut();
+        assert_eq!(
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            zu_bind_temporal_z(
+                stmt,
+                name.as_ptr(),
+                ZU_TEMPORAL_ZONED_TIME,
+                45_296_000_000_000,
+                420
+            ),
+            ZuStatus::Ok
+        );
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(zu_execute(stmt, &mut result, &mut err), ZuStatus::Ok);
+
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            zu_result_arrow(
+                conn,
+                &mut result,
+                0,
+                std::ptr::from_mut(&mut stream).cast::<c_void>(),
+                &mut err
+            ),
+            ZuStatus::Misuse
+        );
+        assert!(result.is_null(), "a refusal spends the result too");
+        assert!(!err.is_null());
+        let message = CStr::from_ptr(zu_error_message(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(message.contains('v'), "names the column: {message}");
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        zu_stmt_close(stmt);
+        zu_conn_close(conn);
+        let _ = err;
+    }
+}
+
+/// The two ways a caller can get the pointers wrong. Neither writes
+/// through a null, and the one that has a result to spend spends it,
+/// so that a caller who fixes the call and tries again cannot hand over
+/// the same handle twice.
+#[cfg(feature = "arrow")]
+#[test]
+fn a_null_result_or_a_null_out_is_a_refusal_and_not_a_crash() {
+    use arrow::ffi_stream::FFI_ArrowArrayStream;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("misuse.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let out = std::ptr::from_mut(&mut stream).cast::<c_void>();
+
+        assert_eq!(
+            zu_result_arrow(conn, ptr::null_mut(), 0, out, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(!err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        let mut empty: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_result_arrow(conn, &mut empty, 0, out, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(!err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        let mut result = query(conn, "MATCH (a:person) RETURN a.id AS id", &mut err);
+        assert_eq!(
+            zu_result_arrow(conn, &mut result, 0, ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(result.is_null(), "spent, so it cannot be handed over twice");
+        assert!(!err.is_null());
+        zu_error_free(err);
+
+        zu_conn_close(conn);
+    }
+}
+
+/// Built without the feature, the symbol is still there and says so.
+/// A binding that opens this library by name learns what it can do from
+/// a status, and not from a lookup that failed.
+#[cfg(not(feature = "arrow"))]
+#[test]
+fn without_the_arrow_feature_the_call_is_unsupported_and_still_spends_the_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("unsupported.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut result = query(conn, "MATCH (a:person) RETURN a.id AS id", &mut err);
+        let mut out = [0u8; 128];
+        assert_eq!(
+            zu_result_arrow(
+                conn,
+                &mut result,
+                0,
+                out.as_mut_ptr().cast::<c_void>(),
+                &mut err
+            ),
+            ZuStatus::Unsupported
+        );
+        assert!(result.is_null());
+        assert!(err.is_null(), "a build without it is not a failed call");
         zu_conn_close(conn);
     }
 }

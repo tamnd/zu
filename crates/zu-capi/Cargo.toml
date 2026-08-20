@@ -25,9 +25,26 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 zu-common.workspace = true
 zudb = { package = "zu", path = "../zu" }
+# The Arrow export, which is a feature rather than a dependency because
+# it is the one part of this library that costs a megabyte to link. On
+# by default, since a shipped libzu is what every binding's Arrow path
+# goes through; off for an embedder that counts bytes and never exports.
+zu-arrow = { workspace = true, features = ["ffi"], optional = true }
 
 [dev-dependencies]
+# The import half of the C Data Interface, so that the suite reads back
+# what zu_result_arrow writes the way a consumer does rather than by
+# looking at the struct.
+arrow = { workspace = true, features = ["ffi"] }
 tempfile.workspace = true
+
+[features]
+default = ["arrow"]
+# zu_result_arrow, and the C Data Interface structs it writes. The
+# symbol exists either way, because a binding that dlopens a library
+# should find out what it can do from a status and not from a missing
+# symbol; without this it answers ZU_UNSUPPORTED.
+arrow = ["dep:zu-arrow"]
 
 [[bench]]
 name = "result"

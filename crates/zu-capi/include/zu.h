@@ -17,7 +17,10 @@
  *
  * Every pointer an accessor returns (column names, column buffers, cell
  * strings) stays valid exactly until zu_result_free on the result that
- * produced it. Every *_free and *_close call here is a no-op on NULL.
+ * produced it, or until zu_result_arrow, which is the one call that
+ * spends a result rather than reading it and hands those same bytes to
+ * an Arrow consumer. Every *_free and *_close call here is a no-op on
+ * NULL.
  *
  * Every fallible call returns a zu_status and writes what it produced
  * through an out-parameter, because one returned pointer cannot say
@@ -49,14 +52,14 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.11 and another
+ * system tests when it has to compile one way against 0.12 and another
  * against what comes next. The two numbers are counts and not decimals,
- * so 0.11 is the revision after 0.10 and a caller comparing them
+ * so 0.12 is the revision after 0.11 and a caller comparing them
  * compares each on its own. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.11"
+#define ZU_ABI_VERSION "0.12"
 
 #ifdef __cplusplus
 extern "C" {
@@ -589,6 +592,109 @@ zu_status zu_value_at(const zu_value *v, uint64_t i, const zu_value **out);
 zu_status zu_value_field(const zu_value *v, uint64_t i, const char **out, size_t *len);
 
 void zu_result_free(zu_result *result);
+
+/* ---- arrow ----
+ *
+ * The other way a result ends. Every call above reads it and leaves it
+ * whole; this one hands its buffers to an Arrow consumer and gives the
+ * result up, which is what makes it free.
+ *
+ * The three structs below are Apache Arrow's C Data Interface, copied
+ * from the specification and guarded by the macro names the
+ * specification tells everybody to guard them by, so a translation unit
+ * that already has them from arrow/c/abi.h or from another library gets
+ * one definition and not two. Nothing here depends on Arrow being
+ * installed. */
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema {
+  const char *format;
+  const char *name;
+  const char *metadata;
+  int64_t flags;
+  int64_t n_children;
+  struct ArrowSchema **children;
+  struct ArrowSchema *dictionary;
+  void (*release)(struct ArrowSchema *);
+  void *private_data;
+};
+
+struct ArrowArray {
+  int64_t length;
+  int64_t null_count;
+  int64_t offset;
+  int64_t n_buffers;
+  int64_t n_children;
+  const void **buffers;
+  struct ArrowArray **children;
+  struct ArrowArray *dictionary;
+  void (*release)(struct ArrowArray *);
+  void *private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
+struct ArrowArrayStream {
+  int (*get_schema)(struct ArrowArrayStream *, struct ArrowSchema *out);
+  int (*get_next)(struct ArrowArrayStream *, struct ArrowArray *out);
+  const char *(*get_last_error)(struct ArrowArrayStream *);
+  void (*release)(struct ArrowArrayStream *);
+  void *private_data;
+};
+
+#endif /* ARROW_C_STREAM_INTERFACE */
+
+/* The whole result as a stream of Arrow record batches, moving the
+ * buffers the executor filled rather than copying them.
+ *
+ * This is the only call that spends a result. It takes the handle
+ * through a pointer to it and writes NULL back on every path, the
+ * failing ones included, because the buffers were on their way out
+ * before anything could refuse: after this the result holds nothing to
+ * read a second time. Do not call zu_result_free on it, and do not keep
+ * a column pointer or a cell string taken before the call, since those
+ * bytes belong to the stream now.
+ *
+ * That is the point of it. A result that stayed readable would have to
+ * be copied on the way out, and the copy is the whole answer, so a
+ * caller exporting a hundred million rows would move eight hundred
+ * megabytes to hand over eight hundred megabytes it already had.
+ *
+ * conn is where a node column's table name comes from, since a node
+ * carries the id of its table and the catalog is what turns that into a
+ * name. It may be NULL, and then the table is named "#7" after the id,
+ * which is what a caller who closed the connection and kept the result
+ * can still be given. When it is not NULL it must be the connection the
+ * result was produced on, and it is claimed for the length of the call.
+ *
+ * rows_per_batch is what the consumer sees per batch, and 0 asks for
+ * this library's own, which is 65536. The batches are slices of arrays
+ * that are already in memory, so this is about what a consumer likes to
+ * work in and not about what gets allocated.
+ *
+ * out points at an ArrowArrayStream the caller owns, uninitialised on
+ * the way in, and released through its own release callback on the way
+ * out rather than by any function of this library. It is written only
+ * on ZU_OK.
+ *
+ * ZU_UNSUPPORTED means the library was built without the arrow feature,
+ * which is the one answer about the build rather than the call; the
+ * symbol is here either way so that a caller loading this library by
+ * name learns what it can do from a status and not from a lookup that
+ * failed. ZU_MISUSE names the column when one holds something Arrow has
+ * no type for, which is a time with an offset and the two handle
+ * types. */
+zu_status zu_result_arrow(zu_conn *conn, zu_result **result, uint64_t rows_per_batch,
+                          struct ArrowArrayStream *out, zu_error **err);
 
 /* ---- diagnostics ----
  *

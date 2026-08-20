@@ -361,6 +361,12 @@ impl RecordBatchReader for Batches {
     }
 }
 
+/// The struct the C Data Interface passes a stream in, re-exported so
+/// that a crate handing one over the boundary can name it without
+/// depending on Arrow itself.
+#[cfg(feature = "ffi")]
+pub use arrow::ffi_stream::FFI_ArrowArrayStream;
+
 /// The result as a C Data Interface stream, ready to hand to anything in
 /// the process that speaks Arrow.
 ///

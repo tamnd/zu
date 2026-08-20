@@ -34,11 +34,12 @@
 
 use std::sync::Arc;
 
+use zu_common::unicode::{self, NormalForm};
 use zu_common::{Result, ZuError};
 
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
-use crate::str::{INLINE_LEN, NO_BUFFERS, StrBuilder, StrView};
+use crate::str::{INLINE_LEN, NO_BUFFERS, StrBuffers, StrBuilder, StrView};
 use crate::vector::{Aux, PhysType, ValueVector, VecEncoding};
 
 /// Which length a call asked for.
@@ -551,6 +552,262 @@ pub fn trim(
     Ok(out)
 }
 
+/// Which of the two normalization functions a call asked for.
+///
+/// They are one kernel's worth of thinking read two ways. `NORMALIZE`
+/// answers the string a form asks for and `IS NORMALIZED` answers
+/// whether the argument is that string already, so the second is the
+/// first with a comparison in place of an answer, and the standard
+/// defines it in exactly those words rather than through the quick
+/// check properties.
+///
+/// What separates them here is where the answer goes. A normalized
+/// string is a string and lands in a vector; a test is a predicate and
+/// lands in a bitmap, the way a comparison does, so the two have
+/// separate entry points below and this says which is which for the
+/// compiler's benefit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrNorm {
+    /// NORMALIZE(s, form).
+    Into(NormalForm),
+    /// s IS NORMALIZED form.
+    Test(NormalForm),
+}
+
+impl StrNorm {
+    fn name(self) -> &'static str {
+        match self {
+            StrNorm::Into(_) => "normalize",
+            StrNorm::Test(_) => "is_normalized",
+        }
+    }
+
+    /// The form the call named, which the statement wrote or which the
+    /// standard's default supplied.
+    pub fn form(self) -> NormalForm {
+        match self {
+            StrNorm::Into(form) | StrNorm::Test(form) => form,
+        }
+    }
+
+    /// The type the answers land in. Both want a string; one gives a
+    /// string back and the other gives a truth value.
+    pub fn answer_type(self, arg: PhysType) -> Option<PhysType> {
+        match (self, arg) {
+            (StrNorm::Into(_), PhysType::Str) => Some(PhysType::Str),
+            (StrNorm::Test(_), PhysType::Str) => Some(PhysType::Bool),
+            _ => None,
+        }
+    }
+
+    /// Whether a row could have no answer. Every string has a normal
+    /// form and every string either is in it or is not, so neither of
+    /// these can raise.
+    pub fn may_raise(self) -> bool {
+        false
+    }
+}
+
+/// Whether every string in `v` is plain ASCII, in which case a
+/// normalization has nothing to do to any of them.
+///
+/// This is the question worth asking before the work starts. No
+/// character below 128 decomposes, canonically or by compatibility, and
+/// none of them is a combining mark, so a string of them is in all four
+/// forms already and what a normalization answers is what it was
+/// handed. Asking is a walk of the bytes with nothing to decide, which
+/// runs a word at a time, against a walk that decodes every character,
+/// looks it up, sorts what comes back and writes it out again.
+///
+/// The dictionary encoding is not asked, because its answer would not
+/// help. The bytes of a table entry are not bytes a view can point at,
+/// so a coded chunk writes its table out either way.
+fn all_ascii(v: &ValueVector, bufs: &StrBuffers) -> bool {
+    match v.encoding {
+        VecEncoding::Constant => v.constant_value::<StrView>().bytes(bufs).is_ascii(),
+        VecEncoding::Dict { .. } => false,
+        VecEncoding::Flat => v
+            .values::<StrView>()
+            .iter()
+            .all(|view| view.bytes(bufs).is_ascii()),
+    }
+}
+
+/// One string, normalized into the builder.
+///
+/// The ASCII test is asked a second time here, a string at a time,
+/// because a chunk holding one accented string still holds plenty that
+/// are plain and a plain one is a copy rather than a decode. What the
+/// test costs when the answer is no is a walk of bytes the
+/// normalization is about to walk anyway.
+///
+/// Bytes that are not UTF-8 cannot arrive, a vector's strings being
+/// UTF-8 by construction, and if they somehow did then handing them
+/// back as they stand loses nothing that was there. A kernel that
+/// promised it cannot raise does not get to change its mind over a
+/// buffer that was already wrong.
+#[inline]
+fn put(build: &mut StrBuilder, form: NormalForm, bytes: &[u8]) -> StrView {
+    if bytes.is_ascii() {
+        return build.push(bytes);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => build.push(unicode::normalize(s, form).as_bytes()),
+        Err(_) => build.push(bytes),
+    }
+}
+
+/// Evaluate `NORMALIZE(v, form)` into a new flat string vector.
+///
+/// This is the string function the builder was built for. A trim
+/// answers a part of what it was handed and a fold answers something
+/// exactly as long, so both of them know where the answer's bytes are
+/// going before they start. A normal form knows neither: composing
+/// makes a string shorter, decomposing makes it longer, and how much
+/// either way is a fact about the characters rather than about the
+/// count of them. So the answers are written out and the room for them
+/// is a guess, the argument's own long bytes, which is right for
+/// everything a query normally holds and grows when it is not.
+///
+/// The one shape that costs nothing is the one nearly every column is:
+/// all ASCII, where the answers are the argument's own strings and the
+/// vector hands its buffers over the way a trim does.
+pub fn normalize(
+    arena: &mut MorselArena,
+    form: NormalForm,
+    v: &ValueVector,
+) -> Result<ValueVector> {
+    let op = StrNorm::Into(form);
+    if op.answer_type(v.phys).is_none() {
+        return Err(ZuError::InvalidArgument(format!(
+            "no {}() kernel for {:?}",
+            op.name(),
+            v.phys
+        )));
+    }
+    let len = v.len as usize;
+    let bufs = v.str_buffers().unwrap_or(&NO_BUFFERS);
+    let mut out = ValueVector::flat_uninit(arena, PhysType::Str, len);
+    if all_ascii(v, bufs) {
+        let dst = out.values_mut::<StrView>();
+        match v.encoding {
+            VecEncoding::Constant => dst[..len].fill(v.constant_value::<StrView>()),
+            _ => {
+                for (slot, view) in dst[..len].iter_mut().zip(v.values::<StrView>()) {
+                    *slot = *view;
+                }
+            }
+        }
+        // The argument's buffers, held rather than copied, because the
+        // answers are its own strings and are reading them where they
+        // already lie.
+        out.aux = match &v.aux {
+            Aux::Str(bufs) => Aux::Str(Arc::clone(bufs)),
+            _ => Aux::None,
+        };
+    } else {
+        let mut build = StrBuilder::with_capacity(long_bytes(v));
+        match v.encoding {
+            VecEncoding::Constant => {
+                let view = v.constant_value::<StrView>();
+                let one = put(&mut build, form, view.bytes(bufs));
+                out.values_mut::<StrView>()[..len].fill(one);
+            }
+            VecEncoding::Dict { .. } => {
+                let dict = v.dictionary();
+                let table: Vec<StrView> = (0..dict.len())
+                    .map(|i| put(&mut build, form, dict.get(i as u32)))
+                    .collect();
+                let codes = v.codes_u16();
+                let dst = out.values_mut::<StrView>();
+                for (slot, code) in dst[..len].iter_mut().zip(codes) {
+                    *slot = table[*code as usize];
+                }
+            }
+            VecEncoding::Flat => {
+                let views = v.values::<StrView>();
+                let dst = out.values_mut::<StrView>();
+                for (slot, view) in dst[..len].iter_mut().zip(views) {
+                    *slot = put(&mut build, form, view.bytes(bufs));
+                }
+            }
+        }
+        out.aux = Aux::Str(Arc::new(build.finish()));
+    }
+    out.validity = carried(arena, v, len);
+    Ok(out)
+}
+
+/// Write `v IS [NOT] NORMALIZED form` into `out`, which must be sized to
+/// the vector and cleared.
+///
+/// The negation is carried in rather than done afterwards, and that is
+/// not a shortcut but the only correct place for it. A predicate over a
+/// column of three-valued logic is a bitmap of the rows that passed, so
+/// a null row is off in the bitmap; taking the complement of the bitmap
+/// would turn every null row into a row that passed, and a null is not
+/// normalized and is not unnormalized either. Deciding the row here and
+/// masking the nulls off afterwards answers `IS NOT NORMALIZED` the way
+/// the row engine answers it, which is why there is no general NOT over
+/// a predicate register anywhere in this crate.
+pub fn normalized(
+    form: NormalForm,
+    negated: bool,
+    v: &ValueVector,
+    out: &mut Bitmap,
+) -> Result<()> {
+    let op = StrNorm::Test(form);
+    debug_assert_eq!(out.len(), v.len as usize);
+    if op.answer_type(v.phys).is_none() {
+        return Err(ZuError::InvalidArgument(format!(
+            "no {}() kernel for {:?}",
+            op.name(),
+            v.phys
+        )));
+    }
+    let len = v.len as usize;
+    let bufs = v.str_buffers().unwrap_or(&NO_BUFFERS);
+    // ASCII is in every form already, which the row engine's answer
+    // reads as well, so a plain column is decided without a table being
+    // touched. Bytes that are not UTF-8 are called normalized for the
+    // same reason the other kernel hands them back untouched.
+    let holds = |bytes: &[u8]| match std::str::from_utf8(bytes) {
+        Ok(s) => unicode::is_normalized(s, form),
+        Err(_) => true,
+    };
+    match v.encoding {
+        VecEncoding::Constant => {
+            if holds(v.constant_value::<StrView>().bytes(bufs)) != negated {
+                out.words_mut().fill(!0u64);
+            }
+        }
+        VecEncoding::Dict { .. } => {
+            let dict = v.dictionary();
+            let table: Vec<bool> = (0..dict.len())
+                .map(|i| holds(dict.get(i as u32)) != negated)
+                .collect();
+            for (row, code) in v.codes_u16()[..len].iter().enumerate() {
+                if table[*code as usize] {
+                    out.set(row);
+                }
+            }
+        }
+        VecEncoding::Flat => {
+            for (row, view) in v.values::<StrView>()[..len].iter().enumerate() {
+                if holds(view.bytes(bufs)) != negated {
+                    out.set(row);
+                }
+            }
+        }
+    }
+    // A row with no string in it has no answer either way.
+    if let Some(valid) = &v.validity {
+        out.and_with(valid);
+    }
+    out.mask_tail();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1160,215 @@ mod tests {
         assert_eq!(StrTrim::Trailing.answer_type(PhysType::Int64), None);
     }
 
+    /// The composed letter and the letter with its accent behind it are
+    /// the same string, and which of the two a form answers is the
+    /// whole of what the two canonical forms disagree about.
+    #[test]
+    fn a_form_puts_an_accent_together_or_leaves_it_apart() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["h\u{e9}llo", "he\u{301}llo", "plain"]);
+        let together = normalize(&mut arena, NormalForm::Nfc, &v).unwrap();
+        assert_eq!(together.phys, PhysType::Str);
+        assert_eq!(read(&together), ["h\u{e9}llo", "h\u{e9}llo", "plain"]);
+        let apart = normalize(&mut arena, NormalForm::Nfd, &v).unwrap();
+        assert_eq!(read(&apart), ["he\u{301}llo", "he\u{301}llo", "plain"]);
+    }
+
+    /// The compatibility forms answer something the canonical ones do
+    /// not, and the answer is a different length from the argument,
+    /// which is the case that rules out both the trim's trick and the
+    /// fold's sizing.
+    #[test]
+    fn a_compatibility_form_answers_a_string_of_another_length() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["o\u{fb01}ce"]);
+        let canonical = normalize(&mut arena, NormalForm::Nfc, &v).unwrap();
+        assert_eq!(read(&canonical), ["o\u{fb01}ce"]);
+        let compat = normalize(&mut arena, NormalForm::Nfkc, &v).unwrap();
+        assert_eq!(read(&compat), ["ofice"]);
+        assert!("o\u{fb01}ce".len() > "ofice".len());
+    }
+
+    /// The column nearly every query holds: plain strings, which are in
+    /// all four forms already. The answers are the argument's own
+    /// strings, so the vector holds the buffers it was handed and fills
+    /// none of its own, and not a byte is copied.
+    #[test]
+    fn a_plain_column_is_answered_without_a_byte_being_copied() {
+        let mut arena = MorselArena::new();
+        let long = "a plain string well past the twelve bytes a view holds";
+        let v = str_vector(&mut arena, &[long, "short"]);
+        let out = normalize(&mut arena, NormalForm::Nfd, &v).unwrap();
+        assert_eq!(read(&out), [long, "short"]);
+        let (Aux::Str(theirs), Aux::Str(ours)) = (&v.aux, &out.aux) else {
+            panic!("a chunk with a long string in it carries buffers");
+        };
+        assert!(Arc::ptr_eq(theirs, ours));
+    }
+
+    /// An answer longer than a view holds lands in the builder's buffer
+    /// and reads back through it, which is what a decomposition of a
+    /// string that was already nearly too long asks for.
+    #[test]
+    fn a_long_answer_lands_in_a_buffer_of_its_own() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["h\u{e9}llo th\u{e9}re"]);
+        let out = normalize(&mut arena, NormalForm::Nfd, &v).unwrap();
+        assert_eq!(read(&out), ["he\u{301}llo the\u{301}re"]);
+        assert!(!out.values::<StrView>()[0].is_inline());
+    }
+
+    /// One string standing for the chunk is normalized once, and every
+    /// row reads the one answer back.
+    #[test]
+    fn a_constant_is_normalized_once() {
+        let mut arena = MorselArena::new();
+        let mut v = ValueVector::constant(
+            &mut arena,
+            PhysType::Str,
+            StrView::inline("h\u{e9}llo".as_bytes()),
+            3,
+        );
+        v.aux = Aux::None;
+        let out = normalize(&mut arena, NormalForm::Nfd, &v).unwrap();
+        assert_eq!(read(&out), ["he\u{301}llo"; 3]);
+    }
+
+    /// Codes over a table normalize the table rather than the rows, and
+    /// the answer still has to be what the same strings flat would have
+    /// given.
+    #[test]
+    fn a_dictionary_is_normalized_a_table_at_a_time() {
+        let mut arena = MorselArena::new();
+        let entries = [
+            "a\u{301} longer entry than a view holds",
+            "bo",
+            "h\u{e9}llo",
+        ];
+        let dict = Arc::new(Dictionary::from_sorted(entries.iter()));
+        let codes = [2u16, 0, 1, 0];
+        let v = ValueVector::dict_str(&mut arena, &codes, dict);
+        let out = normalize(&mut arena, NormalForm::Nfc, &v).unwrap();
+        let flat = str_vector(&mut arena, &codes.map(|c| entries[c as usize]));
+        assert_eq!(
+            read(&out),
+            read(&normalize(&mut arena, NormalForm::Nfc, &flat).unwrap())
+        );
+        assert_eq!(read(&out)[0], "h\u{e9}llo");
+        assert_eq!(read(&out)[1], "\u{e1} longer entry than a view holds");
+    }
+
+    /// A null argument answers null, and the rows around it answer what
+    /// they would have answered on their own.
+    #[test]
+    fn a_normalize_of_a_null_is_null() {
+        let mut arena = MorselArena::new();
+        let mut v = str_vector(&mut arena, &["he\u{301}llo", "bo", "cy"]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        v.validity = Some(valid);
+        let out = normalize(&mut arena, NormalForm::Nfc, &v).unwrap();
+        assert!(!out.is_valid(1), "null in, null out");
+        assert!(out.is_valid(0) && out.is_valid(2));
+        assert_eq!(read(&out)[0], "h\u{e9}llo");
+        assert_eq!(read(&out)[2], "cy");
+    }
+
+    /// Reads a predicate back as the rows that passed.
+    fn passed(bits: &Bitmap) -> Vec<usize> {
+        (0..bits.len()).filter(|i| bits.get(*i)).collect()
+    }
+
+    /// The test answers the rows that are in the form already, and the
+    /// negated test answers the rows that are not, plain strings being
+    /// in every form and so in neither answer's way.
+    #[test]
+    fn the_test_answers_the_rows_that_are_in_the_form() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["h\u{e9}llo", "he\u{301}llo", "plain"]);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfc, false, &v, &mut bits).unwrap();
+        assert_eq!(passed(&bits), [0, 2]);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfc, true, &v, &mut bits).unwrap();
+        assert_eq!(passed(&bits), [1]);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfd, false, &v, &mut bits).unwrap();
+        assert_eq!(passed(&bits), [1, 2]);
+    }
+
+    /// The other two encodings answer what the same strings flat would
+    /// have answered, a constant deciding the chunk in one test and a
+    /// table deciding it in one test an entry.
+    #[test]
+    fn the_test_reads_a_constant_and_a_table_the_same_way() {
+        let mut arena = MorselArena::new();
+        let mut v = ValueVector::constant(
+            &mut arena,
+            PhysType::Str,
+            StrView::inline("he\u{301}llo".as_bytes()),
+            3,
+        );
+        v.aux = Aux::None;
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfc, false, &v, &mut bits).unwrap();
+        assert!(passed(&bits).is_empty());
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfd, false, &v, &mut bits).unwrap();
+        assert_eq!(passed(&bits), [0, 1, 2]);
+
+        // Sorted the way a table on disk is sorted, which puts the
+        // decomposed spelling first: its second byte is the plain
+        // letter and the composed one's is the front of an accent.
+        let entries = ["he\u{301}llo", "h\u{e9}llo", "plain"];
+        let dict = Arc::new(Dictionary::from_sorted(entries.iter()));
+        let codes = [0u16, 1, 2, 0];
+        let v = ValueVector::dict_str(&mut arena, &codes, dict);
+        let mut bits = Bitmap::new_in(&mut arena, 4, false);
+        normalized(NormalForm::Nfc, false, &v, &mut bits).unwrap();
+        let want: Vec<usize> = codes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| entries[**c as usize] != "he\u{301}llo")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(passed(&bits), want);
+    }
+
+    /// A null is not normalized and is not unnormalized either, so it
+    /// is missing from both answers. This is the reason the negation is
+    /// carried into the kernel: a complement of the plain answer would
+    /// have called this row unnormalized.
+    #[test]
+    fn a_null_is_in_neither_answer() {
+        let mut arena = MorselArena::new();
+        let mut v = str_vector(&mut arena, &["h\u{e9}llo", "he\u{301}llo", "cy"]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        v.validity = Some(valid);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfc, false, &v, &mut bits).unwrap();
+        assert_eq!(passed(&bits), [0, 2]);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        normalized(NormalForm::Nfc, true, &v, &mut bits).unwrap();
+        assert!(passed(&bits).is_empty(), "the null row is in neither");
+    }
+
+    /// Neither normalization has a row it cannot answer, and the two
+    /// land in different places: a string for one, a truth value for
+    /// the other.
+    #[test]
+    fn a_normalization_cannot_raise_and_the_two_answer_apart() {
+        let into = StrNorm::Into(NormalForm::Nfkd);
+        let test = StrNorm::Test(NormalForm::Nfkd);
+        assert!(!into.may_raise() && !test.may_raise());
+        assert_eq!(into.form(), NormalForm::Nfkd);
+        assert_eq!(into.answer_type(PhysType::Str), Some(PhysType::Str));
+        assert_eq!(test.answer_type(PhysType::Str), Some(PhysType::Bool));
+        assert_eq!(into.answer_type(PhysType::Int64), None);
+        assert_eq!(test.answer_type(PhysType::Float64), None);
+    }
+
     /// A number is not a string, and a kernel handed one says so
     /// rather than reading sixteen bytes of it as a view.
     #[test]
@@ -921,5 +1387,14 @@ mod tests {
             panic!("a number was trimmed as a string");
         };
         assert!(err.to_string().contains("trim"));
+        let Err(err) = normalize(&mut arena, NormalForm::Nfc, &v) else {
+            panic!("a number was normalized as a string");
+        };
+        assert!(err.to_string().contains("normalize"));
+        let mut bits = Bitmap::new_in(&mut arena, 2, false);
+        let Err(err) = normalized(NormalForm::Nfc, false, &v, &mut bits) else {
+            panic!("a number was tested as a string");
+        };
+        assert!(err.to_string().contains("is_normalized"));
     }
 }

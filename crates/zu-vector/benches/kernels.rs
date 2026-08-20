@@ -13,6 +13,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
+use zu_common::unicode::NormalForm;
 use zu_vector::{
     Bitmap, CmpOp, Dictionary, MorselArena, PhysType, SelVector, ValueVector, kernels,
 };
@@ -527,6 +528,69 @@ fn main() {
         "str_trim_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
         per_sec_trim_dict * VECTOR as f64 / 1e9,
         per_sec_trim_dict / per_sec_trim
+    );
+
+    // The normalization, which is the kernel that has to write its
+    // answers out and cannot say beforehand how many bytes that comes
+    // to. The two lines here are not two encodings, which is what the
+    // three kernels above compare, but two columns, because what
+    // decides the cost of this one is what the strings hold rather
+    // than how they are stored.
+    //
+    // The plain column is the one nearly every query holds. Nothing
+    // below 128 decomposes, so every row is in all four forms already
+    // and the answers are the argument's own strings: a scan of the
+    // bytes to find that out, a copy of the views, and no buffer at
+    // all. The accented column is the same rows with one letter
+    // changed, and it is the other end of the range, every row of it
+    // decoded a character at a time, looked up, sorted and written
+    // back out. The distance between the two lines is what the ASCII
+    // question is worth asking for.
+    let per_sec_norm = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::normalize(&mut arith_scratch, NormalForm::Nfd, black_box(&flat))
+                .unwrap()
+                .len,
+        );
+    });
+    let norm_grows = per_sec_norm * VECTOR as f64 / 1e9;
+    println!(
+        "str_normalize: {norm_grows:.2} G rows/s over plain fourteen byte strings ({:.1}x the fold of the same column, no spec target)",
+        per_sec_norm / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_normalize_grows_s")
+        && norm_grows < floor
+    {
+        println!("GATE FAIL vec_str_normalize_grows_s: {norm_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let accented: Vec<String> = strings
+        .iter()
+        .map(|s| s.replace("category", "cat\u{e9}gory"))
+        .collect();
+    let wide = zu_vector::str_vector(&mut arena, &accented);
+    let per_sec_norm_wide = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::normalize(&mut arith_scratch, NormalForm::Nfd, black_box(&wide))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_normalize_accented: {:.3} G rows/s ({:.3}x the plain column, no target)",
+        per_sec_norm_wide * VECTOR as f64 / 1e9,
+        per_sec_norm_wide / per_sec_norm
+    );
+    let mut norm_bits = Bitmap::new_in(&mut dict_scratch, VECTOR, false);
+    let per_sec_is_norm = measure(|| {
+        kernels::normalized(NormalForm::Nfc, false, black_box(&wide), &mut norm_bits).unwrap();
+        black_box(norm_bits.words());
+    });
+    println!(
+        "str_is_normalized_accented: {:.3} G rows/s over the same column (no target)",
+        per_sec_is_norm * VECTOR as f64 / 1e9
     );
 
     // Sorted intersection, balanced inputs: the multiway join inner

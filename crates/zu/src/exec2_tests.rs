@@ -50,6 +50,24 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
         .map(|i| format!("p{}", i % 50).into_bytes())
         .collect();
     let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
+    // A second string column, and the one that is not plain. Names are
+    // ASCII, which every normal form leaves alone, so a column that
+    // asks the normalization to do something has to be here for the
+    // parity queries to be worth running: the same letter written
+    // composed and decomposed, a ligature that only the compatibility
+    // forms take apart, and plain rows in among them.
+    let tags: Vec<Vec<u8>> = (0..N)
+        .map(|i| {
+            match i % 4 {
+                0 => "he\u{301}llo".to_string(),
+                1 => "h\u{e9}llo".to_string(),
+                2 => "o\u{fb01}ce".to_string(),
+                _ => format!("t{}", i % 50),
+            }
+            .into_bytes()
+        })
+        .collect();
+    let tag_refs: Vec<&[u8]> = tags.iter().map(|v| v.as_slice()).collect();
     store_props(
         &mut db,
         "person",
@@ -57,6 +75,7 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
             ("age", PropValues::Int(&age)),
             ("score", PropValues::Int(&score)),
             ("name", PropValues::Str(&name_refs)),
+            ("tag", PropValues::Str(&tag_refs)),
         ],
     )
     .unwrap();
@@ -510,6 +529,35 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) RETURN rtrim(p.name, '0123456789') AS w, count(*) AS n ORDER BY w",
         "MATCH (p:person) WHERE char_length(ltrim(p.name, 'p')) > 1 RETURN count(*) AS n",
         "MATCH (p:person) WHERE TRIM('p' FROM p.name) = p.name RETURN count(*) AS n",
+        // The four normal forms over the column that is not plain, and
+        // the same forms over the column that is, which the kernel
+        // answers without copying a byte. The default form is written
+        // in one of them and left out of another, since the standard
+        // supplies NFC where a statement writes nothing.
+        "MATCH (p:person) RETURN NORMALIZE(p.tag) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFC) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKC) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.name, NFD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it normalized, which is the four places every
+        // string function is tried in.
+        "MATCH (p:person) WHERE NORMALIZE(p.tag, NFD) = 'he\u{301}llo' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKC) AS t, count(*) AS n ORDER BY t",
+        "MATCH (p:person) WHERE char_length(NORMALIZE(p.tag, NFD)) > 5 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE NORMALIZE(p.tag, NFC) = p.tag RETURN count(*) AS n",
+        // The predicate, which is the one string function whose answer
+        // is a truth value. Both spellings of the negation, a form
+        // written and a form left out, the column that is plain and so
+        // is in every form, and the predicate behind an AND and an OR.
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFD RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.name IS NORMALIZED NFKD RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 AND p.tag IS NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 OR p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
@@ -1127,6 +1175,12 @@ fn fallback_queries() -> &'static [&'static str] {
         // A trim set that is a column is a different set a row, and
         // the kernel prepares one set for the chunk.
         "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // Whether a string is in a normal form is a truth value, and a
+        // truth value is not a column this executor carries: the
+        // predicate has a register of its own and a projection wants a
+        // vector. In a filter the same expression is claimed, which is
+        // where a query writes it.
+        "MATCH (p:person) RETURN p.tag IS NORMALIZED NFC AS b, p.id AS id ORDER BY id LIMIT 20",
     ]
 }
 

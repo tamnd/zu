@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use zu_common::types::LogicalType;
 use zu_common::{IdMap, Result};
-use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
+use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey, UnaryOp};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Math, Schema, TableFunc, Trim,
 };
@@ -29,7 +29,7 @@ use zu_query::snapshot::{
 };
 use zu_vector::{
     BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
-    StrFold, StrLen, StrTrim, TrimSet,
+    StrFold, StrLen, StrNorm, StrTrim, TrimSet,
 };
 
 use crate::join::JoinTable;
@@ -3292,7 +3292,8 @@ impl Compiler<'_> {
                         | Func::OctetLength
                         | Func::Upper
                         | Func::Lower
-                        | Func::Trim(_),
+                        | Func::Trim(_)
+                        | Func::Normalize(_),
                     ..
                 }
         ) {
@@ -4020,6 +4021,53 @@ impl Compiler<'_> {
             b.ops.push(ExprOp::All { on: !*negated, dst });
             return Ok(Some(dst));
         }
+        // GF08's other half. Whether a string is in a normal form is
+        // the one string function whose answer is a truth value, and a
+        // chunk of truth values is not a column this executor carries,
+        // so the answer is written where a comparison writes its own:
+        // straight into a predicate register.
+        //
+        // The NOT that the negated spelling binds to is read here and
+        // handed to the kernel rather than run as an op of its own. A
+        // predicate bitmap has room for two answers and the language
+        // has three, so a row holding null is off in the bitmap either
+        // way, and a complement would have called it unnormalized.
+        {
+            let (inner, negated) = match expr {
+                BoundExpr::Unary {
+                    op: UnaryOp::Not,
+                    expr,
+                } => (&**expr, true),
+                other => (other, false),
+            };
+            if let BoundExpr::Call {
+                func: Func::IsNormalized(form),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } = inner
+                && args.len() == 1
+            {
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                if StrNorm::Test(*form)
+                    .answer_type(b.types[src as usize])
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let dst = b.push_type(PhysType::Bool)?;
+                b.ops.push(ExprOp::StrNormalized {
+                    form: *form,
+                    negated,
+                    src,
+                    dst,
+                });
+                return Ok(Some(dst));
+            }
+        }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
         };
@@ -4428,6 +4476,32 @@ impl Compiler<'_> {
                 });
                 Ok(Some(dst))
             }
+            // GF08, the half of it that answers a string. NORMALIZE is
+            // the string function whose answer is neither a part of the
+            // argument nor the same length as it, so the vector it
+            // writes carries bytes of the kernel's own and nothing in
+            // it points back at the column it read.
+            BoundExpr::Call {
+                func: Func::Normalize(form),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = StrNorm::Into(*form).answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrNorm {
+                    form: *form,
+                    src,
+                    dst,
+                });
+                Ok(Some(dst))
+            }
             _ => Ok(None),
         }
     }
@@ -4765,8 +4839,14 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         // A count has an answer for every string there is, so it is a
         // computed column like a floor or an angle. So does a fold, and
         // so does a trim: the trim family's one condition is about the
-        // set a statement wrote and the compiler settles it there.
-        ExprOp::StrLen { .. } | ExprOp::StrFold { .. } | ExprOp::StrTrim { .. } => false,
+        // set a statement wrote and the compiler settles it there. So
+        // do both normalizations, every string having a normal form and
+        // either being in it or not.
+        ExprOp::StrLen { .. }
+        | ExprOp::StrFold { .. }
+        | ExprOp::StrTrim { .. }
+        | ExprOp::StrNorm { .. }
+        | ExprOp::StrNormalized { .. } => false,
         _ => false,
     })
 }

@@ -651,3 +651,85 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: the-distance-from-nought-of-a-stored-column
+    doc: ISO 20.22. An integer argument keeps its type through the numeric functions, so the distance from nought of a whole number is a whole number and not a float that would lose a digit above two to the fifty third. A stored column is where a vectorized engine answers this a chunk at a time rather than a row at a time.
+    query: MATCH (n:person) RETURN abs(n.age - 40) AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "10"
+      - values:
+          - type: INT64
+            value: "10"
+
+  - name: the-bottom-integer-has-no-distance-from-nought
+    doc: The one whole number whose distance from nought is not a whole number, because it is one past the top of the type holding it. The standard's 22003 is the answer rather than the number wrapped back to itself, which is what an engine computing it without a check hands back.
+    query: MATCH (n:person) RETURN abs(n.big) AS a ORDER BY a
+    raises: "22003"
+
+  - name: the-sign-of-a-stored-column
+    doc: Minus one, nought or one, which is exact whatever arrived and is the one numeric function whose answer is not the type of its argument.
+    query: MATCH (n:person) RETURN sign(n.big) AS s ORDER BY s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+      - values:
+          - type: INT64
+            value: "-1"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-numeric-function-in-a-filter
+    doc: A call in a predicate, which is the shape that decides whether a whole scan is answered a chunk at a time or a row at a time. The answer has to be the same either way.
+    query: MATCH (n:person) WHERE abs(n.age - 40) < 5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: rounding-a-stored-integer-left-of-the-point
+    doc: A negative digit count rounds tens and hundreds, and over the integers it never goes through a float, so a number wider than a double holds is rounded exactly. Halves go away from nought, which is the rule SQL rounds by.
+    query: MATCH (n:person) RETURN round(n.age, -2) AS r ORDER BY r
+    columns:
+      - r
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "100"
+
+  - name: a-numeric-function-behind-a-guard-never-runs
+    doc: The same rule the division behind a guard follows. Nobody here is over a hundred, so the distance from nought of the bottom integer is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND abs(n.big) > 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"

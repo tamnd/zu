@@ -261,6 +261,33 @@ fn main() {
     let arith_checked = per_sec_wide * VECTOR as f64 / 1e9;
     println!("arith_i64_add_checked: {arith_checked:.2} G rows/s (no target, the slow path)");
 
+    // The numeric library, GF01, over the same width. The distance from
+    // nought is the one of the five with a condition behind it on every
+    // argument, so it is the one worth measuring: the fold that clears
+    // a chunk is a single pass and the loop behind it is one
+    // instruction per row.
+    let per_sec_math = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::unary(
+                &mut arith_scratch,
+                kernels::MathOp::Abs,
+                black_box(&v),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let math_grows = per_sec_math * VECTOR as f64 / 1e9;
+    println!("math_i64_abs: {math_grows:.2} G rows/s (target 4)");
+    if let Some(floor) = budgets.get("vec_math_grows_s")
+        && math_grows < floor
+    {
+        println!("GATE FAIL vec_math_grows_s: {math_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
     // Dict-code equality vs the path it replaces: owned Strings compared
     // per row, which is what a Vec<Value::Str> column does today. The
     // gate is the ratio, both sides run the same logical rows.

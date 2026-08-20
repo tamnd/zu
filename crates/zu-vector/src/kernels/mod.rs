@@ -12,6 +12,7 @@ mod arith;
 mod cmp;
 mod gather;
 mod hash;
+mod math;
 mod setops;
 
 pub use agg::{count_valid, max_i64, min_i64, sum_f64, sum_i64};
@@ -19,4 +20,5 @@ pub use arith::{BinOp, binary};
 pub use cmp::{CmpOp, compare};
 pub use gather::{compact, gather_u64};
 pub use hash::{hash_slice, hash64};
+pub use math::{MathOp, unary};
 pub use setops::intersect_sorted;

@@ -1975,3 +1975,11 @@ arrow_taken_export_ratio = 0.25
 # the worst observed run on the loaded vCPU hosts. Raise floors, never
 # lower them.
 vec_arith_grows_s = 0.2
+
+# The distance from nought over a 2048-row flat vector, GF01 as a vector
+# kernel. An integer argument keeps its type, so the loop is one
+# instruction per row, and the one argument with no answer is found by
+# the same kind of fold the arithmetic kernels use rather than by a
+# branch inside the loop. Floor sits under the worst observed run on the
+# loaded vCPU hosts. Raise floors, never lower them.
+vec_math_grows_s = 0.2

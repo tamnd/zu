@@ -443,6 +443,19 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) RETURN DISTINCT p.age + p.age AS b ORDER BY b",
         "MATCH (a:person {id: 1})-[:knows]->(b) RETURN b.age + 1 AS b ORDER BY b",
         "MATCH (a:person)-[:knows]->(b) RETURN sum(b.score + 1) AS s",
+        // A division whose divisor is written as a number that is not
+        // nought, which is the one division shape that cannot raise, so
+        // it is a computed column like any other.
+        "MATCH (p:person) RETURN p.score / 3 AS b",
+        "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
+        // The numeric functions over a whole number, which are kernels
+        // rather than a call per row. Once bare, once in a filter, once
+        // grouped on, and once behind a guard the row engine reads in
+        // the order it was written.
+        "MATCH (p:person) RETURN floor(p.score / 2) AS b, p.id AS id ORDER BY b, id LIMIT 20",
+        "MATCH (p:person) WHERE abs(p.age - 40) < 5 RETURN p.id AS id ORDER BY id",
+        "MATCH (p:person) RETURN sign(p.age - 40) AS s, count(*) AS n ORDER BY s",
+        "MATCH (p:person) WHERE p.age > 40 AND floor(p.score) > 2 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
         // answers with how many groups came out. Once on a column,
         // once on a node, once on a computed value, once on a string,
@@ -897,11 +910,24 @@ fn fallback_queries() -> &'static [&'static str] {
         // A sort inside a WITH orders rows the pipeline is not the
         // last reader of, so the whole chain goes back.
         "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
-        // Division and modulo in a projection: the old engine raises
-        // on a zero divisor and the kernel returns null instead, so
-        // the shape stays where the error is, divisor constant or not.
-        "MATCH (p:person) RETURN p.score / 3 AS b",
-        "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
+        // A division by a column in a projection. A computed column is
+        // filled before the filter that would have dropped the row
+        // whose divisor is nought, so a condition raised here is one
+        // the old engine never reached, and the shape stays where the
+        // question of raising it belongs.
+        "MATCH (p:person) RETURN p.score / (p.id + 1) AS b",
+        "MATCH (p:person) RETURN p.age % (p.id + 1) AS b, p.id AS id",
+        // The same rule over a numeric function that has a condition
+        // behind it: the distance of the bottom integer from nought is
+        // one past the top of one, so a projection holding a distance
+        // declines where a floor would not.
+        "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
+        // And behind an OR, where the old engine reads the halves in
+        // the order they were written and never asks the second one
+        // about a row the first said yes to. An AND is not the same
+        // shape, the planner having split it into a filter apiece, and
+        // the second filter sees the rows the first one kept.
+        "MATCH (p:person) WHERE p.age > 40 OR abs(p.age - 40) > 1 RETURN count(*) AS n",
         // A correlated string end would have to carry its buffers into
         // the broadcast.
         "MATCH (a:person)-[:knows]->(b) WHERE a.name < b.name RETURN count(*) AS n",

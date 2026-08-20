@@ -809,3 +809,38 @@ cases:
       - values:
           - type: DURATION
             value: "-P1D"
+
+  - name: datetime-value-function-types
+    doc: The five words of ISO 20.6 and the five types they answer. Three carry a displacement and two do not, and an engine that answers a local time where a zoned one was asked for has thrown away the field a reader would have compared on.
+    query: RETURN CURRENT_DATE IS TYPED DATE AND CURRENT_TIME IS TYPED ZONED TIME AND CURRENT_TIMESTAMP IS TYPED ZONED DATETIME AND LOCAL_TIME IS TYPED LOCAL TIME AND LOCAL_TIMESTAMP IS TYPED LOCAL DATETIME AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-functions-agree
+    doc: One statement reads one clock, so the date it answers is the date its instant fell on. An engine reading the clock once per function can answer false here for a fraction of a second a day, which is the kind of failure that never shows up in a test run and shows up in production.
+    query: RETURN CURRENT_DATE = CAST(CURRENT_TIMESTAMP AS DATE) AND LOCAL_TIME = CAST(CURRENT_TIMESTAMP AS LOCAL TIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-function-is-not-folded
+    doc: The instant is the one the statement runs at and not the one it was compiled at. An engine holding a plan cache and folding this writes a time into the plan and hands it to every statement after, which this catches by asking for a time later than any build of it.
+    query: RETURN CURRENT_TIMESTAMP > ZONED DATETIME '2024-01-01T00:00:00Z' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-function-takes-no-parentheses
+    doc: The grammar writes these as bare words, so the brackets are a call to a function that does not exist. An engine accepting them is accepting a spelling no other engine has to.
+    query: RETURN CURRENT_DATE() AS n
+    raises: "42002"

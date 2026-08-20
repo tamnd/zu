@@ -68,7 +68,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
+use zu_common::{Clock, DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
@@ -856,6 +856,18 @@ pub struct Options {
     /// statements. The default is the handle nobody armed, so a caller
     /// who wants none pays a branch per chunk.
     pub interrupt: Interrupt,
+    /// The instant the datetime value functions of ISO 20.6 answer,
+    /// `None` for a run that has not read a clock yet.
+    ///
+    /// It is here for the reason the interrupt is: it is state one
+    /// statement has and every path through the executor already
+    /// carries the switches. [`run_stages`] fills it in on the way in
+    /// and hands the filled copy down, so a query written inside an
+    /// expression answers the same instant as the query around it
+    /// rather than reading a clock of its own halfway through the scan.
+    /// A caller may set it before running, which is how a test pins the
+    /// time.
+    pub clock: Option<Clock>,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -6340,6 +6352,14 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
+        // ISO 20.6, the instant behind the five datetime value
+        // functions. It was read once before the first stage and is
+        // handed out here as many times as the rows ask for it, so a
+        // scan of ten million rows makes no system call at all and
+        // every row of it agrees about what time the statement ran.
+        BoundExpr::Clock => Ok(Value::Temporal(
+            ctx.scalars.options.clock.unwrap_or_default().instant(),
+        )),
         // GE01. The binder already asked the catalog which graph this
         // is, so the row's work is a clone of the handle and nothing
         // else.
@@ -6805,6 +6825,7 @@ impl AggState {
             | Func::Lower
             | Func::Trim(_)
             | Func::Cut(_)
+            | Func::Datetime(_)
             | Func::Normalize(_)
             | Func::IsNormalized(_)
             | Func::Math(_) => {
@@ -8016,6 +8037,22 @@ fn run_stages(
         mut profile,
         mut stream,
     } = extras;
+    // The instant this statement answers the datetime value functions
+    // with, read here and nowhere else. A run that arrives with one
+    // already keeps it, which is what makes a query written inside an
+    // expression agree with the query around it, and what lets a test
+    // say what time it is.
+    let read;
+    let options = match options.clock {
+        Some(_) => options,
+        None => {
+            read = Options {
+                clock: Some(Clock::read()),
+                ..options.clone()
+            };
+            &read
+        }
+    };
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }

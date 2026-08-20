@@ -22,8 +22,9 @@ use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError, unicode};
 
-use crate::ast::Literal;
+use crate::ast::{DatetimeFn, Literal};
 use crate::binder::{BoundExpr, Cut, Func, Math, Trim, Type};
+use crate::cast;
 use crate::exec::{Value, settle};
 
 /// The code behind a scalar function: the arguments already evaluated,
@@ -580,6 +581,82 @@ pub static REGISTRY: &[Signature] = &[
         star: false,
         by_name: true,
         kernel: Some(cut_kernel),
+    },
+    // ISO 20.6, the datetime value functions. None of them is reachable
+    // by name: the grammar writes them as bare words with no
+    // parentheses, so a query saying CURRENT_DATE() is asking for a
+    // function nobody defined and gets told so. The argument is the
+    // instant the statement is running at, which the parser never
+    // writes and the binder always does.
+    Signature {
+        name: "current_date",
+        aliases: &[],
+        func: Func::Datetime(DatetimeFn::CurrentDate),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs the instant the statement is running at",
+        ret: Ret::Same,
+        deterministic: false,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(datetime_kernel),
+    },
+    Signature {
+        name: "current_time",
+        aliases: &[],
+        func: Func::Datetime(DatetimeFn::CurrentTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs the instant the statement is running at",
+        ret: Ret::Same,
+        deterministic: false,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(datetime_kernel),
+    },
+    Signature {
+        name: "current_timestamp",
+        aliases: &[],
+        func: Func::Datetime(DatetimeFn::CurrentTimestamp),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs the instant the statement is running at",
+        ret: Ret::Same,
+        deterministic: false,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(datetime_kernel),
+    },
+    Signature {
+        name: "local_time",
+        aliases: &[],
+        func: Func::Datetime(DatetimeFn::LocalTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs the instant the statement is running at",
+        ret: Ret::Same,
+        deterministic: false,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(datetime_kernel),
+    },
+    Signature {
+        name: "local_timestamp",
+        aliases: &[],
+        func: Func::Datetime(DatetimeFn::LocalTimestamp),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs the instant the statement is running at",
+        ret: Ret::Same,
+        deterministic: false,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(datetime_kernel),
     },
     Signature {
         name: "normalize",
@@ -1285,6 +1362,48 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
         Cut::Right => text.chars().skip(held.saturating_sub(count)).collect(),
     };
     Ok(Value::Str(taken))
+}
+
+/// ISO 20.6, the datetime value functions: one instant cut five ways.
+///
+/// The instant arrives as the argument, so this kernel reads no clock
+/// and is as pure as every other one here. What makes the five differ
+/// is only which type the instant is read as, and reading one temporal
+/// type as another is what the cast rules already say, so the cut is a
+/// conversion and not arithmetic written twice.
+///
+/// A null instant answers null, which is the rule every kernel here
+/// keeps rather than an answer a query can reach: the binder plants the
+/// argument itself and the run always has a clock, so nothing a
+/// statement writes gets here with a null in hand.
+fn datetime_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let Func::Datetime(which) = func else {
+        return Err(invalid(format!(
+            "{}() is not a datetime value function",
+            name_of(func)
+        )));
+    };
+    let instant = match args.first().map(|value| settle(value.clone())) {
+        Some(Value::Temporal(instant)) => instant,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(other) => {
+            return Err(invalid(format!(
+                "{}() expects an instant, got {other:?}",
+                name_of(func)
+            )));
+        }
+        None => {
+            return Err(invalid(format!("{}() was given no instant", name_of(func))));
+        }
+    };
+    let cut = cast::convert(instant, &which.target()).ok_or_else(|| {
+        invalid(format!(
+            "{}() cannot read the instant as {}",
+            name_of(func),
+            which.target()
+        ))
+    })?;
+    Ok(Value::Temporal(cut))
 }
 
 /// The string an argument holds, or nothing where it holds a null.

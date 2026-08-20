@@ -1423,6 +1423,12 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             args,
             ..
         } => {
+            // ISO 20.6 writes these five as bare words, so a plan
+            // that printed the instant they were handed would print a
+            // thing no query can write and no reader asked for.
+            if let Func::Datetime(which) = func {
+                return which.word().to_uppercase();
+            }
             let name = func_name(*func);
             let inner = if *star {
                 "*".to_string()
@@ -1460,6 +1466,10 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             let rendered: Vec<String> = items.iter().map(|i| expr_text(i, query)).collect();
             format!("[{}]", rendered.join(", "))
         }
+        // The instant, which only ever appears as the argument of one
+        // of the five words above and is printed as the word a query
+        // would have written to ask for it whole.
+        BoundExpr::Clock => "CURRENT_TIMESTAMP".into(),
         BoundExpr::Map(entries) => {
             let rendered: Vec<String> = entries
                 .iter()

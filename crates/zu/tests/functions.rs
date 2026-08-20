@@ -11,6 +11,8 @@
 
 use zu::Database;
 use zu::query::Value;
+use zu_common::Temporal;
+use zu_common::temporal::NANOS_PER_DAY;
 
 fn opened(dir: &std::path::Path) -> Database {
     let db = Database::create(dir.join("functions.zu1")).expect("create");
@@ -277,4 +279,85 @@ fn what_the_registry_refuses() {
 
     let says = refused(&db, "RETURN ROUND(1.5, 2, 3) AS v");
     assert!(says.contains("takes 1 or 2 argument(s), got 3"), "{says}");
+}
+
+/// The datetime value functions of ISO 20.6: what time the statement
+/// is running at, cut five ways.
+///
+/// Two things are asked here that no other function asks. One is that
+/// the five agree: a statement holding CURRENT_DATE beside
+/// CURRENT_TIMESTAMP reads one instant, so the date it answers is the
+/// date that instant fell on and not the date a second clock read a
+/// moment later. The other is that the answer is not folded, since a
+/// folded one would be written into the plan and every later statement
+/// reading that plan would be told the time it was compiled at.
+#[test]
+fn the_datetime_value_functions_answer_one_instant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+    let mut conn = db.connect().expect("connect");
+
+    let source = "RETURN CURRENT_DATE AS d, CURRENT_TIME AS t, CURRENT_TIMESTAMP AS ts, \
+                  LOCAL_TIME AS lt, LOCAL_TIMESTAMP AS lts";
+    let rows = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let rows: Vec<_> = rows.iter().collect();
+    assert_eq!(rows.len(), 1);
+    let read = |name: &str| match rows[0].value_by_name(name).expect(name) {
+        Value::Temporal(t) => *t,
+        other => panic!("{name} answered {other:?}"),
+    };
+    let (date, time, stamp) = (read("d"), read("t"), read("ts"));
+    let (local_time, local_stamp) = (read("lt"), read("lts"));
+
+    // The instant, and the four cuts of it, each stated as the
+    // arithmetic that takes the whole to the part.
+    let Temporal::ZonedDatetime { nanos, offset } = stamp else {
+        panic!("current_timestamp answered {stamp:?}");
+    };
+    assert_eq!(offset, 0, "zu's session displacement is UTC");
+    assert_eq!(date, Temporal::Date((nanos / NANOS_PER_DAY) as i32));
+    assert_eq!(
+        time,
+        Temporal::ZonedTime {
+            nanos: nanos % NANOS_PER_DAY,
+            offset: 0
+        }
+    );
+    assert_eq!(local_time, Temporal::LocalTime(nanos % NANOS_PER_DAY));
+    assert_eq!(local_stamp, Temporal::LocalDatetime(nanos));
+
+    // Every row of a scan reads the same instant, the clock having
+    // been read once before the first of them.
+    let rows = conn
+        .query("MATCH (p:person) RETURN CURRENT_TIMESTAMP AS ts")
+        .expect("a scan");
+    let seen: Vec<Value> = rows
+        .iter()
+        .map(|row| row.value(0).expect("ts").clone())
+        .collect();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+
+    // Not folded, in the plan and in the answer alike. The plan names
+    // the word rather than a time, and running the same statement
+    // again reads the clock again.
+    let plan = conn.explain(source).expect("explain");
+    assert!(plan.contains("CURRENT_TIMESTAMP"), "{plan}");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let again = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let again: Vec<_> = again.iter().collect();
+    let later = match again[0].value_by_name("ts").expect("ts") {
+        Value::Temporal(t) => *t,
+        other => panic!("ts answered {other:?}"),
+    };
+    assert_ne!(later, stamp, "a cached plan handed back the old instant");
+
+    // They are words and not calls, so the parentheses are a call to a
+    // function nobody defined.
+    let says = refused(&db, "RETURN CURRENT_DATE() AS d");
+    assert!(says.contains("unknown function"), "{says}");
 }

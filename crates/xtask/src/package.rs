@@ -686,10 +686,10 @@ mod tests {
         // dx/02 §8 is the v0.5 restructure, and the error model, the
         // cancellation calls, the transaction boundaries, the appender,
         // the diagnostics and the frames added to it are all additive,
-        // so this is 0.11: the number a binding tests for when it wants
-        // to know whether zu_conn_register is there. The two parts are
+        // so this is 0.12: the number a binding tests for when it wants
+        // to know whether zu_result_arrow is there. The two parts are
         // counts rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.11".to_string(), "0.11".to_string()));
+        assert_eq!(abi.revision, ("0.12".to_string(), "0.12".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

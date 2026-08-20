@@ -2480,6 +2480,146 @@ pub unsafe extern "C" fn zu_result_chunk_col_valid(
     }
 }
 
+/* ---- Arrow ---- */
+
+/// The names of the tables in a result, straight off the catalog the
+/// connection already holds.
+///
+/// A node value carries the id of its table and nothing else, so
+/// [`zu_arrow`] asks for the name. There is no map built here: the
+/// catalog is the map, and a lookup by id is a binary search over a few
+/// tens of entries.
+#[cfg(feature = "arrow")]
+struct Named<'a>(&'a zudb::zu1::catalog::Catalog);
+
+#[cfg(feature = "arrow")]
+impl zu_arrow::Tables for Named<'_> {
+    fn node(&self, id: u32) -> Option<&str> {
+        self.0.node_by_id(id).map(|table| table.name.as_str())
+    }
+
+    fn rel(&self, id: u32) -> Option<&str> {
+        self.0.rel_by_id(id).map(|table| table.name.as_str())
+    }
+}
+
+/// The whole result as an Arrow C Data Interface stream, moving the
+/// buffers rather than copying them.
+///
+/// This is the only call here that spends the result. It takes the
+/// handle through a pointer to it and writes NULL back, on every path
+/// including the failing ones, because what it does is hand the
+/// executor's own buffers to the Arrow arrays: after that the result
+/// holds nothing to read a second time, and a handle to it would be a
+/// handle to an answer with no rows in it. Do not free it afterwards,
+/// and do not keep a pointer into it: a column buffer or a cell string
+/// taken before this call belongs to the stream now.
+///
+/// That is the whole point. A result that stayed readable would have to
+/// be copied on the way out, and the copy is the whole answer, so a
+/// binding exporting a hundred million rows would move eight hundred
+/// megabytes to hand over eight hundred megabytes it already had. The
+/// borrowing calls above are still there for a caller who wants to read
+/// the result rather than give it away.
+///
+/// `conn` is where the table names come from, since a node value
+/// carries the id of its table and the catalog is what turns that into
+/// a name. It may be NULL, and then a node column names its table `#7`
+/// after the id, which is what a caller who has closed the connection
+/// and kept the result can still be given. When it is not NULL it must
+/// be the connection the result was produced on, and it is claimed for
+/// the length of the call like any other use of one.
+///
+/// `rows_per_batch` is the row count the reader sees per batch, and 0
+/// asks for the library's own, which is 65536. Batches are slices of
+/// arrays that are already in memory, so this is about what a consumer
+/// likes to work in and not about what is allocated.
+///
+/// `out` points at an `ArrowArrayStream` the caller owns, uninitialised
+/// on the way in and released the way that interface says on the way
+/// out: call its `release` and not any function of this library.
+/// `ZU_UNSUPPORTED` when the library was built without the Arrow
+/// feature, which is the one answer that is about the build rather than
+/// the call, and `ZU_MISUSE` with a message naming the column when one
+/// holds something Arrow has no type for, which is a time with an
+/// offset and the two handle types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_arrow(
+    conn: *mut ZuConn,
+    result: *mut *mut ZuResult,
+    rows_per_batch: u64,
+    out: *mut c_void,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    // Spent before anything can go wrong, so that a caller who reuses
+    // the variable across calls cannot be left holding a handle to a
+    // result whose buffers left through this call.
+    let taken = if result.is_null() {
+        None
+    } else {
+        let held = unsafe { *result };
+        unsafe { *result = std::ptr::null_mut() };
+        (!held.is_null()).then(|| unsafe { Box::from_raw(held) })
+    };
+    guard(err, || {
+        let Some(taken) = taken else {
+            return Err(misuse("result is NULL"));
+        };
+        if out.is_null() {
+            return Err(misuse("out is NULL"));
+        }
+        arrow_stream(conn, *taken, rows_per_batch, out)
+    })
+}
+
+/// The half of [`zu_result_arrow`] that the feature turns off, kept
+/// apart so that the checks above are one piece of code however the
+/// library was built.
+#[cfg(feature = "arrow")]
+fn arrow_stream(
+    conn: *mut ZuConn,
+    taken: ZuResult,
+    rows_per_batch: u64,
+    out: *mut c_void,
+) -> Result<ZuStatus, EngineError> {
+    let rows = match usize::try_from(rows_per_batch) {
+        Ok(0) => zu_arrow::BATCH,
+        // A count that does not fit a usize is every row there could
+        // ever be, so it is one batch and not a refusal.
+        Ok(rows) => rows,
+        Err(_) => usize::MAX,
+    };
+    let table = if conn.is_null() {
+        zu_arrow::Table::taken(taken.result, &())
+    } else {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let catalog = unsafe { conn_of(conn) }.session_mut().catalog();
+        zu_arrow::Table::taken(taken.result, &Named(catalog))
+    }
+    .map_err(|why| misuse(why.to_string()))?;
+    // Written rather than assigned: the caller's struct is
+    // uninitialised on the way in, and dropping whatever bytes were
+    // there would call a release pointer that is not one.
+    unsafe {
+        out.cast::<zu_arrow::FFI_ArrowArrayStream>()
+            .write(table.into_stream(rows));
+    }
+    Ok(ZuStatus::Ok)
+}
+
+#[cfg(not(feature = "arrow"))]
+fn arrow_stream(
+    _conn: *mut ZuConn,
+    _taken: ZuResult,
+    _rows_per_batch: u64,
+    _out: *mut c_void,
+) -> Result<ZuStatus, EngineError> {
+    Ok(ZuStatus::Unsupported)
+}
+
 /// One string cell, NUL-terminated, valid until the result is freed,
 /// with its byte length through `len` when that is non-NULL. `Misuse`
 /// when the cell is out of range or does not hold a string.

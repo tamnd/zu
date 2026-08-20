@@ -708,6 +708,25 @@ impl Log {
         Ok(self.file.metadata()?.len())
     }
 
+    /// Where recovery keeps the link repairs it is part way through
+    /// writing. Beside the log rather than inside it, because the log's
+    /// header is eight bytes of `begin` with records starting right
+    /// after it and there is nowhere in it to put a slot. See
+    /// [`crate::recover`].
+    pub fn journal_path(&self) -> PathBuf {
+        let mut path = self.path.clone().into_os_string();
+        path.push(".relink");
+        PathBuf::from(path)
+    }
+
+    /// Commits the log file's bytes to the device outside the flusher's
+    /// frontier, which recovery needs after it has written repaired
+    /// pages back.
+    pub fn sync_file(&self) -> Result<()> {
+        file::sync(&self.file)?;
+        Ok(())
+    }
+
     fn wake_flusher(&self) {
         let mut pending = self.dirty_lock.lock().expect("zu2 dirty flag");
         *pending = true;

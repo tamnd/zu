@@ -142,6 +142,25 @@ impl Compaction {
     }
 }
 
+/// What the reopen's scan found and what it had to change.
+///
+/// The last two are what #463 is about. A repaired link is eight bytes
+/// of `previous` and four bytes of checksum twenty four bytes later, and
+/// the page carrying both goes back to the file whole, so a crash in the
+/// middle of that write can leave a record whose checksum does not hold
+/// and end the durable prefix there. How big a window that is depends
+/// entirely on how much a reopen repairs, which is why it is counted.
+#[derive(Debug, Default)]
+pub struct Recovered {
+    /// Records the scan read.
+    pub records: AtomicU64,
+    /// Records whose `previous` did not fit the table being filled and
+    /// had to be rewritten.
+    pub relinked: AtomicU64,
+    /// Pages that went back to the file because of those rewrites.
+    pub pages: AtomicU64,
+}
+
 /// Everything the sessions and the flusher share.
 pub struct Core {
     pub(crate) log: Log,
@@ -154,6 +173,7 @@ pub struct Core {
     /// database that stops being rewritten stops being compacted.
     compact_at: AtomicU64,
     compaction: Compaction,
+    pub(crate) recovered: Recovered,
 }
 
 impl Core {
@@ -279,6 +299,7 @@ impl Db {
             durability: options.durability,
             compact_at: AtomicU64::new(options.compact_below),
             compaction: Compaction::default(),
+            recovered: Recovered::default(),
         })
     }
 
@@ -369,6 +390,12 @@ impl Db {
     /// What compaction has done since this database was opened.
     pub fn compaction(&self) -> &Compaction {
         &self.core.compaction
+    }
+
+    /// What the reopen's scan read and what it had to rewrite. All zeros
+    /// on a database that was created rather than opened.
+    pub fn recovered(&self) -> &Recovered {
+        &self.core.recovered
     }
 
     /// Runs compaction until another pass would not pay for itself, and

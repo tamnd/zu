@@ -22,6 +22,19 @@ pub fn create_new(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Creates a file, truncating whatever was there. Only recovery's
+/// relink journal uses this, and it wants the truncation: a leftover
+/// journal longer than the one being written would otherwise keep its
+/// tail and the checksum would be over the wrong bytes.
+pub fn create_or_replace(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
 /// Opens an existing log file for reading and writing.
 pub fn open_rw(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;

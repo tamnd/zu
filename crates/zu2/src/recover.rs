@@ -42,9 +42,22 @@ use crate::record::{self, RecordRef};
 /// file before anything can evict them. See [`install`].
 type Rewritten = BTreeSet<usize>;
 
+/// Every link the scan moved, as the record and where it now points.
+///
+/// Kept as well as the pages, because the pages are what has to be
+/// written and this is what has to be written down first. See
+/// [`journal`].
+type Repairs = Vec<(Address, Address)>;
+
 /// Rebuilds the index from the file and leaves the log ready to append.
 pub fn replay(core: &Core) -> Result<()> {
     let len = restore_pages(core)?;
+    // Before anything reads a record, because a journal that is still
+    // there is a reopen that died part way through writing its repairs
+    // back and the file may hold a record whose checksum does not hold.
+    // The scan would stop at that record and call it the end of the
+    // durable prefix.
+    journal::apply(core, len)?;
     // A compacted file starts where its begin marker says, because the
     // pages before that are a hole. Starting at FIRST would still work,
     // since a hole reads as zeros and a page of zeros is skipped the
@@ -64,6 +77,7 @@ pub fn replay(core: &Core) -> Result<()> {
     core.index.presize(records.div_ceil(4));
 
     let mut rewritten = Rewritten::new();
+    let mut repairs = Repairs::new();
     let mut version = 0u64;
     let end = walk(core, from, len, |header, address| {
         if header.kind() == record::KIND_EDGE {
@@ -82,17 +96,32 @@ pub fn replay(core: &Core) -> Result<()> {
                 // SAFETY: as above.
                 graph::replay_node(core, unsafe { header.value_unchecked() });
             }
-            install(core, header, address, &mut rewritten);
+            install(core, header, address, &mut rewritten, &mut repairs);
         }
         version = version.max(header.version());
         Ok(())
     })?;
     core.log.resume_at(end);
     core.set_version(version);
+    core.recovered
+        .records
+        .store(records as u64, std::sync::atomic::Ordering::Relaxed);
+    core.recovered
+        .pages
+        .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if rewritten.is_empty() {
+        return Ok(());
+    }
+    // The journal goes down and is committed before a single page moves,
+    // so that whatever a crash leaves in the file can be finished from
+    // it. Then the pages, then a sync, then the journal comes off.
+    journal::write(core, &repairs)?;
     for page in rewritten {
         let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
         core.log.rewrite_page(page, bytes)?;
     }
+    core.log.sync_file()?;
+    journal::clear(core);
     Ok(())
 }
 
@@ -196,8 +225,15 @@ fn walk(
 /// The pages that did change go back to the file at the end of the scan,
 /// because a repair that only happened in memory lasts until the first
 /// eviction and then the old bytes come back off the device. That write
-/// is not torn write safe yet (#463).
-fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut Rewritten) {
+/// is torn write safe through [`journal`], which writes the repairs down
+/// and commits them before any of them is applied (#463).
+fn install(
+    core: &Core,
+    header: RecordRef<'_>,
+    address: Address,
+    rewritten: &mut Rewritten,
+    repairs: &mut Repairs,
+) {
     let key = header.key();
     let hash = index::hash(key);
     let tag = Index::tag(hash);
@@ -222,7 +258,14 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut
             // is the one that is still there after the region below it
             // goes.
             if header.version() >= installed {
-                relink(header, address, index::address_of(entry), rewritten);
+                relink(
+                    core,
+                    header,
+                    address,
+                    index::address_of(entry),
+                    rewritten,
+                    repairs,
+                );
                 bucket.slots[i].store(
                     index::entry(tag, address, index::is_foreign(entry)),
                     std::sync::atomic::Ordering::Relaxed,
@@ -238,7 +281,7 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut
     if let Some(i) = empty {
         // Nothing was reachable through an empty slot, so the record
         // starts a chain rather than extending one.
-        relink(header, address, NULL, rewritten);
+        relink(core, header, address, NULL, rewritten, repairs);
         bucket.slots[i].store(
             index::entry(tag, address, false),
             std::sync::atomic::Ordering::Relaxed,
@@ -251,7 +294,7 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut
     // writes landed leaves less to repair.
     let i = tag as usize % SLOTS;
     let victim = index::address_of(bucket.slots[i].load(std::sync::atomic::Ordering::Relaxed));
-    relink(header, address, victim, rewritten);
+    relink(core, header, address, victim, rewritten, repairs);
     bucket.slots[i].store(
         index::entry(tag, address, true),
         std::sync::atomic::Ordering::Relaxed,
@@ -261,14 +304,40 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address, rewritten: &mut
 /// Points a record at what the entry it is taking over holds, unless it
 /// points there already, and remembers the page so that it goes back to
 /// the file before anything can evict it.
-fn relink(header: RecordRef<'_>, address: Address, previous: Address, rewritten: &mut Rewritten) {
+///
+/// A record that starts a chain is asked to point at [`NULL`], and a
+/// record already pointing below the log's begin is left alone instead.
+/// Every walk in the engine stops on either, because below begin there
+/// is nothing left to find, so the two links say the same thing and
+/// rewriting one into the other buys nothing. It is not a rare case: a
+/// compaction copy chains to whatever the entry held at copy time, which
+/// is in the region the pass is about to drop, so after one pass every
+/// live record in the file points below begin. Repairing all of them
+/// took a reopen of a compacted database from rewriting nothing to
+/// rewriting 99.9% of its records, which is the difference between #463
+/// being a narrow window and being the whole file.
+fn relink(
+    core: &Core,
+    header: RecordRef<'_>,
+    address: Address,
+    previous: Address,
+    rewritten: &mut Rewritten,
+    repairs: &mut Repairs,
+) {
     if header.previous() == previous {
+        return;
+    }
+    if previous == NULL && header.previous() < core.log.begin() {
         return;
     }
     // SAFETY: recovery is single threaded and the record was read out of
     // a resident page, which is a page that can be written back.
     unsafe { header.relink(previous) };
+    core.recovered
+        .relinked
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     rewritten.insert(page_of(address));
+    repairs.push((address, previous));
 }
 
 /// The version of the record this chain holds for `key`, or `None` when
@@ -306,11 +375,263 @@ fn chain_version(core: &Core, entry: u64, key: &[u8]) -> Option<u64> {
     None
 }
 
+/// The side file that makes the link repair torn write safe.
+///
+/// A repair changes eight bytes of `previous` and four bytes of checksum
+/// twenty four bytes later, and the page carrying both goes back to the
+/// file whole. A crash inside that write can leave the file with one of
+/// the two updated and not the other, and then the next scan finds a
+/// record whose checksum does not hold, calls it the end of the durable
+/// prefix, and stops there. Everything above it is gone, and it is not a
+/// small amount, because the repairs are near the bottom of the log
+/// where the oldest pages are. `examples/relink.rs` counts how much a
+/// reopen actually repairs and the answer is up to a third of the
+/// records, so this is a hole worth closing rather than a corner.
+///
+/// So the repairs are written down before any of them is applied, the
+/// way InnoDB's double write buffer works, but by record rather than by
+/// page: sixteen bytes each instead of four megabytes. The order is
+/// journal, sync, pages, sync, remove. A reopen that finds a journal
+/// left behind applies it before the scan reads anything, which puts the
+/// file back into the image the interrupted reopen was writing.
+///
+/// Reapplying is safe whether the crash landed before, during or after
+/// the page writes, because the only bytes that differ between the two
+/// images are the ones the journal names. Every other byte of those
+/// records is the same in both, so setting `previous` and recomputing
+/// the checksum reconstructs the intended record exactly, and doing it
+/// to a record that already has it changes nothing.
+///
+/// A journal beside the file rather than a slot inside it, because the
+/// log's header is eight bytes of `begin` with records starting right
+/// after it. Z10's index checkpoint removes the need for any of this,
+/// since a recovery that reads the table back has no links to repair.
+mod journal {
+    use super::{Address, Core, PAGE_SIZE, Rewritten, page_of, page_start};
+    use crate::addr::NULL;
+    use crate::error::Result;
+    use crate::record::RecordRef;
+
+    /// Says the file is a zu2 relink journal and not something that
+    /// happens to have the right name.
+    const MAGIC: u64 = 0x7a75_3272_656c_6e6b;
+
+    /// Magic, count, and the checksum after the entries.
+    const HEADER: usize = 16;
+    const ENTRY: usize = 16;
+
+    /// Writes the repairs down and commits them, before any of them is
+    /// applied to the log file.
+    pub fn write(core: &Core, repairs: &[(Address, Address)]) -> Result<()> {
+        let buf = encode(repairs);
+        let path = core.log.journal_path();
+        let file = crate::file::create_or_replace(&path)?;
+        crate::file::write_all_at(&file, &buf, 0)?;
+        crate::file::sync(&file)?;
+        Ok(())
+    }
+
+    /// A journal's bytes. Its own function so that a test can make one
+    /// without a database to hang it on.
+    pub fn encode(repairs: &[(Address, Address)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEADER + repairs.len() * ENTRY + 4);
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(repairs.len() as u64).to_le_bytes());
+        for (address, previous) in repairs {
+            buf.extend_from_slice(&address.to_le_bytes());
+            buf.extend_from_slice(&previous.to_le_bytes());
+        }
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Takes the journal away, which is what says the repairs are all in
+    /// the log file now.
+    ///
+    /// A remove that fails leaves a journal that the next reopen applies
+    /// again, which changes nothing, so there is nothing to report.
+    pub fn clear(core: &Core) {
+        let _ = std::fs::remove_file(core.log.journal_path());
+    }
+
+    /// Finishes a reopen that died part way through writing its repairs,
+    /// if there is one to finish.
+    pub fn apply(core: &Core, len: u64) -> Result<()> {
+        let path = core.log.journal_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(());
+        };
+        let Some(repairs) = parse(&bytes) else {
+            // A journal that does not check out was never committed, so
+            // the page writes had not started and the file is whatever
+            // the run before this one left. Nothing to finish.
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        };
+        let mut rewritten = Rewritten::new();
+        for (address, previous) in repairs {
+            if address >= len {
+                continue;
+            }
+            let base = core.log.resident(address);
+            if base.is_null() {
+                continue;
+            }
+            // SAFETY: nothing else is running, the address came out of a
+            // committed journal so it names a record this file wrote,
+            // and the only bytes a torn write can have left wrong are
+            // the ones about to be rewritten.
+            unsafe {
+                let record = RecordRef::new(base);
+                if record.previous() == previous {
+                    continue;
+                }
+                record.relink(previous);
+            }
+            rewritten.insert(page_of(address));
+        }
+        for page in rewritten {
+            let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+            core.log.rewrite_page(page, bytes)?;
+        }
+        core.log.sync_file()?;
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// The repairs a journal holds, or nothing when it does not hold a
+    /// whole committed one.
+    fn parse(bytes: &[u8]) -> Option<Vec<(Address, Address)>> {
+        if bytes.len() < HEADER + 4 {
+            return None;
+        }
+        if u64::from_le_bytes(bytes[0..8].try_into().ok()?) != MAGIC {
+            return None;
+        }
+        let count = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let end = HEADER.checked_add(count.checked_mul(ENTRY)?)?;
+        if bytes.len() != end + 4 {
+            return None;
+        }
+        if u32::from_le_bytes(bytes[end..end + 4].try_into().ok()?) != crc32c::crc32c(&bytes[..end])
+        {
+            return None;
+        }
+        let mut repairs = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = HEADER + i * ENTRY;
+            let address = u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?);
+            let previous = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().ok()?);
+            if address == NULL {
+                return None;
+            }
+            repairs.push((address, previous));
+        }
+        Some(repairs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::addr::{NULL, PAGE_SIZE, offset_of};
+    use crate::addr::{Address, NULL, PAGE_SIZE, offset_of};
     use crate::db::{Db, Options};
     use crate::record::{HEADER, KIND_VALUE};
+
+    /// A reopen that died part way through writing its link repairs
+    /// back, which #463 is about. A repair changes `previous` and the
+    /// checksum twenty four bytes later, the page goes back whole, and a
+    /// crash inside that write can leave one of the two updated and not
+    /// the other. The scan then finds a record whose checksum does not
+    /// hold, calls it the end of the durable prefix, and loses every
+    /// record above it.
+    ///
+    /// Built rather than raced, because the window is one page write
+    /// wide. The tear is written by hand into a copy of a good file:
+    /// `previous` moved, checksum left alone. The negative control is
+    /// the same file with no journal beside it, which has to lose the
+    /// records above the tear, because a positive result means nothing
+    /// unless the damage was real.
+    #[test]
+    fn a_reopen_that_died_writing_its_repairs_back_finishes_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = Options {
+            durability: crate::log::Durability::Async,
+            ..Options::default()
+        };
+        let key = |i: u32| format!("k{i:04}").into_bytes();
+        let records = 10u32;
+        let torn = 5u32;
+
+        // A good file, and the address of the record the tear lands in.
+        let good = dir.path().join("good.zu2");
+        let victim: Address;
+        {
+            let db = Db::create(&good, options).expect("create");
+            let mut s = db.session();
+            let mut at = 0u64;
+            for i in 0..records {
+                if i == torn {
+                    at = db.core().log.tail();
+                }
+                s.upsert(&key(i), &[b'x'; 100]).expect("upsert");
+            }
+            drop(s);
+            db.sync().expect("sync");
+            victim = at;
+        }
+        assert!(victim > 0, "the victim record was never written");
+
+        // The tear: eight bytes of `previous` moved, the checksum
+        // twenty four bytes later left as it was.
+        let tear = |to: &std::path::Path| {
+            std::fs::copy(&good, to).expect("copy");
+            let file = crate::file::open_rw(to).expect("open");
+            let mut was = [0u8; 8];
+            crate::file::read_exact_at(&file, &mut was, victim).expect("read");
+            crate::file::write_all_at(&file, &0xdeadu64.to_le_bytes(), victim).expect("write");
+            crate::file::sync(&file).expect("sync");
+            u64::from_le_bytes(was)
+        };
+
+        // Without a journal there is nothing to finish, and the file is
+        // as bad as it looks.
+        let alone = dir.path().join("alone.zu2");
+        tear(&alone);
+        {
+            let db = Db::open(&alone, options).expect("reopen");
+            let mut s = db.session();
+            let mut out = Vec::new();
+            assert!(
+                !s.read(&key(records - 1), &mut out).expect("read"),
+                "the tear did not stop the scan, so the journal is not what saves the next one"
+            );
+        }
+
+        // With one, the reopen puts the record back before the scan
+        // reads a byte.
+        let saved = dir.path().join("saved.zu2");
+        let was = tear(&saved);
+        let mut journal = saved.clone().into_os_string();
+        journal.push(".relink");
+        std::fs::write(&journal, super::journal::encode(&[(victim, was)])).expect("journal");
+
+        let db = Db::open(&saved, options).expect("reopen");
+        let mut s = db.session();
+        let mut out = Vec::new();
+        for i in 0..records {
+            assert!(
+                s.read(&key(i), &mut out).expect("read"),
+                "the journal did not put the file back, and k{i:04} is gone"
+            );
+            assert_eq!(out, vec![b'x'; 100], "k{i:04} came back wrong");
+        }
+        drop(s);
+        assert!(
+            !std::path::Path::new(&journal).exists(),
+            "the journal is still there after the reopen that applied it"
+        );
+    }
 
     /// A page whose last record leaves less room than a header, which is
     /// the gap the tail allocator makes when the next record does not

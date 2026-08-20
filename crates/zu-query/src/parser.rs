@@ -3769,7 +3769,7 @@ impl Parser<'_> {
         {
             return Ok(Expr::GraphRef(GraphRef::Home));
         }
-        // ISO 20.6, the datetime value functions. They are bare words
+        // ISO 20.27, the datetime value functions. They are bare words
         // and not calls, the grammar giving them no parentheses, so a
         // statement asking what time it is writes CURRENT_DATE and
         // nothing behind it. Reading them here takes nothing away from
@@ -3806,7 +3806,7 @@ impl Parser<'_> {
         {
             return Ok(Expr::List(self.parse_bracketed_items()?));
         }
-        // The record constructor of ISO 20.19, whose name is optional
+        // The record constructor of ISO 20.18, whose name is optional
         // in the same way: `RECORD {a: 1}` and `{a: 1}` are the same
         // record. A brace after a name begins nothing else, so
         // `record` stays free to be a variable everywhere else.
@@ -4022,7 +4022,7 @@ impl Parser<'_> {
     /// `None` means this was not a temporal literal at all and the
     /// caller should carry on reading a variable or a call.
     fn temporal_literal(&mut self, name: &str) -> Result<Option<Expr>> {
-        // ISO 21.5 writes a duration two ways, `DURATION 'P1D'` and the
+        // ISO 21.2 writes a duration two ways, `DURATION 'P1D'` and the
         // SQL spelling, and the SQL one is a grammar of its own rather
         // than another string to read.
         if name.eq_ignore_ascii_case("INTERVAL") {
@@ -4264,7 +4264,7 @@ impl Parser<'_> {
         Ok(args)
     }
 
-    /// `CASE`, ISO 19.4 and GE01, the word already read.
+    /// `CASE`, ISO 20.7 and GE01, the word already read.
     ///
     /// Both forms are read here, and which one this is is settled by
     /// what follows `CASE`: a `WHEN` means the searched form, and

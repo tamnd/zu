@@ -99,7 +99,7 @@ words = ["MERGE", "SESSION"]
 
 [[group]]
 kind = "keyword"
-doc = "The fields an interval qualifier is written with, and the TO that names a range of them. ISO 21.5 gives a duration a second spelling, a string with a qualifier behind it, and the qualifier is the whole of what says how to read the string: '1-2' is a year and two months under YEAR TO MONTH and is no duration at all under DAY. A field word can only stand behind an interval string, so each of these is an ordinary variable name everywhere else, and DAY is the same kind of word DATE is."
+doc = "The fields an interval qualifier is written with, and the TO that names a range of them. ISO 21.2 gives a duration a second spelling, a string with a qualifier behind it, and the qualifier is the whole of what says how to read the string: '1-2' is a year and two months under YEAR TO MONTH and is no duration at all under DAY. A field word can only stand behind an interval string, so each of these is an ordinary variable name everywhere else, and DAY is the same kind of word DATE is."
 words = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "TO"]
 
 [[group]]
@@ -114,7 +114,7 @@ words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "ELEMENT_ID", "SI
 
 [[group]]
 kind = "function"
-doc = "The numeric library of ISO 20.16, 20.17 and 20.18. The first six are the exact ones, which answer the type they were given, and CEILING is the long spelling of CEIL; ROUND is the one of the six that takes a second argument, the number of digits to keep, and a negative count of digits rounds to tens and hundreds. MOD and POWER take two arguments and the rest take one. The other fifteen are approximate and answer a float whatever they were handed, because a square root, a logarithm and a sine are not exact numbers and a function that answered an integer for SQRT(4) and a float for SQRT(2) would be two functions wearing one name. LOG takes the base first and the value second, which is the order ISO 20.18 gives it and the opposite of the order a school book writes."
+doc = "The numeric library of ISO 20.22. The first six are the exact ones, which answer the type they were given, and CEILING is the long spelling of CEIL; ROUND is the one of the six that takes a second argument, the number of digits to keep, and a negative count of digits rounds to tens and hundreds. MOD and POWER take two arguments and the rest take one. The other fifteen are approximate and answer a float whatever they were handed, because a square root, a logarithm and a sine are not exact numbers and a function that answered an integer for SQRT(4) and a float for SQRT(2) would be two functions wearing one name. LOG takes the base first and the value second, which is the order ISO 20.22 gives it and the opposite of the order a school book writes."
 words = ["ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "SIGN", "MOD", "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "DEGREES", "RADIANS"]
 
 [[group]]
@@ -129,7 +129,7 @@ words = ["LEFT", "RIGHT"]
 
 [[group]]
 kind = "keyword"
-doc = "The datetime value functions of ISO 20.6, which ask what time the statement is running at. They are keywords here rather than functions because that is how they are written: the grammar gives them no parentheses, so CURRENT_DATE stands alone and CURRENT_DATE() is a call to a function nobody defined. The three CURRENT words answer in the session's time zone and the two LOCAL ones answer without a zone at all. Every one of them in a statement answers the same instant, so a query returning CURRENT_DATE beside CURRENT_TIMESTAMP cannot have them land on two different days."
+doc = "The datetime value functions of ISO 20.27, which ask what time the statement is running at. They are keywords here rather than functions because that is how they are written: the grammar gives them no parentheses, so CURRENT_DATE stands alone and CURRENT_DATE() is a call to a function nobody defined. The three CURRENT words answer in the session's time zone and the two LOCAL ones answer without a zone at all. Every one of them in a statement answers the same instant, so a query returning CURRENT_DATE beside CURRENT_TIMESTAMP cannot have them land on two different days."
 words = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCAL_TIME", "LOCAL_TIMESTAMP"]
 
 [[group]]

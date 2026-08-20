@@ -313,7 +313,7 @@ fn the_word_in_front_of_a_reference_parameter_says_nothing_the_value_does_not() 
 }
 
 /// GE08. The standard writes a reference parameter with two dollar
-/// signs, `<substituted parameter reference>` in ISO 21.10, and a
+/// signs, `<substituted parameter reference>` in ISO 21.3, and a
 /// value parameter with one. Both name the same parameter here,
 /// because what a parameter holds is settled by the value that
 /// arrives, which is the rule the word in front of it is read under

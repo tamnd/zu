@@ -281,7 +281,7 @@ fn what_the_registry_refuses() {
     assert!(says.contains("takes 1 or 2 argument(s), got 3"), "{says}");
 }
 
-/// The datetime value functions of ISO 20.6: what time the statement
+/// The datetime value functions of ISO 20.27: what time the statement
 /// is running at, cut five ways.
 ///
 /// Two things are asked here that no other function asks. One is that

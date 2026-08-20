@@ -232,7 +232,7 @@ fn path_length_counts_the_edges_and_not_the_elements() {
     assert_eq!(one(&mut db, source), Value::Int(3));
 }
 
-/// ISO 20.9. `ELEMENTS` is how a query reads what a path holds, since
+/// ISO 20.16. `ELEMENTS` is how a query reads what a path holds, since
 /// a path is a value of its own and nothing indexes into one. The list
 /// it answers is the walk in the order it was taken, a node at each end
 /// and an edge between each pair of them.

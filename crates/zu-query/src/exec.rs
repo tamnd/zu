@@ -856,7 +856,7 @@ pub struct Options {
     /// statements. The default is the handle nobody armed, so a caller
     /// who wants none pays a branch per chunk.
     pub interrupt: Interrupt,
-    /// The instant the datetime value functions of ISO 20.6 answer,
+    /// The instant the datetime value functions of ISO 20.27 answer,
     /// `None` for a run that has not read a clock yet.
     ///
     /// It is here for the reason the interrupt is: it is state one
@@ -6352,7 +6352,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
-        // ISO 20.6, the instant behind the five datetime value
+        // ISO 20.27, the instant behind the five datetime value
         // functions. It was read once before the first stage and is
         // handed out here as many times as the rows ask for it, so a
         // scan of ten million rows makes no system call at all and

@@ -811,7 +811,7 @@ cases:
             value: "-P1D"
 
   - name: datetime-value-function-types
-    doc: The five words of ISO 20.6 and the five types they answer. Three carry a displacement and two do not, and an engine that answers a local time where a zoned one was asked for has thrown away the field a reader would have compared on.
+    doc: The five words of ISO 20.27 and the five types they answer. Three carry a displacement and two do not, and an engine that answers a local time where a zoned one was asked for has thrown away the field a reader would have compared on.
     query: RETURN CURRENT_DATE IS TYPED DATE AND CURRENT_TIME IS TYPED ZONED TIME AND CURRENT_TIMESTAMP IS TYPED ZONED DATETIME AND LOCAL_TIME IS TYPED LOCAL TIME AND LOCAL_TIMESTAMP IS TYPED LOCAL DATETIME AS n
     columns:
       - n

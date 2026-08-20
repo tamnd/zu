@@ -1089,3 +1089,110 @@ cases:
       - values:
           - type: INT64
             value: "4"
+
+  - name: the-three-ends-a-trim-can-take
+    doc: ISO 20.24. TRIM, TRIM LEADING and TRIM TRAILING over a stored column, which is one loop and three answers: the ends a trim takes characters off are the whole of what separates the spellings. The name here begins with one letter and ends with another, so each end shows on its own.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN TRIM('n' FROM n.name) AS b, TRIM(LEADING 'a' FROM n.name) AS l, TRIM(TRAILING 'n' FROM n.name) AS r
+    columns:
+      - b
+      - l
+      - r
+    rows:
+      - values:
+          - type: STRING
+            value: "a"
+          - type: STRING
+            value: "nn"
+          - type: STRING
+            value: "a"
+
+  - name: a-trim-of-a-set-takes-any-of-its-members
+    doc: GF05. BTRIM over a column, where the set holds every letter of two of the four names and neither of the letters the other two begin with. A name made only of members trims away to the empty string, which is a value and not a missing one.
+    query: MATCH (n:person) RETURN btrim(n.name, 'adin') AS t ORDER BY t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+
+  - name: the-three-set-trims-differ-only-in-which-end
+    doc: LTRIM, RTRIM and BTRIM over one stored value, each handed the set that suits it. The name is two letters and each function is asked for a different one of them, so the three answers say which end each function read.
+    query: MATCH (n:person) WHERE n.name = 'di' RETURN ltrim(n.name, 'd') AS l, rtrim(n.name, 'i') AS r, btrim(n.name, 'di') AS b
+    columns:
+      - l
+      - r
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "i"
+          - type: STRING
+            value: "d"
+          - type: STRING
+            value: ""
+
+  - name: a-trim-takes-whole-characters-outside-ascii
+    doc: A trim over a stored string holding an accented letter, first taking the plain letter in front of it and then the accented letter itself. An engine that trimmed bytes rather than characters would cut the accented letter in half and answer something that is not text at all.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN ltrim(n.tag, 'h') AS a, btrim(ltrim(n.tag, 'h'), 'é') AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "éllo"
+          - type: STRING
+            value: "llo"
+
+  - name: a-trim-in-a-filter
+    doc: A trim in a predicate, which is how a query matches a value whose padding it does not want to write out. The comparison is against a written string, so the row that matches is the one whose stored name trims onto it.
+    query: MATCH (n:person) WHERE ltrim(n.name, 'a') = 'nn' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-trim-with-nothing-to-take-answers-what-it-was-given
+    doc: A trim of spaces over a column that holds none, counting the rows it left exactly as they were. All four tags come back unchanged, the empty string and the emoji among them, so this says a trim that finds no member at either end stops rather than taking a character anyway.
+    query: MATCH (n:person) WHERE btrim(n.tag, ' ') = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-trim-feeding-a-length
+    doc: A count of a trimmed string, which asks whether the answer of one string function is a proper argument to the next and whether an answer that trimmed away to nothing counts as nought rather than as a missing value.
+    query: MATCH (n:person) RETURN char_length(btrim(n.name, 'adin')) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "2"
+
+  - name: a-trim-of-more-than-one-character-over-a-column-raises
+    doc: TRIM takes one character whatever it is trimming, so a column argument does not make a longer trim string acceptable. The condition belongs to what was written rather than to any row, so it is raised whether a row is read or not.
+    query: MATCH (n:person) RETURN TRIM('ab' FROM n.name) AS t
+    raises: "22027"

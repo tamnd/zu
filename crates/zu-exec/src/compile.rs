@@ -20,7 +20,7 @@ use zu_common::types::LogicalType;
 use zu_common::{IdMap, Result};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{
-    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Math, Schema, TableFunc,
+    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Math, Schema, TableFunc, Trim,
 };
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
@@ -29,7 +29,7 @@ use zu_query::snapshot::{
 };
 use zu_vector::{
     BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
-    StrFold, StrLen,
+    StrFold, StrLen, StrTrim, TrimSet,
 };
 
 use crate::join::JoinTable;
@@ -3269,7 +3269,7 @@ impl Compiler<'_> {
     /// root or an angle is a float whatever arrived, so a projection
     /// holding one would have nowhere to land without this.
     ///
-    /// Or a string, which is what a fold answers. A computed string
+    /// Or a string, which a fold and a trim answer. A computed string
     /// column is read back exactly the way a stored one is, the vector
     /// carrying the bytes its kernel made along with the views into
     /// them, so nothing downstream of here has to know which of the two
@@ -3291,7 +3291,8 @@ impl Compiler<'_> {
                         | Func::CharLength
                         | Func::OctetLength
                         | Func::Upper
-                        | Func::Lower,
+                        | Func::Lower
+                        | Func::Trim(_),
                     ..
                 }
         ) {
@@ -4381,6 +4382,52 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::StrFold { op, src, dst });
                 Ok(Some(dst))
             }
+            // GF06 and GF05, the trim family: six spellings of one
+            // loop. Two of the six differences are settled here rather
+            // than in the kernel. A set that is not written out sends
+            // the query back, since a set that is a column would be a
+            // different set a row and the kernel prepares one; and a
+            // TRIM handed more than a single character raises `22027`,
+            // which the old engine says in its own words, so that shape
+            // goes back as well rather than being said twice.
+            BoundExpr::Call {
+                func: Func::Trim(trim),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if (1..=2).contains(&args.len()) => {
+                let chars = match args.get(1) {
+                    None => " ".to_string(),
+                    Some(arg) => match self.const_value(arg) {
+                        Some(Value::Str(s)) => s,
+                        _ => return Ok(None),
+                    },
+                };
+                let ends = match trim {
+                    Trim::Both | Trim::Btrim => StrTrim::Both,
+                    Trim::Leading | Trim::Ltrim => StrTrim::Leading,
+                    Trim::Trailing | Trim::Rtrim => StrTrim::Trailing,
+                };
+                let one_character = matches!(trim, Trim::Both | Trim::Leading | Trim::Trailing);
+                if one_character && chars.chars().count() != 1 {
+                    return Ok(None);
+                }
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = ends.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrTrim {
+                    ends,
+                    set: Arc::new(TrimSet::new(&chars)),
+                    src,
+                    dst,
+                });
+                Ok(Some(dst))
+            }
             _ => Ok(None),
         }
     }
@@ -4716,8 +4763,10 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         } => !written_nonzero(&ops[..i], *r),
         ExprOp::MathPair { .. } => true,
         // A count has an answer for every string there is, so it is a
-        // computed column like a floor or an angle.
-        ExprOp::StrLen { .. } | ExprOp::StrFold { .. } => false,
+        // computed column like a floor or an angle. So does a fold, and
+        // so does a trim: the trim family's one condition is about the
+        // set a statement wrote and the compiler settles it there.
+        ExprOp::StrLen { .. } | ExprOp::StrFold { .. } | ExprOp::StrTrim { .. } => false,
         _ => false,
     })
 }

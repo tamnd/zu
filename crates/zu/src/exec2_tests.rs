@@ -494,6 +494,22 @@ fn covered_queries() -> &'static [&'static str] {
         // either side to translate against.
         "MATCH (p:person) WHERE upper(p.name) = p.name RETURN count(*) AS n",
         "MATCH (p:person) WHERE lower(p.name) = p.name RETURN count(*) AS n",
+        // The trim family, which is six spellings of one loop and the
+        // kernel that answers without writing a byte. One of each end,
+        // one set of several characters, and the explicit form the
+        // standard writes with LEADING in it.
+        "MATCH (p:person) RETURN TRIM('p' FROM p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN ltrim(p.name, 'p') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN rtrim(p.name, '0123456789') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN btrim(p.name, 'p0123456789') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN TRIM(LEADING 'p' FROM p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it was trimmed from, which is the same four
+        // places the folds are tried in.
+        "MATCH (p:person) WHERE ltrim(p.name, 'p') = '7' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN rtrim(p.name, '0123456789') AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE char_length(ltrim(p.name, 'p')) > 1 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE TRIM('p' FROM p.name) = p.name RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
@@ -1108,6 +1124,9 @@ fn fallback_queries() -> &'static [&'static str] {
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
+        // A trim set that is a column is a different set a row, and
+        // the kernel prepares one set for the chunk.
+        "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
     ]
 }
 
@@ -1257,6 +1276,35 @@ fn a_chunk_is_thinned_only_when_the_bound_takes_most_of_it() {
         ) > 0,
         "a bound one row in ten passes is"
     );
+}
+
+/// TRIM takes one character and raises `22027` when it is handed
+/// more. The compiler reads the written set and knows that condition
+/// is coming, so the shape goes back to the old engine and the message
+/// the statement gets is the one that engine writes, said once and in
+/// one place.
+#[test]
+fn a_trim_of_more_than_one_character_still_raises() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, _, _) = setup(&dir.path().join("trim.zu1"));
+    let err = query::run(
+        "MATCH (p:person) RETURN TRIM('p0' FROM p.name) AS b",
+        &mut db,
+        &[],
+    )
+    .expect_err("a trim of two characters has no answer");
+    let text = err.to_string();
+    assert!(text.contains("22027"), "{text}");
+    assert!(text.contains("btrim, ltrim and rtrim"), "{text}");
+    // The set a query wrote out is trimmed on the pipeline, and the
+    // same trim of a set nobody wrote is the default space.
+    let r = query::run(
+        "MATCH (p:person) WHERE p.id = 7 RETURN ltrim(p.name, 'p') AS b",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Str("7".to_string())]]);
 }
 
 #[test]

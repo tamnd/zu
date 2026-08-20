@@ -6,13 +6,16 @@
 //! probes. The optimizer integration lands with the perf/03 executor;
 //! this module owns the program shape and the evaluator.
 
+use std::sync::Arc;
+
 use zu_common::{Result, ZuError};
 
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
-    BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, binary, compare, fold, length, pair, unary,
+    BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, StrTrim, TrimSet, binary, compare, fold,
+    length, pair, trim, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -80,6 +83,16 @@ pub enum ExprOp {
     /// than only numbers.
     StrFold {
         op: StrFold,
+        src: Reg,
+        dst: Reg,
+    },
+    /// A trim of a string, off either end or both. The set of
+    /// characters is whatever the statement wrote, prepared once at
+    /// compile time and shared by every chunk the program runs over,
+    /// since it is the same set for all of them.
+    StrTrim {
+        ends: StrTrim,
+        set: Arc<TrimSet>,
         src: Reg,
         dst: Reg,
     },
@@ -189,6 +202,19 @@ impl Program {
                     let out = {
                         let v = resolve(&regs, *src, chunk)?;
                         fold(arena, *op, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrTrim {
+                    ends,
+                    set,
+                    src,
+                    dst,
+                } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        trim(arena, *ends, set, v)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

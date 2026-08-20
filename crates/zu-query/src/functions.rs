@@ -20,7 +20,7 @@
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{Result, ZuError, unicode};
+use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
 
 use crate::ast::{DatetimeFn, Literal};
 use crate::binder::{BoundExpr, Cut, Func, Math, Trim, Type};
@@ -657,6 +657,42 @@ pub static REGISTRY: &[Signature] = &[
         star: false,
         by_name: false,
         kernel: Some(datetime_kernel),
+    },
+    // ISO 20.28, the datetime subtraction. Two rows, for the reason the
+    // trims have six: the qualifier behind the brackets says which of
+    // the two duration kinds the answer is, and that is a different
+    // function and not a different argument. The row for months is not
+    // reachable by name, the only thing that picks it being the
+    // qualifier the parser read, and it carries the qualifier in its
+    // name the way `trim_leading` carries the end it trims, so that a
+    // refusal names the form the statement wrote.
+    Signature {
+        name: "duration_between",
+        aliases: &[],
+        func: Func::DurationBetween(DurationKind::DayTime),
+        arity: Arity::Exactly(2),
+        arg: Kind::Any,
+        needs: "needs two datetimes of one shape",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(duration_between_kernel),
+    },
+    Signature {
+        name: "duration_between_year_to_month",
+        aliases: &[],
+        func: Func::DurationBetween(DurationKind::YearMonth),
+        arity: Arity::Exactly(2),
+        arg: Kind::Any,
+        needs: "needs two datetimes of one shape",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(duration_between_kernel),
     },
     Signature {
         name: "normalize",
@@ -1404,6 +1440,53 @@ fn datetime_kernel(func: Func, args: &[Value]) -> Result<Value> {
         ))
     })?;
     Ok(Value::Temporal(cut))
+}
+
+/// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO 20.28.
+///
+/// The answer runs from the first argument to the second, so it is
+/// positive when the second is the later of the two. The standard
+/// writes the two as `<datetime value expression 1>` and `<datetime
+/// value expression 2>` and the publicly readable part of it does not
+/// say which way round the subtraction goes, so zu reads the name: the
+/// duration between a and b is the one that carries a to b. That is
+/// also what every graph engine a query would be ported from answers.
+///
+/// The counting itself is `Temporal::between`, which is also what the
+/// minus operator over two instants answers, so a query written either
+/// way gets the same number.
+fn duration_between_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let Func::DurationBetween(kind) = func else {
+        return Err(invalid(format!(
+            "{}() is not a datetime subtraction",
+            name_of(func)
+        )));
+    };
+    let read = |at: usize| -> Result<Option<Temporal>> {
+        match args.get(at).map(|value| settle(value.clone())) {
+            Some(Value::Temporal(instant)) => Ok(Some(instant)),
+            Some(Value::Null) => Ok(None),
+            Some(other) => Err(gql(
+                codes::C22G03,
+                format!("duration_between() expects a datetime, got {other:?}"),
+            )),
+            None => Err(invalid("duration_between() was given no datetime".into())),
+        }
+    };
+    let (Some(from), Some(to)) = (read(0)?, read(1)?) else {
+        return Ok(Value::Null);
+    };
+    Temporal::between(from, to, kind)
+        .map(Value::Temporal)
+        .ok_or_else(|| {
+            gql(
+                codes::C22G03,
+                format!(
+                    "there is no {} from {from} to {to}",
+                    LogicalType::Duration(kind)
+                ),
+            )
+        })
 }
 
 /// The string an argument holds, or nothing where it holds a null.

@@ -133,6 +133,11 @@ doc = "The datetime value functions of ISO 20.27, which ask what time the statem
 words = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCAL_TIME", "LOCAL_TIMESTAMP"]
 
 [[group]]
+kind = "function"
+doc = "The datetime subtraction of ISO 20.28, which answers the length of time from the first datetime to the second. A qualifier may stand behind the closing bracket, YEAR TO MONTH or DAY TO SECOND and neither of the other four runs of fields, and it says which of the two duration kinds the answer is. Leaving it out reads as DAY TO SECOND, which is the same answer a minus between the two datetimes gives. The two arguments have to be the same shape, since a date and a time have no length between them and neither has a local datetime and a zoned one."
+words = ["DURATION_BETWEEN"]
+
+[[group]]
 kind = "keyword"
 doc = "The trim specification, which names the end of the string TRIM takes characters off, and the FROM that separates what is trimmed from what it is trimmed out of. They are words rather than arguments because an end of a string is not a value a row can hold, which is the arrangement a normal form has. FROM is here and nowhere else: a GQL query reads its rows from a pattern rather than from a table, so this is the one place the word stands."
 words = ["LEADING", "TRAILING", "BOTH", "FROM"]

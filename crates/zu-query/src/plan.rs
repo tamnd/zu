@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use zu_common::Result;
+use zu_common::{DurationKind, Result};
 
 use crate::ast::{
     BinaryOp, Conjunction, Literal, PathMode, RelDirection, Selector, SetOp, SortKey, UnaryOp,
@@ -1428,6 +1428,19 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             // thing no query can write and no reader asked for.
             if let Func::Datetime(which) = func {
                 return which.word().to_uppercase();
+            }
+            // ISO 20.28 puts the qualifier behind the brackets, so a
+            // plan that printed it as an argument would print text no
+            // query can write. It is printed even where the query left
+            // it out, since what a reader wants from a plan is which
+            // of the two the call settled on.
+            if let Func::DurationBetween(kind) = func {
+                let written: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+                let qualifier = match kind {
+                    DurationKind::YearMonth => "YEAR TO MONTH",
+                    DurationKind::DayTime => "DAY TO SECOND",
+                };
+                return format!("DURATION_BETWEEN({}) {qualifier}", written.join(", "));
             }
             let name = func_name(*func);
             let inner = if *star {

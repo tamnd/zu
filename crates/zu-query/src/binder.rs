@@ -16,7 +16,7 @@ use std::fmt;
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{LogicalType, Result, ZuError};
+use zu_common::{DurationKind, LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Conjunction, DatetimeFn, DeleteTarget, Expr, GraphRef, LabelExpr,
@@ -1738,6 +1738,13 @@ pub enum Func {
     /// call carries, so the clock is read once per statement however
     /// many of these it holds and however many rows they answer over.
     Datetime(DatetimeFn),
+    /// ISO 20.28, the datetime subtraction. The kind is on the function
+    /// rather than in the arguments for the reason a normal form is: it
+    /// is a qualifier the statement wrote and not a value a row holds,
+    /// so no row can change whether the answer counts months or
+    /// nanoseconds. A call that wrote no qualifier carries DAY TO
+    /// SECOND, which is what leaving it out means.
+    DurationBetween(DurationKind),
     /// ISO 20.24. The string in one of the four Unicode normal forms.
     /// The form is on the function rather than in the arguments because
     /// it is a word the statement wrote and not a value a row holds, so
@@ -5021,6 +5028,7 @@ impl Binder<'_> {
             // type of a temporal value is ANY here, the way a date
             // literal's is.
             Expr::Clock => Ok((BoundExpr::Clock, Type::Any)),
+            Expr::DurationBetween { args, kind } => self.bind_duration_between(args, *kind, ctx),
             Expr::IsNormalized {
                 expr,
                 form,
@@ -5627,6 +5635,22 @@ impl Binder<'_> {
         self.bind_row(at, func.word(), false, false, &[Expr::Clock], ctx)
     }
 
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28. The qualifier picks the row and the rest is the checking
+    /// every other call gets, which is how a call written with two
+    /// arguments and one written with three reach the same refusal.
+    fn bind_duration_between(
+        &mut self,
+        args: &[Expr],
+        kind: Option<DurationKind>,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let kind = kind.unwrap_or(DurationKind::DayTime);
+        let at = functions::row_of(Func::DurationBetween(kind))
+            .expect("a datetime subtraction has a row");
+        self.bind_row(at, "duration_between", false, false, args, ctx)
+    }
+
     /// A call whose row is already settled: the arity, the argument
     /// types, the folding and the answer's type, which every call gets
     /// however its name was written or whether it was written at all.
@@ -5879,6 +5903,15 @@ pub fn text(expr: &Expr) -> String {
         // the binder's own doing and naming a column after it would
         // name it after a thing the query never wrote.
         Expr::Clock => "CURRENT_TIMESTAMP".into(),
+        Expr::DurationBetween { args, kind } => {
+            let written: Vec<String> = args.iter().map(text).collect();
+            let qualifier = match kind {
+                Some(DurationKind::YearMonth) => " YEAR TO MONTH",
+                Some(DurationKind::DayTime) => " DAY TO SECOND",
+                None => "",
+            };
+            format!("DURATION_BETWEEN({}){qualifier}", written.join(", "))
+        }
         Expr::IsNormalized {
             expr,
             form,

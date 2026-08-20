@@ -6061,25 +6061,15 @@ fn temporal_arith(op: BinaryOp, a: &Value, b: &Value) -> Result<Value> {
             })?;
             shift(other, *kind, count)
         }
-        // Two instants of one kind subtract to the length between
+        // Two instants of one shape subtract to the length between
         // them, which is a day-time duration because the calendar is
-        // not involved in counting it.
-        (Sub, Temporal::Date(p), Temporal::Date(q)) => Ok(Value::Temporal(Temporal::Duration(
-            DurationKind::DayTime,
-            (i64::from(*p) - i64::from(*q)) * temporal::NANOS_PER_DAY,
-        ))),
-        (Sub, Temporal::LocalDatetime(p), Temporal::LocalDatetime(q))
-        | (Sub, Temporal::LocalTime(p), Temporal::LocalTime(q)) => Ok(Value::Temporal(
-            Temporal::Duration(DurationKind::DayTime, p - q),
-        )),
-        (
-            Sub,
-            Temporal::ZonedDatetime { nanos: p, .. },
-            Temporal::ZonedDatetime { nanos: q, .. },
-        ) => Ok(Value::Temporal(Temporal::Duration(
-            DurationKind::DayTime,
-            p - q,
-        ))),
+        // not involved in counting it. It is `DURATION_BETWEEN` with
+        // the arguments the other way round, and it is the same code,
+        // so the operator and the function cannot answer differently.
+        (Sub, left, right) => match Temporal::between(*right, *left, DurationKind::DayTime) {
+            Some(length) => Ok(Value::Temporal(length)),
+            None => refuse(),
+        },
         _ => refuse(),
     }
 }
@@ -6826,6 +6816,7 @@ impl AggState {
             | Func::Trim(_)
             | Func::Cut(_)
             | Func::Datetime(_)
+            | Func::DurationBetween(_)
             | Func::Normalize(_)
             | Func::IsNormalized(_)
             | Func::Math(_) => {

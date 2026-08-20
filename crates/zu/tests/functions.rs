@@ -11,8 +11,8 @@
 
 use zu::Database;
 use zu::query::Value;
-use zu_common::Temporal;
 use zu_common::temporal::NANOS_PER_DAY;
+use zu_common::{DurationKind, Temporal};
 
 fn opened(dir: &std::path::Path) -> Database {
     let db = Database::create(dir.join("functions.zu1")).expect("create");
@@ -360,4 +360,143 @@ fn the_datetime_value_functions_answer_one_instant() {
     // function nobody defined.
     let says = refused(&db, "RETURN CURRENT_DATE() AS d");
     assert!(says.contains("unknown function"), "{says}");
+}
+
+/// ISO 20.28, the datetime subtraction. The qualifier behind the
+/// brackets picks the kind of the answer, the answer runs from the
+/// first argument to the second, and the months are counted against
+/// zu's own month addition rather than against a comparison of day
+/// numbers.
+#[test]
+fn duration_between_counts_from_the_first_datetime_to_the_second() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+
+    let duration = |source: &str| match one(&db, source) {
+        Value::Temporal(Temporal::Duration(kind, count)) => (kind, count),
+        other => panic!("{source} answered {other:?}"),
+    };
+
+    // No qualifier is DAY TO SECOND, and DAY TO SECOND written out is
+    // the same call.
+    let january = "DATE '2024-01-31'";
+    let march = "DATE '2024-03-01'";
+    let thirty = 30 * NANOS_PER_DAY;
+    assert_eq!(
+        duration(&format!("RETURN DURATION_BETWEEN({january}, {march})")),
+        (DurationKind::DayTime, thirty)
+    );
+    assert_eq!(
+        duration(&format!(
+            "RETURN DURATION_BETWEEN({january}, {march}) DAY TO SECOND"
+        )),
+        (DurationKind::DayTime, thirty)
+    );
+
+    // Backwards is the same length with the other sign, and the minus
+    // operator is the same call with the arguments the other way round.
+    assert_eq!(
+        duration(&format!("RETURN DURATION_BETWEEN({march}, {january})")),
+        (DurationKind::DayTime, -thirty)
+    );
+    assert_eq!(
+        duration(&format!("RETURN {march} - {january}")),
+        (DurationKind::DayTime, thirty)
+    );
+
+    // A month is whole or it is not counted, and what counts as whole
+    // is stated by the addition: 31 January to 1 March is one month
+    // and a day, and 31 March to 30 April is one month exactly,
+    // because 31 March plus one month is 30 April.
+    assert_eq!(
+        duration(&format!(
+            "RETURN DURATION_BETWEEN({january}, {march}) YEAR TO MONTH"
+        )),
+        (DurationKind::YearMonth, 1)
+    );
+    assert_eq!(
+        duration("RETURN DURATION_BETWEEN(DATE '2024-03-31', DATE '2024-04-30') YEAR TO MONTH"),
+        (DurationKind::YearMonth, 1)
+    );
+    assert_eq!(
+        duration("RETURN DURATION_BETWEEN(DATE '2020-01-15', DATE '2024-07-14') YEAR TO MONTH"),
+        (DurationKind::YearMonth, 53)
+    );
+    assert_eq!(
+        duration(&format!(
+            "RETURN DURATION_BETWEEN({march}, {january}) YEAR TO MONTH"
+        )),
+        (DurationKind::YearMonth, -1)
+    );
+
+    // The time of day is part of the answer, and a zoned value is read
+    // on its own wall clock for the months and on the instant for the
+    // nanoseconds.
+    assert_eq!(
+        duration(
+            "RETURN DURATION_BETWEEN(LOCAL DATETIME '2024-01-01T23:00:00', \
+             LOCAL DATETIME '2024-01-02T01:30:00')"
+        ),
+        (
+            DurationKind::DayTime,
+            2 * 3_600_000_000_000 + 1_800_000_000_000
+        )
+    );
+    assert_eq!(
+        duration(
+            "RETURN DURATION_BETWEEN(ZONED DATETIME '2024-01-01T00:00:00+07:00', \
+             ZONED DATETIME '2024-01-01T00:00:00Z')"
+        ),
+        (DurationKind::DayTime, 7 * 3_600_000_000_000)
+    );
+
+    // A null on either side answers null, the way every other kernel
+    // does.
+    assert_eq!(
+        one(&db, &format!("RETURN DURATION_BETWEEN({january}, NULL)")),
+        Value::Null
+    );
+
+    // Two values of different shapes have no length between them, and
+    // neither has a value that is not a datetime at all.
+    let says = refused(
+        &db,
+        "RETURN DURATION_BETWEEN(DATE '2024-01-31', LOCAL TIME '10:00:00')",
+    );
+    assert!(says.contains("no DAY TIME DURATION"), "{says}");
+    let says = refused(&db, "RETURN DURATION_BETWEEN(1, 2)");
+    assert!(says.contains("expects a datetime"), "{says}");
+
+    // The arity is the row's, so a short call is refused the way every
+    // short call is.
+    let says = refused(&db, &format!("RETURN DURATION_BETWEEN({january})"));
+    assert!(says.contains("takes 2 argument(s)"), "{says}");
+
+    // Only the two runs the standard names are a qualifier.
+    let says = refused(
+        &db,
+        &format!("RETURN DURATION_BETWEEN({january}, {march}) YEAR TO DAY"),
+    );
+    assert!(says.contains("not a duration qualifier"), "{says}");
+
+    // Everything above is answered while binding, both arguments being
+    // literals, so the same call is run once over arguments that are
+    // not, which is the kernel the rows go through.
+    assert_eq!(
+        duration("RETURN DURATION_BETWEEN(CURRENT_DATE, CURRENT_DATE)"),
+        (DurationKind::DayTime, 0)
+    );
+    assert_eq!(
+        duration("RETURN DURATION_BETWEEN(CURRENT_DATE, CURRENT_DATE) YEAR TO MONTH"),
+        (DurationKind::YearMonth, 0)
+    );
+
+    // The plan prints the qualifier behind the brackets, where a query
+    // writes it, and prints it even where the query left it out.
+    let mut conn = db.connect().expect("connect");
+    let plan = conn
+        .explain("RETURN DURATION_BETWEEN(CURRENT_DATE, CURRENT_DATE)")
+        .expect("explain");
+    assert!(plan.contains("DURATION_BETWEEN"), "{plan}");
+    assert!(plan.contains("DAY TO SECOND"), "{plan}");
 }

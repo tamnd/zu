@@ -12,7 +12,8 @@
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
 use zu_common::{
-    Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result, Temporal, ZuError,
+    DurationKind, Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result,
+    Temporal, ZuError,
 };
 
 use crate::ast::{
@@ -3785,6 +3786,13 @@ impl Parser<'_> {
         {
             return Ok(Expr::Datetime(func));
         }
+        // ISO 20.28, the datetime subtraction. It looks like a call
+        // until the closing bracket, and then a qualifier may follow
+        // where a call has nothing, so the call path cannot read it and
+        // the name is caught here instead.
+        if self.at(&TokenKind::LParen) && name.eq_ignore_ascii_case("duration_between") {
+            return self.parse_duration_between();
+        }
         // GE01 and GE02, the reference a caller passed in. `GRAPH $g`
         // and `BINDING TABLE $t` say what the parameter holds and
         // nothing else, which is what `USE GRAPH $g` beside `USE $g`
@@ -4710,6 +4718,73 @@ impl Parser<'_> {
             star: false,
             args,
         })
+    }
+
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28, with the name read and the bracket standing.
+    ///
+    /// The arguments are read the way a call's are and counted where a
+    /// call's are, on the row, so `DURATION_BETWEEN(a)` is refused with
+    /// the same words every other short call is refused with.
+    fn parse_duration_between(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::DurationBetween {
+            args,
+            kind: self.temporal_duration_qualifier()?,
+        })
+    }
+
+    /// The `YEAR TO MONTH` or `DAY TO SECOND` behind a datetime
+    /// subtraction, or nothing where none is written.
+    ///
+    /// Only those two runs are a temporal duration qualifier, which is
+    /// narrower than an interval qualifier: the answer is a whole
+    /// duration of one kind or the other and never a run of fields
+    /// inside one. The words are read only when a `TO` and a second
+    /// field stand behind the first, so nothing that is not a
+    /// qualifier is eaten and `MONTH TO DAY` still reaches a refusal
+    /// that names it.
+    fn temporal_duration_qualifier(&mut self) -> Result<Option<DurationKind>> {
+        let field = |at: usize| match self.tokens.get(at) {
+            Some(Token {
+                kind: TokenKind::Ident(word),
+                ..
+            }) => IntervalField::spelled(word),
+            _ => None,
+        };
+        let (Some(start), Some(end)) = (field(self.pos), field(self.pos + 2)) else {
+            return Ok(None);
+        };
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token { kind: TokenKind::Ident(word), .. }) if word.eq_ignore_ascii_case("TO"))
+        {
+            return Ok(None);
+        }
+        let at = self.pos;
+        self.pos += 3;
+        match (start, end) {
+            (IntervalField::Year, IntervalField::Month) => Ok(Some(DurationKind::YearMonth)),
+            (IntervalField::Day, IntervalField::Second) => Ok(Some(DurationKind::DayTime)),
+            _ => Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.tokens[at].start,
+                format_args!(
+                    "{} TO {} is not a duration qualifier, which is YEAR TO MONTH or DAY TO SECOND and nothing else",
+                    start.word(),
+                    end.word()
+                ),
+            )),
+        }
     }
 }
 

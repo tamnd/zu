@@ -844,3 +844,63 @@ cases:
     doc: The grammar writes these as bare words, so the brackets are a call to a function that does not exist. An engine accepting them is accepting a spelling no other engine has to.
     query: RETURN CURRENT_DATE() AS n
     raises: "42002"
+
+  - name: duration-between-day-to-second
+    doc: The datetime subtraction of ISO 20.28 with no qualifier, which reads as DAY TO SECOND. Thirty days lie between the two dates, and an engine counting the calendar months instead answers a month here.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P30D"
+
+  - name: duration-between-runs-from-the-first-to-the-second
+    doc: The answer carries the first argument to the second, so it is negative when the second is the earlier of the two. An engine subtracting the other way round answers every duration in a ported query with the wrong sign, which no type check catches.
+    query: RETURN DURATION_BETWEEN(DATE '2024-03-01', DATE '2024-01-31') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "-P30D"
+
+  - name: duration-between-agrees-with-the-minus
+    doc: The function and the operator count the same thing with the arguments the other way round, so an engine whose two paths were written twice is caught here rather than by a reader noticing years later.
+    query: RETURN DURATION_BETWEEN(LOCAL DATETIME '2024-01-01T00:00:00', LOCAL DATETIME '2024-01-01T01:00:00') = LOCAL DATETIME '2024-01-01T01:00:00' - LOCAL DATETIME '2024-01-01T00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: duration-between-year-to-month
+    doc: The qualifier behind the closing bracket says the answer counts months, and a month is whole or it is not counted, so a month and a day is one month.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') YEAR TO MONTH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1M"
+
+  - name: duration-between-zoned-reads-the-instant
+    doc: Two zoned datetimes written for two different wall clocks in two zones are seven hours apart, which is the instant between them and not the digits. An engine comparing the written times answers nothing here.
+    query: RETURN DURATION_BETWEEN(ZONED DATETIME '2024-01-01T00:00:00+07:00', ZONED DATETIME '2024-01-01T00:00:00Z') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT7H"
+
+  - name: duration-between-refuses-two-shapes
+    doc: A date and a time have no length between them, so the call is refused rather than answered by reading one of them as the other.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', LOCAL TIME '10:00:00') AS n
+    raises: "22G03"
+
+  - name: duration-between-takes-only-the-two-qualifiers
+    doc: A temporal duration qualifier is YEAR TO MONTH or DAY TO SECOND and neither of the other four runs of fields, which is narrower than the qualifier behind an interval string.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') YEAR TO DAY AS n
+    raises: "42001"

@@ -65,6 +65,13 @@ pub(crate) const COMMANDS: &[Command] = &[
         see_also: &["shell", "explain", "stat"],
     },
     Command {
+        name: "lsp",
+        summary: "speak the language server protocol, for an editor",
+        synopsis: &["zu lsp --stdio [--db <file.zu1>]"],
+        examples: &["zu lsp --stdio", "zu lsp --stdio --db graph.zu1"],
+        see_also: &["shell", "query"],
+    },
+    Command {
         name: "copy",
         summary: "bulk load an edge list, or a whole dataset, into a new file",
         synopsis: &[

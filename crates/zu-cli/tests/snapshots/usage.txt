@@ -8,6 +8,11 @@ $ zu query --no-such-flag
 ! try `zu query --help` for examples
 # exit 2
 
+$ zu lsp --no-such-flag
+! usage: zu lsp --stdio [--db <file.zu1>]
+! try `zu lsp --help` for examples
+# exit 2
+
 $ zu copy --no-such-flag
 ! usage: zu copy [--reorder degree|bfs|none] [--nodes <nodes.csv>] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
 !        zu copy --node <Table>=<nodes.csv> ... --rel <Table>=<From>:<To>:<rels.csv> ... <out.zu1> [--format text|json]

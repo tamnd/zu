@@ -306,22 +306,34 @@ impl Db {
     /// a caller that wants the space now: a loader that has finished, or
     /// a benchmark about to measure the file.
     ///
-    /// Two stopping conditions, and the second is not optional. A pass
-    /// that found nothing to read is done, plainly. A pass that found
-    /// everything it read still live is also done, because its copies are
-    /// now the oldest thing in the log and the next pass would read those
-    /// same records and copy them again. Without that test a live set
-    /// larger than the mutable window makes this loop forever, walking
-    /// its own copies up the address space.
+    /// Nothing above the tail as it stands when this is called belongs to
+    /// this call. It is either a writer's record or one of the loop's own
+    /// copies, and a pass that reaches into the copies reads the live set
+    /// a second time and writes it a third. So the ceiling is clamped
+    /// there, the region only ever shrinks from the bottom, and the loop
+    /// ends when `begin` has walked up to meet it.
+    ///
+    /// That is also what stops it running forever. The clamp used to be a
+    /// test on the pass instead: a pass that found everything it read
+    /// still live was taken as done, because its copies were then the
+    /// oldest thing in the log and the next pass would copy them again.
+    /// It terminated, and it cost. Any pass that straddled the join
+    /// between the original records and the copies had one dead record in
+    /// it, so the test did not fire and the loop went round again, and on
+    /// a 381 MiB log with a 266 MiB live set it took twenty one passes
+    /// and spent 5793 MiB of addresses to save 115 MiB. It also stopped
+    /// early on the other side, because a first pass over an all live
+    /// region ended the loop with the dead records above it untouched.
     pub fn compact(&self) -> Result<u64> {
         let mut session = self.core.session();
         let mut reclaimed = 0;
+        let started_at = page_start(page_of(self.core.log.tail()));
         loop {
-            let upto = compact::ceiling(&session);
+            let upto = compact::ceiling(&session).min(started_at);
             let pass = compact::compact(&mut session, upto)?;
             self.core.compaction.note(&pass);
             reclaimed += pass.reclaimed;
-            if pass.scanned == 0 || pass.copied == pass.scanned {
+            if pass.scanned == 0 {
                 return Ok(reclaimed);
             }
         }

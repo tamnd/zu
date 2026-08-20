@@ -496,3 +496,67 @@ fn a_chain_through_a_full_bucket_survives_compaction() {
         assert_eq!(out, value(i, rounds - 1), "wrong value for {i} on reopen");
     }
 }
+
+#[test]
+fn a_compaction_copies_the_live_set_about_once() {
+    // The bound this test exists for. 30000 records are written once and
+    // then overwritten 30000 times at random, so half the log is dead and
+    // the live half is scattered evenly through it rather than sitting in
+    // one block. Reclaiming that should cost one copy of what is live and
+    // no more.
+    //
+    // The scattering is the point. With the rounds the other tests use,
+    // the log is a dead block followed by a live block, and the old
+    // stopping rule, that a pass which found everything live is done,
+    // fired on the first pass that reached the live block. With the two
+    // interleaved every pass has a dead record in it, the rule never
+    // fires, and the loop walks its own copies up the address space:
+    // 136 passes and 7304 MiB copied against this shape at ycsb size,
+    // where the clamp does it in 9 passes and 258 MiB.
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(&dir.path().join("z.zu2"), options()).expect("create");
+    let mut s = db.session();
+    let records = 30000u32;
+    for i in 0..records {
+        s.upsert(&key(i), &value(i, 0)).expect("upsert");
+    }
+    // A cheap deterministic sequence rather than a dependency, because
+    // what this needs is spread and not statistical quality.
+    let mut x = 0x9E3779B97F4A7C15u64;
+    for _ in 0..records {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let i = (x >> 33) as u32 % records;
+        s.upsert(&key(i), &value(i, 1)).expect("upsert");
+    }
+    flush(&mut s, 0, 1);
+
+    let live = u64::from(records) * RECORD;
+    let written = db.log_bytes();
+    assert!(
+        written > live + live / 2,
+        "the updates did not leave enough garbage to be a test: {written} against {live} live"
+    );
+
+    db.compact().expect("compact");
+    let copied = db.compaction().copied.load(Ordering::Relaxed);
+    let passes = db.compaction().passes.load(Ordering::Relaxed);
+    assert!(
+        copied < live * 2,
+        "compaction copied {copied} bytes to reclaim a log with {live} bytes live, in {passes} passes"
+    );
+
+    // And it still did the job it was called for.
+    let after = db.disk_bytes().expect("disk bytes");
+    assert!(
+        after < written * 3 / 4,
+        "compaction did not return the space: {after} against a {written} byte log"
+    );
+    let mut out = Vec::new();
+    for i in 0..records {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost {i}");
+    }
+}

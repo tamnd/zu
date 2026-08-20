@@ -6,7 +6,7 @@
 //! description of the text.
 
 use zu_common::unicode::NormalForm;
-use zu_common::{LogicalType, Temporal};
+use zu_common::{DurationKind, LogicalType, Temporal};
 
 /// One statement: a query that reads, a catalog statement that changes
 /// what the file declares, or one of the three that say where a
@@ -1244,6 +1244,21 @@ pub enum Expr {
     /// that the clock is read in one place and cut in five, and so that
     /// every one of them in a statement answers the same instant.
     Clock,
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28's datetime subtraction. Written like a call and not one,
+    /// because the qualifier stands behind the closing parenthesis
+    /// where no call has anything, and the two words it is made of name
+    /// fields rather than values.
+    ///
+    /// The arguments are held as written rather than as a pair, so a
+    /// call with the wrong number of them is refused where every other
+    /// call is, by the arity on its row.
+    DurationBetween {
+        args: Vec<Expr>,
+        /// The kind the qualifier asked for, or none when none was
+        /// written, which reads as DAY TO SECOND.
+        kind: Option<DurationKind>,
+    },
     /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
     /// function answers, asked as a predicate, and the form defaults the
     /// same way.

@@ -61,6 +61,17 @@ fn seeded_wide(path: &std::path::Path, nodes: u32) {
         .expect("load");
 }
 
+/// The same graph with half its people at the far end of no edge at
+/// all, which is how a column with nulls in it reaches a test: an
+/// optional match over this fills the second column for the first half
+/// and leaves the rest empty.
+fn seeded_sparse(path: &std::path::Path, nodes: u32) {
+    let mut db = zudb::zu1::file::Zu1File::create(path).expect("create");
+    let edges: Vec<(u32, u32)> = (0..nodes / 2).map(|i| (i, i)).collect();
+    zudb::zu1::graph::bulk_load_as(&mut db, "person", "follows", u64::from(nodes), &edges)
+        .expect("load");
+}
+
 fn c(text: &str) -> CString {
     CString::new(text).expect("no NUL")
 }
@@ -1196,6 +1207,236 @@ fn a_column_read_chunk_by_chunk_is_the_column_read_whole() {
         );
 
         zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// The buffer a caller reads is the buffer the executor filled, on
+/// every plan that fills one.
+///
+/// This is what the columnar accessors are for and what they did not do
+/// until now: the column came back through a walk over the rows and a
+/// `Vec` of this library's own, which on a scan of ten thousand
+/// integers is a row vector per row, a strided read of every cell, and
+/// eighty kilobytes copied to hand back what the executor had already
+/// written contiguously. Now the sink's buffer is handed over as it
+/// stands, and the test for that is an address: the whole column and
+/// each of its chunks are one buffer, so a chunk is a pointer into the
+/// column rather than a copy of a span of it.
+#[test]
+fn a_filled_column_is_lent_rather_than_copied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lent.zu1");
+    // Two full chunks and a short one, as the chunk tests use, so a
+    // lent chunk is checked at both ends of the buffer.
+    let rows = 2048 * 2 + 173;
+    seeded_wide(&path, rows);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        // No sort and no group, so nothing sits above the projection
+        // and the sink fills columns.
+        let result = query(conn, "MATCH (a:person) RETURN a.id AS id", &mut err);
+        assert_eq!(zu_result_rows(result), u64::from(rows));
+
+        let whole = col_i64(result, 0, rows as usize);
+        let mut seen = whole.to_vec();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..i64::from(rows)).collect::<Vec<i64>>());
+
+        for chunk in 0..zu_result_chunk_count(result) {
+            let (offset, count) = chunk_span(result, chunk);
+            let part = chunk_i64(result, chunk, 0, count as usize);
+            assert_eq!(
+                part.as_ptr(),
+                whole[offset as usize..].as_ptr(),
+                "chunk {chunk} is a span of the column and not a copy of one"
+            );
+        }
+
+        // Nothing is null, so the validity is a byte a row of ones and
+        // is made rather than lent: a bitmap is not what this accessor
+        // hands out.
+        let valid = col_valid(result, 0, rows as usize);
+        assert!(valid.iter().all(|&v| v == 1));
+
+        zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// The other plan, and the reason the walk over rows is still here. A
+/// sort is written across rows, so a result carrying one has no buffers
+/// to lend and the column is built once and kept. What a caller reads
+/// is the same either way, which is the whole of what a caller is
+/// promised.
+#[test]
+fn a_column_the_sink_did_not_fill_reads_the_same_as_one_it_did() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("built.zu1");
+    let rows = 2048 + 11;
+    seeded_wide(&path, rows);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        let filled = query(conn, "MATCH (a:person) RETURN a.id AS id", &mut err);
+        let mut scanned = col_i64(filled, 0, rows as usize).to_vec();
+        scanned.sort_unstable();
+
+        let built = query(
+            conn,
+            "MATCH (a:person) RETURN a.id AS id ORDER BY id",
+            &mut err,
+        );
+        let sorted = col_i64(built, 0, rows as usize);
+        assert_eq!(scanned, sorted, "the two paths are one answer");
+
+        let (_, count) = chunk_span(built, 0);
+        assert_ne!(
+            chunk_i64(built, 0, 0, count as usize).as_ptr(),
+            sorted.as_ptr(),
+            "a built column has no buffer to lend, so its chunks are copies"
+        );
+
+        zu_result_free(built);
+        zu_result_free(filled);
+        zu_conn_close(conn);
+    }
+}
+
+/// Every shape the sink keeps, read through every accessor, against
+/// what the same result says cell by cell.
+///
+/// The cells are the reference on purpose. A columnar accessor that
+/// agreed with itself and with nothing else would be a fast way to
+/// return the wrong answer, and the two paths through this library are
+/// now genuinely different code: one reads a column the executor
+/// filled, the other walks rows built out of it.
+#[test]
+fn the_shapes_the_sink_keeps_read_as_the_cells_do() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("shapes.zu1");
+    let nodes = 100u32;
+    seeded_sparse(&path, nodes);
+    let rows = nodes as usize;
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        // An integer column with half its rows missing: the cells the
+        // optional match did not fill are null, and the buffer carries
+        // a zero where each one sits.
+        let result = query(
+            conn,
+            "MATCH (a:person) OPTIONAL MATCH (a)-[:follows]->(b) RETURN b.id AS id",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), nodes as u64);
+        let ints = col_i64(result, 0, rows);
+        let valid = col_valid(result, 0, rows);
+        let mut floats: *const f64 = ptr::null();
+        assert_eq!(zu_result_col_f64(result, 0, &mut floats), ZuStatus::Ok);
+        let floats = std::slice::from_raw_parts(floats, rows);
+        let mut missing = 0;
+        for row in 0..rows {
+            let null = cell_type(result, row as u64, 0) == ZU_TYPE_NULL;
+            assert_eq!(valid[row] == 0, null, "row {row}");
+            if null {
+                missing += 1;
+                assert_eq!(ints[row], 0, "a missing cell reads as the type's zero");
+                assert_eq!(floats[row], 0.0);
+                continue;
+            }
+            let v = value_i64(cell(result, row as u64, 0));
+            assert_eq!(ints[row], v, "row {row}");
+            assert_eq!(floats[row], v as f64, "row {row}");
+        }
+        assert_eq!(missing, rows / 2, "half of them have nowhere to go");
+        // A node is not an integer, filled column or not.
+        let mut offsets: *const u64 = ptr::null();
+        assert_eq!(
+            zu_result_col_node_offset(result, 0, &mut offsets),
+            ZuStatus::Misuse
+        );
+        assert!(offsets.is_null());
+        zu_result_free(result);
+
+        // A node column with the same holes in it, which is a column of
+        // values rather than a buffer and so is read rather than lent.
+        let result = query(
+            conn,
+            "MATCH (a:person) OPTIONAL MATCH (a)-[:follows]->(b) RETURN b AS n",
+            &mut err,
+        );
+        let offsets = col_node_offset(result, 0, rows);
+        let valid = col_valid(result, 0, rows);
+        for row in 0..rows {
+            let null = cell_type(result, row as u64, 0) == ZU_TYPE_NULL;
+            assert_eq!(valid[row] == 0, null, "row {row}");
+            if null {
+                assert_eq!(offsets[row], 0);
+                continue;
+            }
+            let mut table = u32::MAX;
+            let mut offset = u64::MAX;
+            assert_eq!(
+                zu_value_node(cell(result, row as u64, 0), &mut table, &mut offset),
+                ZuStatus::Ok
+            );
+            assert_eq!(offsets[row], offset, "row {row}");
+        }
+        // And the chunked read of it is the same column again.
+        let (_, count) = chunk_span(result, 0);
+        assert_eq!(
+            chunk_node_offset(result, 0, 0, count as usize),
+            &offsets[..count as usize]
+        );
+        assert_eq!(
+            chunk_valid(result, 0, 0, count as usize),
+            &valid[..count as usize]
+        );
+        zu_result_free(result);
+
+        // A constant column: bits for a bool, and a column of nothing
+        // but nulls, which keeps no buffer and no bitmap because every
+        // row of it is the same answer.
+        let result = query(conn, "MATCH (a:person) RETURN true AS b", &mut err);
+        assert_eq!(col_i64(result, 0, rows), vec![1i64; rows]);
+        assert_eq!(col_valid(result, 0, rows), vec![1u8; rows]);
+        let mut floats: *const f64 = ptr::null();
+        assert_eq!(
+            zu_result_col_f64(result, 0, &mut floats),
+            ZuStatus::Misuse,
+            "a bool is not a double, which is what the walk over rows says too"
+        );
+        zu_result_free(result);
+
+        let result = query(conn, "MATCH (a:person) RETURN null AS z", &mut err);
+        assert_eq!(cell_type(result, 0, 0), ZU_TYPE_NULL);
+        assert_eq!(col_valid(result, 0, rows), vec![0u8; rows]);
+        assert_eq!(col_i64(result, 0, rows), vec![0i64; rows]);
+        assert_eq!(col_node_offset(result, 0, rows), vec![0u64; rows]);
+        zu_result_free(result);
+
+        // A string column has no accessor of its own and is refused by
+        // the ones it is not, the same as it always was.
+        let result = query(conn, "MATCH (a:person) RETURN 'x' AS s", &mut err);
+        let mut ints: *const i64 = ptr::null();
+        assert_eq!(zu_result_col_i64(result, 0, &mut ints), ZuStatus::Misuse);
+        assert!(ints.is_null());
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 0, 0, &mut ints),
+            ZuStatus::Misuse
+        );
+        assert_eq!(col_valid(result, 0, rows), vec![1u8; rows]);
+        // A refusal leaves the result usable, filled column or not.
+        assert_eq!(cell_type(result, 0, 0), ZU_TYPE_STR);
+        zu_result_free(result);
+
         zu_conn_close(conn);
     }
 }

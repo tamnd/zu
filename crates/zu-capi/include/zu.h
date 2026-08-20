@@ -488,7 +488,15 @@ zu_status zu_result_cell_type(const zu_result *result, uint64_t row, uint32_t co
  * read 0 in all three, which col_valid tells apart. A node is not an
  * integer here: reading one as its offset is what col_node_offset is
  * for, and doing it quietly through col_i64 is how a binding ends up
- * handing an internal row number to a user who asked for an identity. */
+ * handing an internal row number to a user who asked for an identity.
+ *
+ * Where the engine filled the column itself, which is every plan whose
+ * projection is a scan of stored values, the pointer is into the
+ * engine's own buffer and the call costs a bounds check rather than a
+ * pass over the rows. Where it did not, a sort or a computed
+ * expression among them, the column is converted on the first call
+ * that asks for it and kept until zu_result_free. Nothing a caller
+ * writes depends on which happened. */
 zu_status zu_result_col_i64(zu_result *result, uint32_t col, const int64_t **out);
 zu_status zu_result_col_f64(zu_result *result, uint32_t col, const double **out);
 zu_status zu_result_col_node_offset(zu_result *result, uint32_t col, const uint64_t **out);
@@ -496,19 +504,20 @@ zu_status zu_result_col_valid(zu_result *result, uint32_t col, const uint8_t **o
 
 /* Chunked reads: the same columns, a chunk of rows at a time.
  *
- * Which one to use is a question of size. A point read wants the whole
- * column, because the answer is small and one call beats a loop. Every
- * large answer wants chunks, because the whole-column call converts all
- * of it before returning any of it, and keeps the conversion until the
- * result is freed: a million-row int column is eight megabytes of
- * buffer beyond the rows, and reading the first hundred rows and
+ * Which one to use is a question of size, and only for the columns the
+ * engine did not fill: on those, the whole-column call converts all of
+ * the column before returning any of it and keeps the conversion until
+ * the result is freed, so a million-row int column is eight megabytes
+ * of buffer beyond the rows and reading the first hundred rows and
  * stopping pays for the other 999,900. A chunked read converts the
  * chunk asked for, into a buffer of a fixed size that the next chunk
- * reuses.
+ * reuses. On a column the engine did fill, both calls are pointers
+ * into the buffer it wrote and neither converts anything, so the
+ * choice is about the shape of the reading loop and nothing else.
  *
  * That is the trade: a chunk pointer is valid until the next call for
- * the same column and the same accessor, which replaces its contents,
- * or until zu_result_free. A host that needs one chunk to outlive the
+ * the same column and the same accessor, which may replace its
+ * contents, or until zu_result_free. A host that needs one chunk to outlive the
  * next copies it, which is the copy it was making anyway on the way
  * into a host array. Columns are independent of each other, so reading
  * a chunk's values and its validity together costs no reconversion.

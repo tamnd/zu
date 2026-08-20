@@ -7,7 +7,7 @@
 //! a wrong one, and that the two conditions the corpus asks for come
 //! back with their gqlstatus codes attached.
 
-use zu::query::{Value, run};
+use zu::query::{Engine, Value, run, run_on};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
@@ -171,11 +171,7 @@ fn a_cast_in_a_filter_agrees_between_the_two_executors() {
     let mut db = graph(dir.path());
     let source = "MATCH (p:person) WHERE CAST('1' AS INT8) = 1 RETURN count(p) AS n";
     let with_exec2 = run(source, &mut db, &[]).unwrap();
-    // SAFETY: single-threaded test, and the variable is read back by
-    // this process only.
-    unsafe { std::env::set_var("ZU_EXEC2", "0") };
-    let without = run(source, &mut db, &[]).unwrap();
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    let without = run_on(source, &mut db, &[], Engine::Rows).unwrap();
     assert_eq!(with_exec2.rows, without.rows);
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }

@@ -8,7 +8,7 @@
 //! for, that a caller can stop early and that the statements which
 //! cannot stream still arrive through the same loop.
 
-use zu::query::Value;
+use zu::query::{Engine, Value};
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
 use zu::{Database, Flow};
@@ -222,11 +222,9 @@ fn the_two_executors_stream_the_same_rows_in_the_same_order() {
 
     for source in statements {
         let pipeline = read(&mut conn, source);
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
+        conn.session_mut().set_engine(Engine::Rows);
         let old = read(&mut conn, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        conn.session_mut().set_engine(Engine::Pipeline);
         assert_eq!(pipeline.0, old.0, "{source}");
         assert_eq!(pipeline.1, old.1, "{source}");
         assert!(pipeline.2 && old.2, "both streamed {source}");
@@ -262,20 +260,18 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
         (rows, out)
     };
 
-    for engine in ["1", "0"] {
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", engine) };
+    for engine in [Engine::Pipeline, Engine::Rows] {
+        conn.session_mut().set_engine(engine);
         let (rows, out) = stopping(&mut conn);
         let err = out.expect_err("the statement was interrupted");
-        assert!(matches!(err, zu::ZuError::Interrupted), "{engine}: {err}");
+        assert!(matches!(err, zu::ZuError::Interrupted), "{engine:?}: {err}");
         assert!(
             rows < u64::from(MANY),
-            "{engine}: {rows} rows is the whole scan"
+            "{engine:?}: {rows} rows is the whole scan"
         );
         interrupt.clear();
     }
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    conn.session_mut().set_engine(Engine::Pipeline);
 
     // Exactly as it was: a statement that was stopped leaves the
     // session holding nothing, so the next one reads the whole table.

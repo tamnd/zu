@@ -160,6 +160,10 @@ pub struct Session {
     /// other part of the process last put in the environment, and
     /// [`crate::db::Config`] is the way a caller sets them on purpose.
     options: exec::Options,
+    /// Which executor this session's reads run on, read from the
+    /// environment once at open for the same reason the options above
+    /// are. [`Self::set_engine`] is the way a caller pins one.
+    engine: query::Engine,
     /// The one write side of this file in this process, shared with
     /// every other connection that has it open.
     handle: Arc<FileHandle>,
@@ -265,6 +269,7 @@ impl Session {
                 interrupt: Interrupt::armed(),
                 ..query::env_options()
             },
+            engine: query::Engine::from_env(),
             seen: published.version(),
             lease: Some(lease),
             handle,
@@ -1016,6 +1021,18 @@ impl Session {
         };
     }
 
+    /// Which executor this session's reads run on.
+    pub fn engine(&self) -> query::Engine {
+        self.engine
+    }
+
+    /// Pins one. The differential tests read the same statement twice
+    /// and compare, and this is how they ask for the second reading
+    /// without announcing it to every other test in the process (#474).
+    pub fn set_engine(&mut self, engine: query::Engine) {
+        self.engine = engine;
+    }
+
     /// The handle a statement on this session can be stopped through.
     ///
     /// One handle for the life of the session, so a caller can take it
@@ -1068,7 +1085,7 @@ impl Session {
         // streaming API for the wrong reason. It has handed nothing over
         // when it answers false, so the fallback below starts on a
         // handoff nothing has been fed through.
-        if query::exec2_enabled() {
+        if self.engine == query::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1149,7 +1166,7 @@ impl Session {
             return self.settle(out, held);
         }
         let options = self.options.clone();
-        if query::exec2_enabled() {
+        if self.engine == query::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1477,7 +1494,7 @@ impl Session {
         args: &[Value],
         options: &exec::Options,
     ) -> Result<QueryResult> {
-        if query::exec2_enabled() {
+        if self.engine == query::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1638,7 +1655,7 @@ impl Session {
         source: &str,
         params: &[(&str, Value)],
     ) -> Result<Option<zu_exec::decide::Decisions>> {
-        if !query::exec2_enabled() {
+        if self.engine != query::Engine::Pipeline {
             return Ok(None);
         }
         let cached = self.plan_for(source, params)?;

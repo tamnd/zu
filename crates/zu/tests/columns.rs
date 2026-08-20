@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use zu::dataset::{NodeFile, RelFile, load_dataset};
 use zu::query::column::{ColumnData, ColumnType};
-use zu::query::{QueryResult, run};
+use zu::query::{Engine, QueryResult, run, run_on};
 use zu_query::exec::Value;
 use zu_zu1::file::Zu1File;
 
@@ -130,9 +130,8 @@ fn the_rows_read_off_the_columns_are_the_rows_the_row_sink_pushed() {
         );
         // The same statement through the old executor, which has no
         // sink but the row one.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let rows = answer(&mut db, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let rows =
+            run_on(source, &mut db, &[], Engine::Rows).unwrap_or_else(|e| panic!("{source}: {e}"));
         assert!(rows.rows.columns().is_none(), "{source} on the old engine");
         assert_eq!(held.columns, rows.columns, "{source} projected the same");
         assert_eq!(held.rows, rows.rows, "{source} answered the same");

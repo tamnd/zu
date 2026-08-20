@@ -1334,6 +1334,45 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// environment overrides the count, `ZU_THREADS=1` forces sequential
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+    run_on(source, db, params, Engine::from_env())
+}
+
+/// Which executor a read runs on.
+///
+/// The pipeline executor covers most plans and hands the rest to the row
+/// at a time one, which is what [`run`] does. Pinning the row executor
+/// is how the differential tests get their oracle rows, and a caller
+/// says so here rather than through the environment: a variable is
+/// process wide, cargo runs a file's tests in one process and in
+/// parallel, and a test that set one was changing what its siblings
+/// were measuring while they ran (#474).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// The pipeline executor wherever it covers the plan.
+    Pipeline,
+    /// The row at a time executor, whatever the plan.
+    Rows,
+}
+
+impl Engine {
+    /// What the environment asks for. `ZU_EXEC2=0` pins the row
+    /// executor and anything else takes the pipeline one.
+    pub fn from_env() -> Engine {
+        if std::env::var("ZU_EXEC2").as_deref() == Ok("0") {
+            Engine::Rows
+        } else {
+            Engine::Pipeline
+        }
+    }
+}
+
+/// [`run`], on the executor the caller names.
+pub fn run_on(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+    engine: Engine,
+) -> Result<QueryResult> {
     match not_a_query(source)? {
         Some(NotAQuery::Catalog(stmt)) => {
             crate::catalog_stmt::apply(db, &stmt, params)?;
@@ -1351,19 +1390,29 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
         None => {}
     }
     let p = prepare(source, db, params)?;
-    let options = env_options();
+    let how = How {
+        options: env_options(),
+        engine,
+    };
     // A match written several ways is a plan per way over the rows the
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a
     // read gets this far: a write was refused while it was prepared.
     if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
         return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
-            read_one(plan, query, &p.schema, db, &p.catalog, args, &options)
+            read_one(plan, query, &p.schema, db, &p.catalog, args, &how)
         });
     }
-    read_one(
-        &p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, &options,
-    )
+    read_one(&p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, &how)
+}
+
+/// How a read runs: the switches the environment set and the executor
+/// the caller named. One argument because they travel together and a
+/// call site that had to carry them apart would be one place for the
+/// two to disagree.
+struct How {
+    options: exec::Options,
+    engine: Engine,
 }
 
 /// Runs one plan against an open file, the pipeline executor first and
@@ -1377,23 +1426,16 @@ fn read_one(
     db: &mut Zu1File,
     catalog: &Catalog,
     args: &[Value],
-    options: &exec::Options,
+    how: &How,
 ) -> Result<QueryResult> {
-    if exec2_enabled() {
+    if how.engine == Engine::Pipeline {
         let mut snap = crate::snapshot::Zu1Snapshot::new(db, catalog.clone());
-        if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, options)? {
+        if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, &how.options)? {
             return Ok(r);
         }
     }
     let mut graph = Zu1Graph::new(db, catalog.clone());
-    exec::execute(plan, query, schema, &mut graph, args, options)
-}
-
-/// Whether plans the pipeline executor covers run there. On by
-/// default; `ZU_EXEC2=0` pins every query to the old executor, which
-/// is how the differential tests get their oracle rows.
-pub(crate) fn exec2_enabled() -> bool {
-    std::env::var("ZU_EXEC2").as_deref() != Ok("0")
+    exec::execute(plan, query, schema, &mut graph, args, &how.options)
 }
 
 /// The execution options both entry points honor, so a profile always
@@ -1437,8 +1479,18 @@ pub(crate) fn env_options() -> exec::Options {
 /// stage. The grammar has no EXPLAIN keyword yet, so this is the API
 /// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
+    explain_analyze_on(source, db, params, Engine::from_env())
+}
+
+/// [`explain_analyze`], on the executor the caller names.
+pub fn explain_analyze_on(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+    engine: Engine,
+) -> Result<String> {
     let (profile, notes) = profile_noted(source, db, params)?;
-    let listing = match decisions(source, db, params)? {
+    let listing = match decisions(source, db, params, engine)? {
         Some(d) => format!("{}decisions:\n{}", profile.render(), d.render()),
         None => profile.render(),
     };
@@ -1455,8 +1507,9 @@ fn decisions(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
+    engine: Engine,
 ) -> Result<Option<zu_exec::decide::Decisions>> {
-    if !exec2_enabled() {
+    if engine != Engine::Pipeline {
         return Ok(None);
     }
     let p = prepare(source, db, params)?;
@@ -2376,17 +2429,13 @@ mod tests {
 
         // Pinned to the old engine there is no pipeline to report on,
         // and the listing says nothing rather than saying zero.
-        // SAFETY: single-threaded test, no other thread reads the
-        // environment while this is set.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let text = explain_analyze(
+        let text = explain_analyze_on(
             "MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n",
             &mut db,
             &[],
+            Engine::Rows,
         )
         .expect("explain analyze");
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("ZU_EXEC2") };
         assert!(!text.contains("decisions:"), "got:\n{text}");
     }
 

@@ -76,6 +76,38 @@ fn the_numeric_functions_answer_the_same_on_both_engines() {
         // answer: the distance of the bottom integer from nought is one
         // past the top of one.
         "MATCH (p:person) RETURN abs(-9223372036854775807 - p.id) AS a ORDER BY a",
+        // The approximate half, whose answers are floats whatever
+        // arrived. A whole number in and a float out is the one shape
+        // where the answer is wider than the argument.
+        "MATCH (p:person) RETURN sqrt(p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN exp(p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN ln(p.id + 1) AS a ORDER BY a",
+        "MATCH (p:person) RETURN log10(p.id + 1) AS a ORDER BY a",
+        "MATCH (p:person) RETURN sin(p.id) AS a, cos(p.id) AS b ORDER BY a",
+        "MATCH (p:person) RETURN tan(p.id * 0.5) AS a ORDER BY a",
+        "MATCH (p:person) RETURN cot(p.id + 1) AS a ORDER BY a",
+        "MATCH (p:person) RETURN asin(p.id * 0.2) AS a, acos(p.id * 0.2) AS b ORDER BY a",
+        "MATCH (p:person) RETURN atan(p.id - 3) AS a ORDER BY a",
+        "MATCH (p:person) RETURN degrees(p.id * 1.5) AS a, radians(p.id * 30) AS b ORDER BY a",
+        // In a filter and behind a guard, which are the shapes the
+        // functions are written in and the reason they are kernels.
+        "MATCH (p:person) WHERE sqrt(p.id) > 1.5 RETURN p.id AS id ORDER BY id",
+        "MATCH (p:person) WHERE p.id > 0 AND ln(p.id) < 1 RETURN p.id AS id ORDER BY id",
+        // Nested, and the sum of a call, which is the shape a report
+        // is written in.
+        "MATCH (p:person) RETURN sqrt(abs(p.id - 3)) AS a ORDER BY a",
+        "MATCH (p:person) RETURN sum(sqrt(p.id)) AS s",
+        // The conditions of the approximate half, one of each kind: a
+        // root below nought, a logarithm of nought, an inverse sine
+        // outside minus one to one, and an exponential past the top of
+        // a float.
+        "MATCH (p:person) RETURN sqrt(p.id - 3) AS a ORDER BY a",
+        "MATCH (p:person) RETURN ln(p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN log10(p.id - 1) AS a ORDER BY a",
+        "MATCH (p:person) RETURN asin(p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN acos(p.id) AS a ORDER BY a",
+        "MATCH (p:person) RETURN exp(p.id * 1000) AS a ORDER BY a",
+        "MATCH (p:person) RETURN cot(p.id) AS a ORDER BY a",
     ];
 
     for source in cases {

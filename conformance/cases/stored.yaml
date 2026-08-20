@@ -733,3 +733,67 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: a-root-of-a-stored-column
+    doc: The half of the numeric library whose answer is a float whatever arrived. A whole number in and a float out is the one shape where the answer is wider than the argument, and a square of a whole number is where that answer is exact enough to write down.
+    query: MATCH (n:person) RETURN sqrt(n.age * n.age) AS r ORDER BY r
+    columns:
+      - r
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "30.0"
+      - values:
+          - type: FLOAT64
+            value: "40.0"
+      - values:
+          - type: FLOAT64
+            value: "40.0"
+      - values:
+          - type: FLOAT64
+            value: "50.0"
+
+  - name: a-root-below-nought-has-no-answer
+    doc: ISO 20.22 defines the square root as the power of one half, so a negative argument is the power function's condition rather than one of its own. A NaN would travel through every comparison below it as false and tell the statement nothing about what went wrong.
+    query: MATCH (n:person) RETURN sqrt(n.age - 40) AS r ORDER BY r
+    raises: "2201F"
+
+  - name: a-logarithm-of-nought-has-no-answer
+    doc: A logarithm is defined for a number above nought and for no other, and the standard names the condition rather than leaving the answer to IEEE arithmetic.
+    query: MATCH (n:person) RETURN ln(n.age - 30) AS l ORDER BY l
+    raises: "2201E"
+
+  - name: an-inverse-sine-outside-minus-one-to-one-has-no-answer
+    doc: The sine of an angle is between minus one and one, so a number outside that is not the sine of anything and the standard says the value is out of range.
+    query: MATCH (n:person) RETURN asin(n.score) AS a ORDER BY a
+    raises: "22003"
+
+  - name: a-cotangent-where-the-sine-is-nought-has-no-answer
+    doc: The cotangent is the cosine over the sine, so where the sine is nought it is a division by nought and is raised as one.
+    query: MATCH (n:person) RETURN cot(n.age - 30) AS c ORDER BY c
+    raises: "22012"
+
+  - name: an-answer-past-the-top-of-a-float-has-no-answer
+    doc: An exponential of a number near the top of the range leaves the range, and an engine that quietly answers infinity has given a wrong answer rather than raised a condition.
+    query: MATCH (n:person) RETURN exp(n.score) AS e ORDER BY e
+    raises: "22003"
+
+  - name: a-root-in-a-filter
+    doc: A call in a predicate over a stored column, which is the shape that decides whether a scan is answered a chunk at a time or a row at a time.
+    query: MATCH (n:person) WHERE sqrt(n.age) > 6.5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: an-angle-read-in-both-directions
+    doc: Degrees into radians and back, which is a pair of multiplications and lands within a digit or two of where it started. The test is written as a comparison rather than an equality because the last digit of the trip is the implementation's to lose.
+    query: MATCH (n:person) WHERE degrees(radians(n.age)) > 39 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"

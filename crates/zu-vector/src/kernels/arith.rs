@@ -314,7 +314,9 @@ fn awkward_divisor(v: &ValueVector, len: usize) -> bool {
 /// an ordinary divisor and nought is not.
 fn zero_divisor_f64(v: &ValueVector, len: usize) -> bool {
     match v.encoding {
-        VecEncoding::Flat => v.values::<f64>()[..len].iter().any(|&x| x == 0.0),
+        // Nought and minus nought are one value to a comparison, which
+        // is what the fold is asking, so both are found here.
+        VecEncoding::Flat => v.values::<f64>()[..len].contains(&0.0),
         VecEncoding::Constant => v.constant_value::<f64>() == 0.0,
         VecEncoding::Dict { .. } => true,
     }

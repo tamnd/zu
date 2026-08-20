@@ -3259,11 +3259,12 @@ impl Compiler<'_> {
     /// column it reads, which is what lets one walk of the list build
     /// the chunk.
     ///
-    /// Integer results only. A property is an int or a string here, so
-    /// a float can only come from a literal, and a literal float
-    /// against an int column already fails the program builder's type
-    /// check; restricting the column keeps the sink reading the two
-    /// types it knows.
+    /// A number, of either width. An integer column and an integer
+    /// written beside it answer an integer, and a float anywhere in the
+    /// expression answers a float, which is the rule the row engine
+    /// follows and the one the numeric functions need: the answer of a
+    /// root or an angle is a float whatever arrived, so a projection
+    /// holding one would have nowhere to land without this.
     ///
     /// Anything that could have no answer for a row declines. A
     /// computed column is filled before the filter that would have
@@ -3293,9 +3294,11 @@ impl Compiler<'_> {
         let Some(root) = self.value_reg(&mut b, expr, level, false)? else {
             return Ok(None);
         };
-        if b.types[root as usize] != PhysType::Int64 {
-            return Ok(None);
-        }
+        let ty = match b.types[root as usize] {
+            PhysType::Int64 => ColType::Int,
+            PhysType::Float64 => ColType::Float,
+            _ => return Ok(None),
+        };
         if may_raise(&b.ops) {
             return Ok(None);
         }
@@ -3309,7 +3312,7 @@ impl Compiler<'_> {
         Ok(Some(ScalarRef::Col {
             level,
             vec: self.levels[level].cols.len(),
-            ty: ColType::Int,
+            ty,
         }))
     }
 
@@ -4012,14 +4015,15 @@ impl Compiler<'_> {
             let Some(r) = self.value_reg(b, rhs, level, true)? else {
                 return Ok(None);
             };
-            // The kernels compare within one physical type, and the one
-            // pair of types a query writes on purpose has been moved
-            // into a single type above, so what is left here is a
-            // mistyped compare and it keeps old-engine semantics by
-            // falling back.
-            if b.types[l as usize] != b.types[r as usize] {
+            // The kernels compare within one physical type, and the two
+            // pairs a query writes on purpose are moved into one type,
+            // the integer column against a written float above and a
+            // float against a written whole number here. What is left
+            // is a mistyped compare and it keeps old-engine semantics
+            // by falling back.
+            let Some((l, r)) = self.matched(b, l, r, lhs, rhs)? else {
                 return Ok(None);
-            }
+            };
             let dst = b.push_type(PhysType::Bool)?;
             b.ops.push(ExprOp::Compare { op: cmp, l, r, dst });
             return Ok(Some(dst));
@@ -4253,19 +4257,22 @@ impl Compiler<'_> {
                 let Some(r) = self.value_reg(b, rhs, level, false)? else {
                     return Ok(None);
                 };
+                let Some((l, r)) = self.matched(b, l, r, lhs, rhs)? else {
+                    return Ok(None);
+                };
                 let ty = b.types[l as usize];
-                if b.types[r as usize] != ty || !matches!(ty, PhysType::Int64 | PhysType::Float64) {
+                if !matches!(ty, PhysType::Int64 | PhysType::Float64) {
                     return Ok(None);
                 }
                 let dst = b.push_type(ty)?;
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
                 Ok(Some(dst))
             }
-            // GF01, the numeric functions whose answer over a whole
-            // number is a whole number. They are the numeric library's
-            // first kernels because they are the ones a filter is
-            // written over: `abs(a.x - b.x) < 3` is a scan the row
-            // engine used to take back for the sake of one call.
+            // GF01 to GF03, the numeric functions of one argument.
+            // They are the numeric library's first kernels because
+            // they are the ones a filter is written over: `abs(a.x -
+            // b.x) < 3` is a scan the row engine used to take back for
+            // the sake of one call.
             BoundExpr::Call {
                 func: Func::Math(math),
                 args,
@@ -4376,7 +4383,64 @@ impl Compiler<'_> {
             (Math::Sign, 1) => Some(MathOp::Sign),
             (Math::Round, 1) => Some(MathOp::Round(0)),
             (Math::Round, 2) => self.const_int(&args[1]).map(MathOp::Round),
+            (Math::Sqrt, 1) => Some(MathOp::Sqrt),
+            (Math::Exp, 1) => Some(MathOp::Exp),
+            (Math::Ln, 1) => Some(MathOp::Ln),
+            (Math::Log10, 1) => Some(MathOp::Log10),
+            (Math::Sin, 1) => Some(MathOp::Sin),
+            (Math::Cos, 1) => Some(MathOp::Cos),
+            (Math::Tan, 1) => Some(MathOp::Tan),
+            (Math::Cot, 1) => Some(MathOp::Cot),
+            (Math::Asin, 1) => Some(MathOp::Asin),
+            (Math::Acos, 1) => Some(MathOp::Acos),
+            (Math::Atan, 1) => Some(MathOp::Atan),
+            (Math::Degrees, 1) => Some(MathOp::Degrees),
+            (Math::Radians, 1) => Some(MathOp::Radians),
+            // POWER, LOG and MOD take two numbers, so each of them is a
+            // second column and not this op.
             _ => None,
+        }
+    }
+
+    /// The two sides of an operator as registers of one physical type,
+    /// or None where they are two types and nothing may be done about
+    /// it.
+    ///
+    /// The pair that arrives here is a value the kernels answer as a
+    /// float against a whole number the query wrote: `sqrt(p.x) > 10`
+    /// and `sqrt(p.x) * 2` are the ordinary spellings, and nobody
+    /// writes the ten as `10.0` because the value it stands for is ten
+    /// either way. The row engine reads such a pair by widening the
+    /// integer to a float and answering in floats, so the constant is
+    /// widened here and the comparison or the sum runs in the float
+    /// kernel. Widening the constant rather than the column is what
+    /// makes the two engines agree exactly: `as f64` is the conversion
+    /// the row engine performs on the same value.
+    fn matched(
+        &self,
+        b: &mut ProgBuilder,
+        l: Reg,
+        r: Reg,
+        lhs: &BoundExpr,
+        rhs: &BoundExpr,
+    ) -> Result<Option<(Reg, Reg)>> {
+        match (b.types[l as usize], b.types[r as usize]) {
+            (x, y) if x == y => Ok(Some((l, r))),
+            (PhysType::Float64, PhysType::Int64) => match self.const_int(rhs) {
+                Some(n) => {
+                    let r = b.push_const(OwnedValue::Float(n as f64))?;
+                    Ok(Some((l, r)))
+                }
+                None => Ok(None),
+            },
+            (PhysType::Int64, PhysType::Float64) => match self.const_int(lhs) {
+                Some(n) => {
+                    let l = b.push_const(OwnedValue::Float(n as f64))?;
+                    Ok(Some((l, r)))
+                }
+                None => Ok(None),
+            },
+            _ => Ok(None),
         }
     }
 

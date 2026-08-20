@@ -12,7 +12,7 @@ use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
-    BinOp, CmpOp, MathOp, MathPair, StrLen, binary, compare, length, pair, unary,
+    BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, binary, compare, fold, length, pair, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -72,6 +72,14 @@ pub enum ExprOp {
     /// needs no room in the arena for bytes.
     StrLen {
         op: StrLen,
+        src: Reg,
+        dst: Reg,
+    },
+    /// A fold of a string, up or down. The answer is a string, so this
+    /// is the first op whose output carries bytes of its own rather
+    /// than only numbers.
+    StrFold {
+        op: StrFold,
         src: Reg,
         dst: Reg,
     },
@@ -173,6 +181,14 @@ impl Program {
                     let out = {
                         let v = resolve(&regs, *src, chunk)?;
                         length(arena, *op, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrFold { op, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        fold(arena, *op, v)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

@@ -479,6 +479,21 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE char_length(p.name) > 3 RETURN count(*) AS n",
         "MATCH (p:person) RETURN char_length(p.name) AS w, count(*) AS n ORDER BY w",
         "MATCH (p:person) WHERE p.age > 40 OR octet_length(p.name) > 3 RETURN count(*) AS n",
+        // The two folds, which are the first calls whose answer is a
+        // string. One in a projection, where the vector the kernel
+        // wrote has to be read back the way a stored column is, one in
+        // a filter, one as a group key, and one either side of a
+        // comparison so the folded bytes are what is compared.
+        "MATCH (p:person) RETURN upper(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN lower(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE upper(p.name) = 'ANN' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN upper(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE char_length(upper(p.name)) > 3 RETURN count(*) AS n",
+        // A folded string against the column it was folded from, which
+        // is two string vectors compared row by row with no constant
+        // either side to translate against.
+        "MATCH (p:person) WHERE upper(p.name) = p.name RETURN count(*) AS n",
+        "MATCH (p:person) WHERE lower(p.name) = p.name RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and

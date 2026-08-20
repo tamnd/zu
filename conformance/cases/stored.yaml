@@ -976,3 +976,116 @@ cases:
             value: "3"
           - type: INT64
             value: "1"
+  - name: the-upper-fold-of-a-stored-column
+    doc: ISO 20.9. UPPER over a column of names, which is the plainest shape the fold has and the one every report that headlines a value takes. The four names are stored in lower case, so every row changes and none of them changes length.
+    query: MATCH (n:person) RETURN upper(n.name) AS u ORDER BY u
+    columns:
+      - u
+    rows:
+      - values:
+          - type: STRING
+            value: "ANN"
+      - values:
+          - type: STRING
+            value: "BO"
+      - values:
+          - type: STRING
+            value: "CY"
+      - values:
+          - type: STRING
+            value: "DI"
+
+  - name: the-lower-fold-undoes-the-upper-one
+    doc: The two folds nested, which is the case that says the answer of one is a string the other can be handed rather than something that only looks like one. Folding up and back down over an ASCII name is the name again.
+    query: MATCH (n:person) RETURN lower(upper(n.name)) AS l ORDER BY l
+    columns:
+      - l
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+      - values:
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+
+  - name: a-fold-leaves-what-has-no-case-alone
+    doc: A fold over the tag column, counting the rows it left exactly as they were. The empty string and the emoji have no case to change, and the other two hold a letter that does, so this is two whichever rule an engine folds by.
+    query: MATCH (n:person) WHERE upper(n.tag) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-fold-in-a-filter
+    doc: A fold in a predicate, which is how a query asks about a name without caring how it was typed in. The comparison is against a written string already in upper case, so the row that matches is the one whose stored name folds onto it.
+    query: MATCH (n:person) WHERE upper(n.name) = 'ANN' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-fold-as-a-grouping-key
+    doc: A folded string standing in a key, which is the shape a report that groups case insensitively takes. The four names differ from each other before the fold and after it, so each one is its own group.
+    query: MATCH (n:person) RETURN upper(n.name) AS u, count(*) AS c ORDER BY u
+    columns:
+      - u
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: "ANN"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "BO"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "CY"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "DI"
+          - type: INT64
+            value: "1"
+
+  - name: a-fold-feeding-a-length
+    doc: A count of a folded string, which asks whether the answer of one string function is a proper argument to the next. An ASCII fold changes no character's width, so the counts are the counts of the names themselves.
+    query: MATCH (n:person) RETURN char_length(upper(n.name)) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "1"
+
+  - name: two-stored-string-columns-compared-row-by-row
+    doc: One string column against another on the same row, which is the comparison with no constant in it and therefore no dictionary to translate against. None of the four names is the tag stored beside it, so every row differs and none matches.
+    query: MATCH (n:person) WHERE n.name <> n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"

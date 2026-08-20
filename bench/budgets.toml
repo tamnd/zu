@@ -2002,7 +2002,19 @@ vec_math_pair_grows_s = 0.2
 # A count of characters over a 2048-row flat string vector, the string
 # library's first kernel. Nothing here can raise, so the loop is a fold
 # over the bytes of each row with no check ahead of it, and the same
-# kernel over a coded column measures the table once and gathers. Floor
-# sits under the worst observed run on the loaded vCPU hosts. Raise
-# floors, never lower them.
-vec_str_length_grows_s = 0.1
+# kernel over a coded column measures the table once and gathers. This
+# floor started at 0.1, which was read off one run on a machine that
+# was busy rather than swamped, and a later run at load 17.6 on ten
+# cores measured just under it. The number below sits under that, which
+# is what the rule about the worst observed run actually asks for.
+vec_str_length_grows_s = 0.05
+
+# An ASCII fold over a 2048-row flat string vector, the string library's
+# first kernel whose answer is a string. Every answer is written into a
+# builder rather than read out of the argument, so this measures the
+# copy and the new view as well as the fold, which is why it runs at
+# about half the count above it. The same kernel over a coded column
+# writes one answer per table entry instead of one per row. Floor sits
+# under the worst observed run, which was 0.05 at load 17.6 on ten
+# cores. Raise floors, never lower them.
+vec_str_fold_grows_s = 0.03

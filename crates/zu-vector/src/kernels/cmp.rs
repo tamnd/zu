@@ -15,7 +15,7 @@ use zu_common::{Result, ZuError};
 
 use crate::bitmap::Bitmap;
 use crate::sel::SelVector;
-use crate::str::StrView;
+use crate::str::{NO_BUFFERS, StrView};
 use crate::vector::{PhysType, ValueVector, VecEncoding};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -339,6 +339,44 @@ fn cmp_str(
             Ok(())
         }
         (VecEncoding::Constant, VecEncoding::Flat) => cmp_str(op.flip(), r, l, sel, out),
+        // Two columns of strings, row against row. Neither side is one
+        // value the other can be translated against, so this is the arm
+        // with no trick in it: the views are compared where they lie.
+        // Equality still avoids most of the payloads, `eq_with`
+        // rejecting a pair on its length and its four byte prefix
+        // before either side is resolved, and an ordering has to look
+        // at the bytes.
+        (VecEncoding::Flat, VecEncoding::Flat) => {
+            let (lb, rb) = (
+                l.str_buffers().unwrap_or(&NO_BUFFERS),
+                r.str_buffers().unwrap_or(&NO_BUFFERS),
+            );
+            let (lv, rv) = (l.values::<StrView>(), r.values::<StrView>());
+            let eval = |i: usize| -> bool {
+                match op {
+                    CmpOp::Eq => lv[i].eq_with(lb, &rv[i], rb),
+                    CmpOp::Ne => !lv[i].eq_with(lb, &rv[i], rb),
+                    _ => op.holds(lv[i].bytes(lb), rv[i].bytes(rb)),
+                }
+            };
+            match sel {
+                None => {
+                    for i in 0..lv.len().min(rv.len()) {
+                        if eval(i) {
+                            out.set(i);
+                        }
+                    }
+                }
+                Some(s) => {
+                    for &row in s.as_slice() {
+                        if eval(row as usize) {
+                            out.set(row as usize);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => unsupported(l, r),
     }
 }

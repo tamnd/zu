@@ -28,7 +28,8 @@ use zu_query::snapshot::{
     ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
 };
 use zu_vector::{
-    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg, StrLen,
+    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
+    StrFold, StrLen,
 };
 
 use crate::join::JoinTable;
@@ -3268,6 +3269,12 @@ impl Compiler<'_> {
     /// root or an angle is a float whatever arrived, so a projection
     /// holding one would have nowhere to land without this.
     ///
+    /// Or a string, which is what a fold answers. A computed string
+    /// column is read back exactly the way a stored one is, the vector
+    /// carrying the bytes its kernel made along with the views into
+    /// them, so nothing downstream of here has to know which of the two
+    /// it is looking at.
+    ///
     /// Anything that could have no answer for a row declines. A
     /// computed column is filled before the filter that would have
     /// dropped the offending row, so a condition raised here is a
@@ -3280,7 +3287,11 @@ impl Compiler<'_> {
             expr,
             BoundExpr::Binary { .. }
                 | BoundExpr::Call {
-                    func: Func::Math(_) | Func::CharLength | Func::OctetLength,
+                    func: Func::Math(_)
+                        | Func::CharLength
+                        | Func::OctetLength
+                        | Func::Upper
+                        | Func::Lower,
                     ..
                 }
         ) {
@@ -3299,6 +3310,10 @@ impl Compiler<'_> {
         let ty = match b.types[root as usize] {
             PhysType::Int64 => ColType::Int,
             PhysType::Float64 => ColType::Float,
+            // A string, which a fold answers. The vector carries the
+            // bytes it made along with the views, so the sink reads one
+            // back exactly the way it reads a stored column.
+            PhysType::Str => ColType::Str,
             _ => return Ok(None),
         };
         if may_raise(&b.ops) {
@@ -4342,6 +4357,30 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::StrLen { op, src, dst });
                 Ok(Some(dst))
             }
+            // GF04's other half, the two folds. These are the first
+            // calls whose answer is a string, so the vector they write
+            // carries bytes of its own rather than numbers alone.
+            BoundExpr::Call {
+                func: func @ (Func::Upper | Func::Lower),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let op = match func {
+                    Func::Upper => StrFold::Upper,
+                    _ => StrFold::Lower,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrFold { op, src, dst });
+                Ok(Some(dst))
+            }
             _ => Ok(None),
         }
     }
@@ -4678,7 +4717,7 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         ExprOp::MathPair { .. } => true,
         // A count has an answer for every string there is, so it is a
         // computed column like a floor or an angle.
-        ExprOp::StrLen { .. } => false,
+        ExprOp::StrLen { .. } | ExprOp::StrFold { .. } => false,
         _ => false,
     })
 }

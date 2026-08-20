@@ -413,7 +413,9 @@ fn main() {
         );
     });
     let len_grows = per_sec_len * VECTOR as f64 / 1e9;
-    println!("str_char_length: {len_grows:.2} G rows/s over fourteen byte strings (target 0.2)");
+    println!(
+        "str_char_length: {len_grows:.2} G rows/s over fourteen byte strings (no spec target)"
+    );
     if let Some(floor) = budgets.get("vec_str_length_grows_s")
         && len_grows < floor
     {
@@ -432,6 +434,46 @@ fn main() {
         "str_char_length_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
         per_sec_len_dict * VECTOR as f64 / 1e9,
         per_sec_len_dict / per_sec_len
+    );
+
+    // The fold, which is the first kernel whose answer is a string.
+    // The two lines are the same two encodings again, and the reason
+    // the coded one is ahead is stronger here than for a count: an
+    // entry is folded once and its bytes are written once however many
+    // rows point at them, so the rows themselves cost a gather of
+    // views rather than a copy of a string.
+    let per_sec_fold = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::fold(
+                &mut arith_scratch,
+                kernels::StrFold::Upper,
+                black_box(&flat),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let fold_grows = per_sec_fold * VECTOR as f64 / 1e9;
+    println!("str_upper: {fold_grows:.2} G rows/s over fourteen byte strings (no spec target)");
+    if let Some(floor) = budgets.get("vec_str_fold_grows_s")
+        && fold_grows < floor
+    {
+        println!("GATE FAIL vec_str_fold_grows_s: {fold_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_fold_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::fold(&mut arith_scratch, kernels::StrFold::Upper, black_box(&dv))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_upper_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_fold_dict * VECTOR as f64 / 1e9,
+        per_sec_fold_dict / per_sec_fold
     );
 
     // Sorted intersection, balanced inputs: the multiway join inner

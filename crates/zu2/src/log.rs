@@ -481,6 +481,12 @@ impl Log {
     /// merely early: too low only holds a flush back for as long as this
     /// takes, and too high would let one through over a half written
     /// record.
+    ///
+    /// A claim that would land past the end of the page table is refused
+    /// before the tail moves rather than after. The tail is what a flush
+    /// and a commit both take as their target, so a tail sitting in a
+    /// page that cannot exist is not a full log, it is a database that
+    /// can no longer be made durable at all.
     fn allocate(&self, slot: &Slotted, size: usize) -> Result<Address> {
         if size > PAGE_SIZE {
             return Err(Error::RecordTooLarge {
@@ -498,6 +504,11 @@ impl Log {
             } else {
                 observed
             };
+            if page_of(start) >= self.pages.len() {
+                return Err(Error::LogFull {
+                    pages: self.pages.len(),
+                });
+            }
             if self
                 .tail
                 .compare_exchange_weak(

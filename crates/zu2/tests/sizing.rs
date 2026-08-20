@@ -123,3 +123,57 @@ fn a_node_past_the_end_does_not_move_the_counter() {
         "refused allocations moved the counter anyway"
     );
 }
+
+/// `max_pages` has the same shape as `max_nodes`: a ceiling picked at
+/// open time that a running database can walk into. Walking into it has
+/// to cost the writes that do not fit and nothing else.
+fn small_log() -> Options {
+    Options {
+        durability: Durability::Async,
+        index_buckets: 1 << 10,
+        max_pages: 2,
+        mutable_pages: 4,
+        max_nodes: 1 << 10,
+        compact_below: 0,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn a_full_log_can_still_be_made_durable() {
+    // The tail allocator claimed its bytes and then found out the page
+    // was past the end of the page table, so a refused append left the
+    // tail sitting in a page that cannot exist. Every flush and every
+    // durable commit takes the tail as its target, so from the first
+    // refusal on, the whole database was undurable: `sync` reported the
+    // tail page as missing, the background flusher took the same error
+    // and stopped, and under `Async` that is every record since the last
+    // flush, gone with no way to ask for them back.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("full.zu2");
+    let value = vec![7u8; 1000];
+    let mut wrote = 0u64;
+    {
+        let db = Db::create(&path, small_log()).expect("create");
+        let mut session = db.session();
+        for i in 0..100_000u64 {
+            match session.upsert(&i.to_be_bytes(), &value) {
+                Ok(()) => wrote += 1,
+                Err(Error::LogFull { .. }) => break,
+                Err(other) => panic!("{other}"),
+            }
+        }
+        assert!(wrote > 0, "the log was full before it was written to");
+        assert!(wrote < 100_000, "the log never filled up");
+        db.sync().expect("a full log still has to reach the device");
+    }
+    let db = Db::open(&path, small_log()).expect("reopen");
+    let mut session = db.session();
+    let mut out = Vec::new();
+    for i in 0..wrote {
+        assert!(
+            session.read(&i.to_be_bytes(), &mut out).expect("read"),
+            "key {i} was accepted and then lost when the log filled"
+        );
+    }
+}

@@ -636,3 +636,18 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: a-divisor-a-row-makes-nought-raises
+    doc: ISO 20.21. A divisor of nought is a condition rather than a null or an infinity, and a stored column is where an engine that vectorizes its arithmetic answers it. A kernel that cleared the row's validity instead would read as a row that failed the predicate, so the statement would answer no rows where it has no answer at all.
+    query: MATCH (n:person) WHERE n.age / (n.age - n.age) > 0 RETURN count(*) AS c
+    raises: "22012"
+
+  - name: a-division-behind-a-guard-never-runs
+    doc: The conjuncts of a WHERE are read in the order they were written and a conjunct that decided the row stops the rest, so the guard people write in front of a division is a guard. Nobody here is over a hundred, so the division is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND 100 / (n.age - 40) > 1 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"

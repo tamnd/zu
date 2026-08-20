@@ -120,7 +120,7 @@ impl Program {
                     let out = {
                         let lv = resolve(&regs, *l, chunk)?;
                         let rv = resolve(&regs, *r, chunk)?;
-                        binary(arena, *op, lv, rv)?
+                        binary(arena, *op, lv, rv, sel)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

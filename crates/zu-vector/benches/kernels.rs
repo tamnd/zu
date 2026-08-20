@@ -204,6 +204,63 @@ fn main() {
         failed = true;
     }
 
+    // Arithmetic kernel, i64 flat plus flat, with the conditions the
+    // row engine raises. The kernel folds both operands into one
+    // magnitude to answer whether any row could have gone over the top
+    // of an integer, and the fold is the whole price of raising where
+    // the row engine raises: a chunk of ordinary numbers never reaches
+    // the checked walk behind it. Both numbers are printed so the price
+    // is on the record rather than assumed.
+    let addends: Vec<i64> = (0..VECTOR as i64)
+        .map(|i| (i * 7_919) % 1_000_000)
+        .collect();
+    let w = ValueVector::flat_from(&mut arena, PhysType::Int64, &addends);
+    let mut arith_scratch = MorselArena::new();
+    let per_sec = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::binary(
+                &mut arith_scratch,
+                kernels::BinOp::Add,
+                black_box(&v),
+                black_box(&w),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let arith_grows = per_sec * VECTOR as f64 / 1e9;
+    println!("arith_i64_add: {arith_grows:.2} G rows/s (target 4)");
+    if let Some(floor) = budgets.get("vec_arith_grows_s")
+        && arith_grows < floor
+    {
+        println!("GATE FAIL vec_arith_grows_s: {arith_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
+    // The same addition over numbers wide enough that the fold cannot
+    // rule out an answer that does not fit, which is what the checked
+    // walk costs when it runs and finds nothing.
+    let wide: Vec<i64> = (0..VECTOR as i64).map(|i| -(i64::MAX - i)).collect();
+    let wv = ValueVector::flat_from(&mut arena, PhysType::Int64, &wide);
+    let per_sec_wide = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::binary(
+                &mut arith_scratch,
+                kernels::BinOp::Add,
+                black_box(&wv),
+                black_box(&w),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let arith_checked = per_sec_wide * VECTOR as f64 / 1e9;
+    println!("arith_i64_add_checked: {arith_checked:.2} G rows/s (no target, the slow path)");
+
     // Dict-code equality vs the path it replaces: owned Strings compared
     // per row, which is what a Vec<Value::Str> column does today. The
     // gate is the ratio, both sides run the same logical rows.

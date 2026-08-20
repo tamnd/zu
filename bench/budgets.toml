@@ -1964,3 +1964,14 @@ fold_group_us = 2000000.0
 # path, and a copy lands at 1 rather than just over 0.003. Lower this
 # ceiling, never raise it.
 arrow_taken_export_ratio = 0.25
+
+# i64 addition over two 2048-row flat vectors, the arithmetic kernel
+# with the conditions the row engine raises. A sum that does not fit an
+# integer is refused rather than wrapped, and what says whether any row
+# could have gone over is one fold of both operands into a single
+# magnitude, so the rows with an answer pay a fold and nothing else. The
+# bench prints the ordinary case and the wide case beside it, the second
+# being the checked walk the fold could not rule out. Floors sit under
+# the worst observed run on the loaded vCPU hosts. Raise floors, never
+# lower them.
+vec_arith_grows_s = 0.2

@@ -23,7 +23,7 @@ use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
 
 use crate::ast::{Literal, TemporalFn};
-use crate::binder::{BoundExpr, Cut, Func, Math, Trim, Type};
+use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Trim, Type};
 use crate::cast;
 use crate::exec::{Value, settle};
 
@@ -285,14 +285,49 @@ pub static REGISTRY: &[Signature] = &[
         by_name: true,
         kernel: None,
     },
+    // ISO 20.9 calls this COLLECT_LIST and openCypher calls it COLLECT.
+    // One row and two spellings, the standard's name first, so a plan
+    // and a refusal name the function the standard names and a query
+    // written against either spelling runs.
     Signature {
-        name: "collect",
-        aliases: &[],
+        name: "collect_list",
+        aliases: &["collect"],
         func: Func::Collect,
         arity: Arity::Exactly(1),
         arg: Kind::Any,
         needs: "needs a value",
         ret: Ret::ListOf,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    // GF10, ISO 20.9. Two rows because the divisor is a different
+    // function and not a different argument, and one accumulator
+    // behind both.
+    Signature {
+        name: "stddev_samp",
+        aliases: &[],
+        func: Func::Stddev(Deviation::Sample),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "stddev_pop",
+        aliases: &[],
+        func: Func::Stddev(Deviation::Population),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
         deterministic: true,
         aggregate: true,
         star: false,

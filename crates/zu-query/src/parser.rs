@@ -4701,7 +4701,14 @@ impl Parser<'_> {
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {
         self.expect(&TokenKind::LParen)?;
+        // The set quantifier of a general set function, which the
+        // standard spells `DISTINCT | ALL`. `ALL` is what leaving it
+        // out means, so it is read and dropped rather than carried:
+        // the two spellings are one query and should be one plan.
         let distinct = self.eat_kw("DISTINCT");
+        if !distinct {
+            self.eat_kw("ALL");
+        }
         if self.eat(&TokenKind::Star) {
             self.expect(&TokenKind::RParen)?;
             return Ok(Expr::Call {
@@ -6216,6 +6223,26 @@ mod tests {
         // two values however many the query wrote.
         assert!(parse_err("RETURN CASE ELSE 1 END AS n").contains("WHEN"));
         assert!(parse_err("RETURN NULLIF(a) AS n").contains("two arguments"));
+    }
+
+    /// The set quantifier of a set function, both spellings and none.
+    /// ALL is the default written down, so the three calls that do not
+    /// say DISTINCT have to arrive as one and the same call.
+    #[test]
+    fn a_set_function_reads_its_set_quantifier() {
+        for (source, want) in [
+            ("count(n)", false),
+            ("count(ALL n)", false),
+            ("count(DISTINCT n)", true),
+            ("collect_list(ALL n.age)", false),
+            ("stddev_samp(ALL n.age)", false),
+        ] {
+            let q = parsed(&format!("MATCH (n) RETURN {source} AS v"));
+            let Expr::Call { distinct, .. } = &q.result().expect("RETURN").items[0].expr else {
+                panic!("{source} is a call");
+            };
+            assert_eq!(*distinct, want, "{source}");
+        }
     }
 
     #[test]

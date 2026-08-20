@@ -605,3 +605,102 @@ fn duration_between_counts_from_the_first_datetime_to_the_second() {
     assert!(plan.contains("DURATION_BETWEEN"), "{plan}");
     assert!(plan.contains("DAY TO SECOND"), "{plan}");
 }
+
+/// The set functions of ISO 20.9: the two names of `COLLECT_LIST`, the
+/// two divisors of the standard deviation, and the set quantifier.
+///
+/// What is asked here rather than in the corpus is the part the corpus
+/// cannot see: that the deviation is right over enough rows to be
+/// split across morsels and folded back, and that it is right over a
+/// column whose values are large and close together, which is where an
+/// engine keeping a sum of squares gives nought or a negative variance.
+#[test]
+fn the_set_functions_answer_over_a_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("aggregates.zu1");
+    // Enough rows that the scan is split, so the answer comes back
+    // through the merge and not out of one accumulator.
+    const NODES: u32 = 50_000;
+    {
+        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+            .expect("load");
+    }
+    let db = Database::open(&path).expect("open");
+    let mut conn = db.connect().expect("connect");
+
+    // The ids are 0 to NODES - 1, so the two deviations are known in
+    // closed form and are computed here the plain way, in two passes,
+    // to be compared against the one pass the engine took.
+    let ids: Vec<f64> = (0..NODES).map(f64::from).collect();
+    let mean = ids.iter().sum::<f64>() / f64::from(NODES);
+    let squares: f64 = ids.iter().map(|id| (id - mean) * (id - mean)).sum();
+    let population = (squares / f64::from(NODES)).sqrt();
+    let sample = (squares / f64::from(NODES - 1)).sqrt();
+
+    let float = |conn: &mut zu::Connection, source: &str| -> f64 {
+        let rows = conn
+            .query(source)
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let rows: Vec<_> = rows.iter().collect();
+        assert_eq!(rows.len(), 1, "{source}");
+        rows[0].get_by_name::<f64>("v").expect("v")
+    };
+    let close = |got: f64, want: f64, source: &str| {
+        assert!(
+            (got - want).abs() <= want.abs() * 1e-12,
+            "{source} answered {got}, wanted {want}"
+        );
+    };
+
+    let source = "MATCH (p:person) RETURN stddev_pop(p.id) AS v";
+    close(float(&mut conn, source), population, source);
+    let source = "MATCH (p:person) RETURN stddev_samp(p.id) AS v";
+    close(float(&mut conn, source), sample, source);
+
+    // The same spread carried a billion up the number line, where the
+    // sum of squares and the square of the sum agree in their leading
+    // digits and their difference is all rounding. Shifting every
+    // value by a constant does not move the deviation, so the answer
+    // is the one above.
+    let source = "MATCH (p:person) RETURN stddev_pop(p.id + 1000000000) AS v";
+    close(float(&mut conn, source), population, source);
+
+    // ALL is the set quantifier that means what leaving it out means,
+    // and DISTINCT is the one that changes the answer. The ids are all
+    // different, so here it does not, which is the point: the query is
+    // asking a different question and getting the same number.
+    let source = "MATCH (p:person) RETURN stddev_pop(ALL p.id) AS v";
+    close(float(&mut conn, source), population, source);
+    let source = "MATCH (p:person) RETURN stddev_pop(DISTINCT p.id) AS v";
+    close(float(&mut conn, source), population, source);
+
+    // Both spellings of the collection reach the one function, so both
+    // gather the same rows, and the plan names it the way the standard
+    // does however the query wrote it.
+    for source in [
+        "MATCH (p:person) WHERE p.id < 3 RETURN collect(p.id) AS v",
+        "MATCH (p:person) WHERE p.id < 3 RETURN collect_list(p.id) AS v",
+    ] {
+        let rows = conn
+            .query(source)
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let rows: Vec<_> = rows.iter().collect();
+        assert_eq!(rows.len(), 1, "{source}");
+        let Ok(Value::List(got)) = rows[0].value(0).cloned() else {
+            panic!("{source} answered no list");
+        };
+        let mut got: Vec<i64> = got
+            .iter()
+            .map(|v| match v {
+                Value::Int(n) => *n,
+                other => panic!("{source} collected {other:?}"),
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, [0, 1, 2], "{source}");
+        let plan = conn.explain(source).expect("explain");
+        assert!(plan.contains("collect_list"), "{plan}");
+    }
+}

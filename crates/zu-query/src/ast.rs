@@ -1142,6 +1142,56 @@ pub enum TrimSide {
     Both,
 }
 
+/// The datetime value functions of ISO 20.6: the five words a statement
+/// asks the time with.
+///
+/// The three CURRENT words answer in the session's displacement and the
+/// two LOCAL ones answer without a displacement at all, which is the
+/// whole of what separates them. All five are cut from one instant, so
+/// a statement holding CURRENT_DATE and CURRENT_TIMESTAMP cannot have
+/// them land on two different days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatetimeFn {
+    /// The date in the session's displacement.
+    CurrentDate,
+    /// The time of day in it, carrying the displacement.
+    CurrentTime,
+    /// The instant, carrying the displacement.
+    CurrentTimestamp,
+    /// The time of day with no displacement on it.
+    LocalTime,
+    /// The date and time of day with no displacement on it.
+    LocalTimestamp,
+}
+
+impl DatetimeFn {
+    /// The word a statement writes for it, which is also the name the
+    /// registry row carries and the plan prints.
+    pub fn word(self) -> &'static str {
+        match self {
+            DatetimeFn::CurrentDate => "current_date",
+            DatetimeFn::CurrentTime => "current_time",
+            DatetimeFn::CurrentTimestamp => "current_timestamp",
+            DatetimeFn::LocalTime => "local_time",
+            DatetimeFn::LocalTimestamp => "local_timestamp",
+        }
+    }
+
+    /// The temporal type the word answers, which is also the cut of the
+    /// instant it is. Every one of these is a conversion the cast rules
+    /// already state, so the five functions are five targets and one
+    /// piece of code rather than five pieces of arithmetic.
+    pub fn target(self) -> LogicalType {
+        match self {
+            DatetimeFn::CurrentDate => LogicalType::Date,
+            DatetimeFn::CurrentTime => LogicalType::ZonedTime,
+            DatetimeFn::CurrentTimestamp => LogicalType::ZonedDatetime,
+            DatetimeFn::LocalTime => LogicalType::LocalTime,
+            DatetimeFn::LocalTimestamp => LogicalType::LocalDatetime,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
@@ -1184,6 +1234,16 @@ pub enum Expr {
         chars: Option<Box<Expr>>,
         source: Box<Expr>,
     },
+    /// `CURRENT_DATE` and the four words beside it, ISO 20.6. They are
+    /// written as bare words rather than as calls, which is why they are
+    /// here and not resolved by name: the grammar gives them no
+    /// parentheses, so nothing follows the word to say it was one.
+    Datetime(DatetimeFn),
+    /// The instant the statement is running at, which no query writes.
+    /// It is the argument the binder hands each of the five above, so
+    /// that the clock is read in one place and cut in five, and so that
+    /// every one of them in a statement answers the same instant.
+    Clock,
     /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
     /// function answers, asked as a predicate, and the form defaults the
     /// same way.

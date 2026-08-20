@@ -19,9 +19,9 @@ use zu_common::unicode::NormalForm;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
-    NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SortKey, TrimSide, UnaryOp,
+    self, BinaryOp, Clause, Conjunction, DatetimeFn, DeleteTarget, Expr, GraphRef, LabelExpr,
+    Literal, NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed,
+    Selector, SetInto, SetItem, SortKey, TrimSide, UnaryOp,
 };
 use crate::functions;
 use crate::refs::GraphHandle;
@@ -1733,6 +1733,11 @@ pub enum Func {
     /// is one no string has. Which end the characters are counted from
     /// is what [`Cut`] says.
     Cut(Cut),
+    /// ISO 20.6, the datetime value functions. Five cuts of the one
+    /// instant the statement is running at, which is the argument the
+    /// call carries, so the clock is read once per statement however
+    /// many of these it holds and however many rows they answer over.
+    Datetime(DatetimeFn),
     /// ISO 20.24. The string in one of the four Unicode normal forms.
     /// The form is on the function rather than in the arguments because
     /// it is a word the statement wrote and not a value a row holds, so
@@ -1906,6 +1911,16 @@ pub enum BoundExpr {
         ty: LogicalType,
         negated: bool,
     },
+    /// The instant the statement is running at, the hidden argument
+    /// every datetime value function is handed. No query writes it: the
+    /// binder plants it under the five words of ISO 20.6.
+    ///
+    /// It is a leaf and not a literal on purpose. A literal is folded
+    /// where the arguments are all literals, and folding a clock would
+    /// write the compile time into the plan cache and answer every
+    /// later statement with it. A leaf the run supplies is read where
+    /// the run is, once per statement.
+    Clock,
     Call {
         func: Func,
         /// Which row of the function registry answers this call, found
@@ -2291,7 +2306,7 @@ fn merge_props<'a>(
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) => {}
+        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) | BoundExpr::Clock => {}
         // A value query expression reads the slots the query inside it
         // captured, and nothing at all when it captured none, which is
         // what makes that one a single value for the whole run.
@@ -5001,6 +5016,11 @@ impl Binder<'_> {
                 chars,
                 source,
             } => self.bind_trim(*side, chars.as_deref(), source, ctx),
+            Expr::Datetime(func) => self.bind_datetime(*func, ctx),
+            // The instant, which is a value the run supplies and the
+            // type of a temporal value is ANY here, the way a date
+            // literal's is.
+            Expr::Clock => Ok((BoundExpr::Clock, Type::Any)),
             Expr::IsNormalized {
                 expr,
                 form,
@@ -5596,6 +5616,17 @@ impl Binder<'_> {
         self.bind_row(at, "trim", false, false, &args, ctx)
     }
 
+    /// `CURRENT_DATE` and the four words beside it, ISO 20.6. Each is
+    /// a cut of one instant, so the call the binder writes takes that
+    /// instant as its argument and the row says which cut it is. The
+    /// clock is read where the statement runs rather than here, which
+    /// is what keeps a cached plan from carrying the time it was
+    /// compiled at.
+    fn bind_datetime(&mut self, func: DatetimeFn, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
+        let at = functions::row_of(Func::Datetime(func)).expect("a datetime function has a row");
+        self.bind_row(at, func.word(), false, false, &[Expr::Clock], ctx)
+    }
+
     /// A call whose row is already settled: the arity, the argument
     /// types, the folding and the answer's type, which every call gets
     /// however its name was written or whether it was written at all.
@@ -5843,6 +5874,11 @@ pub fn text(expr: &Expr) -> String {
             };
             format!("TRIM({side}{chars}FROM {})", text(source))
         }
+        Expr::Datetime(func) => func.word().to_uppercase(),
+        // The word above is what a reader sees, since the instant is
+        // the binder's own doing and naming a column after it would
+        // name it after a thing the query never wrote.
+        Expr::Clock => "CURRENT_TIMESTAMP".into(),
         Expr::IsNormalized {
             expr,
             form,

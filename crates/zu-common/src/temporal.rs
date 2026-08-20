@@ -51,6 +51,56 @@ pub const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 pub const MIN_DAY: i32 = -719_162;
 pub const MAX_DAY: i32 = 2_932_896;
 
+/// What a statement answers the datetime value functions with: the
+/// instant it is running at and the displacement its session keeps.
+///
+/// It is one reading and not a call to the operating system per row,
+/// because ISO 20.6 asks that every datetime value function in one
+/// statement answer the same instant. A statement that read the clock
+/// twice could have `CURRENT_DATE` and `CURRENT_TIMESTAMP` land on two
+/// days, and a scan of ten million rows would spend ten million system
+/// calls finding that out.
+///
+/// The displacement is minutes east of UTC and never a zone name, for
+/// the reason the zoned types carry an offset: a name is a rule that
+/// changes when the zone database is updated, and a value that means
+/// something different tomorrow is not a value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Clock {
+    /// Nanoseconds since 1970-01-01T00:00:00Z.
+    pub nanos: i64,
+    /// Minutes east of UTC.
+    pub offset: i16,
+}
+
+impl Clock {
+    /// The clock read now, in UTC, which is what a statement does once
+    /// before its first row.
+    ///
+    /// The displacement is nought because zu's session time zone is
+    /// UTC, which is one of the implementation-defined choices the
+    /// standard leaves open and is written down as such. A clock before
+    /// the epoch on a machine whose time is set wrong reads as the
+    /// epoch rather than refusing, since a statement asking what time
+    /// it is has no better answer to give and no condition to raise.
+    pub fn read() -> Clock {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| i64::try_from(since.as_nanos()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        Clock { nanos, offset: 0 }
+    }
+
+    /// The instant as a zoned datetime, which is the one value the five
+    /// datetime value functions are cut out of.
+    pub fn instant(self) -> Temporal {
+        Temporal::ZonedDatetime {
+            nanos: self.nanos,
+            offset: self.offset,
+        }
+    }
+}
+
 /// One temporal value.
 ///
 /// The variants carry counts and not fields. A zoned value carries the

@@ -16,12 +16,12 @@ use zu_common::{
 };
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd, ElementDefKind,
-    ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, Group,
-    GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal,
-    PathMode, PathPattern, PatternList, Projection, ProjectionItem, PropertyDef, Query,
-    RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto, SetItem, SetOp,
-    Simple, SortKey, Statement, Subpath, TrimSide, TxnStmt, UnaryOp, YieldItem,
+    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DatetimeFn, DeleteTarget, EdgeEnd,
+    ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef,
+    GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern,
+    NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection, ProjectionItem,
+    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto,
+    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -3769,6 +3769,22 @@ impl Parser<'_> {
         {
             return Ok(Expr::GraphRef(GraphRef::Home));
         }
+        // ISO 20.6, the datetime value functions. They are bare words
+        // and not calls, the grammar giving them no parentheses, so a
+        // statement asking what time it is writes CURRENT_DATE and
+        // nothing behind it. Reading them here takes nothing away from
+        // a query, since all five are reserved words and a variable of
+        // one of those names is a variable the standard does not allow.
+        //
+        // A bracket behind one is left to the call path on purpose. It
+        // is a query asking for a function that does not exist, and the
+        // refusal that says so by name reads better than a refusal
+        // about a bracket that could not go where it was put.
+        if !self.at(&TokenKind::LParen)
+            && let Some(func) = datetime_word(&name)
+        {
+            return Ok(Expr::Datetime(func));
+        }
         // GE01 and GE02, the reference a caller passed in. `GRAPH $g`
         // and `BINDING TABLE $t` say what the parameter holds and
         // nothing else, which is what `USE GRAPH $g` beside `USE $g`
@@ -4695,6 +4711,22 @@ impl Parser<'_> {
             args,
         })
     }
+}
+
+/// The datetime value function a word names, or nothing where the word
+/// names none and is an ordinary identifier. The five words are the
+/// names their rows carry, so there is one list of them and it is the
+/// one the plan prints from.
+fn datetime_word(name: &str) -> Option<DatetimeFn> {
+    [
+        DatetimeFn::CurrentDate,
+        DatetimeFn::CurrentTime,
+        DatetimeFn::CurrentTimestamp,
+        DatetimeFn::LocalTime,
+        DatetimeFn::LocalTimestamp,
+    ]
+    .into_iter()
+    .find(|func| func.word().eq_ignore_ascii_case(name))
 }
 
 fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {

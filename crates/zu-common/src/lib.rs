@@ -18,7 +18,7 @@ pub use id::{Epoch, GROUP_ROWS, NodeGroupId, NodeId, NodeOffset, RelId, TableId}
 pub use ids::{IdMap, IdSet};
 pub use interrupt::Interrupt;
 pub use order::int_key;
-pub use temporal::{IntervalField, IntervalQualifier, Temporal};
+pub use temporal::{Clock, IntervalField, IntervalQualifier, Temporal};
 pub use types::{
     DurationKind, Field, FloatBits, IntBits, LogicalType, PathType, PhysicalType, RecordType,
     type_by_name,

@@ -1,23 +1,34 @@
-//! GF01, the numeric functions that keep an exact argument exact: ABS,
-//! CEIL, FLOOR, ROUND and SIGN.
+//! The numeric functions of one argument, GF01 to GF03.
 //!
-//! An integer in gives an integer out, which is the rule the row engine
-//! follows and the reason these five are a kernel of their own: the
-//! answer of every one of them over a whole number is a whole number,
-//! and widening it to a float would lose a digit above two to the fifty
-//! third for nothing the statement asked for. SIGN is the exception in
-//! the other direction, since minus one, nought and one are whole
-//! whatever arrived, so its answer is an integer even for a float
-//! argument.
+//! They come in two halves and the halves differ in what they answer.
+//! ABS, CEIL, FLOOR, ROUND and SIGN keep an exact argument exact, which
+//! is the rule the row engine follows: the answer of every one of them
+//! over a whole number is a whole number, and widening it to a float
+//! would lose a digit above two to the fifty third for nothing the
+//! statement asked for. SIGN is the exception in the other direction,
+//! since minus one, nought and one are whole whatever arrived, so its
+//! answer is an integer even for a float argument. The rest, the root,
+//! the exponential, the logarithms and the angles, answer a float
+//! whatever arrived, because the answer of a root or a logarithm is
+//! irrational for all but a handful of arguments and a type that
+//! changed with the value would be a type nothing could be planned
+//! against.
 //!
-//! The conditions are the row engine's, in the row engine's words. Only
-//! two of the shapes here have any: the distance of the bottom integer
-//! from nought is one past the top of one, and rounding to a place left
-//! of the point can carry a number past the top the same way. Both are
-//! found the way the arithmetic kernels find theirs, by one cheap fold
-//! over the argument that a chunk of ordinary numbers passes, so the
-//! loop that computes the answers stays branch free and the walk that
-//! builds a condition runs only where the fold could not rule one out.
+//! The conditions are the row engine's, in the row engine's words, and
+//! finding them is the whole of what makes this more than a loop. They
+//! are found the way the arithmetic kernels find theirs, by one cheap
+//! fold over the argument that a chunk of ordinary numbers passes, so
+//! the loop that computes the answers stays branch free and the walk
+//! that builds a condition runs only where the fold could not rule one
+//! out. The fold the exact half wants is how many bits the widest value
+//! takes, and the fold the approximate half wants is the lowest and
+//! highest value the column holds, since every one of those conditions
+//! is about where the argument sits: below nought for a root, at or
+//! below it for a logarithm, outside minus one to one for an inverse
+//! sine, and far enough out for an exponential or a reading in degrees
+//! to leave the range a double holds. The cotangent is the one that no
+//! fold rules out, its condition being about the sine of the argument
+//! rather than the argument, so it is walked whatever the column holds.
 
 use zu_common::{Result, ZuError, gqlstatus::codes};
 
@@ -26,10 +37,11 @@ use crate::bitmap::Bitmap;
 use crate::sel::SelVector;
 use crate::vector::{PhysType, ValueVector, VecEncoding};
 
-/// One of the five, with the digit count ROUND was written with. A
-/// second argument that is not a constant is not this op: the compiler
-/// leaves that call to the row engine rather than reading a column per
-/// row inside a loop that is here to avoid exactly that.
+/// One of the numeric functions of one argument, with the digit count
+/// ROUND was written with. A second argument that is not a constant is
+/// not this op: the compiler leaves that call to the row engine rather
+/// than reading a column per row inside a loop that is here to avoid
+/// exactly that.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MathOp {
     Abs,
@@ -37,6 +49,19 @@ pub enum MathOp {
     Floor,
     Sign,
     Round(i64),
+    Sqrt,
+    Exp,
+    Ln,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Cot,
+    Asin,
+    Acos,
+    Atan,
+    Degrees,
+    Radians,
 }
 
 impl MathOp {
@@ -49,7 +74,30 @@ impl MathOp {
             MathOp::Floor => "floor",
             MathOp::Sign => "sign",
             MathOp::Round(_) => "round",
+            MathOp::Sqrt => "sqrt",
+            MathOp::Exp => "exp",
+            MathOp::Ln => "ln",
+            MathOp::Log10 => "log10",
+            MathOp::Sin => "sin",
+            MathOp::Cos => "cos",
+            MathOp::Tan => "tan",
+            MathOp::Cot => "cot",
+            MathOp::Asin => "asin",
+            MathOp::Acos => "acos",
+            MathOp::Atan => "atan",
+            MathOp::Degrees => "degrees",
+            MathOp::Radians => "radians",
         }
+    }
+
+    /// Whether the answer is a float whatever the argument was, which
+    /// is the half of these whose answer is irrational for all but a
+    /// handful of arguments.
+    fn is_real(self) -> bool {
+        !matches!(
+            self,
+            MathOp::Abs | MathOp::Ceil | MathOp::Floor | MathOp::Sign | MathOp::Round(_)
+        )
     }
 
     /// Whether an argument could leave this function with no answer.
@@ -58,15 +106,26 @@ impl MathOp {
     /// only safe where the query did not write an order for it.
     pub fn may_raise(self) -> bool {
         match self {
+            // The distance of the bottom integer from nought is one
+            // past the top of one, and a carry left of the point can
+            // push a number past the top the same way.
             MathOp::Abs => true,
             MathOp::Round(digits) => digits != 0,
             MathOp::Ceil | MathOp::Floor | MathOp::Sign => false,
+            // A sine, a cosine and a tangent are answers for every
+            // number there is, an inverse tangent is bounded, and
+            // reading a number as radians divides it by about fifty
+            // seven, so none of these five can be asked for a number
+            // nobody has.
+            MathOp::Sin | MathOp::Cos | MathOp::Tan | MathOp::Atan | MathOp::Radians => false,
+            _ => true,
         }
     }
 
     /// The type the answers land in, given the type the arguments have.
     pub fn answer_type(self, arg: PhysType) -> Option<PhysType> {
         match (self, arg) {
+            (_, PhysType::Int64 | PhysType::Float64) if self.is_real() => Some(PhysType::Float64),
             (MathOp::Sign, PhysType::Int64 | PhysType::Float64) => Some(PhysType::Int64),
             (_, PhysType::Int64) => Some(PhysType::Int64),
             (_, PhysType::Float64) => Some(PhysType::Float64),
@@ -134,6 +193,23 @@ pub fn unary(
                 }
             }
         }
+        // A whole number through a root or an angle, which is the one
+        // shape where the answer is wider than what arrived.
+        (PhysType::Int64, PhysType::Float64) => {
+            let dst = out.values_mut::<f64>();
+            match v.encoding {
+                VecEncoding::Constant => {
+                    let c = real(op, v.constant_value::<i64>() as f64);
+                    dst[..len].fill(c);
+                }
+                _ => {
+                    let src = v.values::<i64>();
+                    for i in 0..len {
+                        dst[i] = real(op, src[i] as f64);
+                    }
+                }
+            }
+        }
         (PhysType::Float64, PhysType::Float64) => {
             let dst = out.values_mut::<f64>();
             match v.encoding {
@@ -149,7 +225,7 @@ pub fn unary(
                 }
             }
         }
-        _ => unreachable!("answer_type answers for these three shapes only"),
+        _ => unreachable!("answer_type answers for these four shapes only"),
     }
     // NULL in, NULL out: the answer is null exactly where the argument
     // was, and the bitmap is copied only where the argument carries one.
@@ -179,10 +255,16 @@ fn exact(op: MathOp, x: i64) -> i64 {
         MathOp::Ceil | MathOp::Floor => x,
         MathOp::Round(digits) if digits >= 0 => x,
         MathOp::Round(digits) => rounded_int(x, digits).unwrap_or(0),
+        _ => unreachable!("the approximate half answers a float"),
     }
 }
 
-/// The answer over an approximate number, for the four that answer one.
+/// The answer over an approximate number, which is every one of these
+/// but the sign.
+///
+/// Nothing here branches on the value: a row the check ahead of the
+/// loop let through has an answer, and where it did not the hardware
+/// hands back an infinity or a NaN that nobody reads.
 #[inline(always)]
 fn real(op: MathOp, x: f64) -> f64 {
     match op {
@@ -194,6 +276,22 @@ fn real(op: MathOp, x: f64) -> f64 {
             let scale = 10f64.powi(digits.clamp(-308, 308) as i32);
             (x * scale).round() / scale
         }
+        MathOp::Sqrt => x.sqrt(),
+        MathOp::Exp => x.exp(),
+        MathOp::Ln => x.ln(),
+        MathOp::Log10 => x.log10(),
+        MathOp::Sin => x.sin(),
+        MathOp::Cos => x.cos(),
+        MathOp::Tan => x.tan(),
+        // The cotangent is the cosine over the sine, which is what the
+        // row engine computes and why a sine of nought is a division by
+        // nought there rather than a condition of its own.
+        MathOp::Cot => x.cos() / x.sin(),
+        MathOp::Asin => x.asin(),
+        MathOp::Acos => x.acos(),
+        MathOp::Atan => x.atan(),
+        MathOp::Degrees => x.to_degrees(),
+        MathOp::Radians => x.to_radians(),
         MathOp::Sign => unreachable!("sign answers an integer"),
     }
 }
@@ -238,7 +336,72 @@ fn rounded_int(value: i64, digits: i64) -> Option<i64> {
 /// rather than raising, and so is a row the selection dropped, since the
 /// row engine never evaluated it.
 fn check(op: MathOp, v: &ValueVector, sel: Option<&SelVector>, len: usize) -> Result<()> {
-    let risky = match (v.phys, op) {
+    if !risky(op, v, len) {
+        return Ok(());
+    }
+    let visit = |i: usize| -> Result<()> {
+        if !v.is_valid(i) {
+            return Ok(());
+        }
+        match v.phys {
+            PhysType::Int64 if !op.is_real() => {
+                let x = at_i64(v, i);
+                match op {
+                    MathOp::Abs => x.checked_abs().map(|_| ()).ok_or_else(|| {
+                        out_of_range(op, format!("of {x} is one past the top of an integer"))
+                    }),
+                    MathOp::Round(digits) => rounded_int(x, digits).map(|_| ()).ok_or_else(|| {
+                        out_of_range(op, format!("of {x} to {digits} digits does not fit"))
+                    }),
+                    _ => Ok(()),
+                }
+            }
+            _ => one_real(op, arg_f64(v, i)),
+        }
+    };
+    match sel {
+        Some(sel) => {
+            for &row in sel.as_slice() {
+                visit(row as usize)?;
+            }
+        }
+        None => {
+            for i in 0..len {
+                visit(i)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the fold over the column leaves any row that could have no
+/// answer. False here is the ordinary case and means the loop below
+/// runs with nothing looked at twice.
+fn risky(op: MathOp, v: &ValueVector, len: usize) -> bool {
+    if !op.may_raise() {
+        return false;
+    }
+    if op.is_real() {
+        let (lo, hi) = span(v, len);
+        return match op {
+            MathOp::Sqrt => lo < 0.0,
+            MathOp::Ln | MathOp::Log10 => lo <= 0.0,
+            MathOp::Asin | MathOp::Acos => lo < -1.0 || hi > 1.0,
+            // The exponential passes the top of a double a little above
+            // seven hundred and nine, and nowhere below it.
+            MathOp::Exp => hi > 709.0,
+            // Reading a number as degrees multiplies it by about fifty
+            // seven, so only a number within that factor of the top can
+            // leave the range.
+            MathOp::Degrees => lo <= -3.0e306 || hi >= 3.0e306,
+            // The cotangent's condition is about the sine of the
+            // argument and not the argument, and no fold over a column
+            // of numbers says where the sine lands, so this one is
+            // walked whatever it holds.
+            _ => true,
+        };
+    }
+    match (v.phys, op) {
         // Every integer but the bottom one has a distance from nought
         // that fits, and the bottom one is the only value whose size
         // without its sign reaches two to the sixty third, so one fold
@@ -255,54 +418,55 @@ fn check(op: MathOp, v: &ValueVector, sel: Option<&SelVector>, len: usize) -> Re
         // multiplying by the scale is where a finite number can leave.
         (PhysType::Float64, MathOp::Round(digits)) => digits != 0,
         _ => false,
-    };
-    if !risky {
-        return Ok(());
     }
-    let visit = |i: usize| -> Result<()> {
-        if !v.is_valid(i) {
-            return Ok(());
+}
+
+/// What one row of the approximate half raises, or `Ok` where it has an
+/// answer. These are the row engine's conditions and the row engine's
+/// words, so a statement cannot tell which engine answered it.
+fn one_real(op: MathOp, x: f64) -> Result<()> {
+    match op {
+        // ISO 20.22 defines the square root as the power of one half,
+        // so a negative argument is the power function's condition
+        // rather than a condition of its own.
+        MathOp::Sqrt if x < 0.0 => {
+            return Err(ZuError::gql(
+                codes::C2201F,
+                format!("sqrt() has no answer for {x}, which is below nought"),
+            ));
         }
-        match v.phys {
-            PhysType::Int64 => {
-                let x = at_i64(v, i);
-                match op {
-                    MathOp::Abs => x.checked_abs().map(|_| ()).ok_or_else(|| {
-                        out_of_range(op, format!("of {x} is one past the top of an integer"))
-                    }),
-                    MathOp::Round(digits) => rounded_int(x, digits).map(|_| ()).ok_or_else(|| {
-                        out_of_range(op, format!("of {x} to {digits} digits does not fit"))
-                    }),
-                    _ => Ok(()),
-                }
-            }
-            _ => {
-                let x = at_f64(v, i);
-                let answer = real(op, x);
-                if answer.is_finite() || !x.is_finite() {
-                    Ok(())
-                } else {
-                    Err(out_of_range(
-                        op,
-                        format!("of {x} is outside the range of a float"),
-                    ))
-                }
-            }
+        MathOp::Ln | MathOp::Log10 if x <= 0.0 => {
+            return Err(ZuError::gql(
+                codes::C2201E,
+                format!(
+                    "{}() has no answer for {x}, which is not above nought",
+                    op.name()
+                ),
+            ));
         }
-    };
-    match sel {
-        Some(sel) => {
-            for &row in sel.as_slice() {
-                visit(row as usize)?;
-            }
+        MathOp::Cot if x.sin() == 0.0 => {
+            return Err(ZuError::gql(
+                codes::C22012,
+                format!("cot() has no answer for {x}, where the sine is nought"),
+            ));
         }
-        None => {
-            for i in 0..len {
-                visit(i)?;
-            }
+        MathOp::Asin | MathOp::Acos if !(-1.0..=1.0).contains(&x) && x.is_finite() => {
+            return Err(out_of_range(
+                op,
+                format!("has no answer for {x}, which is outside minus one to one"),
+            ));
         }
+        _ => {}
     }
-    Ok(())
+    let answer = real(op, x);
+    if answer.is_finite() || !x.is_finite() {
+        Ok(())
+    } else {
+        Err(out_of_range(
+            op,
+            format!("of {x} is outside the range of a float"),
+        ))
+    }
 }
 
 /// `22003 data exception, numeric value out of range`, named the way the
@@ -329,10 +493,44 @@ fn at_i64(v: &ValueVector, i: usize) -> i64 {
     }
 }
 
-fn at_f64(v: &ValueVector, i: usize) -> f64 {
-    match v.encoding {
-        VecEncoding::Constant => v.constant_value::<f64>(),
-        _ => v.values::<f64>()[i],
+/// The lowest and highest value the column holds, which is the fold
+/// every condition of the approximate half is answered by. A NaN is
+/// left out of both, since `min` and `max` over a double skip one, and
+/// leaving it out is right: a function of a NaN is a NaN and the row
+/// engine raises nothing for it.
+fn span(v: &ValueVector, len: usize) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut fold = |x: f64| {
+        lo = lo.min(x);
+        hi = hi.max(x);
+    };
+    match (v.encoding, v.phys) {
+        (VecEncoding::Constant, PhysType::Int64) => fold(v.constant_value::<i64>() as f64),
+        (VecEncoding::Constant, _) => fold(v.constant_value::<f64>()),
+        (_, PhysType::Int64) => {
+            for &x in &v.values::<i64>()[..len] {
+                fold(x as f64);
+            }
+        }
+        _ => {
+            for &x in &v.values::<f64>()[..len] {
+                fold(x);
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// One row read as the approximate half reads it, whichever of the two
+/// types the column holds.
+fn arg_f64(v: &ValueVector, i: usize) -> f64 {
+    match v.phys {
+        PhysType::Int64 => at_i64(v, i) as f64,
+        _ => match v.encoding {
+            VecEncoding::Constant => v.constant_value::<f64>(),
+            _ => v.values::<f64>()[i],
+        },
     }
 }
 
@@ -474,6 +672,170 @@ mod tests {
         let v = floats(&mut arena, &[f64::INFINITY]);
         let out = unary(&mut arena, MathOp::Round(2), &v, None).unwrap();
         assert!(out.values::<f64>()[0].is_infinite());
+    }
+
+    /// A root, a logarithm or an angle answers a float whatever
+    /// arrived, so a column of whole numbers comes back wider than it
+    /// went in.
+    #[test]
+    fn the_approximate_half_answers_a_float_whatever_arrived() {
+        let mut arena = MorselArena::new();
+        let v = ints(&mut arena, &[0, 1, 4]);
+        let out = unary(&mut arena, MathOp::Sqrt, &v, None).unwrap();
+        assert_eq!(out.phys, PhysType::Float64);
+        assert_eq!(out.values::<f64>(), &[0.0, 1.0, 2.0]);
+
+        let out = unary(&mut arena, MathOp::Cos, &v, None).unwrap();
+        assert_eq!(out.values::<f64>()[0], 1.0);
+
+        let v = floats(&mut arena, &[100.0, 1000.0]);
+        let out = unary(&mut arena, MathOp::Log10, &v, None).unwrap();
+        assert_eq!(out.values::<f64>(), &[2.0, 3.0]);
+    }
+
+    /// The five that have an answer for every number there is say so,
+    /// which is what lets one of them sit behind a guard.
+    #[test]
+    fn the_angles_and_the_readings_cannot_raise() {
+        for op in [
+            MathOp::Sin,
+            MathOp::Cos,
+            MathOp::Tan,
+            MathOp::Atan,
+            MathOp::Radians,
+            MathOp::Ceil,
+            MathOp::Floor,
+            MathOp::Sign,
+            MathOp::Round(0),
+        ] {
+            assert!(!op.may_raise(), "{op:?} says it can raise");
+        }
+        for op in [
+            MathOp::Sqrt,
+            MathOp::Exp,
+            MathOp::Ln,
+            MathOp::Log10,
+            MathOp::Cot,
+            MathOp::Asin,
+            MathOp::Acos,
+            MathOp::Degrees,
+            MathOp::Abs,
+            MathOp::Round(1),
+        ] {
+            assert!(op.may_raise(), "{op:?} says it cannot raise");
+        }
+    }
+
+    /// A root of a negative number and a logarithm of nought have no
+    /// answer at all, which the standard gives conditions of their own
+    /// rather than leaving to IEEE arithmetic.
+    #[test]
+    fn a_root_or_a_logarithm_outside_its_domain_raises() {
+        let mut arena = MorselArena::new();
+        let v = floats(&mut arena, &[4.0, -1.0]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Sqrt, &v, None)),
+            "2201F: sqrt() has no answer for -1, which is below nought"
+        );
+
+        let v = floats(&mut arena, &[1.0, 0.0]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Ln, &v, None)),
+            "2201E: ln() has no answer for 0, which is not above nought"
+        );
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Log10, &v, None)),
+            "2201E: log10() has no answer for 0, which is not above nought"
+        );
+
+        let v = ints(&mut arena, &[2, -4]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Sqrt, &v, None)),
+            "2201F: sqrt() has no answer for -4, which is below nought"
+        );
+    }
+
+    /// An inverse sine is an angle only for an argument between minus
+    /// one and one, and outside that the standard says the value is out
+    /// of range rather than letting a NaN travel.
+    #[test]
+    fn an_inverse_angle_outside_minus_one_to_one_raises() {
+        let mut arena = MorselArena::new();
+        let v = floats(&mut arena, &[0.5, 2.0]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Asin, &v, None)),
+            "22003: asin() has no answer for 2, which is outside minus one to one"
+        );
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Acos, &v, None)),
+            "22003: acos() has no answer for 2, which is outside minus one to one"
+        );
+    }
+
+    /// The cotangent is the one whose condition no fold over the column
+    /// rules out, since it is about the sine of the argument rather
+    /// than the argument.
+    #[test]
+    fn a_cotangent_where_the_sine_is_nought_raises() {
+        let mut arena = MorselArena::new();
+        let v = floats(&mut arena, &[1.0, 0.0]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Cot, &v, None)),
+            "22012: cot() has no answer for 0, where the sine is nought"
+        );
+
+        let v = floats(&mut arena, &[1.0, 2.0]);
+        let out = unary(&mut arena, MathOp::Cot, &v, None).unwrap();
+        assert!(out.values::<f64>()[0].is_finite());
+    }
+
+    /// An exponential leaves the range a little above seven hundred and
+    /// nine, and a number read as degrees leaves it within about fifty
+    /// seven of the top.
+    #[test]
+    fn an_answer_past_the_top_of_a_float_raises() {
+        let mut arena = MorselArena::new();
+        let v = floats(&mut arena, &[1.0, 710.0]);
+        assert_eq!(
+            raised(unary(&mut arena, MathOp::Exp, &v, None)),
+            "22003: exp() of 710 is outside the range of a float"
+        );
+
+        let v = floats(&mut arena, &[f64::MAX]);
+        assert!(
+            raised(unary(&mut arena, MathOp::Degrees, &v, None))
+                .starts_with("22003: degrees() of "),
+        );
+
+        // And the fold lets an ordinary column past without a walk.
+        let v = floats(&mut arena, &[1.0, 700.0]);
+        assert!(
+            unary(&mut arena, MathOp::Exp, &v, None)
+                .unwrap()
+                .values::<f64>()[0]
+                > 2.7
+        );
+    }
+
+    /// A row the selection dropped is not a condition here either, and
+    /// neither is a null, which are the two things the approximate half
+    /// has to get right for a filter to mean what it says.
+    #[test]
+    fn the_approximate_half_skips_what_nobody_asked_about() {
+        let mut arena = MorselArena::new();
+        let v = floats(&mut arena, &[4.0, -1.0, 9.0]);
+        let mut sel = SelVector::with_capacity(&mut arena, 2);
+        sel.push(0);
+        sel.push(2);
+        let out = unary(&mut arena, MathOp::Sqrt, &v, Some(&sel)).unwrap();
+        assert_eq!(out.values::<f64>()[2], 3.0);
+
+        let mut v = floats(&mut arena, &[4.0, -1.0, 9.0]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        v.validity = Some(valid);
+        let out = unary(&mut arena, MathOp::Sqrt, &v, None).unwrap();
+        assert!(!out.is_valid(1));
     }
 
     /// A finite number the scale pushes out of the range is the one

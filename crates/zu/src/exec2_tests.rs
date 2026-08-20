@@ -456,6 +456,14 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE abs(p.age - 40) < 5 RETURN p.id AS id ORDER BY id",
         "MATCH (p:person) RETURN sign(p.age - 40) AS s, count(*) AS n ORDER BY s",
         "MATCH (p:person) WHERE p.age > 40 AND floor(p.score) > 2 RETURN count(*) AS n",
+        // And the half that answers a float whatever arrived, where a
+        // whole column comes back wider than it went in. A root in a
+        // filter is claimed because the rows it is asked about are the
+        // rows the old engine asked it about, and an angle stands in a
+        // projection because it has an answer for every number there is.
+        "MATCH (p:person) WHERE sqrt(p.score) > 10 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN sin(p.age) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN radians(p.age) * 2 AS b, p.id AS id ORDER BY id LIMIT 20",
         // count(DISTINCT ...), which groups on its own argument and
         // answers with how many groups came out. Once on a column,
         // once on a node, once on a computed value, once on a string,
@@ -922,6 +930,7 @@ fn fallback_queries() -> &'static [&'static str] {
         // one past the top of one, so a projection holding a distance
         // declines where a floor would not.
         "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
+        "MATCH (p:person) RETURN sqrt(p.score) AS b, p.id AS id",
         // And behind an OR, where the old engine reads the halves in
         // the order they were written and never asks the second one
         // about a row the first said yes to. An AND is not the same

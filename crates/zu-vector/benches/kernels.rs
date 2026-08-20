@@ -288,6 +288,35 @@ fn main() {
         failed = true;
     }
 
+    // The approximate half of the same library, whose answer is a float
+    // whatever arrived. A root costs what the hardware charges for one
+    // and the fold that clears the column of negative numbers is the
+    // same single pass, so the distance between this and the line above
+    // is the function itself and nothing the kernel added.
+    let roots: Vec<f64> = (0..VECTOR as i64).map(|i| (i % 10_000) as f64).collect();
+    let rv = ValueVector::flat_from(&mut arena, PhysType::Float64, &roots);
+    let per_sec_sqrt = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::unary(
+                &mut arith_scratch,
+                kernels::MathOp::Sqrt,
+                black_box(&rv),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let sqrt_grows = per_sec_sqrt * VECTOR as f64 / 1e9;
+    println!("math_f64_sqrt: {sqrt_grows:.2} G rows/s (target 1)");
+    if let Some(floor) = budgets.get("vec_math_real_grows_s")
+        && sqrt_grows < floor
+    {
+        println!("GATE FAIL vec_math_real_grows_s: {sqrt_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
     // Dict-code equality vs the path it replaces: owned Strings compared
     // per row, which is what a Vec<Value::Str> column does today. The
     // gate is the ratio, both sides run the same logical rows.

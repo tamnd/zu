@@ -1983,3 +1983,11 @@ vec_arith_grows_s = 0.2
 # branch inside the loop. Floor sits under the worst observed run on the
 # loaded vCPU hosts. Raise floors, never lower them.
 vec_math_grows_s = 0.2
+
+# A square root over a 2048-row flat vector, the approximate half of the
+# same library. The answer is a float whatever arrived, so the loop is
+# one hardware instruction per row and the argument that has no answer,
+# a number below nought, is found by one pass over the column rather
+# than by a branch inside the loop. Floor sits under the worst observed
+# run on the loaded vCPU hosts. Raise floors, never lower them.
+vec_math_real_grows_s = 0.2

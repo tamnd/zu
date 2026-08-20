@@ -368,6 +368,12 @@ impl Db {
         self.core.log.span()
     }
 
+    /// Log pages holding memory right now, each 4 MiB. The memory side
+    /// of what [`Db::disk_bytes`] answers for the filesystem.
+    pub fn resident_pages(&self) -> usize {
+        self.core.log.resident_pages()
+    }
+
     /// Bytes the file occupies on the device, holes excluded. This is
     /// the honest storage number: a compacted log keeps its addresses
     /// but not its blocks.

@@ -71,6 +71,16 @@ pub enum Zu2Status {
 /// the default of 128 MiB", so `u64::MAX` is what says "never compact".
 /// A load that is going to be measured and thrown away wants that, and
 /// it is worth a sentinel rather than a second field.
+///
+/// `fixed_index` is the same shape of problem and takes the same
+/// answer. The engine grows the index by default, so the field that
+/// reaches C has to be the one whose zero is the default, which is the
+/// negative one.
+///
+/// New fields go on the end. The header declares the layout and a host
+/// zeroes the struct before it fills anything in, so an older caller
+/// linked against a newer library gets defaults for what it does not
+/// know about rather than a shifted read.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Zu2Options {
@@ -81,6 +91,11 @@ pub struct Zu2Options {
     pub space_target_percent: u32,
     pub compact_below: u64,
     pub sessions: u64,
+    /// Nonzero pins the index at `index_buckets` however many keys
+    /// arrive. That is what a measurement of what crowding costs needs,
+    /// and it is the only way a caller who knows its key count exactly
+    /// can keep the migration check off its read path.
+    pub fixed_index: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -327,6 +342,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.sessions > 0 {
         options.sessions = given.sessions as usize;
+    }
+    if given.fixed_index != 0 {
+        options.grow_index = false;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,
@@ -1492,6 +1510,73 @@ pub unsafe extern "C" fn zu2_log_span(db: *const Zu2Db) -> u64 {
 pub unsafe extern "C" fn zu2_index_occupancy(db: *const Zu2Db) -> u64 {
     match unsafe { handle(db) } {
         Some(handle) => handle.db.index_occupancy() as u64,
+        None => 0,
+    }
+}
+
+/// Buckets in the live hash table.
+///
+/// Against `zu2_index_occupancy` this is the load factor, which is what
+/// says whether a read is walking a chain because the table is crowded
+/// or because the keys collided.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_buckets(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.index_buckets() as u64,
+        None => 0,
+    }
+}
+
+/// Times the index has doubled since the database was opened.
+///
+/// A run that reports zero here either sized its table right or never
+/// grew, and those are different things: the load factor tells them
+/// apart. A run that reports several has paid for every one of them,
+/// and this is what lets a benchmark say so rather than leave it to be
+/// inferred from a curve.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_grows(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.index_grows(),
+        None => 0,
+    }
+}
+
+/// Nonzero while a doubling is still draining the old table.
+///
+/// A measurement taken here is a measurement of a migration in
+/// progress, which is a real state to be in and not the steady one, so
+/// a phase that ends with this set is worth reporting differently.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_resizing(db: *const Zu2Db) -> u32 {
+    match unsafe { handle(db) } {
+        Some(handle) => u32::from(handle.db.index_resizing()),
+        None => 0,
+    }
+}
+
+/// Log pages holding memory right now, each 4 MiB.
+///
+/// The memory side of the space column. `zu2_disk_bytes` says what the
+/// filesystem is holding and this says what the process is, and a
+/// comparison that reports one without the other is picking whichever
+/// number reads better.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_resident_pages(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.resident_pages() as u64,
         None => 0,
     }
 }

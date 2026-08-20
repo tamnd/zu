@@ -655,3 +655,108 @@ fn a_concurrent_edge_write_does_not_hide_a_path() {
     assert_eq!(missed, 0, "the walk lost a one hop path {missed} times");
     close(db, &[reader, writer]);
 }
+
+/// The header and the struct are two declarations of one layout and
+/// nothing was checking that they agree. A field added to one and not
+/// the other does not fail to compile on either side: the host reads
+/// its own header, the library reads its own struct, and every field
+/// past the divergence is silently the wrong one. Adding `fixed_index`
+/// is what made that concrete, since it is the first field appended
+/// since the struct was written.
+///
+/// The names are listed here rather than derived because there is
+/// nothing to derive them from on the Rust side without a macro, and a
+/// list that has to be edited in two places is exactly the thing under
+/// test. Editing it in three is the point: the third one fails loudly.
+#[test]
+fn the_header_and_the_options_struct_declare_the_same_fields() {
+    const FIELDS: &[(&str, &str)] = &[
+        ("zu2_durability", "durability"),
+        ("uint64_t", "index_buckets"),
+        ("uint64_t", "max_pages"),
+        ("uint64_t", "max_nodes"),
+        ("uint32_t", "space_target_percent"),
+        ("uint64_t", "compact_below"),
+        ("uint64_t", "sessions"),
+        ("uint32_t", "fixed_index"),
+    ];
+    let header = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/include/zu2.h"
+    ))
+    .expect("the header ships with the crate");
+    let body = header
+        .split_once("typedef struct zu2_options {")
+        .expect("the header declares zu2_options")
+        .1
+        .split_once("} zu2_options;")
+        .expect("the declaration is closed")
+        .0;
+    // Comments carry prose with semicolons and braces in it, so they go
+    // before anything is split on either.
+    let mut code = String::new();
+    let mut rest = body;
+    while let Some((before, after)) = rest.split_once("/*") {
+        code.push_str(before);
+        rest = after.split_once("*/").expect("an unclosed comment").1;
+    }
+    code.push_str(rest);
+    let found: Vec<(String, String)> = code
+        .split(';')
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let ty = words.next()?;
+            let name = words.next()?;
+            Some((ty.to_owned(), name.to_owned()))
+        })
+        .collect();
+    let want: Vec<(String, String)> = FIELDS
+        .iter()
+        .map(|(t, n)| ((*t).to_owned(), (*n).to_owned()))
+        .collect();
+    assert_eq!(
+        found, want,
+        "the header's zu2_options is not the struct zu2-capi compiled against"
+    );
+
+    // And the offsets, which is what catches a type changed on one
+    // side rather than a field added to one side. Both languages lay a
+    // repr(C) struct out the same way, so walking the header's types
+    // gives the offsets the struct has to have, padding and all.
+    let mut offset = 0usize;
+    let mut align = 1usize;
+    let mut offsets = Vec::new();
+    for (ty, name) in FIELDS {
+        let size = match *ty {
+            "uint64_t" => 8,
+            "uint32_t" | "zu2_durability" => 4,
+            other => panic!("the header uses {other}, which this test has no size for"),
+        };
+        offset = offset.next_multiple_of(size);
+        offsets.push((*name, offset));
+        offset += size;
+        align = align.max(size);
+    }
+    let expect = offset.next_multiple_of(align);
+    assert_eq!(
+        std::mem::size_of::<Zu2Options>(),
+        expect,
+        "the struct is {} bytes and the header lays out {expect}",
+        std::mem::size_of::<Zu2Options>()
+    );
+    assert_eq!(std::mem::align_of::<Zu2Options>(), align);
+    for (name, want) in offsets {
+        let got = match name {
+            "durability" => std::mem::offset_of!(Zu2Options, durability),
+            "index_buckets" => std::mem::offset_of!(Zu2Options, index_buckets),
+            "max_pages" => std::mem::offset_of!(Zu2Options, max_pages),
+            "max_nodes" => std::mem::offset_of!(Zu2Options, max_nodes),
+            "space_target_percent" => std::mem::offset_of!(Zu2Options, space_target_percent),
+            "compact_below" => std::mem::offset_of!(Zu2Options, compact_below),
+            "sessions" => std::mem::offset_of!(Zu2Options, sessions),
+            "fixed_index" => std::mem::offset_of!(Zu2Options, fixed_index),
+            other => panic!("{other} is in the header and this test does not know it"),
+        };
+        assert_eq!(got, want, "{name} is at {got} in the struct and {want} in the header");
+    }
+}

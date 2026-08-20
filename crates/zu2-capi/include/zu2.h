@@ -133,8 +133,10 @@ typedef struct zu2_options {
    * a bucket and the table wants to stay under half full, so
    * records / 4 is a reasonable hint. 0 takes the default. */
   uint64_t index_buckets;
-  /* Slots in the page table, which caps the log at max_pages * 4 MiB.
-   * 0 takes the default. */
+  /* The live span the log may reach, in 4 MiB pages, counted from the
+   * compaction floor to the tail. A db that compacts hard enough to
+   * keep its span under this never reaches it, however long it runs
+   * and however much it writes. 0 takes the default. */
   uint64_t max_pages;
   /* Nodes the graph plane is sized for. Only one pointer per 16384
    * nodes per direction is allocated up front, so this is cheap to
@@ -153,6 +155,15 @@ typedef struct zu2_options {
    * the engine keeps its own slots for flushing and compaction on top
    * of this number. 0 takes the default of 128. */
   uint64_t sessions;
+  /* Nonzero pins the index at index_buckets however many keys arrive,
+   * which is what measuring the cost of crowding needs, and the only
+   * way a caller who knows its key count exactly keeps the migration
+   * check off its read path. 0 grows, which is the default.
+   *
+   * New fields go on the end. Zero the struct before filling it in and
+   * an older caller against a newer library gets defaults for what it
+   * does not know about rather than a shifted read. */
+  uint32_t fixed_index;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -330,6 +341,25 @@ uint64_t zu2_log_span(const zu2_db *db);
 /* Entries in use in the hash index, for reporting the load factor a run
  * happened at. */
 uint64_t zu2_index_occupancy(const zu2_db *db);
+
+/* Buckets in the live hash table. Against zu2_index_occupancy this is
+ * the load factor, which is what says whether a read walked a chain
+ * because the table was crowded or because the keys collided. */
+uint64_t zu2_index_buckets(const zu2_db *db);
+
+/* Times the index has doubled since the db was opened. Zero means the
+ * table was sized right or was never grown, and the load factor tells
+ * those apart. */
+uint64_t zu2_index_grows(const zu2_db *db);
+
+/* Nonzero while a doubling is still draining the old table, so a phase
+ * that ends here ended mid-migration rather than in the steady state. */
+uint32_t zu2_index_resizing(const zu2_db *db);
+
+/* Log pages holding memory right now, each 4 MiB. The memory side of
+ * the space column: zu2_disk_bytes says what the filesystem holds and
+ * this says what the process does. */
+uint64_t zu2_resident_pages(const zu2_db *db);
 
 /* The library version, NUL-terminated and valid forever. */
 const char *zu2_version(size_t *len);

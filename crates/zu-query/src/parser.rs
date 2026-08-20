@@ -21,7 +21,7 @@ use crate::ast::{
     GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal,
     PathMode, PathPattern, PatternList, Projection, ProjectionItem, PropertyDef, Query,
     RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto, SetItem, SetOp,
-    Simple, SortKey, Statement, Subpath, TxnStmt, UnaryOp, YieldItem,
+    Simple, SortKey, Statement, Subpath, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -3850,6 +3850,13 @@ impl Parser<'_> {
             // word and not a value, and a function would have received
             // a variable called NFC.
             self.parse_normalize()
+        } else if name.eq_ignore_ascii_case("TRIM") {
+            // ISO 20.24, and here for the reason NORMALIZE is: the
+            // explicit form names an end of the string with a word and
+            // separates its two operands with FROM, neither of which a
+            // call can say. The one argument form comes through here
+            // too and comes out as the call it is.
+            self.parse_trim()
         } else if name.eq_ignore_ascii_case("PROPERTY_EXISTS") {
             // G115, and here for the reason CAST is: the second
             // argument is a property name rather than an expression,
@@ -4568,6 +4575,69 @@ impl Parser<'_> {
         };
         self.expect(&TokenKind::RParen)?;
         Ok(Expr::Normalize { expr, form })
+    }
+
+    /// `TRIM(s)`, `TRIM(c FROM s)` or `TRIM(LEADING c FROM s)`, the
+    /// parenthesis unconsumed and TRIM already read.
+    ///
+    /// Three spellings and one function. The trim specification and the
+    /// trim character are both optional, so what stands after the
+    /// parenthesis may be an end of the string, the character to take
+    /// off it, or the string itself, and only what follows says which.
+    fn parse_trim(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let side = self.eat_trim_side();
+        // With an end named, what follows is the character or the FROM,
+        // and the string is behind the FROM. Without one, the first
+        // expression is the character if a FROM follows it and the
+        // string if nothing does.
+        let (chars, source) = if side.is_some() {
+            let chars = match self.at_kw("FROM") {
+                true => None,
+                false => Some(Box::new(self.parse_expr()?)),
+            };
+            self.expect_kw("FROM")?;
+            (chars, self.parse_expr()?)
+        } else {
+            let first = self.parse_expr()?;
+            match self.eat_kw("FROM") {
+                true => (Some(Box::new(first)), self.parse_expr()?),
+                false => (None, first),
+            }
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::Trim {
+            side: side.unwrap_or(TrimSide::Both),
+            chars,
+            source: Box::new(source),
+        })
+    }
+
+    /// The trim specification, if one is written here.
+    ///
+    /// A word is only taken as one when something other than the end of
+    /// the call follows it, so `TRIM(leading)` reads the variable a
+    /// query wrote and `TRIM(LEADING FROM s)` reads the specification.
+    /// The three words are reserved in ISO and are ordinary identifiers
+    /// to this lexer, which is the arrangement every keyword here has.
+    fn eat_trim_side(&mut self) -> Option<TrimSide> {
+        let side = if self.at_kw("LEADING") {
+            TrimSide::Leading
+        } else if self.at_kw("TRAILING") {
+            TrimSide::Trailing
+        } else if self.at_kw("BOTH") {
+            TrimSide::Both
+        } else {
+            return None;
+        };
+        if matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            None | Some(TokenKind::RParen) | Some(TokenKind::Comma)
+        ) {
+            return None;
+        }
+        self.pos += 1;
+        Some(side)
     }
 
     /// One of the four words ISO 19.7 names a normal form with. They are

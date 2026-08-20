@@ -785,3 +785,116 @@ cases:
           - type: BOOL
             value: false
           - type: NULL
+
+  - name: trim-takes-one-character-off-each-end
+    doc: The explicit form of ISO 20.24 with an end named and a character to take off it. BOTH is what the form means when no end is written, and it is written out here so the two cases below read as the halves of this one.
+    query: RETURN TRIM(BOTH 'x' FROM 'xax') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: a
+
+  - name: trim-from-the-front-only
+    doc: LEADING takes characters off the front and leaves the back alone, so a client that trims both ends whatever the statement asked for answers 'a' here and fails.
+    query: RETURN TRIM(LEADING 'x' FROM 'xxay') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ay
+
+  - name: trim-from-the-back-only
+    doc: TRAILING is the other half, and the two together are why the specification is part of the syntax rather than three functions with three names.
+    query: RETURN TRIM(TRAILING 'y' FROM 'xxay') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: xxa
+
+  - name: trim-with-no-end-named-takes-both
+    doc: The specification may be left out and the character kept, which is the shortest spelling of the explicit form and the one a reader is most likely to write.
+    query: RETURN TRIM('x' FROM 'xax') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: a
+
+  - name: trim-with-no-character-named-takes-spaces
+    doc: The character may be left out and the end kept, and the character it defaults to is a space rather than every space-like character Unicode has.
+    query: RETURN TRIM(BOTH FROM '  a  ') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: a
+
+  - name: trim-of-more-than-one-character
+    doc: TRIM trims one character and raises 22027 when it is handed a longer string, which is the condition that makes the multi-character functions a separate feature rather than a convenience.
+    query: RETURN TRIM(BOTH 'ab' FROM 'abx') AS n
+    raises: "22027"
+
+  - name: the-multi-character-trims
+    doc: GF05. BTRIM, LTRIM and RTRIM take a set of characters rather than one, and any character of the set is trimmed however often it appears and in whatever order.
+    query: RETURN LTRIM('xxay', 'x') AS l, RTRIM('xxay', 'y') AS r, BTRIM('xyaxy', 'xy') AS b
+    columns:
+      - l
+      - r
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ay
+          - type: STRING
+            value: xxa
+          - type: STRING
+            value: a
+
+  - name: a-multi-character-trim-with-no-set-named
+    doc: The set defaults to a space, the same way the trim character does, so the one argument form of each of the three is the plain question a client asks most often.
+    query: RETURN LTRIM('  a') AS l, RTRIM('a  ') AS r, BTRIM('  a  ') AS b
+    columns:
+      - l
+      - r
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: a
+          - type: STRING
+            value: a
+          - type: STRING
+            value: a
+
+  - name: trimming-a-character-the-string-does-not-have
+    doc: Nothing is trimmed and nothing is refused, because a trim is not a match: the string comes back as it was written.
+    query: RETURN LTRIM('ay', 'x') AS l, BTRIM('a', '') AS b
+    columns:
+      - l
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ay
+          - type: STRING
+            value: a
+
+  - name: a-trim-over-a-null-is-null
+    doc: A null on either side answers null, so a row an OPTIONAL MATCH left empty is not the empty string and a set nobody named is not the space it defaults to.
+    query: RETURN TRIM(LEADING NULL FROM 'xxa') AS a, LTRIM(NULL) AS b, RTRIM('a', NULL) AS c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+          - type: NULL

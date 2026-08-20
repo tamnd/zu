@@ -1132,6 +1132,16 @@ impl RelDirection {
     }
 }
 
+/// Which end of a string an explicit `TRIM` takes characters off, ISO
+/// 20.24's trim specification. The three words are the whole of the
+/// production, and leaving them out means BOTH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimSide {
+    Leading,
+    Trailing,
+    Both,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
@@ -1162,6 +1172,17 @@ pub enum Expr {
     Normalize {
         expr: Box<Expr>,
         form: NormalForm,
+    },
+    /// `TRIM(LEADING 'x' FROM s)`, ISO 20.24, GF06. Written like a call
+    /// and not one: the first word names an end of the string rather
+    /// than a value, and FROM is not a separator a call has. The one
+    /// argument form and the multi-character functions are ordinary
+    /// calls and do not come through here.
+    Trim {
+        side: TrimSide,
+        /// The character to trim, or none, which means a space.
+        chars: Option<Box<Expr>>,
+        source: Box<Expr>,
     },
     /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
     /// function answers, asked as a predicate, and the form defaults the

@@ -23,7 +23,7 @@ use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError, unicode};
 
 use crate::ast::Literal;
-use crate::binder::{BoundExpr, Func, Math, Trim, Type};
+use crate::binder::{BoundExpr, Cut, Func, Math, Trim, Type};
 use crate::exec::{Value, settle};
 
 /// The code behind a scalar function: the arguments already evaluated,
@@ -52,13 +52,17 @@ pub enum Kind {
     Path,
     /// A node or an edge.
     Element,
+    /// A string first and a count of characters after it, which is what
+    /// the substring function takes and the one kind here whose
+    /// positions are not alike.
+    Counted,
 }
 
 impl Kind {
-    /// Whether an argument of this type is one this kind accepts.
-    /// `ANY` is accepted everywhere, because it is the type of a value
-    /// nobody has narrowed yet and refusing it would refuse a property
-    /// read.
+    /// Whether an argument of this type is one this kind accepts,
+    /// wherever it was written. `ANY` is accepted everywhere, because it
+    /// is the type of a value nobody has narrowed yet and refusing it
+    /// would refuse a property read.
     pub fn accepts(self, ty: &Type) -> bool {
         match self {
             Kind::Any => true,
@@ -68,6 +72,19 @@ impl Kind {
             Kind::Sized => matches!(ty, Type::Any | Type::List(_) | Type::Str | Type::Path),
             Kind::Path => matches!(ty, Type::Any | Type::Path),
             Kind::Element => matches!(ty, Type::Any | Type::Node | Type::Rel),
+            Kind::Counted => Kind::Str.accepts(ty) || Kind::Number.accepts(ty),
+        }
+    }
+
+    /// Whether an argument of this type is one this kind accepts in the
+    /// position it was written in. Only [`Kind::Counted`] reads the
+    /// position: every other kind takes the same thing everywhere, so
+    /// for those this is [`Kind::accepts`] and nothing more.
+    pub fn accepts_at(self, at: usize, ty: &Type) -> bool {
+        match (self, at) {
+            (Kind::Counted, 0) => Kind::Str.accepts(ty),
+            (Kind::Counted, _) => Kind::Number.accepts(ty),
+            _ => self.accepts(ty),
         }
     }
 }
@@ -531,6 +548,38 @@ pub static REGISTRY: &[Signature] = &[
         star: false,
         by_name: true,
         kernel: Some(trim_kernel),
+    },
+    // The substring function, which in GQL is these two and nothing
+    // else: SUBSTRING is a word the standard has reserved and given no
+    // meaning yet, so a query that wants the middle of a string writes
+    // one of these inside the other.
+    Signature {
+        name: "left",
+        aliases: &[],
+        func: Func::Cut(Cut::Left),
+        arity: Arity::Exactly(2),
+        arg: Kind::Counted,
+        needs: "needs a string and a count of characters",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(cut_kernel),
+    },
+    Signature {
+        name: "right",
+        aliases: &[],
+        func: Func::Cut(Cut::Right),
+        arity: Arity::Exactly(2),
+        arg: Kind::Counted,
+        needs: "needs a string and a count of characters",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(cut_kernel),
     },
     Signature {
         name: "normalize",
@@ -1172,6 +1221,72 @@ fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
     Ok(Value::Str(out.to_string()))
 }
 
+/// ISO 20.24, the substring function: the first characters of a string
+/// or the last of them.
+///
+/// The count is characters and not bytes, the way every length here is,
+/// so `LEFT(s, 2)` answers two characters however many bytes they took
+/// to write. A count above the length of the string answers the whole
+/// string, since there is nothing else to hand back and asking for more
+/// than there is is not an error the standard names. A negative count
+/// is `22011`, which is the one condition it does name for these, and a
+/// count that is not a whole number is the same condition, since the
+/// grammar takes any numeric expression there and half a character is
+/// not a thing a string has.
+fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let cut = match func {
+        Func::Cut(cut) => cut,
+        other => {
+            return Err(invalid(format!(
+                "{}() is not a substring function",
+                name_of(other)
+            )));
+        }
+    };
+    let Some(text) = str_arg(func, args.first())? else {
+        return Ok(Value::Null);
+    };
+    let given = args
+        .get(1)
+        .ok_or_else(|| invalid(format!("{}() was given no count", name_of(func))))?;
+    let count = match settle(given.clone()) {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(i) => i,
+        Value::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e18 => f as i64,
+        Value::Float(f) => {
+            return Err(gql(
+                codes::C22011,
+                format!(
+                    "{}() counts whole characters and was asked for {f} of them",
+                    name_of(func)
+                ),
+            ));
+        }
+        other => {
+            return Err(invalid(format!(
+                "{}() expects a number, got {other:?}",
+                name_of(func)
+            )));
+        }
+    };
+    if count < 0 {
+        return Err(gql(
+            codes::C22011,
+            format!(
+                "{}() was asked for {count} characters, and a string has no negative number of them",
+                name_of(func)
+            ),
+        ));
+    }
+    let count = count as usize;
+    let held = text.chars().count();
+    let taken: String = match cut {
+        Cut::Left => text.chars().take(count).collect(),
+        Cut::Right => text.chars().skip(held.saturating_sub(count)).collect(),
+    };
+    Ok(Value::Str(taken))
+}
+
 /// The string an argument holds, or nothing where it holds a null.
 /// Every kernel over strings reads its arguments through this, so a
 /// null answers null in one place rather than in each of them.
@@ -1765,6 +1880,51 @@ mod tests {
                 trimmed(trim, &[Value::Str("abx".into()), Value::Str("ab".into())]).unwrap(),
                 Value::Str(want.into()),
                 "{trim:?}"
+            );
+        }
+    }
+
+    /// ISO 20.24. LEFT counts from the front and RIGHT from the back,
+    /// both in characters, and a count past the end of the string
+    /// answers the string, there being nothing else to answer with.
+    #[test]
+    fn a_substring_is_counted_in_characters_from_the_end_it_names() {
+        let text = Value::Str("héllo".into());
+        for (name, count, want) in [
+            ("left", 2, "hé"),
+            ("right", 2, "lo"),
+            ("left", 0, ""),
+            ("right", 0, ""),
+            ("left", 5, "héllo"),
+            ("right", 5, "héllo"),
+            // More than the string holds is the string. The count is
+            // characters, so the accented one counts once here and takes
+            // two bytes in the store.
+            ("left", 40, "héllo"),
+            ("right", 40, "héllo"),
+        ] {
+            let got = call(name, &[text.clone(), Value::Int(count)]).unwrap();
+            assert_eq!(got, Value::Str(want.into()), "{name} of {count}");
+        }
+    }
+
+    /// A count no string has is `22011`, which is the one condition the
+    /// standard names for the substring function. A count written as a
+    /// whole float is a count, since the grammar takes any numeric
+    /// expression there, and one with a fraction on it is not.
+    #[test]
+    fn a_count_of_characters_no_string_has_is_a_condition() {
+        let text = Value::Str("abc".into());
+        for name in ["left", "right"] {
+            let err = call(name, &[text.clone(), Value::Int(-1)]).expect_err("a substring error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22011), "{name}");
+            let err =
+                call(name, &[text.clone(), Value::Float(1.5)]).expect_err("a substring error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22011), "{name}");
+            assert_eq!(
+                call(name, &[text.clone(), Value::Float(2.0)]).unwrap(),
+                Value::Str(if name == "left" { "ab" } else { "bc" }.into()),
+                "{name}"
             );
         }
     }

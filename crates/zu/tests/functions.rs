@@ -200,6 +200,52 @@ fn the_trim_family_answers_over_a_column() {
     assert!(says.contains("trims one character"), "{says}");
 }
 
+/// ISO 20.24, the substring function: LEFT and RIGHT over a column,
+/// which in GQL are the whole of it, since SUBSTRING is a word the
+/// standard has reserved and given no meaning to.
+#[test]
+fn the_substring_function_answers_over_a_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+    let mut conn = db.connect().expect("connect");
+
+    let source = "MATCH (p:person) RETURN LEFT(p.name, 2) AS l ORDER BY l";
+    let rows = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| row.get_by_name::<String>("l").expect("l"))
+        .collect();
+    assert_eq!(names, ["an", "bo"]);
+
+    let plan = conn.explain(source).expect("explain");
+    assert!(plan.contains("left("), "{plan}");
+    let plan = conn.explain("RETURN LEFT('abc', 2) AS l").expect("explain");
+    assert!(!plan.contains("left("), "{plan}");
+
+    assert_eq!(
+        one(&db, "RETURN RIGHT('abc', 2) AS v"),
+        Value::Str("bc".into())
+    );
+    // The middle of a string is one written inside the other, there
+    // being no third function for it.
+    assert_eq!(
+        one(&db, "RETURN LEFT(RIGHT('abcde', 4), 2) AS v"),
+        Value::Str("bc".into())
+    );
+
+    // A count is a number and a string is a string, both settled while
+    // binding, and a count no string has is the standard's condition.
+    let says = refused(&db, "RETURN LEFT('abc', 'two') AS v");
+    assert!(
+        says.contains("left() needs a string and a count of characters"),
+        "{says}"
+    );
+    let says = refused(&db, "MATCH (p:person) RETURN RIGHT(p.name, -1) AS v");
+    assert!(says.contains("negative number"), "{says}");
+}
+
 /// What a signature refuses, and in its own words: a name no builtin
 /// has, a count of arguments the signature does not allow, and a type
 /// the function has nothing to say about.

@@ -898,3 +898,48 @@ cases:
           - type: NULL
           - type: NULL
           - type: NULL
+
+  - name: the-first-and-last-characters-of-a-string
+    doc: ISO 20.24. LEFT counts from the front and RIGHT from the back, and both count characters, so a string of accented letters answers by the letters a reader sees rather than by the bytes the store keeps.
+    query: RETURN LEFT('héllo', 2) AS l, RIGHT('héllo', 2) AS r
+    columns:
+      - l
+      - r
+    rows:
+      - values:
+          - type: STRING
+            value: hé
+          - type: STRING
+            value: lo
+
+  - name: a-substring-of-more-characters-than-the-string-has
+    doc: Asking for more than there is answers the string, and asking for none of it answers the empty string, neither being a condition the standard names.
+    query: RETURN LEFT('abc', 9) AS l, RIGHT('abc', 9) AS r, LEFT('abc', 0) AS n
+    columns:
+      - l
+      - r
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abc
+          - type: STRING
+            value: abc
+          - type: STRING
+            value: ""
+
+  - name: a-substring-of-a-negative-number-of-characters
+    doc: A string has no negative number of characters, so the count is refused with the substring error the standard names for it rather than read as a count from the other end.
+    query: RETURN LEFT('abc', -1) AS v
+    raises: "22011"
+
+  - name: a-substring-over-a-null-is-null
+    doc: A null string or a null count answers null, the way every scalar here does, so a row an OPTIONAL MATCH left empty is not the empty string.
+    query: RETURN LEFT(NULL, 2) AS a, RIGHT('abc', NULL) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL

@@ -123,6 +123,11 @@ doc = "The multi-character trim functions of ISO 20.24, which take a set of char
 words = ["BTRIM", "LTRIM", "RTRIM"]
 
 [[group]]
+kind = "function"
+doc = "The substring function of ISO 20.24, which in GQL is these two and nothing else. LEFT takes the first characters of a string and RIGHT the last, both counting characters rather than bytes, and a query that wants the middle of a string writes one inside the other. SUBSTRING is not here and is not a function: the standard lists the word among the ones it has reserved for a later edition to give a meaning to, and giving it one here would be inventing a spelling that a later edition could take back."
+words = ["LEFT", "RIGHT"]
+
+[[group]]
 kind = "keyword"
 doc = "The trim specification, which names the end of the string TRIM takes characters off, and the FROM that separates what is trimmed from what it is trimmed out of. They are words rather than arguments because an end of a string is not a value a row can hold, which is the arrangement a normal form has. FROM is here and nowhere else: a GQL query reads its rows from a pattern rather than from a table, so this is the one place the word stands."
 words = ["LEADING", "TRAILING", "BOTH", "FROM"]

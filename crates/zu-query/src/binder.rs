@@ -1727,6 +1727,12 @@ pub enum Func {
     /// [`Trim`] says, and it is a question for the registry and the
     /// kernel behind it.
     Trim(Trim),
+    /// ISO 20.24, the substring function: `LEFT` and `RIGHT`, which are
+    /// one family for the reason the trims are, both taking a string
+    /// and a length and both raising the same condition when the length
+    /// is one no string has. Which end the characters are counted from
+    /// is what [`Cut`] says.
+    Cut(Cut),
     /// ISO 20.24. The string in one of the four Unicode normal forms.
     /// The form is on the function rather than in the arguments because
     /// it is a word the statement wrote and not a value a row holds, so
@@ -1827,6 +1833,20 @@ pub enum Trim {
     Ltrim,
     /// GF05. `RTRIM(s, cs)`: the back only.
     Rtrim,
+}
+
+/// ISO 20.24, the substring function: which end of a string the
+/// characters are counted from.
+///
+/// GQL has no `SUBSTRING`. The word is reserved for a later standard to
+/// use and these two are the whole of the substring function, so a
+/// query that wants the middle of a string writes one inside the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// `LEFT(s, n)`: the first n characters.
+    Left,
+    /// `RIGHT(s, n)`: the last n characters.
+    Right,
 }
 
 impl Func {
@@ -5653,8 +5673,8 @@ impl Binder<'_> {
             bound.push(b);
         }
         ctx.in_aggregate = was_in_aggregate;
-        for ty in &arg_tys {
-            if !sig.arg.accepts(ty) {
+        for (at, ty) in arg_tys.iter().enumerate() {
+            if !sig.arg.accepts_at(at, ty) {
                 return Err(bad_type(format!("{}() {}, got {ty}", sig.name, sig.needs)));
             }
         }

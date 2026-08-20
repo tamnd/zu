@@ -6804,6 +6804,7 @@ impl AggState {
             | Func::Upper
             | Func::Lower
             | Func::Trim(_)
+            | Func::Cut(_)
             | Func::Normalize(_)
             | Func::IsNormalized(_)
             | Func::Math(_) => {

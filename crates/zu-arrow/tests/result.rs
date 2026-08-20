@@ -22,6 +22,7 @@ use zu::dataset::{NodeFile, RelFile, load_dataset};
 use zu::query::{QueryResult, run};
 use zu::session::Session;
 use zu_arrow::{BATCH, Table, Tables};
+use zu_query::column::HeldData;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 
@@ -284,6 +285,53 @@ fn a_batch_size_a_caller_asked_for_is_the_batch_size_the_stream_uses() {
             .map(RecordBatch::num_rows)
             .collect::<Vec<_>>(),
         vec![2, 1]
+    );
+}
+
+#[test]
+fn a_taken_result_hands_arrow_the_buffer_the_engine_filled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let result = answer(&mut db, "MATCH (a:Account) RETURN a.balance AS balance");
+    // Where the sink put the reals, before anything has been exported.
+    let filled_at = match &result.rows.columns().expect("columns").columns[0].data {
+        HeldData::Float(values) => values.as_ptr(),
+        other => panic!("expected a real column, got {other:?}"),
+    };
+    let table = Table::taken(result, &names(dir.path())).expect("arrays");
+    let batches = drain(table.batches(BATCH));
+    let balances = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("floats");
+    // The same address, so between the executor writing the value and
+    // Arrow reading it there was no copy of the column at all.
+    assert_eq!(balances.values().as_ptr(), filled_at);
+    let mut held: Vec<f64> = balances.values().to_vec();
+    held.sort_by(f64::total_cmp);
+    assert_eq!(held, vec![0.0, 20.25, 100.5]);
+}
+
+#[cfg(feature = "ffi")]
+#[test]
+fn a_taken_result_crosses_the_c_data_interface_the_same_as_a_borrowed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let result = answer(&mut db, "MATCH (p:Person) RETURN p.name AS name");
+    let mut stream = zu_arrow::stream_taken(result, &names(dir.path()), BATCH).expect("stream");
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.expect("import");
+    assert_eq!(reader.schema().field(0).name(), "name");
+    let mut people: Vec<Option<String>> =
+        drain(reader).iter().flat_map(|b| strings(b, 0)).collect();
+    people.sort();
+    assert_eq!(
+        people,
+        vec![
+            Some("ann".to_string()),
+            Some("bo".to_string()),
+            Some("cy".to_string())
+        ]
     );
 }
 

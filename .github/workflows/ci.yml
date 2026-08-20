@@ -451,6 +451,19 @@ jobs:
       # sides: a chunked read that converts more than its chunk.
       - run: ZU_GATE=1 cargo bench -p zu-capi --bench result
 
+  arrow-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # What an export costs when the result is taken instead of
+      # borrowed. Both halves run over the same statement in one
+      # process, so it is a ratio and a shared runner does not move it,
+      # and it fails on exactly one defect: a copy coming back to the
+      # path whose whole point is that there is not one.
+      - run: ZU_GATE=1 cargo bench -p zu-arrow --bench export
+
   cli:
     runs-on: ubuntu-latest
     steps:

@@ -2,7 +2,7 @@
 
 Every client in the table beside this page is a repository, a release, a scorecard and a person who answers for it. This one is a crate. `crates/zu-adbc` builds a shared object that any ADBC driver manager opens by name, and a program in Python, R, Java, Go or C++ that has a driver manager already has a zu client, without a package of ours in its dependency list and without anybody writing one.
 
-That is worth a page because it is the cheapest surface this engine has. ADBC is the one database interface whose result is Arrow rather than rows, and a zu result has been columnar since the sink stopped flattening, so the driver is a vocabulary and not a translation. What it hands back is the buffers `zu-arrow` builds for the Python and TypeScript clients, cut into batches, and no row is built anywhere on the path.
+That is worth a page because it is the cheapest surface this engine has. ADBC is the one database interface whose result is Arrow rather than rows, and a zu result has been columnar since the sink stopped flattening, so the driver is a vocabulary and not a translation. What it hands back is the buffers `zu-arrow` builds for the Python and TypeScript clients, cut into batches, and no row is built anywhere on the path. Nor is anything copied: the driver takes the result rather than reading it, so the arrays that cross the boundary are the buffers the executor filled, at the addresses it filled them at.
 
 ## 1. Running it
 

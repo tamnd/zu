@@ -377,6 +377,8 @@ The answer to it starts at `zu::query::column`, which is a result read down its 
 
 It lives in the engine and not in a binding for one reason. The transpose is a transpose only until the sink stops flattening: `crates/zu-vector` is what the executor already computes in, [`SinkState`] is the one place the vectors die, and when that changes `columnar` hands back the buffers the executor filled and no client changes a line. A binding that had written the transpose for itself would have to be rewritten instead.
 
+That is what happened, and it left one copy behind. The sink fills the buffers now, so `columnar` hands them over rather than transposing anything, but it hands them over borrowed: the result stays readable afterwards, and a buffer that leaves through a borrow has to be copied because the one behind it stays where it is. So an export of a half million row column was a memcpy of the whole answer, every time, purely because the caller was allowed to ask twice. `QueryResult::into_columns` is the other half of that bargain and `zu_arrow::Table::taken` is what calls it: the result is consumed, its buffers are moved into the Arrow arrays, and an export costs a pointer a column and nothing at all per row. Measured on a half million row integer column it is 0.375 ms borrowed against 0.001 ms taken, and the gap widens with the answer, because one of those two numbers grows with it and the other does not. A result the sink built across its rows instead has no buffers to move and is handed back untouched, so the borrowing path is still there and is still what a caller who wants to read the result again should use.
+
 [`SinkState`]: https://github.com/tamnd/zu/blob/main/crates/zu-exec/src/sink.rs
 
 ## 17. Documentation deliverables (v1.0 gate)

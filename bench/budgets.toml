@@ -1928,3 +1928,21 @@ paths_count_over_enumerate_x = 0.01
 fold_alloc_bytes_row = 1.0
 fold_over_list_x = 1.4
 fold_group_us = 2000000.0
+
+# What an Arrow export costs when the result is taken rather than
+# borrowed, crates/zu-arrow/benches/export.rs. A projection of one
+# stored column over 500000 nodes, exported both ways.
+#
+# Borrowing leaves the result readable, so every buffer the sink filled
+# is memcpied into the array that leaves and the export costs a copy of
+# the answer. Taking consumes the result and moves those buffers into
+# Arrow, so it costs a pointer a column and nothing per row. Measured
+# 0.339 ms borrowed against 0.001 ms taken on an M series laptop, which
+# is 0.003, and the number is a fixed cost against a cost per row so it
+# falls as the answer grows.
+#
+# The ceiling is set two orders of magnitude above the measurement,
+# because what it exists to catch is a copy coming back on the taking
+# path, and a copy lands at 1 rather than just over 0.003. Lower this
+# ceiling, never raise it.
+arrow_taken_export_ratio = 0.25

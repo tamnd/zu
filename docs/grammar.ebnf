@@ -387,13 +387,32 @@ comparison      = concat , { comparison_op , concat
 normal_form     = "NFC" | "NFD" | "NFKC" | "NFKD" ;
 normalize       = "NORMALIZE" , "(" , expression ,
                   [ "," , normal_form ] , ")" ;
-(* ISO 20.27, mandatory. The five words a statement asks the time with.
-   They are written bare, the grammar giving them no parentheses, so
-   CURRENT_DATE() is a call to a function nobody defined. All five are
-   cut from one instant, read once before the first row, so a statement
-   holding two of them cannot have them land on two different days. *)
-datetime_fn     = "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
-                | "LOCAL_TIME" | "LOCAL_TIMESTAMP" ;
+(* ISO 20.27, mandatory. The temporal value functions, which come in
+   pairs: a word that asks the time and a word that reads the same type
+   out of a string. The first four are written bare, the grammar giving
+   them no parentheses, so CURRENT_DATE() is a call to a function nobody
+   defined, and LOCAL_TIME is the one the standard writes both ways. The
+   bracketed five must be bracketed, and their brackets may stand empty,
+   which reads the clock and answers what the word beside them answers.
+   Every clock reading in a statement is cut from one instant, read once
+   before the first row, so a statement holding two of them cannot have
+   them land on two different days.
+
+   ISO writes each parameter as a string or a record constructor. zu
+   reads the string and not yet the record. *)
+clock_fn        = "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+                | "LOCAL_TIMESTAMP" ;
+temporal_word   = "DATE" | "ZONED_TIME" | "LOCAL_TIME"
+                | "ZONED_DATETIME" | "LOCAL_DATETIME" ;
+temporal_fn     = clock_fn | "LOCAL_TIME"
+                | temporal_word , "(" , [ expression ] , ")" ;
+(* ISO 20.29, mandatory. The duration functions. DURATION reads a length
+   of time out of a string and has no empty form, there being a date now
+   and a time now and no length of time now, and ABS answers the length
+   of a duration without its sign, which is the same word the numbers
+   are given. *)
+duration_fn     = "DURATION" , "(" , expression , ")"
+                | "ABS" , "(" , expression , ")" ;
 (* ISO 20.28, mandatory. The length of time from the first datetime to
    the second, which is the minus between them written the other way
    round. The qualifier stands behind the closing bracket, where no
@@ -429,7 +448,7 @@ unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
                 | function_call | cast | property_exists | normalize
-                | datetime_fn | duration_between
+                | temporal_fn | duration_fn | duration_between
                 | case_expr | coalesce | nullif
                 | path_constructor | exists_block
                 | value_query | "(" , expression , ")" | list | record ;

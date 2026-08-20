@@ -22,7 +22,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
 
-use crate::ast::{DatetimeFn, Literal};
+use crate::ast::{Literal, TemporalFn};
 use crate::binder::{BoundExpr, Cut, Func, Math, Trim, Type};
 use crate::cast;
 use crate::exec::{Value, settle};
@@ -131,6 +131,11 @@ pub enum Ret {
     Same,
     /// A list of the type of the first argument.
     ListOf,
+    /// A temporal value. The binder's type lattice has no temporal
+    /// type, so every one of them binds as `ANY`, and a row saying that
+    /// is what it answers reads better than a row saying it answers the
+    /// type of an argument that might be the string it was read out of.
+    Temporal,
     /// The wider of the arguments: an integer where every argument is
     /// one and a float where any of them is, which is the rule the
     /// arithmetic operators follow and so is the rule `MOD` follows.
@@ -149,6 +154,7 @@ impl Ret {
             Ret::Str => Type::Str,
             Ret::Bool => Type::Bool,
             Ret::ListOfAny => Type::List(Box::new(Type::Any)),
+            Ret::Temporal => Type::Any,
             Ret::Same => first(),
             Ret::ListOf => Type::List(Box::new(first())),
             Ret::Wider => {
@@ -582,81 +588,163 @@ pub static REGISTRY: &[Signature] = &[
         by_name: true,
         kernel: Some(cut_kernel),
     },
-    // ISO 20.27, the datetime value functions. None of them is reachable
-    // by name: the grammar writes them as bare words with no
-    // parentheses, so a query saying CURRENT_DATE() is asking for a
-    // function nobody defined and gets told so. The argument is the
-    // instant the statement is running at, which the parser never
-    // writes and the binder always does.
+    // ISO 20.27, the temporal value functions, and the DURATION of ISO
+    // 20.29. None of the ten is reachable by name, because the grammar
+    // does not write any of them the way it writes a call: four are
+    // bare words that may not be bracketed at all, so a query saying
+    // CURRENT_DATE() is asking for a function nobody defined and gets
+    // told so, five must be bracketed, and LOCAL_TIME is the one the
+    // standard writes both ways. The parser reads that difference and
+    // the registry never sees it.
+    //
+    // Each row takes one argument, which is the string the statement
+    // wrote or, where it wrote none, the instant it is running at. The
+    // row says which temporal type that argument is read as, so the ten
+    // are one kernel over two sources rather than ten conversions.
+    //
+    // They are deterministic in the only sense the folder means, one
+    // answer for one argument, and the ones that read a clock still
+    // never fold: the instant reaches them as a clock and the folder
+    // will not fold anything but literals.
     Signature {
         name: "current_date",
         aliases: &[],
-        func: Func::Datetime(DatetimeFn::CurrentDate),
+        func: Func::Temporal(TemporalFn::CurrentDate),
         arity: Arity::Exactly(1),
         arg: Kind::Any,
-        needs: "needs the instant the statement is running at",
-        ret: Ret::Same,
-        deterministic: false,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
         aggregate: false,
         star: false,
         by_name: false,
-        kernel: Some(datetime_kernel),
+        kernel: Some(temporal_kernel),
     },
     Signature {
         name: "current_time",
         aliases: &[],
-        func: Func::Datetime(DatetimeFn::CurrentTime),
+        func: Func::Temporal(TemporalFn::CurrentTime),
         arity: Arity::Exactly(1),
         arg: Kind::Any,
-        needs: "needs the instant the statement is running at",
-        ret: Ret::Same,
-        deterministic: false,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
         aggregate: false,
         star: false,
         by_name: false,
-        kernel: Some(datetime_kernel),
+        kernel: Some(temporal_kernel),
     },
     Signature {
         name: "current_timestamp",
         aliases: &[],
-        func: Func::Datetime(DatetimeFn::CurrentTimestamp),
+        func: Func::Temporal(TemporalFn::CurrentTimestamp),
         arity: Arity::Exactly(1),
         arg: Kind::Any,
-        needs: "needs the instant the statement is running at",
-        ret: Ret::Same,
-        deterministic: false,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
         aggregate: false,
         star: false,
         by_name: false,
-        kernel: Some(datetime_kernel),
+        kernel: Some(temporal_kernel),
     },
     Signature {
         name: "local_time",
         aliases: &[],
-        func: Func::Datetime(DatetimeFn::LocalTime),
+        func: Func::Temporal(TemporalFn::LocalTime),
         arity: Arity::Exactly(1),
         arg: Kind::Any,
-        needs: "needs the instant the statement is running at",
-        ret: Ret::Same,
-        deterministic: false,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
         aggregate: false,
         star: false,
         by_name: false,
-        kernel: Some(datetime_kernel),
+        kernel: Some(temporal_kernel),
     },
     Signature {
         name: "local_timestamp",
         aliases: &[],
-        func: Func::Datetime(DatetimeFn::LocalTimestamp),
+        func: Func::Temporal(TemporalFn::LocalTimestamp),
         arity: Arity::Exactly(1),
         arg: Kind::Any,
-        needs: "needs the instant the statement is running at",
-        ret: Ret::Same,
-        deterministic: false,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
         aggregate: false,
         star: false,
         by_name: false,
-        kernel: Some(datetime_kernel),
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "date",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::Date),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "zoned_time",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::ZonedTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "zoned_datetime",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::ZonedDatetime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "local_datetime",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::LocalDatetime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "duration",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::Duration),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string spelling a length of time",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
     },
     // ISO 20.28, the datetime subtraction. Two rows, for the reason the
     // trims have six: the qualifier behind the brackets says which of
@@ -673,7 +761,7 @@ pub static REGISTRY: &[Signature] = &[
         arity: Arity::Exactly(2),
         arg: Kind::Any,
         needs: "needs two datetimes of one shape",
-        ret: Ret::Same,
+        ret: Ret::Temporal,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -687,7 +775,7 @@ pub static REGISTRY: &[Signature] = &[
         arity: Arity::Exactly(2),
         arg: Kind::Any,
         needs: "needs two datetimes of one shape",
-        ret: Ret::Same,
+        ret: Ret::Temporal,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -1400,46 +1488,56 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
     Ok(Value::Str(taken))
 }
 
-/// ISO 20.27, the datetime value functions: one instant cut five ways.
+/// The temporal value functions of ISO 20.27 and the `DURATION` of ISO
+/// 20.29: one value read ten ways.
 ///
-/// The instant arrives as the argument, so this kernel reads no clock
-/// and is as pure as every other one here. What makes the five differ
-/// is only which type the instant is read as, and reading one temporal
-/// type as another is what the cast rules already say, so the cut is a
-/// conversion and not arithmetic written twice.
+/// The value arrives as the argument, so this kernel reads no clock and
+/// is as pure as every other one here. What makes the ten differ is
+/// only which type the value is read as, so a string is parsed at that
+/// type and an instant is converted to it, and both of those are rules
+/// written down once elsewhere rather than ten times here.
 ///
-/// A null instant answers null, which is the rule every kernel here
-/// keeps rather than an answer a query can reach: the binder plants the
-/// argument itself and the run always has a clock, so nothing a
-/// statement writes gets here with a null in hand.
-fn datetime_kernel(func: Func, args: &[Value]) -> Result<Value> {
-    let Func::Datetime(which) = func else {
+/// A null argument answers null. A statement can reach that now, since
+/// the string is one a statement wrote and a parameter can hold null,
+/// where the clock the binder plants never can.
+fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let Func::Temporal(which) = func else {
         return Err(invalid(format!(
-            "{}() is not a datetime value function",
+            "{}() is not a temporal value function",
             name_of(func)
         )));
     };
-    let instant = match args.first().map(|value| settle(value.clone())) {
-        Some(Value::Temporal(instant)) => instant,
+    let read = match args.first().map(|value| settle(value.clone())) {
         Some(Value::Null) => return Ok(Value::Null),
-        Some(other) => {
-            return Err(invalid(format!(
-                "{}() expects an instant, got {other:?}",
-                name_of(func)
-            )));
+        Some(Value::Str(text)) => Temporal::parse(&which.target(), &text).ok_or_else(|| {
+            gql(
+                codes::C22007,
+                format!(
+                    "{}() cannot read {text:?} as {}",
+                    name_of(func),
+                    which.target()
+                ),
+            )
+        }),
+        Some(Value::Temporal(instant)) => {
+            cast::convert(instant, &which.target()).ok_or_else(|| {
+                gql(
+                    codes::C22G03,
+                    format!(
+                        "{}() cannot read {instant} as {}",
+                        name_of(func),
+                        which.target()
+                    ),
+                )
+            })
         }
-        None => {
-            return Err(invalid(format!("{}() was given no instant", name_of(func))));
-        }
-    };
-    let cut = cast::convert(instant, &which.target()).ok_or_else(|| {
-        invalid(format!(
-            "{}() cannot read the instant as {}",
-            name_of(func),
-            which.target()
-        ))
-    })?;
-    Ok(Value::Temporal(cut))
+        Some(other) => Err(gql(
+            codes::C22G03,
+            format!("{}() expects a string, got {other:?}", name_of(func)),
+        )),
+        None => Err(invalid(format!("{}() was given nothing", name_of(func)))),
+    }?;
+    Ok(Value::Temporal(read))
 }
 
 /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO 20.28.
@@ -1603,6 +1701,19 @@ fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
             .map(Value::Int)
             .ok_or_else(|| out_of_range(func, format!("of {i} is one past the top of an integer"))),
         (Math::Abs, Value::Float(f)) => Ok(Value::Float(f.abs())),
+        // ISO 20.29's duration absolute value function, which is the
+        // same word over a length of time. A duration is a signed count
+        // of one unit, so the length of it is that count without its
+        // sign and the kind it counts in is untouched.
+        (Math::Abs, Value::Temporal(Temporal::Duration(kind, count))) => count
+            .checked_abs()
+            .map(|count| Value::Temporal(Temporal::Duration(*kind, count)))
+            .ok_or_else(|| {
+                out_of_range(
+                    func,
+                    format!("of {count} is one past the top of a duration"),
+                )
+            }),
         (Math::Sign, Value::Int(i)) => Ok(Value::Int(i.signum())),
         (Math::Sign, Value::Float(f)) => Ok(Value::Int(if *f > 0.0 {
             1

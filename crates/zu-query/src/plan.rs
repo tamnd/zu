@@ -1423,11 +1423,18 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             args,
             ..
         } => {
-            // ISO 20.27 writes these five as bare words, so a plan
-            // that printed the instant they were handed would print a
-            // thing no query can write and no reader asked for.
-            if let Func::Datetime(which) = func {
-                return which.word().to_uppercase();
+            // ISO 20.27 writes some of these as bare words and brackets
+            // the rest, and the argument of a bare one is the instant
+            // the binder planted. Printing that instant would print a
+            // thing no query can write and no reader asked for, so the
+            // clock is printed as the word alone and a written string
+            // is printed inside the brackets it was written in.
+            if let Func::Temporal(which) = func {
+                let word = which.word().to_uppercase();
+                return match args.first() {
+                    Some(BoundExpr::Clock) | None => word,
+                    Some(arg) => format!("{word}({})", expr_text(arg, query)),
+                };
             }
             // ISO 20.28 puts the qualifier behind the brackets, so a
             // plan that printed it as an argument would print text no

@@ -19,9 +19,9 @@ use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Conjunction, DatetimeFn, DeleteTarget, Expr, GraphRef, LabelExpr,
-    Literal, NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed,
-    Selector, SetInto, SetItem, SortKey, TrimSide, UnaryOp,
+    self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
+    NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
+    SetInto, SetItem, SortKey, TemporalFn, TrimSide, UnaryOp,
 };
 use crate::functions;
 use crate::refs::GraphHandle;
@@ -1737,7 +1737,7 @@ pub enum Func {
     /// instant the statement is running at, which is the argument the
     /// call carries, so the clock is read once per statement however
     /// many of these it holds and however many rows they answer over.
-    Datetime(DatetimeFn),
+    Temporal(TemporalFn),
     /// ISO 20.28, the datetime subtraction. The kind is on the function
     /// rather than in the arguments for the reason a normal form is: it
     /// is a qualifier the statement wrote and not a value a row holds,
@@ -5023,7 +5023,7 @@ impl Binder<'_> {
                 chars,
                 source,
             } => self.bind_trim(*side, chars.as_deref(), source, ctx),
-            Expr::Datetime(func) => self.bind_datetime(*func, ctx),
+            Expr::Temporal { func, arg } => self.bind_temporal(*func, arg.as_deref(), ctx),
             // The instant, which is a value the run supplies and the
             // type of a temporal value is ANY here, the way a date
             // literal's is.
@@ -5624,15 +5624,23 @@ impl Binder<'_> {
         self.bind_row(at, "trim", false, false, &args, ctx)
     }
 
-    /// `CURRENT_DATE` and the four words beside it, ISO 20.27. Each is
-    /// a cut of one instant, so the call the binder writes takes that
-    /// instant as its argument and the row says which cut it is. The
-    /// clock is read where the statement runs rather than here, which
-    /// is what keeps a cached plan from carrying the time it was
-    /// compiled at.
-    fn bind_datetime(&mut self, func: DatetimeFn, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
-        let at = functions::row_of(Func::Datetime(func)).expect("a datetime function has a row");
-        self.bind_row(at, func.word(), false, false, &[Expr::Clock], ctx)
+    /// The temporal value functions of ISO 20.27 and 20.29. Each is a
+    /// cut of one value, so the call the binder writes takes that value
+    /// as its argument and the row says which cut it is: the string the
+    /// statement wrote, or the instant it is running at where it wrote
+    /// none. The clock is read where the statement runs rather than
+    /// here, which is what keeps a cached plan from carrying the time
+    /// it was compiled at, and it is why the two forms are one row and
+    /// one kernel.
+    fn bind_temporal(
+        &mut self,
+        func: TemporalFn,
+        arg: Option<&Expr>,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let at = functions::row_of(Func::Temporal(func)).expect("a temporal function has a row");
+        let arg = arg.cloned().unwrap_or(Expr::Clock);
+        self.bind_row(at, func.word(), false, false, &[arg], ctx)
     }
 
     /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
@@ -5898,7 +5906,10 @@ pub fn text(expr: &Expr) -> String {
             };
             format!("TRIM({side}{chars}FROM {})", text(source))
         }
-        Expr::Datetime(func) => func.word().to_uppercase(),
+        Expr::Temporal { func, arg } => match arg {
+            Some(arg) => format!("{}({})", func.word().to_uppercase(), text(arg)),
+            None => func.word().to_uppercase(),
+        },
         // The word above is what a reader sees, since the instant is
         // the binder's own doing and naming a column after it would
         // name it after a thing the query never wrote.

@@ -362,6 +362,111 @@ fn the_datetime_value_functions_answer_one_instant() {
     assert!(says.contains("unknown function"), "{says}");
 }
 
+/// The constructors of ISO 20.27 and the `DURATION` of ISO 20.29: the
+/// same five cuts, read out of a string a statement wrote instead of
+/// out of the clock it is running against.
+///
+/// What is asked here is that the two sources meet in one place. A
+/// string reaches the same value the literal of that type reaches, an
+/// empty pair of brackets reaches the same value the bare word reaches,
+/// and the string form folds while the clock form cannot, which is the
+/// one thing that would go wrong if the argument were not how the two
+/// are told apart.
+#[test]
+fn the_temporal_constructors_read_a_string_or_the_clock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+
+    // A string is read at the type the word names, and what it reaches
+    // is what the literal of that type reaches.
+    for (call, literal) in [
+        ("DATE('2024-01-15')", "DATE '2024-01-15'"),
+        (
+            "ZONED_TIME('10:00:00+07:00')",
+            "ZONED TIME '10:00:00+07:00'",
+        ),
+        ("LOCAL_TIME('10:00:00')", "LOCAL TIME '10:00:00'"),
+        (
+            "ZONED_DATETIME('2024-01-15T10:00:00Z')",
+            "ZONED DATETIME '2024-01-15T10:00:00Z'",
+        ),
+        (
+            "LOCAL_DATETIME('2024-01-15T10:00:00')",
+            "LOCAL DATETIME '2024-01-15T10:00:00'",
+        ),
+        ("DURATION('P1Y2M')", "DURATION 'P1Y2M'"),
+        ("DURATION('P3DT4H')", "DURATION 'P3DT4H'"),
+    ] {
+        assert_eq!(
+            one(&db, &format!("RETURN {call}")),
+            one(&db, &format!("RETURN {literal}")),
+            "{call}"
+        );
+    }
+
+    // Empty brackets read the clock, so they reach what the bare word
+    // beside them reaches. All of it is one instant, the clock being
+    // read once for the statement, so this is an equality and not a
+    // near miss.
+    let source = "RETURN CURRENT_DATE AS a, DATE() AS b, CURRENT_TIME AS c, ZONED_TIME() AS d, \
+                  CURRENT_TIMESTAMP AS e, ZONED_DATETIME() AS f, LOCAL_TIMESTAMP AS g, \
+                  LOCAL_DATETIME() AS h, LOCAL_TIME AS i, LOCAL_TIME() AS j";
+    let mut conn = db.connect().expect("connect");
+    let rows = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let rows: Vec<_> = rows.iter().collect();
+    let read = |name: &str| rows[0].value_by_name(name).expect(name).clone();
+    for (word, brackets) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h"), ("i", "j")] {
+        assert_eq!(read(word), read(brackets), "{word} and {brackets}");
+    }
+
+    // There is a date now and a time now, and there is no length of
+    // time now, so the one of them that reads no clock must be given
+    // its string.
+    let says = refused(&db, "RETURN DURATION()");
+    assert!(says.contains("no length of time now"), "{says}");
+
+    // A string that spells nothing of that type is refused, and so is a
+    // string that spells a value of another one.
+    let says = refused(&db, "RETURN DATE('the fifteenth')");
+    assert!(says.contains("cannot read"), "{says}");
+    let says = refused(&db, "RETURN LOCAL_TIME('10:00:00+07:00')");
+    assert!(says.contains("cannot read"), "{says}");
+    let says = refused(&db, "RETURN DATE(1)");
+    assert!(says.contains("expects a string"), "{says}");
+
+    // A null string answers null, which is a thing a statement can
+    // reach here and cannot reach through the clock.
+    assert_eq!(one(&db, "RETURN DATE(NULL)"), Value::Null);
+
+    // The string form is a fixed value, so it is answered while binding
+    // and the plan carries the date. The clock form is not, so the plan
+    // carries the word, and where the argument is neither the plan
+    // writes the brackets the query wrote.
+    let plan = conn.explain("RETURN DATE('2024-01-15')").expect("explain");
+    assert!(plan.contains("Project 2024-01-15 AS"), "{plan}");
+    let plan = conn.explain("RETURN DATE() AS d").expect("explain");
+    assert!(plan.contains("Project DATE AS d"), "{plan}");
+    let plan = conn
+        .explain("MATCH (p:person) RETURN DATE(p.name)")
+        .expect("explain");
+    assert!(plan.contains("DATE(p.name)"), "{plan}");
+
+    // ISO 20.29's other duration function is the length of one without
+    // its sign, which is the same word the numbers use.
+    for (source, want) in [
+        ("RETURN ABS(DURATION('-P1Y2M'))", "RETURN DURATION 'P1Y2M'"),
+        ("RETURN ABS(DURATION('P1Y2M'))", "RETURN DURATION 'P1Y2M'"),
+        (
+            "RETURN ABS(DURATION('-P3DT4H'))",
+            "RETURN DURATION 'P3DT4H'",
+        ),
+    ] {
+        assert_eq!(one(&db, source), one(&db, want), "{source}");
+    }
+}
+
 /// ISO 20.28, the datetime subtraction. The qualifier behind the
 /// brackets picks the kind of the answer, the answer runs from the
 /// first argument to the second, and the months are counted against

@@ -713,6 +713,22 @@ jobs:
       - run: npm test
         working-directory: grammar
 
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # No install step, and that is the point. What the extension
+      # decides before it talks to the editor is a command line, and
+      # nothing about deciding it needs a package: the tests run on the
+      # node that is already here, in a second, so the manifest against
+      # the code and the grammar against its generator are checked on
+      # every commit rather than at package time.
+      - run: npm test
+        working-directory: editors/vscode
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

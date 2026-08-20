@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt bench gate check-artifacts grammar
+.PHONY: build test lint fmt bench gate check-artifacts grammar extension
 
 # The ISO/IEC 39075:2024 conditions artifact is checked in, and the
 # generated status table is derived from it. This verifies the bytes are
@@ -35,3 +35,10 @@ fmt:
 grammar:
 	cargo run -p xtask -- grammar --check
 	cd grammar && npm ci && npm test
+
+# The VS Code extension. What it decides before it talks to anything is
+# a command line, and that is what these tests check, under plain node
+# with no editor and no install, which is why they need nothing fetched
+# first. Packaging a .vsix is the release train's job and not this one.
+extension:
+	cd editors/vscode && npm test

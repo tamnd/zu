@@ -14,6 +14,7 @@ mod gather;
 mod hash;
 mod math;
 mod setops;
+mod strings;
 
 pub use agg::{count_valid, max_i64, min_i64, sum_f64, sum_i64};
 pub use arith::{BinOp, binary};
@@ -22,3 +23,4 @@ pub use gather::{compact, gather_u64};
 pub use hash::{hash_slice, hash64};
 pub use math::{MathOp, MathPair, pair, unary};
 pub use setops::intersect_sorted;
+pub use strings::{StrLen, length};

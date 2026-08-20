@@ -1998,3 +1998,11 @@ vec_math_real_grows_s = 0.2
 # a chunk of divisors is a single pass. Floor sits under the worst
 # observed run on the loaded vCPU hosts. Raise floors, never lower them.
 vec_math_pair_grows_s = 0.2
+
+# A count of characters over a 2048-row flat string vector, the string
+# library's first kernel. Nothing here can raise, so the loop is a fold
+# over the bytes of each row with no check ahead of it, and the same
+# kernel over a coded column measures the table once and gathers. Floor
+# sits under the worst observed run on the loaded vCPU hosts. Raise
+# floors, never lower them.
+vec_str_length_grows_s = 0.1

@@ -900,3 +900,79 @@ cases:
     doc: A base has to be above nought as well as not be one, which is the same condition the logarithm of a number that is not above nought raises.
     query: MATCH (n:person) RETURN log(n.age - 30, 8) AS l ORDER BY l
     raises: "2201E"
+
+  - name: the-character-length-of-a-stored-column
+    doc: ISO 20.9. CHAR_LENGTH counts characters and OCTET_LENGTH counts bytes, and the two agree on ASCII and nowhere else. The tag column here holds an empty string, a word with an accent in it, a word with a tab in it and one emoji, so a client that measured the encoding where the standard asked for characters answers differently on three of the four rows.
+    query: MATCH (n:person) RETURN char_length(n.tag) AS c ORDER BY c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: the-octet-length-of-a-stored-column
+    doc: The same four strings counted in bytes, which is what they take in the store rather than what a reader sees.
+    query: MATCH (n:person) RETURN octet_length(n.tag) AS o ORDER BY o
+    columns:
+      - o
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "4"
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: the-two-lengths-part-company-outside-ascii
+    doc: The two counts compared against each other on the same row, which is the case an engine measuring both the same way cannot pass whichever of the two it picked. A character takes more than one byte on the accented word and on the emoji, and exactly one on the empty string and on the word with a tab in it.
+    query: MATCH (n:person) WHERE char_length(n.tag) < octet_length(n.tag) RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-length-in-a-filter
+    doc: A count in a predicate over a stored column, which is the shape that decides whether a scan is answered a chunk at a time or a row at a time. Three of these four names are two characters long.
+    query: MATCH (n:person) WHERE char_length(n.name) = 2 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-length-as-a-grouping-key
+    doc: A count standing in a key, which is the shape a report grouping by how long a value is takes. The names are one of three characters and three of two.
+    query: MATCH (n:person) RETURN char_length(n.name) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "1"

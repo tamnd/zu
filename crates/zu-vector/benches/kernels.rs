@@ -397,6 +397,43 @@ fn main() {
         failed = true;
     }
 
+    // The string library's first kernel, over the same two encodings
+    // the comparison above uses. A count of characters is a fold over
+    // the bytes of each row when the column is flat, and a fold over
+    // the table plus a gather when it is coded, so the distance
+    // between these two lines is the reason the kernel reads codes
+    // rather than asking the caller to materialize them.
+    let flat = zu_vector::str_vector(&mut arena, &strings);
+    let per_sec_len = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::length(&mut arith_scratch, kernels::StrLen::Chars, black_box(&flat))
+                .unwrap()
+                .len,
+        );
+    });
+    let len_grows = per_sec_len * VECTOR as f64 / 1e9;
+    println!("str_char_length: {len_grows:.2} G rows/s over fourteen byte strings (target 0.2)");
+    if let Some(floor) = budgets.get("vec_str_length_grows_s")
+        && len_grows < floor
+    {
+        println!("GATE FAIL vec_str_length_grows_s: {len_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_len_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::length(&mut arith_scratch, kernels::StrLen::Chars, black_box(&dv))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_char_length_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_len_dict * VECTOR as f64 / 1e9,
+        per_sec_len_dict / per_sec_len
+    );
+
     // Sorted intersection, balanced inputs: the multiway join inner
     // loop. Throughput counts every element the merge consumes.
     let a: Vec<u64> = (0..4096u64).map(|i| i * 3).collect();

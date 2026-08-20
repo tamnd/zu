@@ -159,9 +159,19 @@ pub struct StrBuffers {
     bufs: Vec<Buf>,
 }
 
+/// A vector whose views are all short carries no buffers at all, and a
+/// kernel resolving one still has to hand something to `bytes`. This is
+/// that something, and being a constant it costs nothing to have.
+pub static NO_BUFFERS: StrBuffers = StrBuffers::empty();
+
 impl StrBuffers {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// No buffers at all, in a form a static can hold.
+    pub const fn empty() -> Self {
+        Self { bufs: Vec::new() }
     }
 
     /// Register an allocation of the engine's own and get its id.

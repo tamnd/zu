@@ -1220,6 +1220,19 @@ fn shortest(
             for &direction in ways {
                 let hit = state.session.neighbours(direction, node, |slice| {
                     for &far in slice {
+                        // Outside the mark rather than under it. A mark
+                        // is a fact about what this walk has done and
+                        // an arrival is a fact about the graph, and the
+                        // seqlock can run this closure a second time,
+                        // where the mark is already set and the
+                        // arrival is still true. Under the guard the
+                        // second run skipped the test, the walk carried
+                        // on with the destination marked and unreachable
+                        // for the rest of the search, and a one hop pair
+                        // came back as no path. #468
+                        if far == dst {
+                            return true;
+                        }
                         if mark(&mut seen, far) {
                             // Every marked node is remembered so the
                             // bitmap can be handed back clean at a cost
@@ -1227,9 +1240,6 @@ fn shortest(
                             // exists.
                             touched.push(far);
                             next.push(far);
-                            if far == dst {
-                                return true;
-                            }
                         }
                     }
                     false

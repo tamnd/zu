@@ -595,3 +595,63 @@ fn the_version_is_the_crate_version() {
     );
     assert_eq!(len, env!("CARGO_PKG_VERSION").len());
 }
+
+/// A concurrent edge write must not turn a path into no path.
+///
+/// The walk marks every node it discovers so a frontier stays distinct,
+/// and the arrival test sat inside that guard. A neighbour read is a
+/// seqlock, so a writer that bumps a version while the closure is
+/// running makes the engine run the closure again, and the second run
+/// meets its own bit on the destination, skips the arrival test and
+/// reports no path for a pair one hop apart.
+///
+/// The writer never touches the edge being looked for. It adds and
+/// removes an unrelated one on the same node, which is all it takes to
+/// move the version under the reader.
+#[test]
+fn a_concurrent_edge_write_does_not_hide_a_path() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, db) = open("shortest-race.zu2");
+    let reader = session_on(db);
+    let writer = session_on(db);
+
+    let src = node(reader, b"src");
+    // A wide neighbourhood with the destination at the end of it, so
+    // the closure spends its whole walk inside the window the writer
+    // has to land in. A two element list would make this test pass by
+    // being too fast to interrupt rather than by being correct.
+    for i in 0..512u32 {
+        let id = node(reader, format!("filler{i}").as_bytes());
+        edge(reader, src, id);
+    }
+    let dst = node(reader, b"dst");
+    edge(reader, src, dst);
+    let churn = node(reader, b"churn");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let address = writer as usize;
+    let hand = std::thread::spawn(move || {
+        let w = address as *mut Zu2Session;
+        while !flag.load(Ordering::Relaxed) {
+            assert_eq!(unsafe { zu2::zu2_add_edge(w, src, churn) }, Zu2Status::Ok);
+            assert_eq!(
+                unsafe { zu2::zu2_remove_edge(w, src, churn) },
+                Zu2Status::Ok
+            );
+        }
+    });
+
+    let mut missed = 0;
+    for _ in 0..20_000 {
+        if shortest(reader, 0, src, dst, 0) != Some(1) {
+            missed += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    hand.join().expect("writer");
+    assert_eq!(missed, 0, "the walk lost a one hop path {missed} times");
+    close(db, &[reader, writer]);
+}

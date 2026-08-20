@@ -628,6 +628,15 @@ impl Session<'_> {
     /// to be pure. This is the form the traversal benchmark uses,
     /// because it is the one that shows what the layout is worth: the
     /// neighbours are handed over as a slice of the storage itself.
+    ///
+    /// Pure is a stronger promise than it looks and #468 is what it
+    /// costs to get it wrong. A closure that keeps a bitmap and only
+    /// appends to its answer under the bit is fine, because a second
+    /// run meets its own bits and adds nothing. A closure that also
+    /// *decides* something under that bit is not, because the second
+    /// run takes the other branch. The rule is that anything the return
+    /// value depends on must be a fact about the slice rather than a
+    /// fact about what this closure has already done.
     pub fn neighbours<R>(
         &mut self,
         direction: Direction,

@@ -58,6 +58,9 @@ pub enum Zu2Status {
     Misuse = 4,
     /// Two threads used one handle at once. Nothing was done.
     MisuseConcurrent = 5,
+    /// The db already has as many sessions open as `sessions` gave it
+    /// room for. Nothing was done.
+    NoSessions = 6,
 }
 
 /// How a database is sized and how durable it is, in the layout the
@@ -77,6 +80,7 @@ pub struct Zu2Options {
     pub max_nodes: u64,
     pub space_target_percent: u32,
     pub compact_below: u64,
+    pub sessions: u64,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -321,6 +325,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     if given.space_target_percent > 0 {
         options.space_target_percent = given.space_target_percent;
     }
+    if given.sessions > 0 {
+        options.sessions = given.sessions as usize;
+    }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,
         u64::MAX => 0,
@@ -506,7 +513,15 @@ pub unsafe extern "C" fn zu2_session_open(db: *mut Zu2Db, out: *mut *mut Zu2Sess
         Arc::increment_strong_count(db as *const Handle);
         Arc::from_raw(db as *const Handle)
     };
-    let session = owner.db.session();
+    let session = match owner.db.try_session() {
+        Ok(session) => session,
+        Err(_) => {
+            // The `Arc` was incremented on the way in and the caller
+            // still holds its own, so this hands back the clone this
+            // call took rather than the caller's.
+            return Zu2Status::NoSessions;
+        }
+    };
     // SAFETY: the session borrows the `Db`, which lives inside the
     // `Arc` this struct holds a clone of, at an address that does not
     // move for as long as the clone does. The clone is the last field

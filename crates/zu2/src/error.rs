@@ -44,6 +44,13 @@ pub enum Error {
     /// the same thing the write path would have.
     #[error("file needs max_nodes of at least {needs}, the options gave room for {max}")]
     GraphTooSmall { needs: usize, max: usize },
+
+    /// The host has as many sessions open as it asked for. A session is
+    /// held for the life of a worker rather than per operation, so this
+    /// is a sizing mistake and not back pressure: raise
+    /// `Options::sessions` to the number of threads that will hold one.
+    #[error("all {max} sessions are open, raise Options::sessions")]
+    NoSessions { max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

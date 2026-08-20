@@ -39,6 +39,21 @@ const IDLE: u64 = u64::MAX;
 /// real address, so a session at rest never holds the floor down.
 pub const NOWHERE: u64 = u64::MAX;
 
+/// Slots the engine keeps for itself, at the front of the table.
+///
+/// Flushing and compaction each want a session, and a host that sized
+/// `Options::sessions` for its workers has none to give: that is the
+/// sizing the option invites, and before this the background compactor
+/// panicked in a thread nobody was watching when it hit it. Two, because
+/// the background maintainer and a foreground `Db::compact` can both be
+/// running.
+///
+/// At the front rather than the end because [`Epochs::claimed`] is a
+/// high water mark. A reserved slot at the end would raise it past every
+/// idle worker slot, and every durable commit would then read a
+/// cacheline for each of them.
+const RESERVED: usize = 2;
+
 /// One session's announced epoch and write frontier, on their own
 /// cacheline so that two sessions announcing do not fight over one line.
 /// The two live together because a write announces both and pays for one
@@ -71,13 +86,13 @@ pub struct Epochs {
 }
 
 impl Epochs {
-    /// Room for `sessions` concurrent sessions.
+    /// Room for `sessions` of the host's sessions, plus the engine's own.
     pub fn new(sessions: usize) -> Self {
         Self {
             // Epoch 0 is never announced, so a reclaim safe point of 0
             // means nothing has been queued yet.
             current: AtomicU64::new(1),
-            slots: (0..sessions)
+            slots: (0..sessions + RESERVED)
                 .map(|_| Slot {
                     epoch: AtomicU64::new(FREE),
                     writing: AtomicU64::new(NOWHERE),
@@ -220,8 +235,13 @@ impl Epochs {
         }
     }
 
-    fn claim(&self) -> usize {
-        for (i, slot) in self.slots.iter().enumerate() {
+    /// How many sessions the host was given room for.
+    pub fn sessions(&self) -> usize {
+        self.slots.len() - RESERVED
+    }
+
+    fn take(&self, from: usize, upto: usize) -> Option<usize> {
+        for (i, slot) in self.slots[from..upto].iter().enumerate() {
             if slot
                 .epoch
                 .compare_exchange(FREE, IDLE, Ordering::AcqRel, Ordering::Acquire)
@@ -231,14 +251,25 @@ impl Epochs {
                 // so a scan that sees the raised mark always sees a slot
                 // that is at worst idle, never one still reading FREE
                 // from a session about to announce.
-                self.claimed.fetch_max(i + 1, Ordering::AcqRel);
-                return i;
+                self.claimed.fetch_max(from + i + 1, Ordering::AcqRel);
+                return Some(from + i);
             }
         }
-        panic!(
-            "zu2: all {} epoch sessions are in use, raise Options::sessions",
-            self.slots.len()
-        );
+        None
+    }
+
+    /// A slot for one of the host's sessions, or `None` when it has
+    /// opened as many as it asked for.
+    fn claim(&self) -> Option<usize> {
+        self.take(RESERVED, self.slots.len())
+    }
+
+    /// A slot for the engine's own work. The reserved ones first, and
+    /// the host's range after that, because a spare worker slot is
+    /// better spent on a compaction pass than left idle.
+    fn claim_reserved(&self) -> Option<usize> {
+        self.take(0, RESERVED)
+            .or_else(|| self.take(RESERVED, self.slots.len()))
     }
 }
 
@@ -249,9 +280,15 @@ pub struct Slotted<'a> {
 }
 
 impl<'a> Slotted<'a> {
-    pub fn new(epochs: &'a Epochs) -> Self {
-        let slot = epochs.claim();
-        Self { epochs, slot }
+    /// A slot for the host, or `None` when its sessions are all open.
+    pub fn claim(epochs: &'a Epochs) -> Option<Self> {
+        epochs.claim().map(|slot| Self { epochs, slot })
+    }
+
+    /// A slot for the engine's own flushing and compaction, which the
+    /// host cannot take.
+    pub fn reserved(epochs: &'a Epochs) -> Option<Self> {
+        epochs.claim_reserved().map(|slot| Self { epochs, slot })
     }
 
     /// Announces the current epoch. Every operation that dereferences
@@ -329,7 +366,7 @@ mod tests {
     #[test]
     fn deferred_work_waits_for_the_session_that_could_see_it() {
         let epochs = Epochs::new(4);
-        let session = Slotted::new(&epochs);
+        let session = Slotted::claim(&epochs).expect("slot");
         session.protect();
         let ran = Arc::new(AtomicUsize::new(0));
         let flag = Arc::clone(&ran);
@@ -369,7 +406,7 @@ mod tests {
     #[test]
     fn an_idle_session_does_not_hold_the_safe_epoch_back() {
         let epochs = Epochs::new(4);
-        let _idle = Slotted::new(&epochs);
+        let _idle = Slotted::claim(&epochs).expect("slot");
         let before = epochs.current();
         epochs.bump();
         assert!(epochs.safe_epoch() > before, "an idle slot pinned reclaim");
@@ -379,10 +416,10 @@ mod tests {
     fn a_dropped_session_frees_its_slot() {
         let epochs = Epochs::new(1);
         {
-            let s = Slotted::new(&epochs);
+            let s = Slotted::claim(&epochs).expect("slot");
             s.protect();
         }
-        let s = Slotted::new(&epochs);
+        let s = Slotted::claim(&epochs).expect("slot");
         s.protect();
         s.unprotect();
     }
@@ -390,10 +427,10 @@ mod tests {
     #[test]
     fn a_writing_session_holds_the_write_floor_and_a_reader_does_not() {
         let epochs = Epochs::new(4);
-        let reader = Slotted::new(&epochs);
+        let reader = Slotted::claim(&epochs).expect("slot");
         reader.protect();
         assert_eq!(epochs.write_floor(100), 100, "a reader held the floor");
-        let writer = Slotted::new(&epochs);
+        let writer = Slotted::claim(&epochs).expect("slot");
         writer.appending_at(40);
         assert_eq!(epochs.write_floor(100), 40, "the writer did not hold it");
         writer.wrote();
@@ -408,7 +445,7 @@ mod tests {
     fn a_dropped_session_does_not_hold_the_write_floor() {
         let epochs = Epochs::new(2);
         {
-            let writer = Slotted::new(&epochs);
+            let writer = Slotted::claim(&epochs).expect("slot");
             writer.appending_at(40);
         }
         assert_eq!(epochs.write_floor(100), 100, "a gone session pinned it");
@@ -422,7 +459,7 @@ mod tests {
             let epochs = Arc::clone(&epochs);
             let started = Arc::clone(&started);
             std::thread::spawn(move || {
-                let s = Slotted::new(&epochs);
+                let s = Slotted::claim(&epochs).expect("slot");
                 s.protect();
                 started.fetch_add(1, Ordering::Release);
                 std::thread::sleep(std::time::Duration::from_millis(20));

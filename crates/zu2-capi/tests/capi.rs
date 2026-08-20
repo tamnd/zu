@@ -439,6 +439,54 @@ fn a_node_is_found_by_its_key() {
     close(db, &[s]);
 }
 
+/// A host that asks for more sessions than it said it would gets told
+/// so. It used to abort the process: `Db::session` panicked when the
+/// epoch table was full, and a panic crossing `extern "C"` is an abort,
+/// so go-ycsb at a threadcount above the default 128 died with no
+/// message at all.
+#[test]
+fn a_session_past_the_count_is_refused_and_not_fatal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sessions.zu2");
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.compact_below = u64::MAX;
+    options.sessions = 2;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    let first = session_on(db);
+    let second = session_on(db);
+    let mut third: *mut Zu2Session = ptr::null_mut();
+    assert_eq!(
+        unsafe { zu2::zu2_session_open(db, &mut third) },
+        Zu2Status::NoSessions
+    );
+    assert!(third.is_null(), "a refused open still wrote a pointer");
+    // The two that were opened still work, and the refusal did not cost
+    // the db a reference either.
+    upsert(first, b"k", b"v");
+    assert_eq!(read(second, b"k").as_deref(), Some(&b"v"[..]));
+    // And a slot comes back when its session closes.
+    unsafe { zu2::zu2_session_close(first) };
+    let again = session_on(db);
+    close(db, &[second, again]);
+}
+
 /// Two sessions on one database see each other's writes, which is the
 /// arrangement the whole API is shaped around: one db, a session per
 /// thread.

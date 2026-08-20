@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::epoch::Slotted;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::index::{self, Bucket, EMPTY, Index, SLOTS};
 use crate::log::{self, Durability, Log};
@@ -130,10 +130,42 @@ pub struct Core {
 impl Core {
     /// A session on a core held behind an `Arc`, which is what the
     /// background thread needs and what [`Db::session`] is built on.
+    ///
+    /// Panics when the host has as many sessions open as it asked for,
+    /// because a caller that sized `Options::sessions` for its workers
+    /// and then opened one more has a bug in it and not a full table.
+    /// [`Core::try_session`] is the same thing for a caller that cannot
+    /// say that, which in practice means the C API.
     pub(crate) fn session(&self) -> Session<'_> {
+        self.try_session().expect("zu2 session")
+    }
+
+    /// A session, or [`Error::NoSessions`] when the host already has as
+    /// many open as `Options::sessions` gave it room for.
+    pub(crate) fn try_session(&self) -> Result<Session<'_>> {
+        let Some(slot) = Slotted::claim(&self.log.epochs) else {
+            return Err(Error::NoSessions {
+                max: self.log.epochs.sessions(),
+            });
+        };
+        Ok(self.wrap(slot))
+    }
+
+    /// A session for the engine's own flushing and compaction, out of
+    /// slots the host cannot take. See [`crate::epoch`].
+    pub(crate) fn maintenance_session(&self) -> Result<Session<'_>> {
+        let Some(slot) = Slotted::reserved(&self.log.epochs) else {
+            return Err(Error::NoSessions {
+                max: self.log.epochs.sessions(),
+            });
+        };
+        Ok(self.wrap(slot))
+    }
+
+    fn wrap<'a>(&'a self, slot: Slotted<'a>) -> Session<'a> {
         Session {
             core: self,
-            slot: Slotted::new(&self.log.epochs),
+            slot,
             durability: self.durability,
             scratch: Vec::new(),
         }
@@ -237,8 +269,19 @@ impl Db {
     }
 
     /// A worker's handle. Hold one per thread for the whole run.
+    ///
+    /// Panics when `Options::sessions` has run out. A session is a
+    /// worker's for the length of the run, so the count is something the
+    /// host knows before it starts and running out is a bug in the host.
+    /// [`Db::try_session`] is for a host that cannot panic, which in
+    /// practice means one on the other side of the C API.
     pub fn session(&self) -> Session<'_> {
         self.core.session()
+    }
+
+    /// A worker's handle, or [`Error::NoSessions`].
+    pub fn try_session(&self) -> Result<Session<'_>> {
+        self.core.try_session()
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -325,7 +368,7 @@ impl Db {
     /// early on the other side, because a first pass over an all live
     /// region ended the loop with the dead records above it untouched.
     pub fn compact(&self) -> Result<u64> {
-        let mut session = self.core.session();
+        let mut session = self.core.maintenance_session()?;
         let mut reclaimed = 0;
         let started_at = page_start(page_of(self.core.log.tail()));
         loop {
@@ -369,8 +412,15 @@ fn maintain(core: &Core, options: Options) {
             && core.log.span() >= core.compact_at.load(Ordering::Acquire)
             && let Err(error) = compact_slice(core, options)
         {
-            debug_assert!(false, "zu2 compactor: {error}");
-            return;
+            // Every slot in use is a pass this thread does not get to
+            // make, not a reason to stop making them. The reserved slots
+            // mean it takes a host holding all of its own sessions and a
+            // foreground compaction at the same time, and the next pass
+            // round the loop will find one.
+            if !matches!(error, Error::NoSessions { .. }) {
+                debug_assert!(false, "zu2 compactor: {error}");
+                return;
+            }
         }
         core.log.wait_for_work();
     }
@@ -385,7 +435,7 @@ fn maintain(core: &Core, options: Options) {
 /// span, which is what stops a database nobody is rewriting from being
 /// scanned over and over for nothing.
 fn compact_slice(core: &Core, options: Options) -> Result<()> {
-    let mut session = core.session();
+    let mut session = core.maintenance_session()?;
     let upto = compact::slice(&session);
     let pass = compact::compact(&mut session, upto)?;
     core.compaction.note(&pass);

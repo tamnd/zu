@@ -83,7 +83,12 @@ typedef enum zu2_status {
    * because it is the mistake a host makes by accident rather than by
    * typo, and because the fix is a different one: open another session
    * rather than correct the call. */
-  ZU2_MISUSE_CONCURRENT = 5
+  ZU2_MISUSE_CONCURRENT = 5,
+  /* The db already has as many sessions open as zu2_options.sessions
+   * gave it room for. Nothing was done. A session belongs to a thread
+   * for the length of a run, so this is a sizing mistake and not back
+   * pressure: say how many threads there will be and open one each. */
+  ZU2_NO_SESSIONS = 6
 } zu2_status;
 
 /* How far a write waits before it is acknowledged.
@@ -142,6 +147,12 @@ typedef struct zu2_options {
    * that will be measured and thrown away wants compaction off, which
    * is what UINT64_MAX does. 0 takes the default. */
   uint64_t compact_below;
+  /* Sessions this db can have open at once, which is the number of
+   * threads that will use it. One epoch slot and one set of read
+   * buffers each, so a cacheline and a few kilobytes per session, and
+   * the engine keeps its own slots for flushing and compaction on top
+   * of this number. 0 takes the default of 128. */
+  uint64_t sessions;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -174,7 +185,10 @@ const char *zu2_db_error(const zu2_db *db, size_t *len);
 
 /* Opens a session. Hold one per thread for the whole run: it owns an
  * epoch slot and the buffers the read path uses, so an operation on a
- * warm database allocates nothing. */
+ * warm database allocates nothing.
+ *
+ * ZU2_NO_SESSIONS when the db already has zu2_options.sessions of them
+ * open. */
 zu2_status zu2_session_open(zu2_db *db, zu2_session **out);
 
 /* Closes a session. A no-op on NULL. */

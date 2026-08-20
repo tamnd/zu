@@ -45,7 +45,7 @@ fn main() {
         std::thread::scope(|scope| {
             for _ in 0..readers {
                 scope.spawn(|| {
-                    let session = Slotted::new(&epochs);
+                    let session = Slotted::claim(&epochs).expect("slot");
                     ready.fetch_add(1, Ordering::Release);
                     while !stop.load(Ordering::Relaxed) {
                         // A reader announcing and standing down as fast

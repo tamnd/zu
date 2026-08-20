@@ -764,7 +764,7 @@ mod tests {
     use crate::epoch::Slotted;
 
     fn neighbours_of(epochs: &Epochs, graph: &Graph, direction: Direction, node: u32) -> Vec<u32> {
-        let session = Slotted::new(epochs);
+        let session = Slotted::claim(epochs).expect("slot");
         session.protect();
         let mut visit = |slice: &[u32]| slice.to_vec();
         // SAFETY: the epoch is announced and the closure only reads.

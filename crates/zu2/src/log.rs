@@ -988,7 +988,7 @@ mod tests {
     #[test]
     fn a_record_never_straddles_a_page() {
         let (_dir, log) = log(usize::MAX);
-        let session = Slotted::new(&log.epochs);
+        let session = Slotted::claim(&log.epochs).expect("slot");
         let value = vec![0u8; 4000];
         let mut last = 0;
         // 4032 bytes a record over 4 MiB pages, so this crosses four
@@ -1019,7 +1019,7 @@ mod tests {
     #[test]
     fn the_read_only_boundary_trails_the_tail_by_the_mutable_window() {
         let (_dir, log) = log(usize::MAX);
-        let session = Slotted::new(&log.epochs);
+        let session = Slotted::claim(&log.epochs).expect("slot");
         let value = vec![7u8; 8192];
         for i in 0..2000u32 {
             log.append(
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn an_evicted_record_comes_back_off_disk_with_its_bytes() {
         let (_dir, log) = log(3);
-        let session = Slotted::new(&log.epochs);
+        let session = Slotted::claim(&log.epochs).expect("slot");
         let value = vec![0xABu8; 8192];
         let mut first = 0;
         // A page holds 509 of these, and nothing is evicted until the
@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn an_evicted_page_gives_its_memory_back() {
         let (_dir, log) = log(3);
-        let session = Slotted::new(&log.epochs);
+        let session = Slotted::claim(&log.epochs).expect("slot");
         let value = vec![0xABu8; 8192];
         for i in 0..3000u32 {
             log.append(
@@ -1139,7 +1139,7 @@ mod tests {
         let mut end = 0;
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let reader = Slotted::new(&log.epochs);
+                let reader = Slotted::claim(&log.epochs).expect("slot");
                 reader.protect();
                 holding.store(true, Ordering::Release);
                 while !release.load(Ordering::Acquire) {
@@ -1150,7 +1150,7 @@ mod tests {
             while !holding.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
-            let session = Slotted::new(&log.epochs);
+            let session = Slotted::claim(&log.epochs).expect("slot");
             let a = log
                 .append(&session, 0, 1, b"k", b"v", false, record::KIND_VALUE)
                 .expect("append");
@@ -1164,7 +1164,7 @@ mod tests {
     #[test]
     fn a_record_larger_than_a_page_is_refused_rather_than_split() {
         let (_dir, log) = log(usize::MAX);
-        let session = Slotted::new(&log.epochs);
+        let session = Slotted::claim(&log.epochs).expect("slot");
         let value = vec![0u8; PAGE_SIZE];
         let error = log
             .append(&session, 0, 1, b"k", &value, false, record::KIND_VALUE)

@@ -28,7 +28,7 @@ use zu_query::snapshot::{
     ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
 };
 use zu_vector::{
-    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
+    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg, StrLen,
 };
 
 use crate::join::JoinTable;
@@ -3280,7 +3280,7 @@ impl Compiler<'_> {
             expr,
             BoundExpr::Binary { .. }
                 | BoundExpr::Call {
-                    func: Func::Math(_),
+                    func: Func::Math(_) | Func::CharLength | Func::OctetLength,
                     ..
                 }
         ) {
@@ -4316,6 +4316,32 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::MathPair { op, l, r, dst });
                 Ok(Some(dst))
             }
+            // GF04, the two questions about a string whose answer is a
+            // number. They come before the rest of the string library
+            // because an answer that is a count needs no room in the
+            // arena for bytes, which is the question the folds and the
+            // trims still have to settle.
+            BoundExpr::Call {
+                func: func @ (Func::CharLength | Func::OctetLength),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let op = match func {
+                    Func::CharLength => StrLen::Chars,
+                    _ => StrLen::Octets,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrLen { op, src, dst });
+                Ok(Some(dst))
+            }
             _ => Ok(None),
         }
     }
@@ -4650,6 +4676,9 @@ fn may_raise(ops: &[ExprOp]) -> bool {
             ..
         } => !written_nonzero(&ops[..i], *r),
         ExprOp::MathPair { .. } => true,
+        // A count has an answer for every string there is, so it is a
+        // computed column like a floor or an angle.
+        ExprOp::StrLen { .. } => false,
         _ => false,
     })
 }

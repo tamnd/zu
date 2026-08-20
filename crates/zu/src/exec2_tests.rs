@@ -470,6 +470,15 @@ fn covered_queries() -> &'static [&'static str] {
         // the rows they are asked about are the rows the old engine
         // asked them about.
         "MATCH (p:person) RETURN mod(p.age, 7) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // The two questions about a string whose answer is a number.
+        // Every string has a length, so a count is a computed column
+        // like a floor, and it stands in a filter and in a group key
+        // as well.
+        "MATCH (p:person) RETURN char_length(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN octet_length(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE char_length(p.name) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN char_length(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE p.age > 40 OR octet_length(p.name) > 3 RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and

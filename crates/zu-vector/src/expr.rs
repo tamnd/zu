@@ -11,7 +11,9 @@ use zu_common::{Result, ZuError};
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
-use crate::kernels::{BinOp, CmpOp, MathOp, MathPair, binary, compare, pair, unary};
+use crate::kernels::{
+    BinOp, CmpOp, MathOp, MathPair, StrLen, binary, compare, length, pair, unary,
+};
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
 
@@ -63,6 +65,14 @@ pub enum ExprOp {
         op: MathPair,
         l: Reg,
         r: Reg,
+        dst: Reg,
+    },
+    /// The length of a string, in characters or in bytes. The answer
+    /// is a number, so this is the one string function whose output
+    /// needs no room in the arena for bytes.
+    StrLen {
+        op: StrLen,
+        src: Reg,
         dst: Reg,
     },
     /// Comparison produces a predicate bitmap register.
@@ -155,6 +165,14 @@ impl Program {
                         let lv = resolve(&regs, *l, chunk)?;
                         let rv = resolve(&regs, *r, chunk)?;
                         pair(arena, *op, lv, rv, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrLen { op, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        length(arena, *op, v)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

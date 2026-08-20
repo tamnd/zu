@@ -8,7 +8,9 @@
 //! rows the old sink pushed, and that a plan with a step above the
 //! projection still answers the way it always did.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use zu::dataset::{NodeFile, RelFile, load_dataset};
 use zu::query::column::{ColumnData, ColumnType};
@@ -60,8 +62,26 @@ fn graph(dir: &Path) -> Zu1File {
     Zu1File::open(&out).unwrap()
 }
 
+// cargo runs this file's tests in one process, in parallel. ZU_EXEC2 is
+// process-wide, so a test that pins the old executor would otherwise
+// change what its siblings measure (#474).
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
 fn answer(db: &mut Zu1File, source: &str) -> QueryResult {
+    let _guard = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"))
+}
+
+fn answer_on_old_executor(db: &mut Zu1File, source: &str) -> QueryResult {
+    let _guard = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: EXEC_LOCK makes this the only test in the process that
+    // reads or writes ZU_EXEC2 for the duration of the call.
+    unsafe { std::env::set_var("ZU_EXEC2", "0") };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"))
+    }));
+    unsafe { std::env::remove_var("ZU_EXEC2") };
+    result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 #[test]
@@ -130,9 +150,7 @@ fn the_rows_read_off_the_columns_are_the_rows_the_row_sink_pushed() {
         );
         // The same statement through the old executor, which has no
         // sink but the row one.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let rows = answer(&mut db, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let rows = answer_on_old_executor(&mut db, source);
         assert!(rows.rows.columns().is_none(), "{source} on the old engine");
         assert_eq!(held.columns, rows.columns, "{source} projected the same");
         assert_eq!(held.rows, rows.rows, "{source} answered the same");

@@ -52,14 +52,14 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.12 and another
+ * system tests when it has to compile one way against 0.13 and another
  * against what comes next. The two numbers are counts and not decimals,
- * so 0.12 is the revision after 0.11 and a caller comparing them
+ * so 0.13 is the revision after 0.12 and a caller comparing them
  * compares each on its own. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.12"
+#define ZU_ABI_VERSION "0.13"
 
 #ifdef __cplusplus
 extern "C" {
@@ -594,6 +594,11 @@ zu_status zu_value_temporal(const zu_value *v, int32_t *kind, int64_t *count, in
  * number their rows from zero. Either out-parameter may be NULL. */
 zu_status zu_value_node(const zu_value *v, uint32_t *table, uint64_t *offset);
 zu_status zu_value_rel(const zu_value *v, uint32_t *table, uint64_t *src, uint64_t *dst);
+/* What that table id is called, or NULL when no table has that id. Node
+ * and rel tables share one id space, so one call answers for both
+ * kinds. NUL-terminated, owned by the connection, and valid until the
+ * next zu_conn_table_name on it or until it closes; len may be NULL. */
+const char *zu_conn_table_name(zu_conn *conn, uint32_t table, size_t *len);
 uint64_t zu_value_len(const zu_value *v);
 zu_status zu_value_at(const zu_value *v, uint64_t i, const zu_value **out);
 /* A record's fields are in name order and a name appears once, which is

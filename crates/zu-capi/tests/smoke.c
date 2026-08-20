@@ -236,6 +236,46 @@ int main(int argc, char **argv) {
     zu_result_free(chunked);
   }
 
+  /* Naming the table a node came out of. The value carries an id and
+   * the id means nothing on its own, since two tables both number
+   * their rows from zero, so a host that reads a node has a number and
+   * the catalog is the only thing that can say what it is a number of.
+   * `zu copy` calls the two tables node and edge. */
+  {
+    zu_result *named = NULL;
+    const zu_value *cell = NULL;
+    uint32_t table = 0xffffffffu;
+    uint64_t at = 0;
+    const char *name = NULL;
+    size_t name_len = 9;
+    status = zu_query_z(first, "MATCH (a) RETURN a AS n LIMIT 1", &named, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("node query failed", status, err);
+    }
+    if (zu_result_cell(named, 0, 0, &cell) != ZU_OK || zu_value_type(cell) != ZU_TYPE_NODE ||
+        zu_value_node(cell, &table, &at) != ZU_OK) {
+      zu_result_free(named);
+      zu_conn_close(first);
+      return fail("a matched node did not read as a table and an offset");
+    }
+    name = zu_conn_table_name(first, table, &name_len);
+    /* Five bytes compared for a name of four, because unlike a
+     * registered name this one is NUL terminated and a host that walks
+     * to the NUL has to find one. */
+    if (name == NULL || name_len != 4 || memcmp(name, "node", 5) != 0) {
+      zu_result_free(named);
+      zu_conn_close(first);
+      return fail("a node's table was named something else");
+    }
+    if (zu_conn_table_name(first, 0xffffffffu, &name_len) != NULL || name_len != 0) {
+      zu_result_free(named);
+      zu_conn_close(first);
+      return fail("an id no table has was named anyway");
+    }
+    zu_result_free(named);
+  }
+
   /* The cell reader, which is how the values that have no column reach
    * a C host. A pointer into the result rather than a handle, so what
    * this checks on top of the answers is that nothing here needs
@@ -1142,8 +1182,9 @@ int main(int argc, char **argv) {
   zu_stmt_close(stmt);
 
   printf(
-      "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one append, one warning carried alongside its rows, one watched "
+      "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one table named "
+      "from a node, one date, one nested list, one load, one append, one warning carried "
+      "alongside its rows, one watched "
       "statement, one transaction, one frame read where it lies and handed back once, one result "
       "handed over as arrow batches, one refusal with a place and one without\n",
       version);

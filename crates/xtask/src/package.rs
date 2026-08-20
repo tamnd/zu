@@ -689,7 +689,7 @@ mod tests {
         // so this is 0.12: the number a binding tests for when it wants
         // to know whether zu_result_arrow is there. The two parts are
         // counts rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.12".to_string(), "0.12".to_string()));
+        assert_eq!(abi.revision, ("0.13".to_string(), "0.13".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

@@ -674,6 +674,11 @@ unsafe fn conn_registered<'a>(conn: *mut ZuConn) -> &'a mut Vec<String> {
     unsafe { &mut (*conn).registered }
 }
 
+/// Where the last table name asked for is kept, under a [`Claim`].
+unsafe fn conn_table<'a>(conn: *mut ZuConn) -> &'a mut Option<CString> {
+    unsafe { &mut (*conn).table }
+}
+
 /// The word a running statement reads, cloned so the caller holds no
 /// borrow. This is the one field a second thread touches on purpose
 /// while the first is inside a call.
@@ -725,6 +730,10 @@ pub struct ZuConn {
     /// pointers into them and a name has to be somewhere to be pointed
     /// at.
     registered: Vec<String>,
+    /// The last name [`zu_conn_table_name`] handed out, for the same
+    /// reason: the catalog's copy goes away when the next statement
+    /// changes the catalog, so what the caller holds is this one.
+    table: Option<CString>,
 }
 
 impl ZuConn {
@@ -739,6 +748,7 @@ impl ZuConn {
             stop,
             progress: Mutex::new(None),
             registered: Vec::new(),
+            table: None,
         }
     }
 
@@ -5569,6 +5579,49 @@ pub unsafe extern "C" fn zu_conn_registered_name(
         unsafe { *len = name.len() };
     }
     name.as_ptr().cast::<c_char>()
+}
+
+/// What a table id is called, or `NULL` when no table has that id.
+/// `len` may be `NULL`.
+///
+/// A node value is a table id and a row offset and an edge value is a
+/// table id and two of them, so a host that reads one with
+/// [`zu_value_node`] or [`zu_value_rel`] has a number and no way to
+/// say what it is a number of. Every other client reaches the catalog
+/// through its own language; this is the same reach for C. Node and
+/// rel tables share one id space in the engine, so one call answers
+/// for both kinds.
+///
+/// The answer is NUL-terminated and owned by the connection, valid
+/// until the next `zu_conn_table_name` on it or until it closes,
+/// whichever comes first. The length is there so that a host that
+/// already knows how long a name is does not walk it again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_table_name(
+    conn: *mut ZuConn,
+    table: u32,
+    len: *mut usize,
+) -> *const c_char {
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+    if conn.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(_claim) = (unsafe { claim_conn(conn) }) else {
+        return std::ptr::null();
+    };
+    let Some(name) = unsafe { conn_of(conn) }
+        .table_name(table)
+        .and_then(|name| CString::new(name).ok())
+    else {
+        return std::ptr::null();
+    };
+    let held = unsafe { conn_table(conn) }.insert(name);
+    if !len.is_null() {
+        unsafe { *len = held.as_bytes().len() };
+    }
+    held.as_ptr()
 }
 
 #[cfg(test)]

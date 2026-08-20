@@ -1336,6 +1336,24 @@ capi_chunk_scan_ratio = 1.5
 # chunk. Raise this floor, never lower it.
 capi_chunk_early_speedup = 50.0
 
+# lent is the accessor call on its own, on a result the executor filled
+# its columns for against one it built row by row. The first hands back
+# the buffer the executor already wrote, so it is a bounds check and a
+# pointer and nothing that grows with the result; the second walks all
+# 500000 rows and copies every cell, which is what this path did for
+# every plan before there was anything to lend. The sum is outside both
+# measurements, because the question is what asking for a column costs
+# and not what reading one does.
+#
+# Measured 5800 on the local M series, and the number is that large
+# because the two sides are not the same kind of work: one is constant
+# and the other is linear in the rows. The floor is two orders of
+# magnitude under it, which leaves room for a slow box and a noisy vCPU
+# and still fails the moment a copy creeps back into the filled path,
+# because a copy would put the two sides within a small factor of each
+# other rather than thousands. Raise this floor, never lower it.
+capi_lent_col_speedup = 100.0
+
 # cell reads the same column one value at a time through the cell
 # reader, which is the path a temporal, a list and a node's table take
 # because no column holds them. The ratio is against the whole-column

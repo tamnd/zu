@@ -1,7 +1,7 @@
 //! What the chunked read path is for, measured against the whole-column
 //! one it sits beside (dx/02 §3, zu#167).
 //!
-//! Four numbers. scan drives a whole column both ways and sums it, so
+//! Five numbers. scan drives a whole column both ways and sums it, so
 //! the chunked loop pays for the same conversions plus a call and a
 //! bounds check per chunk; the ratio is what that overhead costs, and
 //! it is a ceiling because the chunked path is meant to be the default
@@ -51,6 +51,12 @@ const REPS: usize = 5;
 /// measurement.
 const QUERY: &str = "MATCH (a:person) RETURN a.id AS id ORDER BY id";
 
+/// The same column with nothing above the projection, which is the plan
+/// the sink fills columns for. The rows come back in whatever order the
+/// scan reached them, which is why the crosschecks on this one are sums
+/// rather than positions.
+const SCAN: &str = "MATCH (a:person) RETURN a.id AS id";
+
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
     for line in std::fs::read_to_string(path).ok()?.lines() {
@@ -64,15 +70,15 @@ fn budget(key: &str) -> Option<f64> {
     None
 }
 
-/// The column, materialized fresh, so a measurement of a conversion is
+/// A result, materialized fresh, so a measurement of a conversion is
 /// never a measurement of one that already happened.
-unsafe fn fresh(conn: *mut ZuConn) -> *mut ZuResult {
+unsafe fn run(conn: *mut ZuConn, text: &str) -> *mut ZuResult {
     let mut result: *mut ZuResult = ptr::null_mut();
     let status = unsafe {
         zu_query(
             conn,
-            QUERY.as_ptr().cast::<c_char>(),
-            QUERY.len(),
+            text.as_ptr().cast::<c_char>(),
+            text.len(),
             &mut result,
             ptr::null_mut(),
         )
@@ -80,6 +86,16 @@ unsafe fn fresh(conn: *mut ZuConn) -> *mut ZuResult {
     assert_eq!(status, ZuStatus::Ok, "query");
     assert_eq!(unsafe { zu_result_rows(result) }, u64::from(NODES));
     result
+}
+
+/// The sorted column, which is what every measurement but lent reads.
+unsafe fn fresh(conn: *mut ZuConn) -> *mut ZuResult {
+    unsafe { run(conn, QUERY) }
+}
+
+/// The same column off the plan that fills columns.
+unsafe fn scanned(conn: *mut ZuConn) -> *mut ZuResult {
+    unsafe { run(conn, SCAN) }
 }
 
 fn main() {
@@ -258,6 +274,50 @@ fn main() {
         cell_scan * 1e9 / f64::from(NODES)
     );
 
+    // ---- lent: the accessor call itself, on both plans ----
+    //
+    // The sum is outside the measurement here, because the question is
+    // not what reading a column costs but what asking for one does. On
+    // a result the executor filled, the answer is a bounds check and a
+    // pointer. On a result it built, it is a walk over every row and a
+    // copy of every cell, which is what this path was before there was
+    // anything to lend.
+    let mut lent = f64::MAX;
+    let mut copied = f64::MAX;
+    for _ in 0..REPS {
+        unsafe {
+            let result = scanned(conn);
+            let mut out: *const i64 = ptr::null();
+            let t = Instant::now();
+            assert_eq!(zu_result_col_i64(result, 0, &mut out), ZuStatus::Ok);
+            lent = lent.min(t.elapsed().as_secs_f64());
+            let mut sum = 0u64;
+            for &v in std::slice::from_raw_parts(out, NODES as usize) {
+                sum += v as u64;
+            }
+            assert_eq!(sum, reference, "lent column sum");
+            zu_result_free(result);
+
+            let result = fresh(conn);
+            let mut out: *const i64 = ptr::null();
+            let t = Instant::now();
+            assert_eq!(zu_result_col_i64(result, 0, &mut out), ZuStatus::Ok);
+            copied = copied.min(t.elapsed().as_secs_f64());
+            let mut sum = 0u64;
+            for &v in std::slice::from_raw_parts(out, NODES as usize) {
+                sum += v as u64;
+            }
+            assert_eq!(sum, reference, "built column sum");
+            zu_result_free(result);
+        }
+    }
+    let lent_speedup = copied / lent;
+    println!(
+        "lent: filled {:.4} ms, built {:.1} ms, speedup {lent_speedup:.0}x for the call itself",
+        lent * 1e3,
+        copied * 1e3
+    );
+
     // ---- buffer: what each path keeps alive, untimed ----
     let whole_bytes = NODES as usize * size_of::<i64>();
     let chunk_bytes = head * size_of::<i64>();
@@ -290,6 +350,18 @@ fn main() {
                 failed = true;
             } else {
                 println!("gate: early speedup {early_speedup:.0}x over {min}");
+            }
+        }
+        // A floor: asking a filled result for a column has to cost a
+        // pointer rather than a pass over it, and the way that stops
+        // being true is a copy creeping back in. Raise this floor,
+        // never lower it.
+        if let Some(min) = budget("capi_lent_col_speedup") {
+            if lent_speedup < min {
+                println!("GATE FAIL: lent speedup {lent_speedup:.0}x under floor {min}");
+                failed = true;
+            } else {
+                println!("gate: lent speedup {lent_speedup:.0}x over {min}");
             }
         }
         // A ceiling on the per-value path, which is what catches a cell

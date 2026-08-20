@@ -19,13 +19,15 @@ use std::sync::Arc;
 use zu_common::types::LogicalType;
 use zu_common::{IdMap, Result};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
-use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
+use zu_query::binder::{
+    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Math, Schema, TableFunc,
+};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{
     ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
 };
-use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
+use zu_vector::{BinOp, CmpOp, ExprOp, MathOp, MorselArena, OwnedValue, PhysType, Program, Reg};
 
 use crate::join::JoinTable;
 use crate::sip::SipFilter;
@@ -3263,14 +3265,22 @@ impl Compiler<'_> {
     /// check; restricting the column keeps the sink reading the two
     /// types it knows.
     ///
-    /// Division and modulo decline. The kernel is total and clears the
-    /// row's validity when the divisor is zero, the old engine raises,
-    /// and a computed column runs before the filter that would have
-    /// dropped the offending row, so there is no way to match the old
-    /// answer here. They stay with the old engine until the error is
-    /// carried out of the kernel.
+    /// Anything that could have no answer for a row declines. A
+    /// computed column is filled before the filter that would have
+    /// dropped the offending row, so a condition raised here is a
+    /// condition the old engine never reached, and the two answers
+    /// would differ on which engine took the plan. A divisor written as
+    /// a number that is not nought cannot raise and neither can most of
+    /// the numeric functions, so those shapes are the ones that arrive.
     fn register_expr(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
-        if !matches!(expr, BoundExpr::Binary { .. }) {
+        if !matches!(
+            expr,
+            BoundExpr::Binary { .. }
+                | BoundExpr::Call {
+                    func: Func::Math(_),
+                    ..
+                }
+        ) {
             return Ok(None);
         }
         let Some(level) = self.expr_level(expr) else {
@@ -3286,15 +3296,7 @@ impl Compiler<'_> {
         if b.types[root as usize] != PhysType::Int64 {
             return Ok(None);
         }
-        if b.ops.iter().any(|op| {
-            matches!(
-                op,
-                ExprOp::Binary {
-                    op: BinOp::Div | BinOp::Mod,
-                    ..
-                }
-            )
-        }) {
+        if may_raise(&b.ops) {
             return Ok(None);
         }
         let prog = Program {
@@ -3337,6 +3339,14 @@ impl Compiler<'_> {
             BoundExpr::Binary { lhs, rhs, .. } => {
                 self.walk_slots(lhs, f);
                 self.walk_slots(rhs, f);
+            }
+            // A call reads what its arguments read. Without this the
+            // level of `abs(p.x)` is no level at all, and a projection
+            // that named one would be registered against nothing.
+            BoundExpr::Call { args, .. } => {
+                for arg in args {
+                    self.walk_slots(arg, f);
+                }
             }
             _ => {}
         }
@@ -4024,17 +4034,18 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 // The row engine stops at a conjunct that decided the
-                // row, so a division written behind one is a division
-                // it never runs, and `n <> 0 AND 100 / n > 5` is how a
+                // row, so anything written behind one is something it
+                // never runs, and `n <> 0 AND 100 / n > 5` is how a
                 // query says which rows the division is for. The
                 // program has no such order: every op runs over the
                 // whole chunk, so a divisor of nought behind the guard
                 // would raise where the query said it could not. Such a
                 // plan goes back to the row engine whole. A divisor
                 // written as a number that is not nought cannot raise,
-                // which is the other way people write it, so that shape
-                // stays here.
-                if divides(&b.ops[second..]) {
+                // which is the other way people write it, and most of
+                // the numeric functions cannot raise at all, so those
+                // shapes stay here.
+                if may_raise(&b.ops[second..]) {
                     return Ok(None);
                 }
                 let dst = b.push_type(PhysType::Bool)?;
@@ -4250,6 +4261,31 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
                 Ok(Some(dst))
             }
+            // GF01, the numeric functions whose answer over a whole
+            // number is a whole number. They are the numeric library's
+            // first kernels because they are the ones a filter is
+            // written over: `abs(a.x - b.x) < 3` is a scan the row
+            // engine used to take back for the sake of one call.
+            BoundExpr::Call {
+                func: Func::Math(math),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } => {
+                let Some(op) = self.math_op(*math, args) else {
+                    return Ok(None);
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::Math { op, src, dst });
+                Ok(Some(dst))
+            }
             _ => Ok(None),
         }
     }
@@ -4321,6 +4357,26 @@ impl Compiler<'_> {
         match self.const_int(expr) {
             Some(c) => cmp_op(op).map(|cmp| (cmp, c)),
             None => narrow_float(op, self.const_float(expr)?),
+        }
+    }
+
+    /// Which vector op a numeric call is, or `None` where the kernels
+    /// have nothing for it.
+    ///
+    /// ROUND is the one with a second argument, and the digit count has
+    /// to be a number the statement wrote or bound: a count read off a
+    /// column would be a branch inside the loop these kernels exist to
+    /// keep branch free, and a query that rounds every row to a
+    /// different place is rare enough to leave to the row engine.
+    fn math_op(&self, math: Math, args: &[BoundExpr]) -> Option<MathOp> {
+        match (math, args.len()) {
+            (Math::Abs, 1) => Some(MathOp::Abs),
+            (Math::Ceil, 1) => Some(MathOp::Ceil),
+            (Math::Floor, 1) => Some(MathOp::Floor),
+            (Math::Sign, 1) => Some(MathOp::Sign),
+            (Math::Round, 1) => Some(MathOp::Round(0)),
+            (Math::Round, 2) => self.const_int(&args[1]).map(MathOp::Round),
+            _ => None,
         }
     }
 
@@ -4472,16 +4528,17 @@ fn widens(from: PhysType, to: &LogicalType) -> bool {
     }
 }
 
-/// Whether these ops hold a division a row could have no answer for,
-/// which is any division whose divisor is not written as a number that
-/// is not nought.
-fn divides(ops: &[ExprOp]) -> bool {
+/// Whether these ops hold something a row could have no answer for: a
+/// division whose divisor is not written as a number that is not
+/// nought, or a numeric function with a condition behind it.
+fn may_raise(ops: &[ExprOp]) -> bool {
     ops.iter().enumerate().any(|(i, op)| match op {
         ExprOp::Binary {
             op: BinOp::Div | BinOp::Mod,
             r,
             ..
         } => !written_nonzero(&ops[..i], *r),
+        ExprOp::Math { op, .. } => op.may_raise(),
         _ => false,
     })
 }

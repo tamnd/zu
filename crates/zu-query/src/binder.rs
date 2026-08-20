@@ -21,7 +21,7 @@ use zu_common::{LogicalType, Result, ZuError};
 use crate::ast::{
     self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
     NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SortKey, UnaryOp,
+    SetInto, SetItem, SortKey, TrimSide, UnaryOp,
 };
 use crate::functions;
 use crate::refs::GraphHandle;
@@ -1721,10 +1721,12 @@ pub enum Func {
     Upper,
     /// ISO 20.24. The string with every character folded down.
     Lower,
-    /// ISO 20.24. The string with the spaces taken off both ends, which
-    /// is the one form of TRIM every implementation must have; naming
-    /// an end or a character to trim is GF06 and a separate spelling.
-    Trim,
+    /// GF05 and GF06: the trim family, under one arm for the reason the
+    /// numeric library is one. Which end is trimmed and whether the
+    /// characters trimmed are one character or a set of them is what
+    /// [`Trim`] says, and it is a question for the registry and the
+    /// kernel behind it.
+    Trim(Trim),
     /// ISO 20.24. The string in one of the four Unicode normal forms.
     /// The form is on the function rather than in the arguments because
     /// it is a word the statement wrote and not a value a row holds, so
@@ -1798,6 +1800,33 @@ pub enum Math {
     Degrees,
     /// GF02. Degrees read as radians.
     Radians,
+}
+
+/// ISO 20.24, the trim family: which end of a string is trimmed, and
+/// whether what is trimmed is one character or a set of them.
+///
+/// The two questions are one enum because the answers are not
+/// independent of each other in the standard. `TRIM` takes a trim
+/// character, singular, and raises `22027` when it is handed anything
+/// else, and trimming a set of characters is a separate feature with
+/// three functions of its own, which is why an implementation can have
+/// the first without the second. So each of the six is a function, and
+/// the three that trim a set say so in their name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trim {
+    /// `TRIM(s)` and `TRIM([BOTH] [c] FROM s)`: one character off both
+    /// ends, a space when none is named.
+    Both,
+    /// `TRIM(LEADING c FROM s)`: the front only.
+    Leading,
+    /// `TRIM(TRAILING c FROM s)`: the back only.
+    Trailing,
+    /// GF05. `BTRIM(s, cs)`: every character of the set off both ends.
+    Btrim,
+    /// GF05. `LTRIM(s, cs)`: the front only.
+    Ltrim,
+    /// GF05. `RTRIM(s, cs)`: the back only.
+    Rtrim,
 }
 
 impl Func {
@@ -4947,6 +4976,11 @@ impl Binder<'_> {
             Expr::Normalize { expr, form } => {
                 self.bind_normalize(Func::Normalize(*form), expr, ctx)
             }
+            Expr::Trim {
+                side,
+                chars,
+                source,
+            } => self.bind_trim(*side, chars.as_deref(), source, ctx),
             Expr::IsNormalized {
                 expr,
                 form,
@@ -5517,6 +5551,43 @@ impl Binder<'_> {
     ) -> Result<(BoundExpr, Type)> {
         let at = crate::functions::lookup(name)
             .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        self.bind_row(at, name, distinct, star, args, ctx)
+    }
+
+    /// `TRIM(LEADING 'x' FROM s)`, ISO 20.24 and GF06. The explicit
+    /// form is not written like a call and is one once it is read, so
+    /// the end it names picks the row and the rest is the checking
+    /// every other call gets.
+    fn bind_trim(
+        &mut self,
+        side: TrimSide,
+        chars: Option<&Expr>,
+        source: &Expr,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let trim = match side {
+            TrimSide::Leading => Trim::Leading,
+            TrimSide::Trailing => Trim::Trailing,
+            TrimSide::Both => Trim::Both,
+        };
+        let at = functions::row_of(Func::Trim(trim)).expect("a trim has a row");
+        let mut args = vec![source.clone()];
+        args.extend(chars.cloned());
+        self.bind_row(at, "trim", false, false, &args, ctx)
+    }
+
+    /// A call whose row is already settled: the arity, the argument
+    /// types, the folding and the answer's type, which every call gets
+    /// however its name was written or whether it was written at all.
+    fn bind_row(
+        &mut self,
+        at: u16,
+        name: &str,
+        distinct: bool,
+        star: bool,
+        args: &[Expr],
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
         let sig = functions::row(at).expect("a row number came from the table");
         let func = sig.func;
         if sig.aggregate
@@ -5735,6 +5806,22 @@ pub fn text(expr: &Expr) -> String {
         }
         Expr::Normalize { expr, form } => {
             format!("NORMALIZE({}, {})", text(expr), form.name())
+        }
+        Expr::Trim {
+            side,
+            chars,
+            source,
+        } => {
+            let side = match side {
+                TrimSide::Leading => "LEADING ",
+                TrimSide::Trailing => "TRAILING ",
+                TrimSide::Both => "BOTH ",
+            };
+            let chars = match chars {
+                Some(chars) => format!("{} ", text(chars)),
+                None => String::new(),
+            };
+            format!("TRIM({side}{chars}FROM {})", text(source))
         }
         Expr::IsNormalized {
             expr,

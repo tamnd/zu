@@ -118,6 +118,16 @@ doc = "The numeric library of ISO 20.16, 20.17 and 20.18. The first six are the 
 words = ["ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "SIGN", "MOD", "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "DEGREES", "RADIANS"]
 
 [[group]]
+kind = "function"
+doc = "The multi-character trim functions of ISO 20.24, which take a set of characters rather than one. TRIM itself is in the list above, being older here than these three are, and it trims one character and raises a trim error when it is handed more, which is the whole reason these three exist."
+words = ["BTRIM", "LTRIM", "RTRIM"]
+
+[[group]]
+kind = "keyword"
+doc = "The trim specification, which names the end of the string TRIM takes characters off, and the FROM that separates what is trimmed from what it is trimmed out of. They are words rather than arguments because an end of a string is not a value a row can hold, which is the arrangement a normal form has. FROM is here and nowhere else: a GQL query reads its rows from a pattern rather than from a table, so this is the one place the word stands."
+words = ["LEADING", "TRAILING", "BOTH", "FROM"]
+
+[[group]]
 kind = "keyword"
 doc = "The predicate of ISO 19.7 and the four normal forms it and NORMALIZE are written with. A normal form is a word rather than a string because which normalization runs is settled by the statement and not by a row, and the four are reserved words, so nothing else can be standing where one is expected."
 words = ["NORMALIZED", "NFC", "NFD", "NFKC", "NFKD"]

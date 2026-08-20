@@ -23,7 +23,7 @@ use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError, unicode};
 
 use crate::ast::Literal;
-use crate::binder::{BoundExpr, Func, Math, Type};
+use crate::binder::{BoundExpr, Func, Math, Trim, Type};
 use crate::exec::{Value, settle};
 
 /// The code behind a scalar function: the arguments already evaluated,
@@ -446,8 +446,8 @@ pub static REGISTRY: &[Signature] = &[
     Signature {
         name: "trim",
         aliases: &[],
-        func: Func::Trim,
-        arity: Arity::Exactly(1),
+        func: Func::Trim(Trim::Both),
+        arity: Arity::Between(1, 2),
         arg: Kind::Str,
         needs: "needs a string",
         ret: Ret::Str,
@@ -455,7 +455,82 @@ pub static REGISTRY: &[Signature] = &[
         aggregate: false,
         star: false,
         by_name: true,
-        kernel: Some(string_kernel),
+        kernel: Some(trim_kernel),
+    },
+    // The two ends, which a statement reaches by writing LEADING or
+    // TRAILING in the explicit form and cannot reach by name: there is
+    // no function called trim_leading in ISO, and inventing one here
+    // would be inventing a spelling for a thing the standard already
+    // spells.
+    Signature {
+        name: "trim_leading",
+        aliases: &[],
+        func: Func::Trim(Trim::Leading),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "trim_trailing",
+        aliases: &[],
+        func: Func::Trim(Trim::Trailing),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "btrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Btrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "ltrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Ltrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "rtrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Rtrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
     },
     Signature {
         name: "normalize",
@@ -1001,9 +1076,9 @@ fn identity_kernel(func: Func, args: &[Value]) -> Result<Value> {
 }
 
 /// ISO 20.22 and 20.24, the questions about one string: its two
-/// lengths, its two folds, the spaces off its ends and the two about a
-/// normal form. A null in answers null, which is the rule every scalar
-/// here shares with the operators around them.
+/// lengths, its two folds and the two about a normal form. A null in
+/// answers null, which is the rule every scalar here shares with the
+/// operators around them.
 fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     let s = match settle(one(func, args)?.clone()) {
         Value::Str(s) => s,
@@ -1027,11 +1102,6 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
         // by a rule this engine has not written down yet.
         Func::Upper => Value::Str(s.to_ascii_uppercase()),
         Func::Lower => Value::Str(s.to_ascii_lowercase()),
-        // The one argument form trims spaces, which is what ISO 20.24
-        // says it trims: the trim character defaults to a space and the
-        // trim specification to BOTH. Naming either is GF06 and a
-        // spelling this does not read.
-        Func::Trim => Value::Str(s.trim_matches(' ').to_string()),
         // ISO 20.24 and 19.7, both answered by UAX 15 and the Unicode
         // Character Database, which is where the tables under these two
         // come from.
@@ -1044,6 +1114,77 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
             )));
         }
     })
+}
+
+/// ISO 20.24, the trim family: characters off the front of a string,
+/// off the back, or off both.
+///
+/// Six functions and one piece of code, because the whole of what
+/// tells them apart is which ends are trimmed and how many characters
+/// may be trimmed. `TRIM` takes one character and raises `22027` when
+/// it is handed a longer string, which is the condition the standard
+/// names and the reason `BTRIM`, `LTRIM` and `RTRIM` exist at all:
+/// those three take a set and trim any character of it. A trim
+/// character nobody wrote is a space, and trimming an empty set
+/// answers the string it was given.
+fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let trim = match func {
+        Func::Trim(trim) => trim,
+        other => {
+            return Err(invalid(format!("{}() is not a trim", name_of(other))));
+        }
+    };
+    let text = match str_arg(func, args.first())? {
+        Some(text) => text,
+        None => return Ok(Value::Null),
+    };
+    let chars = match args.get(1) {
+        None => Some(" ".to_string()),
+        Some(_) => str_arg(func, args.get(1))?,
+    };
+    let Some(chars) = chars else {
+        return Ok(Value::Null);
+    };
+    let one_character = matches!(trim, Trim::Both | Trim::Leading | Trim::Trailing);
+    if one_character && chars.chars().count() != 1 {
+        return Err(gql(
+            codes::C22027,
+            format!(
+                "{}() trims one character and was given {} of them, which is what btrim, ltrim and rtrim are for",
+                name_of(func),
+                chars.chars().count()
+            ),
+        ));
+    }
+    let set: Vec<char> = chars.chars().collect();
+    let front = matches!(trim, Trim::Both | Trim::Leading | Trim::Btrim | Trim::Ltrim);
+    let back = matches!(
+        trim,
+        Trim::Both | Trim::Trailing | Trim::Btrim | Trim::Rtrim
+    );
+    let mut out = text.as_str();
+    if front {
+        out = out.trim_start_matches(|c| set.contains(&c));
+    }
+    if back {
+        out = out.trim_end_matches(|c| set.contains(&c));
+    }
+    Ok(Value::Str(out.to_string()))
+}
+
+/// The string an argument holds, or nothing where it holds a null.
+/// Every kernel over strings reads its arguments through this, so a
+/// null answers null in one place rather than in each of them.
+fn str_arg(func: Func, value: Option<&Value>) -> Result<Option<String>> {
+    let value = value.ok_or_else(|| invalid(format!("{}() was given no string", name_of(func))))?;
+    match settle(value.clone()) {
+        Value::Str(s) => Ok(Some(s)),
+        Value::Null => Ok(None),
+        other => Err(invalid(format!(
+            "{}() expects a string, got {other:?}",
+            name_of(func)
+        ))),
+    }
 }
 
 /// A GQL condition raised by a kernel. These are conditions the
@@ -1540,5 +1681,91 @@ mod tests {
             call("exp", &[Value::Float(f64::INFINITY)]).unwrap(),
             Value::Float(f64::INFINITY)
         );
+    }
+
+    /// The answer of a trim, by the function rather than by a name,
+    /// since the two ends of the explicit form have no name a statement
+    /// can write.
+    fn trimmed(trim: Trim, args: &[Value]) -> Result<Value> {
+        trim_kernel(Func::Trim(trim), args)
+    }
+
+    /// GF05 and GF06. Which end is trimmed is the function, and every
+    /// one of the six trims the characters it was given and stops at
+    /// the first character it was not.
+    #[test]
+    fn a_trim_takes_characters_off_the_ends_it_is_asked_for() {
+        let text = Value::Str("xxayx".into());
+        let x = Value::Str("x".into());
+        for (trim, want) in [
+            (Trim::Both, "ay"),
+            (Trim::Leading, "ayx"),
+            (Trim::Trailing, "xxay"),
+            (Trim::Btrim, "ay"),
+            (Trim::Ltrim, "ayx"),
+            (Trim::Rtrim, "xxay"),
+        ] {
+            let got = trimmed(trim, &[text.clone(), x.clone()]).unwrap();
+            assert_eq!(got, Value::Str(want.into()), "{trim:?}");
+        }
+        // A set of characters is a set: any of them is trimmed, in
+        // whatever order they stand and however often.
+        assert_eq!(
+            trimmed(
+                Trim::Btrim,
+                &[Value::Str("xyyxaxy".into()), Value::Str("xy".into())]
+            )
+            .unwrap(),
+            Value::Str("a".into())
+        );
+        // An empty set trims nothing, and neither does a character the
+        // string does not begin with.
+        assert_eq!(
+            trimmed(
+                Trim::Btrim,
+                &[Value::Str("ab".into()), Value::Str("".into())]
+            )
+            .unwrap(),
+            Value::Str("ab".into())
+        );
+        assert_eq!(
+            trimmed(
+                Trim::Ltrim,
+                &[Value::Str("ab".into()), Value::Str("b".into())]
+            )
+            .unwrap(),
+            Value::Str("ab".into())
+        );
+        // What nobody wrote is a space, for all six.
+        assert_eq!(
+            trimmed(Trim::Both, &[Value::Str("  a  ".into())]).unwrap(),
+            Value::Str("a".into())
+        );
+    }
+
+    /// GF05 is a feature of its own because TRIM trims one character
+    /// and says so: a longer trim character raises the condition the
+    /// standard names rather than being read as the set the three
+    /// multi-character functions take.
+    #[test]
+    fn trimming_more_than_one_character_is_a_condition() {
+        for trim in [Trim::Both, Trim::Leading, Trim::Trailing] {
+            let err = trimmed(trim, &[Value::Str("abx".into()), Value::Str("ab".into())])
+                .expect_err("a trim error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22027), "{trim:?}");
+        }
+        for (trim, want) in [
+            (Trim::Btrim, "x"),
+            (Trim::Ltrim, "x"),
+            // Nothing off the back, the string ending in a character
+            // the set does not hold.
+            (Trim::Rtrim, "abx"),
+        ] {
+            assert_eq!(
+                trimmed(trim, &[Value::Str("abx".into()), Value::Str("ab".into())]).unwrap(),
+                Value::Str(want.into()),
+                "{trim:?}"
+            );
+        }
     }
 }

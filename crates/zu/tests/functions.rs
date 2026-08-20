@@ -142,6 +142,64 @@ fn the_numeric_library_answers_over_a_column() {
     assert!(says.contains("division by zero"), "{says}");
 }
 
+/// GF05 and GF06, the trim family: the explicit form over a column,
+/// which is the one spelling that is not written like a call, and the
+/// three multi-character functions beside it.
+#[test]
+fn the_trim_family_answers_over_a_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+    let mut conn = db.connect().expect("connect");
+
+    // The names in the fixture have no spaces on them, so what is
+    // trimmed here is a letter, which is also the only way to see that
+    // the end named is the end trimmed.
+    let source = "MATCH (p:person) RETURN TRIM(LEADING 'a' FROM p.name) AS l ORDER BY l";
+    let rows = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| row.get_by_name::<String>("l").expect("l"))
+        .collect();
+    assert_eq!(names, ["bo", "na"]);
+
+    // The call over a column stays in the plan and is printed under the
+    // name of the row that answers it, and the same form over what the
+    // statement wrote is answered while binding.
+    let plan = conn.explain(source).expect("explain");
+    assert!(plan.contains("trim_leading("), "{plan}");
+    let plan = conn
+        .explain("RETURN TRIM(LEADING 'x' FROM 'xxay') AS v")
+        .expect("explain");
+    assert!(!plan.contains("trim"), "{plan}");
+
+    assert_eq!(
+        one(&db, "RETURN TRIM(TRAILING 'y' FROM 'xxay') AS v"),
+        Value::Str("xxa".into())
+    );
+    assert_eq!(
+        one(&db, "RETURN TRIM('  a  ') AS v"),
+        Value::Str("a".into())
+    );
+    assert_eq!(
+        one(&db, "RETURN BTRIM('xyaxy', 'xy') AS v"),
+        Value::Str("a".into())
+    );
+
+    // The three words are ordinary names everywhere else, which is what
+    // keeps a query that bound one of them readable.
+    assert_eq!(
+        one(&db, "LET leading = 'x' RETURN TRIM(leading) AS v"),
+        Value::Str("x".into())
+    );
+
+    // One character, and the condition the standard names when it is
+    // handed more, which is the whole reason the three above exist.
+    let says = refused(&db, "RETURN TRIM(BOTH 'ab' FROM 'abx') AS v");
+    assert!(says.contains("trims one character"), "{says}");
+}
+
 /// What a signature refuses, and in its own words: a name no builtin
 /// has, a count of arguments the signature does not allow, and a type
 /// the function has nothing to say about.

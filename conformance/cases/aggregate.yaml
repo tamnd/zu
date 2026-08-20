@@ -427,3 +427,120 @@ cases:
     doc: A deviation of strings raises rather than measuring their lengths or their order, the same refusal the sum gives and for the same reason.
     query: UNWIND ['a', 'b'] AS n RETURN stddev_pop(n) AS p
     raises: "22G03"
+
+  - name: percentile-cont-of-an-even-count
+    doc: The median of four values under the continuous percentile, which falls between the second and the third and is answered by the point on the line between them. The answer is a number that is not in the input, which is the whole difference between this function and the one below.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: percentile-disc-of-an-even-count
+    doc: The same median under the discrete percentile, which answers the first value whose share of the group reaches the fraction. That is a value that was there and it comes back with the type it had, so this column is an integer where the one above is a float.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_disc(n, 0.5) AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: percentile-of-the-ends
+    doc: A fraction of nought is the smallest value and a fraction of one is the largest, under both functions, which is where the two have to agree and is the pair that catches an off by one in either.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_cont(n, 0.0) AS a, percentile_cont(n, 1.0) AS b, percentile_disc(n, 0.0) AS c, percentile_disc(n, 1.0) AS d
+    columns:
+      - a
+      - b
+      - c
+      - d
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+          - type: FLOAT64
+            value: "4.0"
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "4"
+
+  - name: percentile-that-lands-on-a-value
+    doc: A quarter of the way through five values lands on the second one exactly, so nothing is interpolated and both functions answer it, one as a float and one as the integer it was.
+    query: UNWIND [1, 2, 3, 4, 5] AS n RETURN percentile_cont(n, 0.25) AS c, percentile_disc(n, 0.25) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+          - type: INT64
+            value: "2"
+
+  - name: percentile-ignores-the-order-of-the-rows
+    doc: A percentile is about the values and not about the order they arrived in, so shuffling the input does not move it. A client that reads the rows positionally rather than sorting them fails this and passes every case above.
+    query: UNWIND [4, 1, 3, 2] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: percentile-skips-nulls
+    doc: A null is not a value at the bottom of the order, it is not a value at all, so this is the median of two numbers and not of three things.
+    query: UNWIND [1, null, 3] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: percentile-with-no-rows
+    doc: No values is no percentile, so both answer null rather than nought, which is the same choice the deviations make and the opposite of the one the count makes.
+    query: UNWIND [] AS n RETURN percentile_cont(n, 0.5) AS c, percentile_disc(n, 0.5) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+
+  - name: percentile-of-a-null-fraction
+    doc: A fraction of null is a question with nothing asked in it, which is null and not an error, the same reading every other null argument gets.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_cont(n, null) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: NULL
+
+  - name: percentile-refuses-a-fraction-past-one
+    doc: The fraction is a fraction, so a number outside nought to one is out of range rather than clamped to the nearest end. A client that clamps answers the largest value here and is wrong quietly.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_cont(n, 1.5) AS c
+    raises: "22003"
+
+  - name: percentile-refuses-a-negative-fraction
+    doc: The other end of the same rule, written down because clamping to nought is the more tempting of the two mistakes.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_disc(n, -0.5) AS d
+    raises: "22003"
+
+  - name: percentile-refuses-text
+    doc: Both arguments are numbers, so a column of strings has no percentile, the same refusal the sum and the deviations give.
+    query: UNWIND ['a', 'b'] AS n RETURN percentile_cont(n, 0.5) AS c
+    raises: "22G03"
+
+  - name: percentile-distinct
+    doc: DISTINCT under a percentile measures the values rather than the rows, so the repeated ones count once and the median moves. Without the quantifier this is the median of five and with it the median of three.
+    query: UNWIND [1, 1, 2, 2, 3] AS n RETURN percentile_cont(DISTINCT n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"

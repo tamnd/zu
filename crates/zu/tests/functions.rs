@@ -704,3 +704,143 @@ fn the_set_functions_answer_over_a_graph() {
         assert!(plan.contains("collect_list"), "{plan}");
     }
 }
+
+/// GF11, the two percentiles, ISO 20.9's binary set functions.
+///
+/// The corpus covers the values. What is asked here is the rest of the
+/// arrangement: that the fraction may be a parameter, that a fraction
+/// reading a column is refused rather than answered from whichever row
+/// arrived first, that a group of a hundred thousand rows folded back
+/// through the merge lands on the same value the closed form does, and
+/// that the plan prints both arguments.
+#[test]
+fn the_percentiles_answer_over_a_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("percentiles.zu1");
+    const NODES: u32 = 100_000;
+    {
+        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+            .expect("load");
+    }
+    let db = Database::open(&path).expect("open");
+    let mut conn = db.connect().expect("connect");
+
+    // The ids are 0 to NODES - 1, evenly spaced, so the fraction lands
+    // where arithmetic says it does and the answer is known without
+    // sorting anything: the continuous one is the point on the line and
+    // the discrete one is the first id whose share reaches it.
+    let last = f64::from(NODES - 1);
+    for (fraction, want) in [(0.0, 0.0), (0.5, last / 2.0), (1.0, last)] {
+        let source = format!("MATCH (p:person) RETURN percentile_cont(p.id, {fraction}) AS v");
+        let rows = conn.query(&source).expect("query");
+        let rows: Vec<_> = rows.iter().collect();
+        assert_eq!(rows.len(), 1, "{source}");
+        let got = rows[0].get_by_name::<f64>("v").expect("v");
+        assert!((got - want).abs() <= 1e-9, "{source} answered {got}");
+    }
+    let rows = conn
+        .query("MATCH (p:person) RETURN percentile_disc(p.id, 0.5) AS v")
+        .expect("query");
+    let rows: Vec<_> = rows.iter().collect();
+    // Half of a hundred thousand ids starting at nought is the id at
+    // index forty-nine thousand nine hundred and ninety-nine, the share
+    // of the group through it being exactly one half.
+    assert_eq!(rows[0].get_by_name::<i64>("v").expect("v"), 49_999);
+
+    // The fraction may be a parameter, which is the reason the check on
+    // it is that it reads no column rather than that it is a literal.
+    let rows = conn
+        .query_with(
+            "MATCH (p:person) WHERE p.id < 4 RETURN percentile_cont(p.id, $p) AS v",
+            &[("p", zu::query::Value::Float(0.5))],
+        )
+        .expect("query");
+    let rows: Vec<_> = rows.iter().collect();
+    assert_eq!(rows[0].get_by_name::<f64>("v").expect("v"), 1.5);
+
+    // A fraction that reads a column is refused, because the standard's
+    // independent value expression is one value for the whole group and
+    // this is not one.
+    let says = conn
+        .query("MATCH (p:person) RETURN percentile_cont(p.id, p.id) AS v")
+        .expect_err("a fraction that reads a column")
+        .to_string();
+    assert!(says.contains("same for the whole group"), "{says}");
+
+    // A group per key, so the two answers come out of two accumulators
+    // and neither sees the other's values.
+    let rows = conn
+        .query(
+            "MATCH (p:person) WHERE p.id < 6 \
+             LET k = p.id % 2 \
+             RETURN k AS k, percentile_cont(p.id, 0.5) AS v ORDER BY k",
+        )
+        .expect("query");
+    let groups: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get_by_name::<i64>("k").expect("k"),
+                row.get_by_name::<f64>("v").expect("v"),
+            )
+        })
+        .collect();
+    assert_eq!(groups, [(0, 2.0), (1, 3.0)]);
+
+    // A chunk the plan left unflat stands for many rows at once, and a
+    // percentile weights the value by how many rather than counting it
+    // once. The nodes below have different out degrees on purpose, so
+    // the weights differ and a percentile that dropped them would land
+    // somewhere else. The same pattern without the set function gives
+    // back the rows one at a time, which is the multiset the answer is
+    // checked against.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("weighted.zu1");
+    const REACH: u32 = 300;
+    {
+        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = Vec::new();
+        for i in 0..REACH {
+            edges.push((i, (i + 1) % REACH));
+            if i % 2 == 0 {
+                edges.push((i, (i + 2) % REACH));
+            }
+            if i % 3 == 0 {
+                edges.push((i, (i + 5) % REACH));
+            }
+        }
+        edges.sort_unstable();
+        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", REACH.into(), &edges)
+            .expect("load");
+    }
+    let db = Database::open(&path).expect("open");
+    let mut conn = db.connect().expect("connect");
+    let pattern = "MATCH (a:person)-[:knows*1..2]->(b)";
+    let rows = conn
+        .query(&format!("{pattern} RETURN a.id AS x"))
+        .expect("query");
+    let mut seen: Vec<f64> = rows
+        .iter()
+        .map(|row| row.get_by_name::<i64>("x").expect("x") as f64)
+        .collect();
+    seen.sort_by(f64::total_cmp);
+    let exact = 0.5 * (seen.len() - 1) as f64;
+    let low = seen[exact.floor() as usize];
+    let want = low + (seen[exact.ceil() as usize] - low) * (exact - exact.floor());
+    let rows = conn
+        .query(&format!("{pattern} RETURN percentile_cont(a.id, 0.5) AS v"))
+        .expect("query");
+    let rows: Vec<_> = rows.iter().collect();
+    let got = rows[0].get_by_name::<f64>("v").expect("v");
+    assert!((got - want).abs() <= 1e-9, "{got} against {want}");
+
+    // Both arguments are in the plan, the fraction being part of what
+    // the function was asked and not a setting beside it.
+    let plan = conn
+        .explain("MATCH (p:person) RETURN percentile_disc(p.id, 0.9) AS v")
+        .expect("explain");
+    assert!(plan.contains("percentile_disc("), "{plan}");
+    assert!(plan.contains("0.9"), "{plan}");
+}

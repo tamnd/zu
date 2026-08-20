@@ -23,7 +23,7 @@ use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
 
 use crate::ast::{Literal, TemporalFn};
-use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Trim, Type};
+use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Percentile, Trim, Type};
 use crate::cast;
 use crate::exec::{Value, settle};
 
@@ -328,6 +328,37 @@ pub static REGISTRY: &[Signature] = &[
         arg: Kind::Number,
         needs: "needs a number",
         ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "percentile_cont",
+        aliases: &[],
+        func: Func::Percentile(Percentile::Continuous),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs numbers",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "percentile_disc",
+        aliases: &[],
+        func: Func::Percentile(Percentile::Discrete),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs numbers",
+        // The answer is one of the values that arrived rather than a
+        // point between two of them, so it comes back with the type
+        // they had: a percentile of integers is an integer.
+        ret: Ret::Same,
         deterministic: true,
         aggregate: true,
         star: false,

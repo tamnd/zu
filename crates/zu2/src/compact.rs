@@ -43,10 +43,32 @@
 //!
 //! Edges are not keyed, so the index cannot answer for them. The
 //! adjacency itself does: an add is live when the edge is in the
-//! adjacency now, and a remove is live when it is not. Keeping a remove
-//! whose add lies above the region is what stops a replay from bringing
-//! a deleted edge back, and it is why removes are the one thing here
-//! that is kept conservatively rather than exactly.
+//! adjacency now. A remove is never live, and the reason is the same
+//! prefix property everything else here rests on.
+//!
+//! A region is always a prefix. The scan starts at `begin`, `reclaim_to`
+//! writes the new `begin` durably before it releases a page, and a
+//! replay starts its scan there. So a record above the region is a
+//! record a replay applies *after* everything in the region, and a
+//! remove in the region followed by an add above it replays as an edge
+//! that is present whether the remove is kept or not.
+//!
+//! Work the pair's history through. If the adjacency has the edge, the
+//! remove is stale and goes. If it does not, then the last edge record
+//! for that pair on the whole log is a remove, because an add as the
+//! last record would have left the edge present. That last remove is
+//! either this one or one above the region. One above the region does
+//! the job on its own. This one being the last means the pair has no
+//! add above the region at all and the rest of its history is inside the
+//! region about to be punched, so dropping it leaves the pair with no
+//! record anywhere, which replays as absent, which is what the adjacency
+//! says. Either way the remove is redundant.
+//!
+//! Keeping them instead was #452, and it was not the cheap safety margin
+//! it reads as. A removed edge stays removed, so its remove record
+//! matched on every pass and was copied forward on every pass: 48 bytes
+//! per deleted edge that never came back and that every future pass paid
+//! to copy again.
 //!
 //! That question can go stale, which was #437. An edge writer puts its
 //! record on the log before it touches the adjacency, because an edge in
@@ -203,22 +225,28 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
 /// Decides an edge record and re-appends it when it still counts.
 ///
 /// An add is live when the adjacency has the edge, because a replay that
-/// skipped it would come up short. A remove is live when the adjacency
-/// does not, because the add it cancels may sit above this region and a
-/// replay without the remove would bring the edge back. That keeps a few
-/// removes longer than strictly needed, which is the safe direction.
+/// skipped it would come up short. A remove is never live: the module
+/// comment has the argument, and the short of it is that a region is a
+/// prefix, so anything a remove in it could still be cancelling is
+/// either gone with the region or answered by a record above it (#452).
 ///
 /// The question and the copy are one step, under the same order an edge
 /// writer takes, because an answer read between a writer's append and
 /// its apply is an answer that is already wrong. #437 has what that
-/// costs when the two are apart.
+/// costs when the two are apart, and it is also what makes dropping a
+/// remove safe rather than merely cheaper: a copy goes to the tail,
+/// above everything, so the pass and a concurrent writer must not be
+/// able to interleave. Under the order they cannot, and taking records
+/// out cannot invent an interleaving that putting them in did not have.
 fn keep_edge(session: &mut Session<'_>, payload: &[u8]) -> Result<bool> {
     let Some((add, src, dst)) = graph::decode_edge(payload) else {
         return Ok(false);
     };
+    if !add {
+        return Ok(false);
+    }
     let _order = session.core.graph().order_edges(src);
-    let present = session.neighbours(Direction::Out, src, |n| n.binary_search(&dst).is_ok());
-    if present != add {
+    if !session.neighbours(Direction::Out, src, |n| n.binary_search(&dst).is_ok()) {
         return Ok(false);
     }
     session.append_untracked(record::KIND_EDGE, payload)?;

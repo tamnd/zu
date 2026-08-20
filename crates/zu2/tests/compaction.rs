@@ -560,3 +560,169 @@ fn a_compaction_copies_the_live_set_about_once() {
         assert!(s.read(&key(i), &mut out).expect("read"), "lost {i}");
     }
 }
+
+/// Wider than [`options`], for the two edge churn tests below, which
+/// write enough keys that the narrower index would be chains rather than
+/// buckets.
+fn wide() -> Options {
+    Options {
+        index_buckets: 1 << 16,
+        max_pages: 1 << 10,
+        max_nodes: 1 << 20,
+        ..options()
+    }
+}
+
+/// Appends about `pages` pages of keys nothing else in the test touches,
+/// to push what came before below the read only boundary and give the
+/// next pass something it is allowed to read.
+fn fill(db: &Db, tag: char, pages: usize) {
+    let mut s = db.session();
+    for i in 0..(pages * 4200) {
+        s.upsert(format!("{tag}{i:012}").as_bytes(), &vec![b'x'; 1000])
+            .expect("fill");
+    }
+    db.sync().expect("sync");
+}
+
+/// Adds every edge of a ring and then removes every one of them, or does
+/// neither, then compacts to a steady state and returns the span of the
+/// log that is left. The two answers should agree: a removed edge is
+/// gone, and gone means it costs nothing.
+fn churn_to_steady_span(edges: bool) -> u64 {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(&dir.path().join("e.zu2"), wide()).expect("create");
+    let nodes = 8000u32;
+    {
+        let mut s = db.session();
+        for i in 0..nodes {
+            s.add_node(&key(i)).expect("node");
+        }
+        if edges {
+            for i in 0..nodes {
+                s.add_edge(i, (i + 1) % nodes).expect("add");
+            }
+            for i in 0..nodes {
+                s.remove_edge(i, (i + 1) % nodes).expect("remove");
+            }
+        }
+    }
+    fill(&db, 'f', 3);
+    // Several passes, each with fresh records above it, because one pass
+    // reclaims a quarter of what it is allowed to read and the question
+    // here is what the log settles at rather than what one pass does.
+    for _ in 0..4 {
+        db.sync().expect("sync");
+        db.compact().expect("compact");
+        fill(&db, 'g', 1);
+    }
+    db.sync().expect("sync");
+    db.log_span()
+}
+
+#[test]
+fn a_removed_edge_stops_costing_once_it_is_compacted() {
+    // #452. Compaction kept an edge remove whenever the edge was absent,
+    // which for a removed edge is forever, so every pass matched it and
+    // copied it forward again: 48 bytes a deleted edge, paid on every
+    // pass for the life of the database. The same workload with the
+    // edges taken out is the control, and the two spans should be the
+    // same log.
+    let with = churn_to_steady_span(true);
+    let without = churn_to_steady_span(false);
+    let leaked = with as i64 - without as i64;
+    assert!(
+        leaked.unsigned_abs() < 4 * RECORD,
+        "8000 added then removed edges left {leaked} bytes behind after compaction, \
+         {with} against {without} for the same workload with no edges in it"
+    );
+}
+
+#[test]
+fn a_churned_graph_reopens_as_the_graph_in_memory() {
+    // The failure mode of dropping remove records is an edge coming back
+    // from the dead, so this one is about the answer rather than the
+    // size. Every pair gets a different history, some ending in an add
+    // and some in a remove, and what is on disk after a compaction and a
+    // reopen has to be what the session said before it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("c.zu2");
+    let nodes = 4000u32;
+    let mut expected: Vec<Vec<u32>> = vec![Vec::new(); nodes as usize];
+    {
+        let db = Db::create(&path, wide()).expect("create");
+        {
+            let mut s = db.session();
+            for i in 0..nodes {
+                s.add_node(&key(i)).expect("node");
+            }
+            for i in 0..nodes {
+                let dst = (i + 1) % nodes;
+                let chord = (i * 7 + 1) % nodes;
+                s.add_edge(i, dst).expect("add");
+                s.add_edge(i, chord).expect("chord");
+                match i % 4 {
+                    // Added and left alone.
+                    0 => expected[i as usize].extend([dst, chord]),
+                    // Added and removed, so it must stay gone.
+                    1 => {
+                        s.remove_edge(i, dst).expect("remove");
+                        expected[i as usize].push(chord);
+                    }
+                    // Added, removed, added back, so it must come back.
+                    2 => {
+                        s.remove_edge(i, dst).expect("remove");
+                        s.add_edge(i, dst).expect("re-add");
+                        expected[i as usize].extend([dst, chord]);
+                    }
+                    // Both of them removed, leaving the node with none.
+                    _ => {
+                        s.remove_edge(i, dst).expect("remove");
+                        s.remove_edge(i, chord).expect("remove");
+                    }
+                }
+            }
+        }
+        // The removes have to end up below the read only boundary with
+        // their adds, or the pass never reads them and the test proves
+        // nothing.
+        fill(&db, 'f', 3);
+        for _ in 0..3 {
+            db.sync().expect("sync");
+            db.compact().expect("compact");
+            fill(&db, 'g', 1);
+        }
+        db.sync().expect("sync");
+
+        let mut s = db.session();
+        for i in 0..nodes {
+            let mut out = s.neighbours(Direction::Out, i, |n| n.to_vec());
+            out.sort_unstable();
+            let mut want = expected[i as usize].clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(out, want, "node {i} was wrong before the reopen");
+        }
+    }
+
+    let db = Db::open(&path, wide()).expect("reopen");
+    let mut s = db.session();
+    for i in 0..nodes {
+        let mut out = s.neighbours(Direction::Out, i, |n| n.to_vec());
+        out.sort_unstable();
+        let mut want = expected[i as usize].clone();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(out, want, "node {i} came back from disk wrong");
+    }
+    // And the other side of every surviving edge, since the in edges are
+    // a separate list built by the same replay.
+    for i in 0..nodes {
+        for &dst in &expected[i as usize] {
+            assert!(
+                s.neighbours(Direction::In, dst, |n| n.binary_search(&i).is_ok()),
+                "edge {i} to {dst} survived out but not in"
+            );
+        }
+    }
+}

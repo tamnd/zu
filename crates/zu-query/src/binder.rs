@@ -1258,6 +1258,14 @@ pub enum BoundClause {
         distinct: bool,
         items: Vec<BoundItem>,
         order_by: Vec<SortKey<BoundExpr>>,
+        /// GF20. The aggregates an `ORDER BY` asked for that no item
+        /// carries, each one an accumulator the grouping fills into the
+        /// slot on it and nothing else reads. The keys in `order_by`
+        /// hold that slot rather than the call, so a sort key is read
+        /// off the group the way a projected aggregate is. A key whose
+        /// aggregate the projection already carries reads that item's
+        /// slot instead and leaves nothing here.
+        order_aggs: Vec<BoundItem>,
         skip: Option<BoundExpr>,
         limit: Option<BoundExpr>,
         filter: Option<BoundExpr>,
@@ -2450,6 +2458,93 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     }
 }
 
+/// Walks an expression, offering every part to `f` before the parts
+/// under it and putting whatever `f` answers in its place.
+///
+/// A part that is replaced is not walked into: what stands there now is
+/// the answer and not what the query wrote. A value query expression is
+/// a leaf here for the same reason it is one in [`expr_slots`], since
+/// what is inside it is a query of its own and not this expression.
+fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundExpr>) {
+    if let Some(replacement) = f(expr) {
+        *expr = replacement;
+        return;
+    }
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Graph(_)
+        | BoundExpr::Clock
+        | BoundExpr::Scalar { .. }
+        | BoundExpr::Var(_)
+        | BoundExpr::HasLabels { .. } => {}
+        BoundExpr::Property { base, .. } => rewrite(base, f),
+        BoundExpr::Unary { expr, .. } => rewrite(expr, f),
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            rewrite(lhs, f);
+            rewrite(rhs, f);
+        }
+        BoundExpr::IsNull { expr, .. } => rewrite(expr, f),
+        BoundExpr::IsTyped { expr, .. } => rewrite(expr, f),
+        BoundExpr::Call { args, .. } | BoundExpr::Fold { args, .. } => {
+            for arg in args {
+                rewrite(arg, f);
+            }
+        }
+        BoundExpr::List(items) => {
+            for item in items {
+                rewrite(item, f);
+            }
+        }
+        BoundExpr::Map(pairs) => {
+            for (_, value) in pairs {
+                rewrite(value, f);
+            }
+        }
+        BoundExpr::Path(elements) => {
+            for element in elements {
+                rewrite(element, f);
+            }
+        }
+        BoundExpr::Let { values, body } => {
+            for (_, value) in values {
+                rewrite(value, f);
+            }
+            rewrite(body, f);
+        }
+        BoundExpr::Cast { expr, .. } => rewrite(expr, f),
+        BoundExpr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            for expr in subject.iter_mut().chain(otherwise.iter_mut()) {
+                rewrite(expr, f);
+            }
+            for (when, then) in branches {
+                rewrite(when, f);
+                rewrite(then, f);
+            }
+        }
+        BoundExpr::Coalesce(args) => {
+            for arg in args {
+                rewrite(arg, f);
+            }
+        }
+        BoundExpr::NullIf { value, compared } => {
+            rewrite(value, f);
+            rewrite(compared, f);
+        }
+        BoundExpr::IsDirected { expr, .. }
+        | BoundExpr::IsLabeled { expr, .. }
+        | BoundExpr::PropertyExists { expr, .. } => rewrite(expr, f),
+        BoundExpr::IsEndpoint { node, rel, .. } => {
+            rewrite(node, f);
+            rewrite(rel, f);
+        }
+    }
+}
+
 /// Binds one linear query statement, appending whatever parameters it
 /// names to `params` so the positions stay the statement's.
 fn bind_linear(
@@ -3451,10 +3546,38 @@ impl Binder<'_> {
 
         self.scope = order_scope;
         let mut order_by = Vec::new();
+        let mut order_aggs = Vec::new();
         for key in &projection.order_by {
             let mut ctx = ExprCtx::new(true);
-            let (bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
+            let (mut bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
+            if ctx.saw_aggregate {
+                self.hoist_sort_aggregates(&mut bound, &items, &mut order_aggs);
+            }
             order_by.push(key.with_expr(bound));
+        }
+        // GF20. Sorting by an aggregate makes the clause a grouping
+        // even where no item is one, and behind a grouping a name is
+        // read once per group. The pre-projection variables were in
+        // scope while the keys were bound, because until the keys were
+        // read nothing said this was a grouping, so a key that reads
+        // one of them is refused here rather than answered off
+        // whichever row of the group the engine happened to hold.
+        if !order_aggs.is_empty() && !has_aggregate {
+            let grouped: HashSet<usize> = items
+                .iter()
+                .chain(order_aggs.iter())
+                .filter_map(|item| item.slot)
+                .collect();
+            for key in &order_by {
+                let mut reads = Vec::new();
+                expr_slots(&key.expr, &mut reads);
+                if let Some(slot) = reads.iter().find(|slot| !grouped.contains(slot)) {
+                    return Err(invalid(format!(
+                        "'{}' is read once per group, so it has to be one of the {clause} items or an aggregate over the group",
+                        self.variables[*slot].name
+                    )));
+                }
+            }
         }
         let skip = self.bind_count_limit(&projection.skip, "SKIP")?;
         let limit = self.bind_count_limit(&projection.limit, "LIMIT")?;
@@ -3486,10 +3609,64 @@ impl Binder<'_> {
             distinct: projection.distinct || grouped_without_aggregate,
             items,
             order_by,
+            order_aggs,
             skip,
             limit,
             filter,
         })
+    }
+
+    /// GF20. Takes the aggregates out of one sort key and leaves a name
+    /// where each one stood.
+    ///
+    /// An aggregate answers one value per group, and a sort key behind
+    /// a grouping is read once per group as well, so the key does not
+    /// have to hold the call: it can hold a slot the grouping fills,
+    /// which is what a projected aggregate already is. Where an item
+    /// carries the same call the key reads that item's slot and the
+    /// statement pays for one accumulator; where none does, the call
+    /// gets a slot of its own that no column reads.
+    ///
+    /// What is under a hoisted call is left alone. Those parts are read
+    /// once per row of the group, inside the accumulator, which is the
+    /// one place behind a grouping where a name is still a row's.
+    fn hoist_sort_aggregates(
+        &mut self,
+        key: &mut BoundExpr,
+        items: &[BoundItem],
+        hidden: &mut Vec<BoundItem>,
+    ) {
+        rewrite(key, &mut |node| {
+            let BoundExpr::Call { func, .. } = node else {
+                return None;
+            };
+            if !func.is_aggregate() {
+                return None;
+            }
+            let carried = items
+                .iter()
+                .chain(hidden.iter())
+                .find(|item| item.aggregate && item.expr == *node)
+                .and_then(|item| item.slot);
+            if let Some(slot) = carried {
+                return Some(BoundExpr::Var(slot));
+            }
+            // The slot holds whatever the call answers and nothing
+            // reads it but the key, which is already bound, so there is
+            // no type left for this to be the answer to. The item is
+            // named after the slot rather than after what the query
+            // wrote, so a plan listing names it the same way in the
+            // grouping that fills it and in the sort that reads it.
+            let slot = self.anon_slot(Type::Any);
+            hidden.push(BoundItem {
+                expr: node.clone(),
+                ty: Type::Any,
+                name: self.variables[slot].name.clone(),
+                slot: Some(slot),
+                aggregate: true,
+            });
+            Some(BoundExpr::Var(slot))
+        });
     }
 
     /// Binds a `LET`: the names it gives, added to everything already
@@ -3575,6 +3752,7 @@ impl Binder<'_> {
                 distinct: false,
                 items: carried.chain(stage).collect(),
                 order_by: Vec::new(),
+                order_aggs: Vec::new(),
                 skip: None,
                 limit: None,
                 filter: None,
@@ -3640,6 +3818,7 @@ impl Binder<'_> {
             distinct: false,
             items: bound,
             order_by: Vec::new(),
+            order_aggs: Vec::new(),
             skip: None,
             limit: None,
             filter: None,

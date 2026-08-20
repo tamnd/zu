@@ -1794,7 +1794,21 @@ impl Compiler<'_> {
                 }
                 SinkSpec::Rows { items: refs, post }
             }
-            Some(LogicalPlan::Aggregate { keys, aggs, .. }) => {
+            Some(LogicalPlan::Aggregate {
+                keys,
+                aggs,
+                order_aggs,
+                ..
+            }) => {
+                // GF20. An aggregate a sort key asked for and no column
+                // carries finalizes into a slot of its own, which this
+                // sink has no room for: its rows are the columns and
+                // nothing else. The old executor keeps those values
+                // beside the row, so the plan goes there whole rather
+                // than being sorted here by a column that is not in it.
+                if !order_aggs.is_empty() {
+                    return Ok(None);
+                }
                 let mut key_refs = Vec::with_capacity(keys.len());
                 for item in keys {
                     let Some(r) = self.item_ref(&item.expr)? else {

@@ -256,6 +256,11 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         keys: Vec<BoundItem>,
         aggs: Vec<BoundItem>,
+        /// GF20. The aggregates the `ORDER BY` above asked for that no
+        /// item carries. They are accumulated with the rest and land in
+        /// the slot each one names, which the sort reads and no column
+        /// does, so they widen the grouping's work and not its answer.
+        order_aggs: Vec<BoundItem>,
     },
     Distinct {
         input: Box<LogicalPlan>,
@@ -508,13 +513,17 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                 distinct,
                 items,
                 order_by,
+                order_aggs,
                 skip,
                 limit,
                 filter,
             } => {
                 let (aggs, keys): (Vec<_>, Vec<_>) =
                     items.iter().cloned().partition(|i| i.aggregate);
-                plan = if aggs.is_empty() {
+                // A sort key holding an aggregate groups the clause on
+                // its own, so the items are the keys and the answer is
+                // one row per group even where no column is a count.
+                plan = if aggs.is_empty() && order_aggs.is_empty() {
                     LogicalPlan::Project {
                         input: plan.boxed(),
                         items: items.clone(),
@@ -524,6 +533,7 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                         input: plan.boxed(),
                         keys,
                         aggs,
+                        order_aggs: order_aggs.clone(),
                     }
                 };
                 for item in items {
@@ -1228,8 +1238,21 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
                 ..plain("Project", rendered.join(", "), under(input))
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
-            let rendered: Vec<String> = aggs.iter().map(|i| item_text(i, query)).collect();
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } => {
+            // The hidden ones are listed with the rest, under the name
+            // the sort key above reads them by, because a listing that
+            // left them out would say a grouping does less work than it
+            // does and leave the sort reading a name from nowhere.
+            let rendered: Vec<String> = aggs
+                .iter()
+                .chain(order_aggs)
+                .map(|i| item_text(i, query))
+                .collect();
             let grouped: Vec<String> = keys.iter().map(|i| item_text(i, query)).collect();
             let detail = match grouped.is_empty() {
                 true => rendered.join(", "),

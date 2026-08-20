@@ -1774,7 +1774,14 @@ struct SinkDef {
     /// interleaves keys and aggregates exactly as written.
     items: Vec<BoundItem>,
     aggregate: bool,
+    /// One per aggregate item in clause order, then one per hidden sort
+    /// aggregate. The two live in one list because a group accumulates
+    /// them together; what tells them apart is that the second lot has
+    /// no column, which is why the slots below say where they go.
     aggs: Vec<AggSpec>,
+    /// GF20. The slot each hidden sort aggregate finalizes into, in the
+    /// order those specs sit at the end of `aggs`.
+    order_slots: Vec<usize>,
     post: Vec<PostOp>,
     /// Slots snapshotted per row for post-projection filters.
     extra_slots: Vec<usize>,
@@ -2804,11 +2811,13 @@ fn build_stages(
     let leaf = cur;
     linear.reverse();
 
-    let projections: Vec<&Vec<BoundItem>> = query
+    let projections: Vec<(&Vec<BoundItem>, &Vec<BoundItem>)> = query
         .clauses
         .iter()
         .filter_map(|c| match c {
-            crate::binder::BoundClause::Project { items, .. } => Some(items),
+            crate::binder::BoundClause::Project {
+                items, order_aggs, ..
+            } => Some((items, order_aggs)),
             _ => None,
         })
         .collect();
@@ -2925,14 +2934,16 @@ fn build_stages(
                 b.produced(chunk);
             }
             LogicalPlan::Project { .. } | LogicalPlan::Aggregate { .. } => {
-                let items = projections
+                let (items, order_aggs) = projections
                     .get(proj_ix)
-                    .ok_or_else(|| invalid("more sinks than projection clauses".into()))?
-                    .to_vec();
+                    .ok_or_else(|| invalid("more sinks than projection clauses".into()))?;
+                let items = items.to_vec();
+                let order_aggs = order_aggs.to_vec();
                 proj_ix += 1;
                 let aggregate = matches!(linear[i], LogicalPlan::Aggregate { .. });
 
                 let mut aggs = Vec::new();
+                let mut order_slots = Vec::new();
                 if aggregate {
                     // Grouping keys must be flat; each aggregate
                     // argument may keep exactly one unflat vector.
@@ -2941,7 +2952,15 @@ fn build_stages(
                             b.ensure_flat(c);
                         }
                     }
-                    for item in items.iter().filter(|it| it.aggregate) {
+                    // The aggregates with a column first, in clause
+                    // order, then the ones a sort key asked for. The
+                    // second lot accumulates exactly like the first,
+                    // which is why one loop reads both.
+                    for item in items
+                        .iter()
+                        .filter(|it| it.aggregate)
+                        .chain(order_aggs.iter())
+                    {
                         let BoundExpr::Call {
                             func,
                             distinct,
@@ -3009,6 +3028,11 @@ fn build_stages(
                             fraction,
                         });
                     }
+                    for item in &order_aggs {
+                        order_slots.push(item.slot.ok_or_else(|| {
+                            invalid("a sort key's aggregate lost its slot, this is a bug".into())
+                        })?);
+                    }
                 }
 
                 let mut post = Vec::new();
@@ -3028,8 +3052,15 @@ fn build_stages(
                     i += 1;
                 }
 
-                rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra, aggregate);
-                rewrite_reach_varlen(&mut b, &items, &aggs, &post, &extra, aggregate);
+                // A hidden sort aggregate reads its argument the way a
+                // projected one does, and the two rewrites below decide
+                // what a column may drop by what is read, so they are
+                // handed the items and the hidden ones together. Left
+                // out, the argument of `ORDER BY count(r.weight)` would
+                // look like a slot nobody wants.
+                let read: Vec<BoundItem> = items.iter().chain(&order_aggs).cloned().collect();
+                rewrite_count_expand(&mut b, &read, &mut aggs, &post, &extra, aggregate);
+                rewrite_reach_varlen(&mut b, &read, &aggs, &post, &extra, aggregate);
 
                 let unflat = (0..b.chunk_flat.len())
                     .filter(|&c| !b.chunk_flat[c])
@@ -3038,6 +3069,7 @@ fn build_stages(
                     items,
                     aggregate,
                     aggs,
+                    order_slots,
                     post,
                     extra_slots: extra.into_iter().collect(),
                 };
@@ -7427,6 +7459,27 @@ fn finalize_group(
             ctx.overlay.insert(slot, v.clone());
         }
     }
+    // GF20. What is left in the two iterators is the aggregates a sort
+    // key asked for and no column carries. They finalize like the rest
+    // and go into the slot each one was given, which is what the key
+    // reads a line below, so a sort by a count costs the sort an
+    // accumulator and the answer nothing.
+    for slot in &sink.order_slots {
+        let state = sit.next().expect("one state per hidden sort aggregate");
+        let spec = specs.next().expect("one spec per hidden sort aggregate");
+        if state.nulls_eliminated {
+            ctx.notices.push(DiagnosticRecord::new(
+                codes::C01G11,
+                "a set function ignored one or more null arguments",
+            ));
+        }
+        let fraction = match &spec.fraction {
+            Some(expr) => Some(eval(ctx, expr)?),
+            None => None,
+        };
+        let v = state.finalize(fraction)?;
+        ctx.overlay.insert(*slot, v);
+    }
     let mut keys = Vec::new();
     for SortKey { expr, .. } in sort_exprs(sink) {
         keys.push(OrdValue(eval(ctx, expr)?));
@@ -9479,7 +9532,13 @@ mod tests {
         // then rewire the match into the shared-vector order by hand
         // so the shape cannot drift with the optimizer.
         let built = crate::plan::build(&query).expect("plan");
-        let LogicalPlan::Aggregate { input, keys, aggs } = built else {
+        let LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } = built
+        else {
             panic!("count(*) builds an aggregate");
         };
         let LogicalPlan::Expand {
@@ -9528,6 +9587,7 @@ mod tests {
             input: Box::new(close_a_b),
             keys,
             aggs,
+            order_aggs,
         };
         // Everyone points at 0, plus 1 knows 3 and 2 knows 4: the
         // triangles are (1, 3, 0) and (2, 4, 0).

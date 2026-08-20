@@ -74,7 +74,9 @@ use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
     UnaryOp,
 };
-use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
+use crate::binder::{
+    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Schema, TableFunc,
+};
 use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
 use crate::refs::{BindingTable, GraphHandle};
@@ -6772,10 +6774,38 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
 enum Acc {
     Count(i64),
     Sum(Option<Value>),
-    Avg { sum: f64, n: i64 },
+    Avg {
+        sum: f64,
+        n: i64,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// GF10's two standard deviations, kept as a running count, mean
+    /// and sum of squared deviations from that mean.
+    ///
+    /// This is Welford's, and it is here rather than the sum of squares
+    /// because the sum of squares is what a one pass deviation is
+    /// usually written as and it is wrong: over values that are large
+    /// and close together the sum of squares and the square of the sum
+    /// are two big numbers whose difference is small, and subtracting
+    /// them loses the answer's leading digits. Welford's subtracts
+    /// nothing large from anything large, and it costs one more
+    /// multiply per row.
+    ///
+    /// The fields are the ones the merge needs too, so a morsel partial
+    /// is this and a group is these folded together.
+    Spread {
+        /// Which of the two divisors the answer takes, which is the
+        /// whole of what the two functions differ by.
+        which: Deviation,
+        /// How many values arrived, counting multiplicities.
+        n: f64,
+        /// The mean of them so far.
+        mean: f64,
+        /// The sum of squared deviations from that mean.
+        m2: f64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -6801,6 +6831,12 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
+            Func::Stddev(which) => Acc::Spread {
+                which,
+                n: 0.0,
+                mean: 0.0,
+                m2: 0.0,
+            },
             Func::Id
             | Func::ElementId
             | Func::Size
@@ -6900,6 +6936,22 @@ impl AggState {
                     items.push(v.clone());
                 }
             }
+            // A multiplicity is `mult` copies of one value, so this is
+            // the merge below with a second set of `mult` values whose
+            // mean is the value and whose spread is nought. Written out
+            // rather than looped, since a chunk may stand for a great
+            // many rows and they all fold in the same step.
+            Acc::Spread { n, mean, m2, .. } => {
+                let x = as_f64(&v).ok_or_else(|| {
+                    gql(codes::C22G03, format!("stddev() needs numbers, got {v:?}"))
+                })?;
+                let w = mult as f64;
+                let total = *n + w;
+                let delta = x - *mean;
+                *mean += delta * w / total;
+                *m2 += delta * delta * w * *n / total;
+                *n = total;
+            }
         }
         Ok(())
     }
@@ -6917,6 +6969,17 @@ impl AggState {
             Acc::Avg { sum, n } => Value::Float(sum / n as f64),
             Acc::Min(cur) | Acc::Max(cur) => cur.unwrap_or(Value::Null),
             Acc::Collect(items) => Value::List(items),
+            // No values is no deviation, and one value is no sample of
+            // one, so both answer null rather than nought. A population
+            // of one has a deviation and it is nought, the one value
+            // being the whole of the population and sitting on its own
+            // mean.
+            Acc::Spread { which, n, m2, .. } => match which {
+                _ if n < 1.0 => Value::Null,
+                Deviation::Sample if n < 2.0 => Value::Null,
+                Deviation::Sample => Value::Float((m2 / (n - 1.0)).sqrt()),
+                Deviation::Population => Value::Float((m2 / n).sqrt()),
+            },
         })
     }
 
@@ -6960,6 +7023,26 @@ impl AggState {
             }
             (Acc::Min(_), Acc::Min(None)) | (Acc::Max(_), Acc::Max(None)) => {}
             (Acc::Collect(items), Acc::Collect(more)) => items.extend(more),
+            // Chan's merge, which is what makes the deviation one pass
+            // and parallel at once: two partials fold into one without
+            // either of them keeping the values it saw.
+            (
+                Acc::Spread { n, mean, m2, .. },
+                Acc::Spread {
+                    n: n2,
+                    mean: mean2,
+                    m2: m22,
+                    ..
+                },
+            ) => {
+                let total = *n + n2;
+                if total > 0.0 {
+                    let delta = mean2 - *mean;
+                    *mean += delta * n2 / total;
+                    *m2 += m22 + delta * delta * *n * n2 / total;
+                    *n = total;
+                }
+            }
             _ => unreachable!("morsel partials built from the same aggregate spec"),
         }
         Ok(())

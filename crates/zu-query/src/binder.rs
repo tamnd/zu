@@ -1660,6 +1660,25 @@ impl TableFunc {
     }
 }
 
+/// Which of the two standard deviations of GF10 a call asks for, which
+/// is the whole of what tells `STDDEV_SAMP` from `STDDEV_POP`.
+///
+/// A population is every value there is and a sample is some of them,
+/// so a sample's spread is the wider of the two: dividing by one less
+/// than the count is Bessel's correction, and it is there because the
+/// mean a sample is measured against is the sample's own mean and so
+/// sits closer to the sample than the true mean does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Deviation {
+    /// `STDDEV_SAMP`, divided by one less than the count, and null
+    /// where the count is one, a single value being no sample of a
+    /// spread at all.
+    Sample,
+    /// `STDDEV_POP`, divided by the count, and nought where the count
+    /// is one.
+    Population,
+}
+
 /// Builtin functions the binder accepts in v0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
@@ -1668,7 +1687,16 @@ pub enum Func {
     Avg,
     Min,
     Max,
+    /// ISO 20.9's `COLLECT_LIST`, the set function that answers what it
+    /// was given rather than a number about it. `COLLECT` is the name
+    /// openCypher gives the same function and is kept as a spelling of
+    /// it.
     Collect,
+    /// GF10, ISO 20.9. The standard deviation of what it was given,
+    /// over the sample or over the population. One arm rather than two,
+    /// the two differing only in what the sum of squares is divided by,
+    /// and one accumulator behind both.
+    Stddev(Deviation),
     Id,
     /// G100, ISO 20.10. An identifier for an element, node or edge.
     ///
@@ -1862,11 +1890,13 @@ pub enum Cut {
 }
 
 impl Func {
+    /// Whether this is a set function, which the registry row says and
+    /// nothing else does. It was a list here once and a list here is a
+    /// second table: the day a set function is added and the list is
+    /// not touched is the day the executor is asked for an accumulator
+    /// the function has no arm for.
     pub fn is_aggregate(&self) -> bool {
-        matches!(
-            self,
-            Func::Count | Func::Sum | Func::Avg | Func::Min | Func::Max | Func::Collect
-        )
+        functions::row_of(*self).is_some_and(|at| functions::REGISTRY[at as usize].aggregate)
     }
 }
 

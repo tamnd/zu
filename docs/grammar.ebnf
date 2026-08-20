@@ -526,7 +526,10 @@ record_fields   = "{" , [ name , "::" , value_type ,
    the store keeps, and the two agree only for ASCII. UPPER and LOWER
    fold, and the one argument TRIM takes the spaces off both ends. A
    number here is refused rather than measured by its spelling. *)
-function_call   = name , "(" , [ "DISTINCT" ] ,
+(* The set quantifier of ISO 20.9 belongs to the set functions and is
+   read here so one place parses a call. ALL is what leaving it out
+   means, so `COUNT(ALL n)` and `COUNT(n)` are one plan. *)
+function_call   = name , "(" , [ "DISTINCT" | "ALL" ] ,
                   [ "*" | expression , { "," , expression } ] , ")" ;
 list            = "[" , [ expression , { "," , expression } ] , "]" ;
 (* The same braces are an inline property predicate inside a pattern

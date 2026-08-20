@@ -1325,6 +1325,34 @@ cases:
           - type: BOOL
             value: true
 
+  - name: the-cardinality-of-a-path-is-what-it-holds-and-its-length-is-not
+    doc: A path is one of the four things ISO 20.10 gives CARDINALITY, and the two questions about a walk have separate answers. A walk of two edges holds five elements and has a length of two, and an engine that answers the hop count to both has made PATH_LENGTH the only one of them it implements.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN cardinality(p) AS a, path_length(p) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+          - type: INT64
+            value: "2"
+
+  - name: the-cardinality-of-a-path-of-one-node
+    doc: A path with no edges is the shortest there is and it still holds the node it started at, so its cardinality is one. There is no path of zero elements to compare it against, which is why this is the floor.
+    query: MATCH p = (a:person) WHERE a.name = 'ann' RETURN cardinality(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: the-size-of-a-property-that-is-a-number
+    doc: The same condition as asking a literal number for its size, raised on the row rather than at binding time, because a property read has no type until a row arrives. A client sorting failures by code should not have to know which side of that line caught it.
+    query: MATCH (a:person) WHERE a.name = 'ann' RETURN size(a.age) AS a
+    raises: "22G03"
+
   - name: elements-refuses-a-list
     doc: A list is already the list of its elements, so asking a list for them is a query that has lost the path it meant to ask about.
     query: RETURN elements([1, 2, 3]) AS a

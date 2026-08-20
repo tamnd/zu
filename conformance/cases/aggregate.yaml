@@ -544,3 +544,55 @@ cases:
       - values:
           - type: FLOAT64
             value: "2.0"
+
+  - name: sorted-by-a-count-no-column-carries
+    doc: A sort key of ISO 14.9 is an expression, so a set function may stand in one, and it means there what it means in a returned item: the rows group by everything else the statement answers and the key is read once per group. Nothing here carries the count, so a client that only accepts a set function where a column will hold it answers three rows in the order they arrived.
+    query: UNWIND ['a', 'a', 'a', 'b', 'c', 'c'] AS t RETURN t ORDER BY count(*) DESC
+    columns:
+      - t
+    rows:
+      - values:
+          - type: STRING
+            value: a
+      - values:
+          - type: STRING
+            value: c
+      - values:
+          - type: STRING
+            value: b
+
+  - name: sorted-by-an-expression-over-a-count
+    doc: The key is the whole expression and not a call standing on its own, so the arithmetic runs on what the group answered. A client that matches sort keys against the returned items by their text finds nothing to match here and has to work the count out for itself.
+    query: UNWIND ['a', 'a', 'a', 'b', 'c', 'c'] AS t RETURN t, count(*) AS c ORDER BY count(*) * -1 ASC
+    columns:
+      - t
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: a
+          - type: INT64
+            value: "3"
+      - values:
+          - type: STRING
+            value: c
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: b
+          - type: INT64
+            value: "1"
+
+  - name: sorted-by-a-sum-of-a-column
+    doc: The star is the easy form because it needs no argument, so the same question is asked of a set function that reads one: the argument is a row's and the sum is a group's, which is the one place behind a grouping where a name is still read once per row.
+    query: UNWIND [1, 2, 2] AS n RETURN n % 2 AS parity ORDER BY sum(n) DESC
+    columns:
+      - parity
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"

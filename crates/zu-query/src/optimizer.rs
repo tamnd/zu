@@ -270,10 +270,16 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(lift_close_filters(*input)),
             items,
         },
-        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } => LogicalPlan::Aggregate {
             input: Box::new(lift_close_filters(*input)),
             keys,
             aggs,
+            order_aggs,
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(lift_close_filters(*input)),
@@ -824,7 +830,12 @@ fn mark_asp_node(
                 est,
             )
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } => {
             let (input, _) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Grouping changes what a slot's rows are, so the tracked
             // distributions go with the estimate. Nothing here says how
@@ -839,6 +850,7 @@ fn mark_asp_node(
                     input: Box::new(input),
                     keys,
                     aggs,
+                    order_aggs,
                 },
                 1.0,
             )
@@ -993,10 +1005,16 @@ fn rewrite(
             input: Box::new(rewrite(*input, query, schema, notes)?),
             items,
         }),
-        LogicalPlan::Aggregate { input, keys, aggs } => Ok(LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } => Ok(LogicalPlan::Aggregate {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             keys,
             aggs,
+            order_aggs,
         }),
         LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
             input: Box::new(rewrite(*input, query, schema, notes)?),

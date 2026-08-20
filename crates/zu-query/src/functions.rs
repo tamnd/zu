@@ -49,6 +49,11 @@ pub enum Kind {
     /// A list, a string or a path: the three things that have a count
     /// of elements, which is what `SIZE` answers.
     Sized,
+    /// The four things ISO 20.10's `<cardinality expression argument>`
+    /// names: a binding table reference, a path, a list or a record.
+    /// What they have in common is that each one holds a countable
+    /// number of things, and `CARDINALITY` answers how many.
+    Countable,
     /// A path.
     Path,
     /// A node or an edge.
@@ -71,6 +76,15 @@ impl Kind {
             Kind::Str => matches!(ty, Type::Any | Type::Str),
             Kind::List => matches!(ty, Type::Any | Type::List(_)),
             Kind::Sized => matches!(ty, Type::Any | Type::List(_) | Type::Str | Type::Path),
+            // A binding table reference has no arm of its own in
+            // [`Type`], because nothing in a statement writes one: it
+            // arrives as a parameter and a parameter is `ANY`. So the
+            // fourth argument form is the `Type::Any` here, and the
+            // kernel is what turns a value that is not one of the four
+            // away.
+            Kind::Countable => {
+                matches!(ty, Type::Any | Type::List(_) | Type::Path | Type::Record)
+            }
             Kind::Path => matches!(ty, Type::Any | Type::Path),
             Kind::Element => matches!(ty, Type::Any | Type::Node | Type::Rel),
             Kind::Counted => Kind::Str.accepts(ty) || Kind::Number.accepts(ty),
@@ -412,8 +426,8 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Cardinality,
         arity: Arity::Exactly(1),
-        arg: Kind::List,
-        needs: "needs a list",
+        arg: Kind::Countable,
+        needs: "needs a list, a path, a record or a binding table",
         ret: Ret::Int,
         deterministic: true,
         aggregate: false,
@@ -1322,10 +1336,8 @@ fn element_kernel(func: Func, args: &[Value]) -> Result<Value> {
             },
         ) => Ok(Value::Str(format!("e:{table}:{src}:{dst}:{ord}"))),
         (_, Value::Null) => Ok(Value::Null),
-        (Func::Id, other) => Err(invalid(format!("id() expects a node, got {other:?}"))),
-        (_, other) => Err(invalid(format!(
-            "element_id() expects a node or an edge, got {other:?}"
-        ))),
+        (Func::Id, other) => Err(bad_type(func, "a node", other)),
+        (_, other) => Err(bad_type(func, "a node or an edge", other)),
     }
 }
 
@@ -1334,9 +1346,20 @@ fn element_kernel(func: Func, args: &[Value]) -> Result<Value> {
 ///
 /// SIZE counts the elements of a list, the characters of a string and
 /// the elements of a path, and reads a chain's stored length rather
-/// than materializing the list behind it. CARDINALITY is the same count
-/// over lists only, since a string has a length and not a cardinality
-/// and answering anyway would let a query that meant CHAR_LENGTH pass.
+/// than materializing the list behind it. The string is an extension:
+/// ISO 20.10 gives SIZE a `<list value expression>` and nothing else,
+/// and CHAR_LENGTH is the standard's spelling for a string. It stays
+/// because the openCypher queries that arrive here write it and mean
+/// the character count, and refusing them would gain nothing that
+/// CHAR_LENGTH does not already give.
+///
+/// CARDINALITY is the same count over the four argument forms of ISO
+/// 20.10's `<cardinality expression argument>`: the elements of a
+/// list, the elements of a path, the fields of a record and the rows
+/// of a binding table. It refuses a string, since a string has a
+/// length and not a cardinality and answering anyway would let a query
+/// that meant CHAR_LENGTH pass.
+///
 /// PATH_LENGTH counts edges, so a path of two nodes has three elements
 /// and a length of one. ELEMENTS hands back the walk in the order it
 /// was taken, which is the shape the path already holds, so the list is
@@ -1348,19 +1371,30 @@ fn count_kernel(func: Func, args: &[Value]) -> Result<Value> {
         (Func::Size, Value::Chain(link)) => Ok(Value::Int(link.hops as i64)),
         (Func::Size, Value::List(items) | Value::Path(items)) => Ok(Value::Int(items.len() as i64)),
         (Func::Size, Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
-        (Func::Cardinality, Value::List(items)) => Ok(Value::Int(items.len() as i64)),
+        // A chain is the walk a variable length pattern took and it
+        // settles into the list of its edges, so the count it answers
+        // is the count that list has. Both of these read the hop count
+        // the chain already carries rather than walking it.
+        (Func::Cardinality, Value::Chain(link)) => Ok(Value::Int(link.hops as i64)),
+        (Func::Cardinality, Value::List(items) | Value::Path(items)) => {
+            Ok(Value::Int(items.len() as i64))
+        }
+        (Func::Cardinality, Value::Record(fields)) => Ok(Value::Int(fields.len() as i64)),
+        // The rows, not the cells. A table is a sequence of rows the
+        // way a list is a sequence of elements, and the columns are
+        // the shape of a row rather than a second thing to count.
+        (Func::Cardinality, Value::BindingTable(table)) => {
+            Ok(Value::Int(table.rows().len() as i64))
+        }
         (Func::PathLength, Value::Path(elements)) => Ok(Value::Int((elements.len() / 2) as i64)),
         (Func::Elements, Value::Path(elements)) => Ok(Value::List(elements.clone())),
-        (Func::Size, other) => Err(invalid(format!(
-            "size() expects a list or string, got {other:?}"
-        ))),
-        (Func::Cardinality, other) => Err(invalid(format!(
-            "cardinality() expects a list, got {other:?}"
-        ))),
-        (func, other) => Err(invalid(format!(
-            "{}() expects a path, got {other:?}",
-            name_of(func)
-        ))),
+        (Func::Size, other) => Err(bad_type(func, "a list or string", other)),
+        (Func::Cardinality, other) => Err(bad_type(
+            func,
+            "a list, a path, a record or a binding table",
+            other,
+        )),
+        (func, other) => Err(bad_type(func, "a path", other)),
     }
 }
 
@@ -1376,10 +1410,14 @@ fn identity_kernel(func: Func, args: &[Value]) -> Result<Value> {
             Value::Null => return Ok(Value::Null),
             Value::Node { .. } | Value::Rel { .. } => {}
             other => {
-                return Err(invalid(format!(
-                    "{}() compares nodes and edges, got {other:?}",
-                    name_of(func)
-                )));
+                return Err(gql(
+                    codes::C22G03,
+                    format!(
+                        "{}() compares nodes and edges, got {}",
+                        name_of(func),
+                        crate::cast::value_type(other)
+                    ),
+                ));
             }
         }
     }
@@ -1399,12 +1437,7 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     let s = match settle(one(func, args)?.clone()) {
         Value::Str(s) => s,
         Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(invalid(format!(
-                "{}() expects a string, got {other:?}",
-                name_of(func)
-            )));
-        }
+        other => return Err(bad_type(func, "a string", &other)),
     };
     Ok(match func {
         // Characters, not bytes: what a reader counts is the scalar
@@ -1529,12 +1562,7 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
                 ),
             ));
         }
-        other => {
-            return Err(invalid(format!(
-                "{}() expects a number, got {other:?}",
-                name_of(func)
-            )));
-        }
+        other => return Err(bad_type(func, "a number", &other)),
     };
     if count < 0 {
         return Err(gql(
@@ -1597,10 +1625,7 @@ fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
                 )
             })
         }
-        Some(other) => Err(gql(
-            codes::C22G03,
-            format!("{}() expects a string, got {other:?}", name_of(func)),
-        )),
+        Some(other) => Err(bad_type(func, "a string", &other)),
         None => Err(invalid(format!("{}() was given nothing", name_of(func)))),
     }?;
     Ok(Value::Temporal(read))
@@ -1630,10 +1655,7 @@ fn duration_between_kernel(func: Func, args: &[Value]) -> Result<Value> {
         match args.get(at).map(|value| settle(value.clone())) {
             Some(Value::Temporal(instant)) => Ok(Some(instant)),
             Some(Value::Null) => Ok(None),
-            Some(other) => Err(gql(
-                codes::C22G03,
-                format!("duration_between() expects a datetime, got {other:?}"),
-            )),
+            Some(other) => Err(bad_type(func, "a datetime", &other)),
             None => Err(invalid("duration_between() was given no datetime".into())),
         }
     };
@@ -1661,10 +1683,7 @@ fn str_arg(func: Func, value: Option<&Value>) -> Result<Option<String>> {
     match settle(value.clone()) {
         Value::Str(s) => Ok(Some(s)),
         Value::Null => Ok(None),
-        other => Err(invalid(format!(
-            "{}() expects a string, got {other:?}",
-            name_of(func)
-        ))),
+        other => Err(bad_type(func, "a string", &other)),
     }
 }
 
@@ -1673,6 +1692,29 @@ fn str_arg(func: Func, value: Option<&Value>) -> Result<Option<String>> {
 /// client checks rather than a message it would have to read.
 fn gql(status: zu_common::GqlStatus, detail: String) -> ZuError {
     ZuError::gql(status, detail)
+}
+
+/// `22G03 invalid value type`, for an argument that is not of a type
+/// the function takes.
+///
+/// This is the condition the binder raises for the same mistake, and
+/// it is raised here for the arguments the binder cannot judge. A
+/// literal has a type the binder reads, so `SIZE(1)` never reaches a
+/// kernel; a property read is `ANY` until a row arrives, so
+/// `SIZE(n.id)` reaches one and the row is where the mistake becomes
+/// visible. Both are the same error and a client sorting them by code
+/// should not have to know which side caught it. The type is named
+/// rather than printed, because the value's own contents are not what
+/// the message is about.
+fn bad_type(func: Func, wants: &str, got: &Value) -> ZuError {
+    gql(
+        codes::C22G03,
+        format!(
+            "{}() expects {wants}, got {}",
+            name_of(func),
+            crate::cast::value_type(got)
+        ),
+    )
 }
 
 /// `22003 numeric value out of range`, for an answer that is a number
@@ -1702,10 +1744,7 @@ fn real(func: Func, value: &Value) -> Result<f64> {
     match value {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
-        other => Err(invalid(format!(
-            "{}() expects a number, got {other:?}",
-            name_of(func)
-        ))),
+        other => Err(bad_type(func, "a number", other)),
     }
 }
 
@@ -1808,10 +1847,7 @@ fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
             };
             finite(func, *f, answer)
         }
-        (_, other) => Err(invalid(format!(
-            "{}() expects a number, got {other:?}",
-            name_of(func)
-        ))),
+        (_, other) => Err(bad_type(func, "a number", other)),
     }
 }
 

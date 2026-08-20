@@ -844,3 +844,102 @@ fn the_percentiles_answer_over_a_graph() {
     assert!(plan.contains("percentile_disc("), "{plan}");
     assert!(plan.contains("0.9"), "{plan}");
 }
+
+/// GF12 and GF13, the cardinality expression of ISO 20.10.
+///
+/// The corpus pins each argument form on one small value. What is
+/// asked here is what a single row cannot say: that the three counts a
+/// walk answers keep their relation over every path a pattern reaches
+/// rather than over the one that was written out by hand, that a
+/// variable length pattern's edge list counts the same under both
+/// names, that a call over a literal is answered while the statement is
+/// bound, and that a wrong argument type raises the standard's
+/// condition on the row it was found on and not a message with no code
+/// on it.
+#[test]
+fn the_cardinality_of_a_walk_is_what_it_holds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cardinality.zu1");
+    const NODES: u32 = 20_000;
+    {
+        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+            .expect("load");
+    }
+    let db = Database::open(&path).expect("open");
+    let mut conn = db.connect().expect("connect");
+
+    // A walk of n edges holds n edges and the n + 1 nodes between and
+    // around them. The two questions are asked of every row rather than
+    // of one, because an engine that answers the hop count to both
+    // passes any single case where the walk is one edge long.
+    let rows = conn
+        .query(
+            "MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+             RETURN cardinality(p) AS n, path_length(p) AS l, size(elements(p)) AS s",
+        )
+        .expect("query");
+    let mut seen = 0;
+    for row in rows.iter() {
+        let n = row.get_by_name::<i64>("n").expect("n");
+        let l = row.get_by_name::<i64>("l").expect("l");
+        let s = row.get_by_name::<i64>("s").expect("s");
+        assert_eq!(n, 2 * l + 1, "a walk of {l} edges holds {n} elements");
+        assert_eq!(n, s, "the two names for the count of a path disagree");
+        seen += 1;
+    }
+    assert_eq!(seen, NODES as i64, "a walk of two edges from every node");
+
+    // A variable length pattern binds the edges rather than the walk,
+    // and that list has as many elements as the pattern took hops. Both
+    // names answer it, since the value is a list whichever form the
+    // executor is holding it in.
+    let rows = conn
+        .query(
+            "MATCH (a:person)-[r:knows*1..3]->(b:person) WHERE a.id < 50 \
+             RETURN cardinality(r) AS n, size(r) AS s",
+        )
+        .expect("query");
+    let mut hops = std::collections::BTreeMap::new();
+    for row in rows.iter() {
+        let n = row.get_by_name::<i64>("n").expect("n");
+        assert_eq!(n, row.get_by_name::<i64>("s").expect("s"), "two names");
+        *hops.entry(n).or_insert(0) += 1;
+    }
+    assert_eq!(
+        hops,
+        [(1, 50), (2, 50), (3, 50)].into_iter().collect(),
+        "fifty starts, one walk of each length from each"
+    );
+
+    // The kernel is deterministic, so a call over what the statement
+    // wrote is answered while it is bound. Only one of these two can
+    // reach that: a string is a literal and a list is not, so SIZE over
+    // text folds and the same count over a list stays a call. The pair
+    // is here rather than the fold alone because the reason for the
+    // difference is the argument and not the function.
+    let plan = conn.explain("RETURN size('abc') AS n").expect("explain");
+    assert!(!plan.contains("size("), "{plan}");
+    assert!(plan.contains('3'), "{plan}");
+    let plan = conn
+        .explain("RETURN cardinality([1, 2, 3]) AS n")
+        .expect("explain");
+    assert!(plan.contains("cardinality("), "{plan}");
+
+    // A property has no type until a row arrives, so this is refused
+    // where the literal form is refused while binding. It is the same
+    // mistake and it carries the same code.
+    let err = conn
+        .query("MATCH (p:person) RETURN cardinality(p.id) AS n")
+        .expect_err("an integer is not one of the four");
+    let record = err.diagnostic().expect("a condition");
+    assert_eq!(record.status.code(), "22G03");
+    assert!(
+        record
+            .detail
+            .contains("a list, a path, a record or a binding table"),
+        "the message names the four: {}",
+        record.detail
+    );
+}

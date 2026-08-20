@@ -175,6 +175,15 @@ cases:
       - values:
           - type: NULL
 
+  - name: cardinality-propagates
+    doc: The other name for the count takes four kinds of argument and a null is none of them, so the rule that decides this is the null rule and not the type check. An engine that runs the type check first raises here instead of answering.
+    query: RETURN cardinality(null) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
   - name: cast-propagates
     doc: A cast of a null is a null of the new type rather than a zero or a failure, which is where a client using the host language's own conversion produces a value out of nothing.
     query: RETURN cast(null AS INT64) AS n

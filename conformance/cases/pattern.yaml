@@ -1270,3 +1270,77 @@ cases:
     doc: An edge is stored under exactly one type in this engine, so a negated label on a step describes something no edge of it can be asked about. It is refused by name where it is written rather than answered as though the negation had been dropped.
     query: MATCH (a:person)-/ !knows /->(b:person) RETURN count(*) AS a
     raises: "42001"
+
+  - name: path-length-counts-the-edges-of-a-walk
+    doc: Feature GF04, ISO 20.22. The length of a path is its edges and not its elements, and the two are different numbers that are both integers, so an engine answering with the element count would be believed. The walk asked about here is ann to bo to cy.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN path_length(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: path-length-of-a-path-of-one-node
+    doc: A path of one node has no edges and is the shortest path there is. There is no empty path, a path being a walk and a walk starting somewhere, so nought is the bottom of this number.
+    query: MATCH (a:person) WHERE a.name = 'ann' RETURN path_length(PATH [a]) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: path-length-of-null-is-null
+    doc: The path functions answer null for a null path rather than nought, which is what an optional match that found nothing hands them.
+    query: RETURN path_length(null) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: path-length-refuses-a-list
+    doc: A list of the elements of a walk is not the walk, so it has no path length. Answering the element count anyway would let a query that lost its path on the way in look like it still had one.
+    query: RETURN path_length([1, 2, 3]) AS a
+    raises: "22G03"
+
+  - name: elements-answers-the-whole-walk
+    doc: ISO 20.16. A path is a value of its own and nothing indexes into one, so ELEMENTS is how a query reads what a path holds. A walk of two edges is five elements, a node at each end and an edge between each pair.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN size(elements(p)) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: elements-answers-the-walk-in-the-order-it-was-taken
+    doc: The list is the elements the path holds and in the same places, so it equals the list the query can write out of the names the pattern bound. An engine answering the same elements in another order passes a count and fails this.
+    query: MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.name = 'ann' RETURN (elements(p) = [a, e, b]) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: elements-refuses-a-list
+    doc: A list is already the list of its elements, so asking a list for them is a query that has lost the path it meant to ask about.
+    query: RETURN elements([1, 2, 3]) AS a
+    raises: "22G03"
+
+  - name: a-path-built-from-elements-equals-the-path-that-was-matched
+    doc: Features GE06 and GA09 together. The constructor of ISO 20.14 builds a path out of the elements a pattern bound, and the only thing that says it built the same walk the pattern matched is that the two are equal.
+    query: MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.name = 'ann' RETURN (PATH [a, e, b] = p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-built-path-has-to-be-a-walk-somebody-could-take
+    doc: The elements have to join. An edge between two nodes it does not touch is the interesting case, because the sequence is the right shape and the right kinds, so nothing but the graph can tell it is wrong. Here the edge runs from di to di and neither end of it is ann.
+    query: MATCH (a:person), (d:person)-[e:knows]->(d) WHERE a.name = 'ann' AND d.name = 'di' RETURN PATH [a, e, d] AS a
+    raises: "22G0Z"

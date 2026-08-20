@@ -544,9 +544,97 @@ fn insert_sorted(slots: &mut [u32], len: usize, value: u32) -> bool {
     }
 }
 
+/// Reads after which a [`Walk`] announces itself again.
+///
+/// An announcement costs about 2.5 ns, so announcing once a walk rather
+/// than once a node is worth two to five percent of a traversal (#469
+/// and `examples/protecting.rs`). Announcing once and never again would
+/// be worth a hair more and would pin reclamation for as long as the
+/// walk runs. A traversal over a large component is not short, and every
+/// neighbourhood a writer grows underneath it waits on the epoch this
+/// walk is standing in. So the walk refreshes on a bound instead, which
+/// is FASTER's answer to the same problem: a thousandth of the old cost,
+/// and a bound on how far behind the walk can hold the oldest live
+/// epoch. Refreshing between reads is safe because a slice never
+/// outlives the closure it was handed to.
+const WALK_REFRESH: u32 = 1024;
+
+/// A traversal's window onto the graph, with the epoch announced for
+/// as long as it is alive.
+///
+/// Every neighbourhood read hands its slice to a closure and the slice
+/// does not outlive that closure, so re-announcing between reads is
+/// safe: there is nothing outstanding to be reclaimed from under.
+pub struct Walk<'a> {
+    graph: &'a Graph,
+    slot: &'a crate::epoch::Slotted<'a>,
+    since: u32,
+}
+
+impl Walk<'_> {
+    /// A node's neighbours, without announcing again.
+    ///
+    /// `visit` may run more than once for the same reason and under the
+    /// same rule as [`Session::neighbours`], and that rule is worth
+    /// reading before writing one.
+    pub fn neighbours<R>(
+        &mut self,
+        direction: Direction,
+        node: u32,
+        mut visit: impl FnMut(&[u32]) -> R,
+    ) -> R {
+        self.since += 1;
+        if self.since >= WALK_REFRESH {
+            self.since = 0;
+            self.slot.protect();
+        }
+        // SAFETY: the epoch has been announced since before this walk
+        // began and has not been stood down, so a block a writer
+        // replaced is still mapped.
+        unsafe { self.graph.with_neighbours(direction, node, &mut visit) }
+    }
+
+    /// The out or in degree, one load.
+    pub fn degree(&self, direction: Direction, node: u32) -> u32 {
+        self.graph.degree(direction, node)
+    }
+
+    /// How many nodes the graph holds, for sizing a bitmap.
+    pub fn nodes(&self) -> u32 {
+        self.graph.nodes()
+    }
+}
+
+impl Drop for Walk<'_> {
+    fn drop(&mut self) {
+        self.slot.unprotect();
+    }
+}
+
 impl Session<'_> {
     fn graph(&self) -> &Graph {
         self.core_ref().graph()
+    }
+
+    /// Runs a traversal with the epoch announced once rather than once
+    /// a node.
+    ///
+    /// This is the entry point every multi node walk should be written
+    /// on. The per read [`Session::neighbours`] is right for a single
+    /// read and heavier than it needs to be for a search, which is what
+    /// #469 measured.
+    ///
+    /// The guard stands down when the [`Walk`] drops, including on the
+    /// way out of a panic, so there is no path that leaves a session
+    /// announced in an epoch it has left.
+    pub fn walk<R>(&mut self, f: impl FnOnce(&mut Walk<'_>) -> R) -> R {
+        self.slot.protect();
+        let mut walk = Walk {
+            graph: self.core_ref().graph(),
+            slot: &self.slot,
+            since: 0,
+        };
+        f(&mut walk)
     }
 
     /// Creates a node under an external key and returns its dense id.
@@ -683,26 +771,27 @@ impl Session<'_> {
             seen.resize(words, 0);
         }
         out.clear();
-        self.neighbours_into(direction, node, first);
-        self.slot.protect();
-        let graph = self.core_ref().graph();
-        for &near in first.iter() {
-            let mut collect = |slice: &[u32]| {
-                for &far in slice {
-                    let word = far as usize / 64;
-                    let bit = 1u64 << (far % 64);
-                    if word < seen.len() && seen[word] & bit == 0 {
-                        seen[word] |= bit;
-                        out.push(far);
+        self.walk(|walk| {
+            // Clearing before the copy is what makes this safe against a
+            // retry: a second run overwrites the first rather than
+            // appending to it.
+            walk.neighbours(direction, node, |slice| {
+                first.clear();
+                first.extend_from_slice(slice);
+            });
+            for &near in first.iter() {
+                walk.neighbours(direction, near, |slice| {
+                    for &far in slice {
+                        let word = far as usize / 64;
+                        let bit = 1u64 << (far % 64);
+                        if word < seen.len() && seen[word] & bit == 0 {
+                            seen[word] |= bit;
+                            out.push(far);
+                        }
                     }
-                }
-            };
-            // SAFETY: the epoch is announced around the whole walk. The
-            // closure is not pure, but a retry can only re-add a
-            // neighbour the bitmap already holds, which it filters.
-            unsafe { graph.with_neighbours(direction, near, &mut collect) };
-        }
-        self.slot.unprotect();
+                });
+            }
+        });
         // Leave the bitmap clean for the next probe without paying for
         // the whole thing: only the bits this traversal set are cleared.
         for &far in out.iter() {

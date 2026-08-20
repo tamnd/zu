@@ -1000,33 +1000,35 @@ fn khop(state: &mut State, ways: &[Direction], seed: u32, k: u32) {
     resize_seen(&mut seen, &state.session);
     current.clear();
     current.push(seed);
-    for _ in 0..k {
-        next.clear();
-        for &node in &current {
-            for &direction in ways {
-                state.session.neighbours(direction, node, |slice| {
-                    for &far in slice {
-                        // The bitmap makes the level distinct, and it
-                        // also makes the closure safe to run twice: a
-                        // retry meets its own bits and adds nothing. It
-                        // is also what keeps the undirected walk from
-                        // naming a node once per direction.
-                        if mark(&mut seen, far) {
-                            next.push(far);
+    state.session.walk(|walk| {
+        for _ in 0..k {
+            next.clear();
+            for &node in &current {
+                for &direction in ways {
+                    walk.neighbours(direction, node, |slice| {
+                        for &far in slice {
+                            // The bitmap makes the level distinct, and it
+                            // also makes the closure safe to run twice: a
+                            // retry meets its own bits and adds nothing. It
+                            // is also what keeps the undirected walk from
+                            // naming a node once per direction.
+                            if mark(&mut seen, far) {
+                                next.push(far);
+                            }
                         }
-                    }
-                });
+                    });
+                }
+            }
+            // Cleared per level rather than cumulatively, because distinct
+            // here means distinct within the level: a node the walk
+            // already passed is still a node k hops out.
+            clear(&mut seen, &next);
+            std::mem::swap(&mut current, &mut next);
+            if current.is_empty() {
+                break;
             }
         }
-        // Cleared per level rather than cumulatively, because distinct
-        // here means distinct within the level: a node the walk
-        // already passed is still a node k hops out.
-        clear(&mut seen, &next);
-        std::mem::swap(&mut current, &mut next);
-        if current.is_empty() {
-            break;
-        }
-    }
+    });
     state.answer.clear();
     state.answer.extend_from_slice(&current);
     state.frontier = current;
@@ -1104,30 +1106,32 @@ fn reach(state: &mut State, ways: &[Direction], seed: u32, max_depth: u32, max_v
     // The seed goes into the frontier without going into the bitmap, so
     // it is somewhere the walk can arrive at rather than somewhere it
     // has been.
-    'walk: while !current.is_empty() && visited.len() < cap && depth < depth_cap {
-        depth += 1;
-        next.clear();
-        for &node in &current {
-            for &direction in ways {
-                let full = state.session.neighbours(direction, node, |slice| {
-                    for &far in slice {
-                        if mark(&mut seen, far) {
-                            visited.push(far);
-                            next.push(far);
-                            if visited.len() >= cap {
-                                return true;
+    state.session.walk(|walk| {
+        'walk: while !current.is_empty() && visited.len() < cap && depth < depth_cap {
+            depth += 1;
+            next.clear();
+            for &node in &current {
+                for &direction in ways {
+                    let full = walk.neighbours(direction, node, |slice| {
+                        for &far in slice {
+                            if mark(&mut seen, far) {
+                                visited.push(far);
+                                next.push(far);
+                                if visited.len() >= cap {
+                                    return true;
+                                }
                             }
                         }
+                        false
+                    });
+                    if full {
+                        break 'walk;
                     }
-                    false
-                });
-                if full {
-                    break 'walk;
                 }
             }
+            std::mem::swap(&mut current, &mut next);
         }
-        std::mem::swap(&mut current, &mut next);
-    }
+    });
     // Cumulative here, unlike the k-hop walk, so the whole visited set
     // is what has to be given back.
     clear(&mut seen, &visited);
@@ -1213,45 +1217,47 @@ fn shortest(
     touched.push(src);
     let mut distance = 0;
     let mut arrived = None;
-    'walk: while !current.is_empty() && distance < depth_cap {
-        distance += 1;
-        next.clear();
-        for &node in &current {
-            for &direction in ways {
-                let hit = state.session.neighbours(direction, node, |slice| {
-                    for &far in slice {
-                        // Outside the mark rather than under it. A mark
-                        // is a fact about what this walk has done and
-                        // an arrival is a fact about the graph, and the
-                        // seqlock can run this closure a second time,
-                        // where the mark is already set and the
-                        // arrival is still true. Under the guard the
-                        // second run skipped the test, the walk carried
-                        // on with the destination marked and unreachable
-                        // for the rest of the search, and a one hop pair
-                        // came back as no path. #468
-                        if far == dst {
-                            return true;
+    state.session.walk(|walk| {
+        'walk: while !current.is_empty() && distance < depth_cap {
+            distance += 1;
+            next.clear();
+            for &node in &current {
+                for &direction in ways {
+                    let hit = walk.neighbours(direction, node, |slice| {
+                        for &far in slice {
+                            // Outside the mark rather than under it. A mark
+                            // is a fact about what this walk has done and
+                            // an arrival is a fact about the graph, and the
+                            // seqlock can run this closure a second time,
+                            // where the mark is already set and the
+                            // arrival is still true. Under the guard the
+                            // second run skipped the test, the walk carried
+                            // on with the destination marked and unreachable
+                            // for the rest of the search, and a one hop pair
+                            // came back as no path. #468
+                            if far == dst {
+                                return true;
+                            }
+                            if mark(&mut seen, far) {
+                                // Every marked node is remembered so the
+                                // bitmap can be handed back clean at a cost
+                                // of what was walked rather than what
+                                // exists.
+                                touched.push(far);
+                                next.push(far);
+                            }
                         }
-                        if mark(&mut seen, far) {
-                            // Every marked node is remembered so the
-                            // bitmap can be handed back clean at a cost
-                            // of what was walked rather than what
-                            // exists.
-                            touched.push(far);
-                            next.push(far);
-                        }
+                        false
+                    });
+                    if hit {
+                        arrived = Some(distance);
+                        break 'walk;
                     }
-                    false
-                });
-                if hit {
-                    arrived = Some(distance);
-                    break 'walk;
                 }
             }
+            std::mem::swap(&mut current, &mut next);
         }
-        std::mem::swap(&mut current, &mut next);
-    }
+    });
     clear(&mut seen, &touched);
     state.answer = touched;
     state.frontier = current;
@@ -1293,26 +1299,29 @@ fn triangles(state: &mut State, seed: u32) -> u64 {
     let mut first = std::mem::take(&mut state.frontier);
     let mut seen = std::mem::take(&mut state.seen);
     resize_seen(&mut seen, &state.session);
-    state
-        .session
-        .neighbours_into(Direction::Out, seed, &mut first);
-    // The seed's own neighbourhood goes in the bitmap once, so the
-    // closing test on every candidate is a bit rather than a search.
-    for &near in first.iter() {
-        mark(&mut seen, near);
-    }
     let mut total = 0u64;
-    for &near in &first {
-        total += state.session.neighbours(Direction::Out, near, |slice| {
-            let mut hits = 0u64;
-            for &far in slice {
-                if is_marked(&seen, far) {
-                    hits += 1;
-                }
-            }
-            hits
+    state.session.walk(|walk| {
+        walk.neighbours(Direction::Out, seed, |slice| {
+            first.clear();
+            first.extend_from_slice(slice);
         });
-    }
+        // The seed's own neighbourhood goes in the bitmap once, so the
+        // closing test on every candidate is a bit rather than a search.
+        for &near in first.iter() {
+            mark(&mut seen, near);
+        }
+        for &near in &first {
+            total += walk.neighbours(Direction::Out, near, |slice| {
+                let mut hits = 0u64;
+                for &far in slice {
+                    if is_marked(&seen, far) {
+                        hits += 1;
+                    }
+                }
+                hits
+            });
+        }
+    });
     clear(&mut seen, &first);
     state.frontier = first;
     state.seen = seen;

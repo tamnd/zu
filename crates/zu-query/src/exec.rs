@@ -75,7 +75,7 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::binder::{
-    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Schema, TableFunc,
+    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Percentile, Schema, TableFunc,
 };
 use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
@@ -1745,6 +1745,13 @@ struct AggSpec {
     /// The one unflat chunk the argument reads, if any; the optimizer
     /// flattens the rest.
     arg_chunk: Option<usize>,
+    /// The second argument of a binary set function, which is the
+    /// percentiles and nothing else: the standard's independent value
+    /// expression, the fraction of the way through the group to
+    /// answer. It reads no slot, which the compiler checks, so it is
+    /// the same value for every row and is evaluated once, when the
+    /// group is finalized.
+    fraction: Option<BoundExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -2958,12 +2965,34 @@ fn build_stages(
                                 unflat.first().copied()
                             }
                         };
+                        // The percentiles' second argument. The
+                        // standard says it is one value for the whole
+                        // group and says nothing about what happens if
+                        // a query writes something that is not, which
+                        // is a question worth refusing rather than
+                        // answering with whichever row arrived first.
+                        // Reading no slot is the strict form of that
+                        // and it is a compile time check, so a literal
+                        // and a parameter both pass and a column does
+                        // not.
+                        let fraction = args.get(1).cloned();
+                        if let Some(expr) = &fraction {
+                            let mut slots = BTreeSet::new();
+                            crate::binder::expr_slots(expr, &mut slots);
+                            if !slots.is_empty() {
+                                return Err(invalid(format!(
+                                    "the second argument of {}() is the fraction to answer and has to be the same for the whole group, so it cannot read a column",
+                                    crate::functions::name_of(*func)
+                                )));
+                            }
+                        }
                         aggs.push(AggSpec {
                             func: *func,
                             distinct: *distinct,
                             star: *star,
                             arg,
                             arg_chunk,
+                            fraction,
                         });
                     }
                 }
@@ -6677,11 +6706,14 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 star: false,
                 arg: None,
                 arg_chunk: None,
+                fraction: None,
             });
             for arg in args {
                 state.add(eval(ctx, arg)?, 1)?;
             }
-            state.finalize()
+            // The binder sends only the one argument set functions
+            // down this path, so there is no fraction to hand over.
+            state.finalize(None)
         }
         BoundExpr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -6806,6 +6838,110 @@ enum Acc {
         /// The sum of squared deviations from that mean.
         m2: f64,
     },
+    /// GF11's two percentiles, kept as the values that arrived and how
+    /// many rows each of them stood for.
+    ///
+    /// A percentile is holistic: no fixed amount of state answers it,
+    /// because the answer can be any of the values and which one it is
+    /// is not known until the last row has arrived. So the values are
+    /// kept, which is what `COLLECT_LIST` does and costs what it costs.
+    /// They are kept against their multiplicities rather than expanded,
+    /// so an unflat chunk standing for a thousand rows is one entry
+    /// weighing a thousand, and they are kept unsorted, the sort being
+    /// one pass at the end rather than an insertion per row.
+    Quantile {
+        /// Whether a fraction that lands between two values is
+        /// interpolated or answered with the value above it.
+        which: Percentile,
+        /// The values and their weights, in arrival order.
+        values: Vec<(Value, i64)>,
+    },
+}
+
+/// The percentile of a group: what arrived, weighted, and the fraction
+/// of the way through it to answer.
+///
+/// The two functions read the same values and part on one question,
+/// what to say when the fraction falls between two of them. The
+/// discrete one answers the first value whose running share of the
+/// group reaches the fraction, so its answer is a value that was there.
+/// The continuous one draws a line through the values and answers the
+/// point on it, so its answer usually was not.
+fn percentile(which: Percentile, mut values: Vec<(Value, i64)>, fraction: &Value) -> Result<Value> {
+    let name = match which {
+        Percentile::Continuous => "percentile_cont",
+        Percentile::Discrete => "percentile_disc",
+    };
+    let p = match fraction {
+        // A null fraction is a question with nothing asked, which is
+        // null, the same answer a null argument gets everywhere else.
+        Value::Null => return Ok(Value::Null),
+        other => as_f64(other).ok_or_else(|| {
+            gql(
+                codes::C22G03,
+                format!("{name}() needs a number for its fraction, got {other:?}"),
+            )
+        })?,
+    };
+    if !(0.0..=1.0).contains(&p) {
+        return Err(gql(
+            codes::C22003,
+            format!("{name}() needs a fraction from 0 to 1, got {p}"),
+        ));
+    }
+    let n: i64 = values.iter().map(|(_, weight)| *weight).sum();
+    if n <= 0 {
+        return Ok(Value::Null);
+    }
+    // Every value that got in here is a number, which `apply` checked,
+    // so the order is the numeric one and a value that is somehow not a
+    // number sorts to the end rather than making the comparison
+    // inconsistent and the sort panic.
+    let key = |value: &Value| as_f64(value).unwrap_or(f64::NAN);
+    values.sort_by(|left, right| key(&left.0).total_cmp(&key(&right.0)));
+    if let Percentile::Discrete = which {
+        let mut seen = 0_i64;
+        for (value, weight) in &values {
+            seen += weight;
+            if seen as f64 / n as f64 >= p {
+                return Ok(value.clone());
+            }
+        }
+        // Unreachable while the fraction is at most one, since the last
+        // share is exactly one, but the answer if the rounding ever
+        // says otherwise is the last value and not a null.
+        return Ok(values
+            .last()
+            .map_or(Value::Null, |(value, _)| value.clone()));
+    }
+    // The value at a place in the group counted as though the weights
+    // had been expanded, which is what the standard's rule is written
+    // over. Two walks rather than one because the two places are
+    // adjacent and the second is usually in the same entry.
+    let at = |place: i64| -> f64 {
+        let mut seen = 0_i64;
+        for (value, weight) in &values {
+            seen += weight;
+            if place < seen {
+                return key(value);
+            }
+        }
+        values.last().map_or(f64::NAN, |(value, _)| key(value))
+    };
+    let exact = p * (n - 1) as f64;
+    let below = exact.floor();
+    let above = exact.ceil();
+    let low = at(below as i64);
+    if below == above {
+        return Ok(Value::Float(low));
+    }
+    // The standard writes this as the two ends weighted by their
+    // distances and summed. It is written here as the low end plus the
+    // step, which is the same number and does not subtract two nearly
+    // equal products when the two ends are nearly equal.
+    Ok(Value::Float(
+        low + (at(above as i64) - low) * (exact - below),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -6836,6 +6972,10 @@ impl AggState {
                 n: 0.0,
                 mean: 0.0,
                 m2: 0.0,
+            },
+            Func::Percentile(which) => Acc::Quantile {
+                which,
+                values: Vec::new(),
             },
             Func::Id
             | Func::ElementId
@@ -6952,11 +7092,26 @@ impl AggState {
                 *m2 += delta * delta * w * *n / total;
                 *n = total;
             }
+            // The type is checked here rather than at the end so that a
+            // string in the column is refused where it is, and so that
+            // the sort below can order what it holds by number.
+            Acc::Quantile { values, .. } => {
+                if as_f64(&v).is_none() {
+                    return Err(gql(
+                        codes::C22G03,
+                        format!("percentile() needs numbers, got {v:?}"),
+                    ));
+                }
+                values.push((v, mult));
+            }
         }
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<Value> {
+    /// The group's answer. `fraction` is the second argument of a
+    /// binary set function, already evaluated, and is `None` for every
+    /// other set function because they have no second argument.
+    fn finalize(mut self, fraction: Option<Value>) -> Result<Value> {
         if let Some(set) = self.distinct.take() {
             for v in set {
                 self.apply(v.0, 1)?;
@@ -6980,6 +7135,14 @@ impl AggState {
                 Deviation::Sample => Value::Float((m2 / (n - 1.0)).sqrt()),
                 Deviation::Population => Value::Float((m2 / n).sqrt()),
             },
+            Acc::Quantile { which, values } => {
+                let Some(fraction) = fraction else {
+                    return Err(invalid(
+                        "a percentile needs the fraction to answer as its second argument".into(),
+                    ));
+                };
+                percentile(which, values, &fraction)?
+            }
         })
     }
 
@@ -7042,6 +7205,11 @@ impl AggState {
                     *m2 += m22 + delta * delta * *n * n2 / total;
                     *n = total;
                 }
+            }
+            // Nothing to fold: the values are sorted once, at the end,
+            // over whatever the morsels between them gathered.
+            (Acc::Quantile { values, .. }, Acc::Quantile { values: more, .. }) => {
+                values.extend(more);
             }
             _ => unreachable!("morsel partials built from the same aggregate spec"),
         }
@@ -7210,10 +7378,12 @@ fn finalize_group(
 ) -> Result<Row> {
     let mut kit = keyvals.into_iter();
     let mut sit = states.into_iter();
+    let mut specs = sink.aggs.iter();
     let mut values = Vec::with_capacity(sink.items.len());
     for item in &sink.items {
         let v = if item.aggregate {
             let state = sit.next().expect("one state per aggregate item");
+            let spec = specs.next().expect("one spec per aggregate item");
             // Read the flag before finalize consumes the state. The
             // warning is per statement, not per group: notice() dedupes
             // by status, so a thousand groups that each dropped a null
@@ -7224,7 +7394,14 @@ fn finalize_group(
                     "a set function ignored one or more null arguments",
                 ));
             }
-            state.finalize()?
+            // The fraction of a percentile, which the compiler made
+            // sure reads no slot, so it is the same value wherever it
+            // is asked for and here is the one place it is needed.
+            let fraction = match &spec.fraction {
+                Some(expr) => Some(eval(ctx, expr)?),
+                None => None,
+            };
+            state.finalize(fraction)?
         } else {
             kit.next().expect("one key value per key item").0
         };

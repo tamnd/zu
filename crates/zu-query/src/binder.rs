@@ -1679,6 +1679,26 @@ pub enum Deviation {
     Population,
 }
 
+/// Which of the two percentiles of GF11 a call asks for, which is what
+/// a fraction landing between two of the values is answered with.
+///
+/// `PERCENTILE_DISC` answers one of the values that were there, so its
+/// answer has the type the values had and is a number somebody could
+/// point at in the input. `PERCENTILE_CONT` answers the point the
+/// fraction names on the line drawn through them, which is a float
+/// whatever went in and is usually not a value that was there at all.
+/// The median of two and four is three under one and two under the
+/// other, and neither is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Percentile {
+    /// `PERCENTILE_CONT`, which interpolates between the two values the
+    /// fraction falls between and always answers a float.
+    Continuous,
+    /// `PERCENTILE_DISC`, which answers the first value whose share of
+    /// the group reaches the fraction, with the type it had.
+    Discrete,
+}
+
 /// Builtin functions the binder accepts in v0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
@@ -1697,6 +1717,12 @@ pub enum Func {
     /// the two differing only in what the sum of squares is divided by,
     /// and one accumulator behind both.
     Stddev(Deviation),
+    /// GF11, ISO 20.9. The one set function that takes two arguments:
+    /// the values, and the fraction of the way through them to answer.
+    /// The fraction is the standard's independent value expression and
+    /// is the same for the whole group, which is checked rather than
+    /// assumed.
+    Percentile(Percentile),
     Id,
     /// G100, ISO 20.10. An identifier for an element, node or edge.
     ///

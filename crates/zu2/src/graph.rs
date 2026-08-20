@@ -340,8 +340,45 @@ impl Graph {
         self.out.capacity()
     }
 
-    pub(crate) fn allocate(&self) -> u32 {
-        self.next.fetch_add(1, Ordering::AcqRel)
+    /// The next id, or nothing when the graph has no room for it.
+    ///
+    /// A compare and swap rather than a fetch and add because the check
+    /// has to be part of the allocation. Adding first and looking after
+    /// moves the counter whether or not the id was usable, so a caller
+    /// that keeps asking past the end walks `nodes()` up past
+    /// `capacity()` and it reports nodes that cannot exist. This is once
+    /// per node and every node writes a record, so the loop costs
+    /// nothing worth counting.
+    pub(crate) fn allocate(&self) -> Option<u32> {
+        let capacity = self.capacity();
+        loop {
+            let next = self.next.load(Ordering::Acquire);
+            if next as usize >= capacity {
+                return None;
+            }
+            if self
+                .next
+                .compare_exchange_weak(next, next + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(next);
+            }
+        }
+    }
+
+    /// Whether both ends of an edge are inside the table, which is what
+    /// [`Graph::apply`] would refuse for. Asked before the record is
+    /// appended rather than after, because a record on the log that
+    /// cannot be applied is one a replay cannot get past either (#455).
+    pub(crate) fn holds(&self, src: u32, dst: u32) -> Result<()> {
+        let highest = src.max(dst);
+        if highest as usize >= self.capacity() {
+            return Err(Error::NodeOutOfRange {
+                node: highest,
+                max: self.capacity(),
+            });
+        }
+        Ok(())
     }
 
     fn note_node(&self, node: u32) {
@@ -517,13 +554,12 @@ impl Session<'_> {
     /// up by key is a hash probe and nothing more, and it is paid once
     /// per traversal rather than once per hop.
     pub fn add_node(&mut self, key: &[u8]) -> Result<u32> {
-        let node = self.graph().allocate();
-        if node as usize >= self.graph().capacity() {
+        let Some(node) = self.graph().allocate() else {
             return Err(Error::NodeOutOfRange {
-                node,
+                node: self.graph().nodes(),
                 max: self.graph().capacity(),
             });
-        }
+        };
         self.write(key, &node.to_le_bytes(), false, KIND_VERTEX)?;
         Ok(node)
     }
@@ -550,6 +586,13 @@ impl Session<'_> {
 
     fn edge(&mut self, add: bool, src: u32, dst: u32) -> Result<()> {
         let core = self.core;
+        // Before anything is written. The record goes down before the
+        // adjacency is touched, which is what makes an edge durable, and
+        // it used to mean an edge the graph has no room for left its
+        // record behind on the way out. A replay cannot apply that
+        // record either, so the file could not be opened again: one
+        // rejected call and everything in it was gone (#455).
+        core.graph().holds(src, dst)?;
         // Before the epoch is announced, so a thread waiting here is not
         // a thread a flush is waiting for, and dropped before the commit
         // so that the device is never waited on under it.
@@ -686,7 +729,20 @@ pub(crate) fn replay_edge(core: &Core, payload: &[u8]) -> Result<()> {
     let Some((add, src, dst)) = decode_edge(payload) else {
         return Ok(());
     };
-    core.graph().apply(core.epochs(), add, src, dst)
+    // An edge the graph has no room for is not a bad record here, it is
+    // a file opened with less room than it was written with. Dropping
+    // the edge would open a database that has quietly lost part of its
+    // graph, so this refuses, and it says what would work rather than
+    // repeating what the write path says (#455).
+    core.graph()
+        .apply(core.epochs(), add, src, dst)
+        .map_err(|error| match error {
+            Error::NodeOutOfRange { node, max } => Error::GraphTooSmall {
+                needs: node as usize + 1,
+                max,
+            },
+            other => other,
+        })
 }
 
 /// Restores the id counter from a node record during recovery, so that

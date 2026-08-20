@@ -36,6 +36,14 @@ pub enum Error {
     /// loads, so the ceiling is a configuration decision.
     #[error("node {node} is past the {max} the graph was sized for")]
     NodeOutOfRange { node: u32, max: usize },
+
+    /// The file holds an edge between nodes the options have no room
+    /// for, which is what reopening with a smaller `max_nodes` than the
+    /// run that wrote it looks like. Nothing is wrong with the file, so
+    /// this names the number that would open it rather than reporting
+    /// the same thing the write path would have.
+    #[error("file needs max_nodes of at least {needs}, the options gave room for {max}")]
+    GraphTooSmall { needs: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

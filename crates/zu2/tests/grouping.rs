@@ -59,8 +59,11 @@ fn ratio(db: &Db, writers: usize, ops: u64, round: u64) -> f64 {
 ///
 /// It cannot force the interleaving it is about: whether a second thread
 /// reaches the commit path while the first is inside its barrier is the
-/// scheduler's decision, not the test's. So it takes the best of three
-/// attempts and asks for less than the machines give.
+/// scheduler's decision, not the test's. So it takes the best of six
+/// attempts and asks for less than the machines give. Three was enough
+/// on a quiet machine and failed once in a full suite run on a busy one,
+/// which is the #435 lesson again: the bar is not the fragile part, the
+/// number of chances at it is.
 ///
 /// The bar is 3.0 because the shape it is guarding against is not zero.
 /// The old arrangement, where the leader held the flush lock across its
@@ -89,8 +92,12 @@ fn a_group_of_commits_pays_for_one_device_write() {
     let db = Db::create(&dir.path().join("group.zu2"), options()).expect("create");
     let writers = 8;
     let mut best = 0.0f64;
-    for round in 0..3 {
+    for round in 0..6 {
         best = best.max(ratio(&db, writers, 400, round));
+        // Six chances, but no reason to spend them once one has landed.
+        if best >= 3.0 {
+            break;
+        }
     }
     assert!(
         best >= 3.0,

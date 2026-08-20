@@ -671,6 +671,7 @@ impl Session<'_> {
         loop {
             let mut empty = None;
             let mut found = None;
+            let mut claimed = false;
             for i in 0..SLOTS {
                 let entry = bucket.slots[i].load(Ordering::Acquire);
                 if entry == EMPTY {
@@ -680,6 +681,7 @@ impl Session<'_> {
                     continue;
                 }
                 if index::is_tentative(entry) {
+                    claimed = true;
                     continue;
                 }
                 if index::tag_of(entry) != tag && !index::is_foreign(entry) {
@@ -689,6 +691,25 @@ impl Session<'_> {
                     found = Some((i, entry, address));
                     break;
                 }
+            }
+
+            // A scan that walked past a claim did not see the key that
+            // claim is for, because a claim names no address yet, so its
+            // answer of "not here" is only good if the claim is still
+            // there when it is acted on. It usually is not: the claimer
+            // finishes, the scan goes on believing the key is missing,
+            // and puts a second entry for it in the bucket. Two entries
+            // for one key is not a lost record, since both chains hold
+            // it, but a lookup answers from the lower slot while a replay
+            // answers from the higher version, and those are not always
+            // the same record. 258 duplicates in 20000 racing pairs, 6 of
+            // them reopening a version behind what memory had just said
+            // (#454). Reading the key is fine, since the claim's key was
+            // not there when the read started either. Creating an entry
+            // is not, so that goes round again.
+            if found.is_none() && claimed {
+                std::hint::spin_loop();
+                continue;
             }
 
             if let Some((i, entry, address)) = found {
@@ -748,16 +769,29 @@ impl Session<'_> {
                     continue;
                 }
                 let version = self.core.next_version();
-                let fresh = self
+                let fresh = match self
                     .core
                     .log
-                    .append(&self.slot, NULL, version, key, value, tombstone, kind)?;
+                    .append(&self.slot, NULL, version, key, value, tombstone, kind)
+                {
+                    Ok(fresh) => fresh,
+                    // The claim has to come off on the way out. A slot
+                    // left tentative is a slot nothing can ever look
+                    // through and nothing can ever reuse, and every
+                    // insert for that tag would wait on a claim that is
+                    // never going to resolve.
+                    Err(error) => {
+                        bucket.slots[i].store(EMPTY, Ordering::Release);
+                        return Err(error);
+                    }
+                };
                 bucket.slots[i].store(index::entry(tag, fresh, false), Ordering::Release);
                 return Ok(Some(fresh + size));
             }
 
             // The bucket is full, so the new record takes over an entry
             // and adopts what it was holding as its chain.
+            //
             let i = tag as usize % SLOTS;
             let entry = bucket.slots[i].load(Ordering::Acquire);
             if index::is_tentative(entry) {
@@ -946,4 +980,158 @@ pub(crate) fn restore_pages(core: &Core) -> Result<u64> {
         core.log.restore_page(page, bytes)?;
     }
     Ok(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One bucket, so every key in the test lands in it and the eighth
+    /// insert is the one that finds it full.
+    fn one_bucket() -> Options {
+        Options {
+            durability: Durability::Async,
+            index_buckets: 1,
+            max_pages: 8,
+            max_nodes: 1 << 10,
+            compact_below: 0,
+            mutable_pages: 1,
+            ..Options::default()
+        }
+    }
+
+    /// Which slots of a bucket reach `key`, and the version of the
+    /// record each of them reaches it at.
+    fn reachers(core: &Core, key: &[u8]) -> Vec<(usize, u64)> {
+        let bucket = core.index.bucket(index::hash(key));
+        let mut session = core.session();
+        let mut found = Vec::new();
+        for i in 0..SLOTS {
+            let entry = bucket.slots[i].load(Ordering::Acquire);
+            if entry == EMPTY || index::is_tentative(entry) {
+                continue;
+            }
+            if let Some(address) = session
+                .chain_find(index::address_of(entry), key)
+                .expect("chain find")
+            {
+                let base = session.locate(address).expect("locate");
+                // SAFETY: locate returns a whole record and nothing is
+                // writing to this database by the time this runs.
+                found.push((i, unsafe { RecordRef::new(base).version() }));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_racing_insert_never_names_one_key_twice_in_a_bucket() {
+        // #454. A scan cannot tell which key a tentative claim is for,
+        // because a claim names no address, so it walks past one and
+        // reports the key missing. Acting on that report after the claim
+        // has resolved puts a second entry for the same key in the
+        // bucket, and then a lookup answers from the lower slot while a
+        // replay answers from the higher version. Before the fix this
+        // shape gave 258 duplicates in 20000 pairs and 6 of them left
+        // memory a version behind what a reopen would say.
+        //
+        // Two racers rather than a crowd, because the divergence needs
+        // the racing pair to be the last write to the key: with more
+        // threads the writes that follow go through the lower slot and
+        // put the newest version there, which hides it.
+        for trial in 0..2000u64 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = Arc::new(Db::create(&dir.path().join("r.zu2"), one_bucket()).expect("create"));
+            {
+                let mut session = db.session();
+                // Seven keys, so the bucket has exactly one free slot
+                // when the racers arrive and one of them has to take
+                // over a slot that is already spoken for.
+                for i in 0..7u64 {
+                    session
+                        .upsert(format!("fill{trial}-{i}").as_bytes(), &[b'x'; 64])
+                        .expect("fill");
+                }
+            }
+            let key = format!("hot{trial}");
+            std::thread::scope(|scope| {
+                for who in 0..2u64 {
+                    let db = Arc::clone(&db);
+                    let key = key.clone();
+                    scope.spawn(move || {
+                        let mut session = db.session();
+                        session
+                            .upsert(key.as_bytes(), &[b'a' + who as u8; 64])
+                            .expect("hot");
+                    });
+                }
+            });
+
+            let found = reachers(&db.core, key.as_bytes());
+            assert_eq!(
+                found.len(),
+                1,
+                "trial {trial}: slots {found:?} all reach one key, and a lookup would take the \
+                 first of them while a replay would take the newest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_append_gives_the_slot_back() {
+        // The other half of #454. An append between claiming a slot and
+        // storing the entry can fail, and a slot left tentative is one
+        // nothing can look through and nothing can reuse, which after
+        // the fix above is also one every insert for that tag waits on.
+        //
+        // Two buckets, a log of one page, and the fill aimed at one of
+        // them. The insert that has to fail is then the first one into
+        // the other bucket, which is the empty path, which is the path
+        // that claims a slot. Aiming by hash rather than by hope,
+        // because with the fill in the same bucket the failing append is
+        // a take over and takes no claim at all.
+        let options = Options {
+            index_buckets: 2,
+            max_pages: 1,
+            ..one_bucket()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(&dir.path().join("f.zu2"), options).expect("create");
+        let mut session = db.session();
+        let mut fill = Vec::new();
+        let mut spare = Vec::new();
+        for i in 0..100_000u64 {
+            let key = format!("k{i:09}").into_bytes();
+            let side = index::hash(&key) as usize & 1;
+            if side == 0 && fill.len() < PAGE_SIZE / 1000 {
+                fill.push(key);
+            } else if side == 1 && spare.is_empty() {
+                spare.push(key);
+            }
+        }
+        let spare = spare.pop().expect("a key on the other side");
+        let mut failed = false;
+        for key in &fill {
+            if session.upsert(key, &[b'x'; 1000]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "the log took the whole fill, so nothing failed");
+        assert!(
+            session.upsert(&spare, &[b'x'; 1000]).is_err(),
+            "the log had room after all"
+        );
+        let bucket = db.core.index.bucket(index::hash(&spare));
+        for i in 0..SLOTS {
+            let entry = bucket.slots[i].load(Ordering::Acquire);
+            assert!(
+                !index::is_tentative(entry),
+                "slot {i} was left claimed by an append that failed"
+            );
+        }
+        // And the slot is usable again once there is room, which is what
+        // being left claimed would have cost.
+        db.compact().expect("compact");
+    }
 }

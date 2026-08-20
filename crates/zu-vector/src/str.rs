@@ -240,6 +240,74 @@ impl StrBuffers {
     }
 }
 
+/// Where a kernel puts the bytes of the strings it makes.
+///
+/// A kernel that answers a number writes into a register the arena
+/// already sized for it. A kernel that answers a string has no such
+/// room, because how many bytes a chunk of answers comes to is not
+/// known until the answers are made, so the bytes go here instead and
+/// the vector's views point back into them. Short answers never reach
+/// the buffer at all, a view of twelve bytes or fewer carrying its own
+/// payload, so a column of words costs one vector and nothing else.
+///
+/// The whole chunk shares one buffer, which is one allocation for a
+/// call rather than one per row, and the views hold offsets rather
+/// than pointers so the buffer may grow underneath them.
+#[derive(Default)]
+pub struct StrBuilder {
+    long: Vec<u8>,
+}
+
+impl StrBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Room for the long answers of a chunk, when the caller can say
+    /// what that comes to. An answer no longer than what it was made
+    /// from is the common case, so the input's byte count is the usual
+    /// argument and the usual outcome is that the buffer never grows.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            long: Vec::with_capacity(bytes),
+        }
+    }
+
+    /// Room for a string of `len` bytes, filled by `fill`, answered as
+    /// the view that reads it back.
+    ///
+    /// The caller writes into the answer rather than handing one over,
+    /// so a fold or a trim costs no working string of its own.
+    pub fn push_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> StrView {
+        if len <= INLINE_LEN {
+            let mut inline = [0u8; INLINE_LEN];
+            fill(&mut inline[..len]);
+            StrView::inline(&inline[..len])
+        } else {
+            let start = self.long.len();
+            self.long.resize(start + len, 0);
+            fill(&mut self.long[start..]);
+            // Buffer nought, which is the only buffer `finish` makes.
+            StrView::long(&self.long[start..], 0, start as u32)
+        }
+    }
+
+    /// A string already in hand, copied in.
+    pub fn push(&mut self, bytes: &[u8]) -> StrView {
+        self.push_with(bytes.len(), |dst| dst.copy_from_slice(bytes))
+    }
+
+    /// The buffers the views this handed out read through. A chunk
+    /// whose answers were all short leaves no buffer behind.
+    pub fn finish(self) -> StrBuffers {
+        let mut bufs = StrBuffers::new();
+        if !self.long.is_empty() {
+            bufs.push(Arc::from(self.long.into_boxed_slice()));
+        }
+        bufs
+    }
+}
+
 /// A sorted, deduplicated string dictionary, matching the on-disk dict
 /// encoding's order so range predicates map to code ranges. Entry bytes
 /// are concatenated; `ends[i]` is the exclusive end of entry i.

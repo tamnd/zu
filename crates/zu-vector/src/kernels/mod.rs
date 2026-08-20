@@ -23,4 +23,4 @@ pub use gather::{compact, gather_u64};
 pub use hash::{hash_slice, hash64};
 pub use math::{MathOp, MathPair, pair, unary};
 pub use setops::intersect_sorted;
-pub use strings::{StrLen, length};
+pub use strings::{StrFold, StrLen, fold, length};

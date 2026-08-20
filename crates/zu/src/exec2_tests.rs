@@ -464,6 +464,14 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE sqrt(p.score) > 10 RETURN count(*) AS n",
         "MATCH (p:person) RETURN sin(p.age) AS b, p.id AS id ORDER BY id LIMIT 20",
         "MATCH (p:person) RETURN radians(p.age) * 2 AS b, p.id AS id ORDER BY id LIMIT 20",
+        // The three that take two numbers. A remainder by a written
+        // number that is not nought is a computed column like any
+        // other, and a power and a logarithm stand in a filter, where
+        // the rows they are asked about are the rows the old engine
+        // asked them about.
+        "MATCH (p:person) RETURN mod(p.age, 7) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
         // answers with how many groups came out. Once on a column,
         // once on a node, once on a computed value, once on a string,
@@ -931,6 +939,8 @@ fn fallback_queries() -> &'static [&'static str] {
         // declines where a floor would not.
         "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
         "MATCH (p:person) RETURN sqrt(p.score) AS b, p.id AS id",
+        "MATCH (p:person) RETURN power(p.age, 2) AS b, p.id AS id",
+        "MATCH (p:person) RETURN mod(p.age, p.id + 1) AS b, p.id AS id",
         // And behind an OR, where the old engine reads the halves in
         // the order they were written and never asks the second one
         // about a row the first said yes to. An AND is not the same

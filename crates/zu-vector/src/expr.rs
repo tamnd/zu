@@ -11,7 +11,7 @@ use zu_common::{Result, ZuError};
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
-use crate::kernels::{BinOp, CmpOp, MathOp, binary, compare, unary};
+use crate::kernels::{BinOp, CmpOp, MathOp, MathPair, binary, compare, pair, unary};
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
 
@@ -54,6 +54,15 @@ pub enum ExprOp {
     Math {
         op: MathOp,
         src: Reg,
+        dst: Reg,
+    },
+    /// One of the numeric functions over two numbers: POWER, LOG and
+    /// MOD under its function spelling. Two registers in and one out,
+    /// and both arguments hold the one type by the time they get here.
+    MathPair {
+        op: MathPair,
+        l: Reg,
+        r: Reg,
         dst: Reg,
     },
     /// Comparison produces a predicate bitmap register.
@@ -137,6 +146,15 @@ impl Program {
                     let out = {
                         let v = resolve(&regs, *src, chunk)?;
                         unary(arena, *op, v, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::MathPair { op, l, r, dst } => {
+                    let out = {
+                        let lv = resolve(&regs, *l, chunk)?;
+                        let rv = resolve(&regs, *r, chunk)?;
+                        pair(arena, *op, lv, rv, sel)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

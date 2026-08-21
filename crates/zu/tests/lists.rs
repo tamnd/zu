@@ -228,22 +228,48 @@ fn list_is_still_a_name_where_a_name_is_what_is_wanted() {
     assert_eq!(one(&mut db, source), Value::Int(2));
 }
 
-/// `size(collect(n))` is a call, so the optimizer takes it for an
-/// aggregate and then asks for an accumulator that only the set
-/// functions have. It is a projection over the grouped rows and the
-/// executor has no place to put one yet, so it has to say so: an
-/// unimplemented shape is an error and never a panic, because a client
-/// on the other side of the socket cannot tell a crash from a hang.
+/// GF10 and GF12. `size(collect(n))` is two things that run at two
+/// times: the list is accumulated over the rows of the group and the
+/// count is taken of what came out. The binder splits the clause into
+/// the grouping that accumulates and the projection that reads it, so
+/// what a reader writes as one item is one column of the answer and two
+/// operators underneath.
 #[test]
-fn a_scalar_function_over_a_set_function_is_refused_rather_than_reached() {
+fn a_scalar_function_over_a_set_function_reads_what_the_grouping_answered() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    for source in [
-        "UNWIND [1, 2] AS n RETURN size(collect(n)) AS v",
-        "UNWIND [[1], [2]] AS n RETURN cardinality(collect(n)) AS v",
+    for (source, want) in [
+        ("UNWIND [1, 2] AS n RETURN size(collect(n)) AS v", 2),
+        (
+            "UNWIND [[1], [2]] AS n RETURN cardinality(collect(n)) AS v",
+            2,
+        ),
+        // The set function written twice is accumulated once, which is
+        // what the hoist reusing an item's slot buys, and there is no
+        // way to see that from here beyond the answer being right.
+        ("UNWIND [1, 2, 3] AS n RETURN sum(n) + count(n) AS v", 9),
+        // A grouping with keys, where the read runs once per group.
+        (
+            "UNWIND [1, 2, 3, 4] AS n RETURN count(n) * 10 AS v, n % 2 AS k ORDER BY k LIMIT 1",
+            20,
+        ),
     ] {
-        let err = run(source, &mut db, &[]).expect_err(source);
-        let text = err.to_string();
-        assert!(text.contains("not implemented yet"), "{source}: {text}");
+        assert_eq!(one(&mut db, source), Value::Int(want), "{source}");
     }
+}
+
+/// A sort key holding a set function beside an item that reads one is
+/// the shape the split leaves out: the key would be a value the
+/// grouping answers and the projection behind it sorts by, and neither
+/// half is where it stands. An unimplemented shape is an error and
+/// never a panic, because a client on the other side of the socket
+/// cannot tell a crash from a hang.
+#[test]
+fn a_set_function_in_a_sort_key_beside_one_that_is_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let source = "UNWIND [1, 2] AS n RETURN size(collect(n)) AS v ORDER BY count(*)";
+    let err = run(source, &mut db, &[]).expect_err(source);
+    let text = err.to_string();
+    assert!(text.contains("not implemented yet"), "{source}: {text}");
 }

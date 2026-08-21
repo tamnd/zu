@@ -593,6 +593,64 @@ fn main() {
         per_sec_is_norm * VECTOR as f64 / 1e9
     );
 
+    // The substring function, which is the trim's trick with the walk
+    // bounded by the count rather than by the set. Four characters off
+    // the front is four steps whatever the column holds, so this is the
+    // cheapest of the string kernels and the ratio against the trim of
+    // the same column says how much of the trim was the set test.
+    //
+    // The second line is the same call with the count coming from a
+    // column instead of from the statement. It reads a number a row and
+    // is otherwise the same work, so the gap between the two is what
+    // asking a column costs and nothing else.
+    let four = ValueVector::constant(&mut arena, PhysType::Int64, 4i64, VECTOR);
+    let varying: Vec<i64> = (0..VECTOR).map(|i| (i % 9) as i64).collect();
+    let counted = ValueVector::flat_from(&mut arena, PhysType::Int64, &varying);
+    let per_sec_cut = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::cut(
+                &mut arith_scratch,
+                kernels::StrCut::Left,
+                black_box(&flat),
+                black_box(&four),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let cut_grows = per_sec_cut * VECTOR as f64 / 1e9;
+    println!(
+        "str_cut: {cut_grows:.2} G rows/s over fifteen byte strings ({:.1}x the trim of the same column, no spec target)",
+        per_sec_cut / per_sec_trim
+    );
+    if let Some(floor) = budgets.get("vec_str_cut_grows_s")
+        && cut_grows < floor
+    {
+        println!("GATE FAIL vec_str_cut_grows_s: {cut_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_cut_counted = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::cut(
+                &mut arith_scratch,
+                kernels::StrCut::Right,
+                black_box(&flat),
+                black_box(&counted),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    println!(
+        "str_cut_counted: {:.2} G rows/s ({:.1}x the written count, no target)",
+        per_sec_cut_counted * VECTOR as f64 / 1e9,
+        per_sec_cut_counted / per_sec_cut
+    );
+
     // Sorted intersection, balanced inputs: the multiway join inner
     // loop. Throughput counts every element the merge consumes.
     let a: Vec<u64> = (0..4096u64).map(|i| i * 3).collect();

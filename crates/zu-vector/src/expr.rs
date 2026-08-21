@@ -15,8 +15,8 @@ use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
-    BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, StrTrim, TrimSet, binary, compare, fold,
-    length, normalize, normalized, pair, trim, unary,
+    BinOp, CmpOp, MathOp, MathPair, StrCut, StrFold, StrLen, StrTrim, TrimSet, binary, compare,
+    cut, fold, length, normalize, normalized, pair, trim, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -95,6 +95,16 @@ pub enum ExprOp {
         ends: StrTrim,
         set: Arc<TrimSet>,
         src: Reg,
+        dst: Reg,
+    },
+    /// The characters at one end of a string, counted by a second
+    /// register rather than by something the statement wrote, since
+    /// LEFT and RIGHT take their count as an ordinary argument and a
+    /// column is one of the things that can arrive in it.
+    StrCut {
+        end: StrCut,
+        src: Reg,
+        n: Reg,
         dst: Reg,
     },
     /// A string put into one of the four normal forms. The form is
@@ -235,6 +245,15 @@ impl Program {
                     let out = {
                         let v = resolve(&regs, *src, chunk)?;
                         trim(arena, *ends, set, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrCut { end, src, n, dst } => {
+                    let out = {
+                        let s = resolve(&regs, *src, chunk)?;
+                        let count = resolve(&regs, *n, chunk)?;
+                        cut(arena, *end, s, count, sel)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

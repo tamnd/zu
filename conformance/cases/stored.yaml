@@ -1288,3 +1288,102 @@ cases:
       - values:
           - type: INT64
             value: "3"
+
+  - name: a-stored-string-is-cut-by-characters
+    doc: The substring function counts characters and not bytes, so the first character of a tag holding one emoji is the whole emoji and the four bytes it is written as. An engine that cut the string by bytes would answer the first byte of it, which is not a string at all.
+    query: MATCH (n:person) WHERE n.name = 'di' RETURN LEFT(n.tag, 1) AS s, octet_length(LEFT(n.tag, 1)) AS o
+    columns:
+      - s
+      - o
+    rows:
+      - values:
+          - type: STRING
+            value: "🙂"
+          - type: INT64
+            value: "4"
+
+  - name: the-two-ends-of-a-stored-string
+    doc: LEFT and RIGHT over one column, which is how a client tells them apart. The stored tag holds a tab in the middle, so the two answers overlap in it and differ everywhere else, and an engine that answered the same end twice fails one of the two.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN LEFT(n.tag, 2) AS l, RIGHT(n.tag, 2) AS r
+    columns:
+      - l
+      - r
+    rows:
+      - values:
+          - type: STRING
+            value: "a\t"
+          - type: STRING
+            value: "\tb"
+
+  - name: a-cut-longer-than-the-column-answers-the-column
+    doc: Asking for more characters than a string has is an answer rather than a condition, and the answer is the whole string. It holds for the empty tag as well, which is the row where every count answers the same thing.
+    query: MATCH (n:person) WHERE LEFT(n.tag, 99) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-cut-of-no-characters-is-the-empty-string
+    doc: The other end of the range. Nought characters is a count a statement may write, and what comes back is the empty string for every row, which is a value and not a null.
+    query: MATCH (n:person) WHERE RIGHT(n.tag, 0) = '' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-middle-of-a-stored-string
+    doc: GQL has no SUBSTRING, the word being reserved and left without a meaning, so a query that wants the middle of a string writes one substring function inside the other. This takes the last two characters of a name and then the first of those.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN LEFT(RIGHT(n.name, 2), 1) AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "n"
+
+  - name: a-cut-whose-count-is-a-column
+    doc: The count is an ordinary argument rather than a word the statement wrote, so it may be a different number on every row. Here it is the character count of one column applied to another, which answers the empty string where the count is nought and the whole name where the count reaches it.
+    query: MATCH (n:person) RETURN n.name AS m, LEFT(n.name, char_length(n.tag)) AS s ORDER BY m
+    columns:
+      - m
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: "bo"
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+          - type: STRING
+            value: "d"
+
+  - name: a-negative-count-over-a-column-raises
+    doc: A string has no negative number of characters, and the condition the standard gives that is 22011. The count is written out here, so the condition belongs to the statement rather than to any row, and an engine that answered the empty string instead would be inventing a value nobody asked for.
+    query: MATCH (n:person) RETURN LEFT(n.name, -1) AS s
+    raises: "22011"
+
+  - name: a-cut-in-a-filter
+    doc: The same function on the reading side of a comparison, which is where a query most often writes it. One name ends in the character named and the other three do not.
+    query: MATCH (n:person) WHERE RIGHT(n.name, 1) = 'i' RETURN n.name AS m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "di"

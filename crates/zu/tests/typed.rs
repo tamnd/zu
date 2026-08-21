@@ -10,6 +10,8 @@ use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
+mod pin;
+
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("typed.zu1")).unwrap();
     bulk_load_as(&mut zu, "person", "knows", 2, &[(0, 1)]).unwrap();
@@ -18,6 +20,7 @@ fn graph(dir: &std::path::Path) -> Zu1File {
 
 /// The one row a `RETURN` of constants produces, as booleans.
 fn row(db: &mut Zu1File, source: &str) -> Vec<Value> {
+    let _reading = pin::reading();
     let result = run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"));
     assert_eq!(result.rows.len(), 1, "{source} returned {:?}", result.rows);
     result.rows[0].clone()
@@ -141,12 +144,14 @@ fn a_predicate_in_a_filter_agrees_between_the_two_executors() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
     let source = "MATCH (p:person) WHERE 1 IS TYPED INT RETURN count(p) AS n";
-    let with_exec2 = run(source, &mut db, &[]).unwrap();
-    // SAFETY: single-threaded test, and the variable is read back by
-    // this process only.
-    unsafe { std::env::set_var("ZU_EXEC2", "0") };
-    let without = run(source, &mut db, &[]).unwrap();
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    let with_exec2 = {
+        let _reading = pin::reading();
+        run(source, &mut db, &[]).unwrap()
+    };
+    // The test is one thread and the process is not, so the variable
+    // is pinned rather than set: the tests beside this one are running
+    // statements while it is held.
+    let without = pin::pinned("ZU_EXEC2", "0", || run(source, &mut db, &[]).unwrap());
     assert_eq!(with_exec2.rows, without.rows);
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }
@@ -195,12 +200,13 @@ fn a_cast_and_a_type_test_over_a_stored_column_answer_the_same_either_way() {
     ];
     for (predicate, want) in counts {
         let source = format!("MATCH (p:person) WHERE {predicate} RETURN count(p) AS n");
-        let vectorised = run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"));
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let rows = run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"));
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let vectorised = {
+            let _reading = pin::reading();
+            run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"))
+        };
+        let rows = pin::pinned("ZU_EXEC2", "0", || {
+            run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"))
+        });
         assert_eq!(vectorised.rows, rows.rows, "{predicate}");
         assert_eq!(vectorised.rows[0][0], Value::Int(want), "{predicate}");
     }
@@ -208,6 +214,7 @@ fn a_cast_and_a_type_test_over_a_stored_column_answer_the_same_either_way() {
     // would quietly take away: 300 does not fit in eight bits and the
     // query has to say so rather than count a row.
     let source = "MATCH (p:person) WHERE CAST(p.age AS INT8) > 30 RETURN count(p) AS n";
+    let _reading = pin::reading();
     let err = run(source, &mut db, &[]).expect_err("300 does not fit in an INT8");
     assert_eq!(err.gqlstatus().unwrap().code(), "22003");
 }

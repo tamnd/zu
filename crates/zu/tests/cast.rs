@@ -11,6 +11,8 @@ use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
+mod pin;
+
 /// The smallest graph a query can run against: the executor needs a
 /// catalog, and no case here reads a property from it.
 fn graph(dir: &std::path::Path) -> Zu1File {
@@ -20,12 +22,14 @@ fn graph(dir: &std::path::Path) -> Zu1File {
 }
 
 fn one(db: &mut Zu1File, source: &str) -> Value {
+    let _reading = pin::reading();
     let result = run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"));
     assert_eq!(result.rows.len(), 1, "{source} returned {:?}", result.rows);
     result.rows[0][0].clone()
 }
 
 fn status(db: &mut Zu1File, source: &str) -> String {
+    let _reading = pin::reading();
     let err = run(source, db, &[]).expect_err(&format!("{source} should have failed"));
     err.gqlstatus()
         .unwrap_or_else(|| panic!("{source} raised {err}, which carries no gqlstatus"))
@@ -170,12 +174,14 @@ fn a_cast_in_a_filter_agrees_between_the_two_executors() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
     let source = "MATCH (p:person) WHERE CAST('1' AS INT8) = 1 RETURN count(p) AS n";
-    let with_exec2 = run(source, &mut db, &[]).unwrap();
-    // SAFETY: single-threaded test, and the variable is read back by
-    // this process only.
-    unsafe { std::env::set_var("ZU_EXEC2", "0") };
-    let without = run(source, &mut db, &[]).unwrap();
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    let with_exec2 = {
+        let _reading = pin::reading();
+        run(source, &mut db, &[]).unwrap()
+    };
+    // The test is one thread and the process is not, so the variable
+    // is pinned rather than set: the tests beside this one are running
+    // statements while it is held.
+    let without = pin::pinned("ZU_EXEC2", "0", || run(source, &mut db, &[]).unwrap());
     assert_eq!(with_exec2.rows, without.rows);
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }

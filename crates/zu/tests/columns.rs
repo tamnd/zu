@@ -16,6 +16,8 @@ use zu::query::{QueryResult, run};
 use zu_query::exec::Value;
 use zu_zu1::file::Zu1File;
 
+mod pin;
+
 /// Three accounts with a name and a balance, and three people two of
 /// whom own one, so the third owns nothing and an OPTIONAL MATCH over
 /// the people has a null to carry.
@@ -61,6 +63,7 @@ fn graph(dir: &Path) -> Zu1File {
 }
 
 fn answer(db: &mut Zu1File, source: &str) -> QueryResult {
+    let _reading = pin::reading();
     run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"))
 }
 
@@ -129,10 +132,10 @@ fn the_rows_read_off_the_columns_are_the_rows_the_row_sink_pushed() {
             "{source} has nothing above its projection"
         );
         // The same statement through the old executor, which has no
-        // sink but the row one.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let rows = answer(&mut db, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        // sink but the row one. Pinned rather than set, because the
+        // variable is the process's and the tests beside this one are
+        // running while it is held.
+        let rows = pin::pinned("ZU_EXEC2", "0", || answer(&mut db, source));
         assert!(rows.rows.columns().is_none(), "{source} on the old engine");
         assert_eq!(held.columns, rows.columns, "{source} projected the same");
         assert_eq!(held.rows, rows.rows, "{source} answered the same");

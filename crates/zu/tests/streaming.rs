@@ -13,6 +13,8 @@ use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
 use zu::{Database, Flow};
 
+mod pin;
+
 const NODES: u32 = 500;
 
 /// Rows enough for a scan to advance in several steps rather than one,
@@ -53,6 +55,7 @@ fn buffered(conn: &mut zu::Connection, source: &str) -> Vec<i64> {
 
 #[test]
 fn a_streamed_statement_gives_the_rows_the_buffered_one_gives_in_batches() {
+    let _reading = pin::reading();
     let (_dir, db) = opened("stream.zu1");
     let mut conn = db.connect().expect("connect");
 
@@ -87,6 +90,7 @@ fn a_streamed_statement_gives_the_rows_the_buffered_one_gives_in_batches() {
 
 #[test]
 fn a_sink_that_stops_stops_the_scan_under_it() {
+    let _reading = pin::reading();
     let (_dir, db) = opened("stop.zu1");
     let mut conn = db.connect().expect("connect");
 
@@ -112,6 +116,7 @@ fn a_sink_that_stops_stops_the_scan_under_it() {
 
 #[test]
 fn skip_and_limit_are_spent_across_batches_and_not_inside_each_one() {
+    let _reading = pin::reading();
     let (_dir, db) = opened("window.zu1");
     let mut conn = db.connect().expect("connect");
 
@@ -151,6 +156,7 @@ fn skip_and_limit_are_spent_across_batches_and_not_inside_each_one() {
 
 #[test]
 fn a_statement_that_must_see_every_row_first_arrives_in_batches_anyway() {
+    let _reading = pin::reading();
     let (_dir, db) = opened("ordered.zu1");
     let mut conn = db.connect().expect("connect");
 
@@ -221,12 +227,14 @@ fn the_two_executors_stream_the_same_rows_in_the_same_order() {
     };
 
     for source in statements {
-        let pipeline = read(&mut conn, source);
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let old = read(&mut conn, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let pipeline = {
+            let _reading = pin::reading();
+            read(&mut conn, source)
+        };
+        // Pinned rather than set, because the variable is the
+        // process's and the tests beside this one are running
+        // statements while it is held.
+        let old = pin::pinned("ZU_EXEC2", "0", || read(&mut conn, source));
         assert_eq!(pipeline.0, old.0, "{source}");
         assert_eq!(pipeline.1, old.1, "{source}");
         assert!(pipeline.2 && old.2, "both streamed {source}");
@@ -263,10 +271,7 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
     };
 
     for engine in ["1", "0"] {
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", engine) };
-        let (rows, out) = stopping(&mut conn);
+        let (rows, out) = pin::pinned("ZU_EXEC2", engine, || stopping(&mut conn));
         let err = out.expect_err("the statement was interrupted");
         assert!(matches!(err, zu::ZuError::Interrupted), "{engine}: {err}");
         assert!(
@@ -275,7 +280,6 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
         );
         interrupt.clear();
     }
-    unsafe { std::env::remove_var("ZU_EXEC2") };
 
     // Exactly as it was: a statement that was stopped leaves the
     // session holding nothing, so the next one reads the whole table.
@@ -285,6 +289,7 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
 
 #[test]
 fn a_streamed_statement_takes_parameters_and_a_failing_sink_fails_the_call() {
+    let _reading = pin::reading();
     let (_dir, db) = opened("params.zu1");
     let mut conn = db.connect().expect("connect");
 

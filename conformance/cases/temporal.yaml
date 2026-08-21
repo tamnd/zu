@@ -1059,3 +1059,18 @@ cases:
     doc: A month is not a number of seconds, since months are of different lengths, so there is no count a year-month duration and a day-time duration share and no sum for the two of them to have. The two kinds exist to say this, and asking for it is an error rather than an answer in whichever kind was written first.
     query: RETURN DURATION('P1M') + DURATION('PT1H') AS n
     raises: "22G14"
+
+  - name: a-date-pair-with-no-day-time-duration-between-them
+    doc: A day-time duration counts nanoseconds and a signed word of them reaches only about two hundred and ninety years either side of the epoch, while a date runs to the year 9999. So a pair of perfectly ordinary dates a single day apart can have no day-time duration between them at all, and the answer is a condition rather than a wrapped count. The same pair counted in months is fine, months being a small enough unit of a large enough thing.
+    query: RETURN DURATION_BETWEEN(DATE '9999-01-01', DATE '9999-01-02') AS n
+    raises: "22G03"
+
+  - name: the-same-far-out-dates-counted-in-months
+    doc: The pair above asked for in the other kind, a little further apart so the count is not nought. Months are a large enough unit that a count of them fits for any date the calendar has, so the year 9999 has an answer here where it had none in nanoseconds.
+    query: RETURN DURATION_BETWEEN(DATE '9999-01-01', DATE '9999-03-05') YEAR TO MONTH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P2M"

@@ -77,6 +77,15 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
     let shift: Vec<i64> = (0..N)
         .map(|i| ((i % 7) as i64) * 3_600_000_000_000)
         .collect();
+    // An instant, an hour apart per row, starting at 2020-09-13. A
+    // datetime is nanoseconds since the epoch and a date is days, so
+    // the two lanes are different widths of the same idea and the
+    // arithmetic over them is not: a length of time between two of
+    // these is a subtraction, and between two of the dates above it is
+    // a multiplication first, which is where the answers stop fitting.
+    let seen: Vec<i64> = (0..N)
+        .map(|i| 1_600_000_000_000_000_000 + (i as i64) * 3_600_000_000_000)
+        .collect();
     store_props(
         &mut db,
         "person",
@@ -90,6 +99,7 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
                 "shift",
                 PropValues::Duration(zu_common::DurationKind::DayTime, &shift),
             ),
+            ("seen", PropValues::LocalDatetime(&seen)),
         ],
     )
     .unwrap();
@@ -1129,6 +1139,19 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE p.id < 30 RETURN p.shift + p.shift AS s, count(p) AS n ORDER BY s",
         "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, \
          p.shift + DURATION 'PT1H' - DURATION 'PT30M' AS s ORDER BY id",
+        // A length of time between two instants, which is what the
+        // stored column and the literal have between them once both are
+        // counts. The datetime pair counts in nanoseconds and is a
+        // subtraction; the date pair counts in months and is a walk
+        // over the calendar, and both are the same call with the same
+        // two operands.
+        "MATCH (p:person) \
+         WHERE DURATION_BETWEEN(LOCAL DATETIME '2020-09-13T12:26:40', p.seen) \
+         > DURATION 'PT1000H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE DURATION_BETWEEN(p.born, DATE '2000-01-01') YEAR TO MONTH \
+         > DURATION 'P30Y' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 40 \
+         AND DURATION_BETWEEN(p.seen, p.seen) = DURATION 'PT0S' RETURN count(p) AS n",
     ]
 }
 
@@ -1153,6 +1176,16 @@ fn fallback_queries() -> &'static [&'static str] {
         // arithmetic kernel has no op for, so the shape declines.
         "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.born + DURATION 'P1D' AS d \
          ORDER BY id",
+        // A length of time in a projection rather than behind a filter.
+        // A date the calendar has is not always a number of
+        // nanoseconds, so a pair of ordinary dates can have no day-time
+        // duration between them, and a computed column is filled before
+        // the filter that would have dropped the row it happened on.
+        // The old engine reaches the call only for the rows the filter
+        // kept, so the shape goes back to it rather than raising where
+        // it never would.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, \
+         DURATION_BETWEEN(p.born, DATE '2000-01-01') YEAR TO MONTH AS d ORDER BY id",
         // A duration scaled by a number. The kernel would multiply the
         // words happily and the result is a duration, but the operands
         // are a duration and a number, and a register pair that does

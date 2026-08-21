@@ -4701,6 +4701,49 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::StrLen { op, src, dst });
                 Ok(Some(dst))
             }
+            // DURATION_BETWEEN, ISO 20.28, over two instants of the
+            // same type. Both operands are counts and the answer is a
+            // count, so the whole call is arithmetic over words once
+            // the type is known, and the type is known here rather than
+            // in the loop: the op carries it and the kernel picks its
+            // loop once a chunk.
+            //
+            // The two sides have to agree on a lane, which is what says
+            // they are instants of one type. A date and a datetime do
+            // not have a duration between them, the row engine refusing
+            // that pair rather than reading one as the other, and two
+            // registers that disagree decline here for the same reason.
+            // A duration is not an instant either, so a lane that is
+            // one is not this call.
+            BoundExpr::Call {
+                func: Func::DurationBetween(kind),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 2 => {
+                let Some(from) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(to) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                let (Some(a), Some(c)) = (b.lane(from), b.lane(to)) else {
+                    return Ok(None);
+                };
+                if a != c || matches!(a, TemporalLane::Duration(_)) {
+                    return Ok(None);
+                }
+                let dst = b.push_lane(TemporalLane::Duration(*kind))?;
+                b.ops.push(ExprOp::Between {
+                    of: a.logical_type(),
+                    kind: *kind,
+                    from,
+                    to,
+                    dst,
+                });
+                Ok(Some(dst))
+            }
             // GF04's other half, the two folds. These are the first
             // calls whose answer is a string, so the vector they write
             // carries bytes of its own rather than numbers alone.
@@ -5204,6 +5247,14 @@ fn may_raise(ops: &[ExprOp]) -> bool {
             ..
         } => !written_nonzero(&ops[..i], *r),
         ExprOp::MathPair { .. } => true,
+        // A length of time between two instants, which has a condition
+        // no fold over the operands settles: a date the calendar has is
+        // not always a number of nanoseconds, so a pair of perfectly
+        // ordinary dates can have no day-time duration between them.
+        // The call stands behind a filter, where the row engine
+        // evaluates it too, and not in a computed column, which is
+        // filled before the filter that would have dropped the row.
+        ExprOp::Between { .. } => true,
         // A count has an answer for every string there is, so it is a
         // computed column like a floor or an angle. So does a fold, and
         // so does a trim: the trim family's one condition is about the

@@ -22,6 +22,17 @@ pub enum Statement {
     Query(Query),
     Catalog(CatalogStmt),
     Transaction(TxnStmt),
+    /// GP18. Several of them chained by `NEXT`, at least one of which
+    /// changes the catalog and at least one of which does not.
+    ///
+    /// A part is carried as its own text rather than as its tree. Every
+    /// part is a statement whose runner already exists, plan cache and
+    /// write splitting and all, and the text is what keys that cache,
+    /// so handing the runner the text is handing it the thing it takes.
+    /// The parts have all been parsed by the time this is built, so a
+    /// block holding a part that does not parse is a syntax error
+    /// before any of it runs.
+    Block(Vec<String>),
 }
 
 /// Where a transaction begins and ends (docs/08 §1, GT01, GT02).

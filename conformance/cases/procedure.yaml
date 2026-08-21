@@ -230,3 +230,8 @@ cases:
     doc: A binding table of more than one column is refused rather than read down its first, since nothing in the call says which column holds the node ids and a sample nobody meant is worse than a refusal.
     query: BINDING TABLE seeds = { MATCH (p:person) RETURN p.id AS id, p.age AS age } CALL betweenness('knows', seeds) YIELD node, centrality RETURN count(*) AS a
     raises: "22G03"
+
+  - name: a-catalog-statement-inside-a-call-body
+    doc: A call body runs once for every row that reaches it and a catalog statement makes or unmakes a thing once, so it is written beside the call rather than inside it. A client that allowed it would answer a row for a graph with one node and a condition for the same graph with two.
+    query: "MATCH (p:person) CALL (p) { CREATE GRAPH g ANY } RETURN count(*) AS a"
+    raises: "42001"

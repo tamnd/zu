@@ -6,9 +6,33 @@
    assembles every arrow from single characters. Changes here require a
    spec change to docs/07 first. *)
 
-statement       = query | catalog_statement ;
+statement       = statement_block | transaction_statement ;
+
+(* GP18, ISO 13.6. A statement block is the parts of a procedure body,
+   and what a session is handed is a procedure body. A part is a query
+   or a catalog statement, so a block may hold both, which is the whole
+   of the feature: nothing about the syntax says a chain has to be all
+   one kind. A catalog statement hands nothing to the part behind it,
+   so the parts of a mixed block do not share rows; a run of query
+   statements is a linear query and shares them the way it always did.
+   The block answers what its last part answered. *)
+statement_block = block_part , { "NEXT" , block_part } , [ ";" ] ;
+block_part      = query | catalog_statement ;
 query           = [ use_clause ] , { binding_variable_definition } ,
-                  composite_query , [ ";" ] ;
+                  composite_query ;
+
+(* GT01 and GT02, ISO 15.1 to 15.3. Where a transaction begins and
+   ends. These three are not parts of a block: a block runs as one
+   transaction, so a word among its parts that began or ended one
+   would be saying the unit is two. ISO writes the characteristics as
+   a list because it has more of them to come, and the two that mean
+   something here are the access modes; a list naming both names
+   neither. *)
+transaction_statement
+                = "START" , "TRANSACTION" ,
+                  [ access_mode , { "," , access_mode } ]
+                | "COMMIT" | "ROLLBACK" ;
+access_mode     = "READ" , ( "ONLY" | "WRITE" ) ;
 
 (* GQ02 to GQ07, ISO 12.1. A composite query meets two result tables.
    Every conjunction is at one level and the fold is to the left, so
@@ -29,7 +53,9 @@ set_operator    = "UNION" | "EXCEPT" | "INTERSECT" ;
    are the last statement's. A statement in front of a NEXT ends with
    RETURN unless it writes; a write ends without projecting anything,
    the way it does at the end of a query, and hands on the rows it was
-   given. *)
+   given. The chain is query statements and nothing else, so a NEXT
+   handing over to a catalog statement ends it and the statement block
+   above carries on from there. *)
 linear_query    = simple_query , { "NEXT" , simple_query } ;
 simple_query    = { reading_clause } , return_clause
                 | { reading_clause } ;
@@ -170,6 +196,9 @@ call_clause     = "CALL" , ( inline_procedure_call | named_procedure_call ) ;
 inline_procedure_call
                 = [ variable_scope ] , "{" ,
                   [ use_clause ] , composite_query , "}" ;
+(* A composite query and not a statement block: the body runs once for
+   every row that reaches the call, and a catalog statement makes or
+   unmakes a thing once, so it is written beside the call. *)
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 (* GP04, ISO 13.1. The named procedure call. The name is a catalog

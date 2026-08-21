@@ -1653,6 +1653,13 @@ merge_stmt_growth_b = 4096.0
 # was also using that read 9.6 and failed a gate nothing in the engine
 # had moved: the load is in the tail at every width and only tail over
 # tail cancels it.
+#
+# All three are read only where one writer's commit costs a sync. The
+# hosted runners commit in about 150 us against a laptop's 3500, which
+# is storage that answers before there is anything to batch, and the
+# columns there are thirty two threads bidding for four cores rather
+# than writers sharing a sync. The bench says so and reports without
+# gating; the numbers below are for a machine that syncs.
 commit_x = 6.0
 commit_p50_x = 3.0
 commit_p99_x = 6.0

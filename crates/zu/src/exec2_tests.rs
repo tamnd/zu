@@ -1708,6 +1708,56 @@ fn a_secondary_label_falls_back_and_still_answers() {
     assert_eq!(r.rows, [[Value::Int(managers)]]);
 }
 
+/// GP05 and GP17. A binding variable definition is a query run before
+/// the plan starts, whose answer goes into a parameter position, so an
+/// engine that does not run one reads a position the caller left null.
+/// The pipeline does not run one yet, so it hands the statement back
+/// rather than putting the null on the plan as the value of the name.
+#[test]
+fn a_binding_variable_definition_falls_back_and_still_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bindings.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    let n = 64u32;
+    let mut edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i * 7 + 3) % n)).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    bulk_load_keyed(&mut db, "person", "knows", u64::from(n), &edges, None).unwrap();
+    let age: Vec<u64> = (0..u64::from(n)).map(|i| i % 100).collect();
+    store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).unwrap();
+    drop(db);
+
+    let mut db = Zu1File::open(&path).unwrap();
+    let (catalog, schema) = query::load_schema(&mut db).unwrap();
+    let source = "VALUE t = 3 MATCH (p:person) WHERE p.age > 60 \
+                  RETURN t AS t, p.age AS age ORDER BY age";
+    // Not `falls_back`: a definition makes a parameter position of its
+    // own and that helper is for the statements that take none.
+    {
+        let (query, plan, _) =
+            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema).unwrap();
+        let args = vec![Value::Null; query.params.len()];
+        let mut snap = Zu1Snapshot::new(&mut db, catalog.clone());
+        let new = zu_exec::try_execute(
+            &plan,
+            &query,
+            &schema,
+            &mut snap,
+            &args,
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(new.is_none(), "the pipeline does not work out a definition");
+    }
+    let r = query::run(source, &mut db, &[]).unwrap();
+    assert!(!r.rows.is_empty(), "the fixture has rows over the bound");
+    assert!(
+        r.rows.iter().all(|row| row[0] == Value::Int(3)),
+        "the definition reaches the projection: {:?}",
+        r.rows
+    );
+}
+
 #[test]
 #[ignore = "scratch"]
 fn dump_plans() {

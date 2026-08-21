@@ -148,6 +148,39 @@ cases:
           - type: INT64
             value: "50"
 
+  - name: a-definition-written-with-a-double-colon-separator
+    doc: GP06. The standard writes the separator between the name and the type two ways and lets the type be written with neither, so all three spellings are one definition. The colons are the spelling a client that also speaks a type system elsewhere is likely to reach for.
+    query: "VALUE oldest :: INT = { MATCH (p:person) RETURN max(p.age) AS a } RETURN oldest AS x"
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: a-definition-written-with-the-typed-word
+    doc: The other spelling of the same separator, which is the one the standard writes out in words. It says what the colons say, so the type it carries is checked the same way and the answer is the same answer.
+    query: "VALUE oldest TYPED INT = { MATCH (p:person) RETURN max(p.age) AS a } RETURN oldest AS x"
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: a-value-variable-returned-as-a-column
+    doc: GP05. A definition is worked out once and reading the name is reading what it answered, wherever the name is read. A projection is the plainest place to read one and the place where an engine that never worked the definition out would answer null instead, so the value goes out beside a column of the graph to say the row carries both.
+    query: "VALUE cut = 45 MATCH (p:person) WHERE p.age > cut RETURN cut AS x, p.name AS y ORDER BY y"
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: INT64
+            value: "45"
+          - type: STRING
+            value: cy
+
   - name: a-definition-that-does-not-answer-its-type
     doc: The declared type turning out to be wrong is a condition about a value and not about the text, so it is a data exception rather than a syntax one, and it is raised where the value was worked out rather than where the name is read.
     query: VALUE n STRING = 1 + 1 RETURN n AS x

@@ -901,6 +901,17 @@ pub(crate) fn compile(
     if !query.scalars.is_empty() {
         return Ok(None);
     }
+    // A binding variable is the same story from the other side (GP05
+    // through GP17): the definition is a query run before this plan
+    // starts and its answer is written into a parameter position, so an
+    // engine that does not run it reads a position the caller left
+    // null. Reading it is what makes this worth declining rather than
+    // leaving alone: `VALUE t = 3 MATCH (p:Person) RETURN t AS t`
+    // compiles here, the null goes on the plan as a constant, and the
+    // answer comes out null instead of three.
+    if !query.bindings.is_empty() {
+        return Ok(None);
+    }
     let mut c = Compiler {
         query,
         schema,

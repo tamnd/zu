@@ -186,6 +186,56 @@ cases:
     query: CALL /app/wcc('knows') YIELD node, component RETURN count(*) AS a
     raises: "42002"
 
+  - name: a-statement-at-a-schema
+    doc: GP16, the AT schema clause. The word in front of the statement says which schema every name written without a path in it is looked up in, so it reaches the calls inside the statement rather than one of them. The root is where the built-in procedures are, so a statement at the root answers what a statement with no AT at all answers.
+    query: AT / CALL wcc('knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-statement-at-the-schema-the-session-works-in
+    doc: The clause names a schema three ways and two of them are words rather than paths. CURRENT_SCHEMA is the schema the statement is already resolving in, so writing it changes nothing, which is the point of having it: a client that builds the clause from a setting has something to put there when the setting says stay where you are.
+    query: AT CURRENT_SCHEMA MATCH (p:person) RETURN count(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-statement-at-a-schema-that-holds-no-such-procedure
+    doc: The clause reaches the call, which is what says it did anything at all. A name the named schema does not hold is the same reference condition a path to that schema would have raised, since the two say the same thing about where to look.
+    query: AT /app CALL wcc('knows') YIELD node, component RETURN count(*) AS a
+    raises: "42002"
+
+  - name: a-path-on-the-name-beats-the-schema-clause
+    doc: A name written out as a path says where it lives, so there is nothing for the clause to say about it. The two never disagree for that reason rather than by a rule about which wins: the clause is the default for a name that gave none.
+    query: AT /app CALL /wcc('knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-schema-clause-inside-a-call-body
+    doc: A call body that is spliced into the statement around it resolves names where that statement does, so a schema clause of its own would be a second answer to a question already settled. It is refused rather than ignored, since a client that wrote one meant it. A call the statement begins with is the other case, and that body is taken out of the call rather than spliced in, so the clause it carries becomes the statement's.
+    query: "MATCH (p:person) CALL (p) { AT / MATCH (q:person) RETURN q.name AS f } RETURN count(*) AS a"
+    raises: "42001"
+
+  - name: a-schema-clause-on-a-leading-call-body
+    doc: GP16 and GP18 together. The body of a call the statement begins with runs for the one row every statement starts from, so it is put in the chain in front of what was written after the call, and the clause it was written with travels with it. What the statement answers is what the body found.
+    query: "CALL { AT CURRENT_SCHEMA MATCH (p:person) RETURN count(p) AS n } RETURN n AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
   - name: a-procedure-nobody-declared
     doc: A name no schema holds, which is the shape of every typo in a procedure name and of every call to something this engine does not have.
     query: CALL nonsense('knows') YIELD node, component RETURN count(*) AS a

@@ -1149,14 +1149,28 @@ fn resize_index(core: &Core) -> Result<()> {
         // waits a little is a few lookups that walk a chain.
         return Ok(());
     };
-    if core.index.wants_growth() {
-        core.index.grow(core.epochs());
+    // A load fills the table between two of this thread's wakeups, and
+    // one doubling a wakeup is not enough to keep up with it: twenty
+    // thousand keys into a table hinted at 256 buckets needs five, and
+    // taking one leaves the other four for whenever the log next has
+    // work, which for a load that fits in a page is never. So this
+    // doubles until the table is no longer crowded rather than once.
+    // Each round finishes its own migration, because `wants_growth` is
+    // false while one is open.
+    while core.index.wants_growth() && core.index.grow(core.epochs()) {
+        drain(core)?;
     }
     if !core.index.resizing() {
         return Ok(());
     }
+    drain(core)
+}
+
+/// Splits whatever of the old table is left and lets it go.
+fn drain(core: &Core) -> Result<()> {
     let mut session = core.maintenance_session()?;
     session.drain_index()?;
+    drop(session);
     // Outside the epoch this time, so the table the last drain retired
     // can actually go back.
     core.epochs().drain();

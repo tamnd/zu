@@ -140,6 +140,7 @@ fn row(n: u64, value: usize, samples: u64, presize: bool) {
     }
 
     drop(s);
+    let buckets = db.index_buckets();
     let disk = db.disk_bytes().unwrap_or(0);
     let logical = n * (value as u64 + 16);
 
@@ -148,7 +149,7 @@ fn row(n: u64, value: usize, samples: u64, presize: bool) {
     let update = Took::of(updates);
     let delete = Took::of(deletes);
     println!(
-        "{n:>10} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.0} {:>7.2} {:>8.2}",
+        "{n:>10} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.0} {:>7.2} {:>7.2} {:>8.2}",
         insert.p50,
         insert.p99,
         read.p50,
@@ -160,6 +161,7 @@ fn row(n: u64, value: usize, samples: u64, presize: bool) {
         insert.mean.max(read.mean).max(update.mean).max(delete.mean),
         per_update,
         disk as f64 / logical as f64,
+        n as f64 / (buckets * 8) as f64,
         load.as_secs_f64(),
     );
 }
@@ -167,7 +169,7 @@ fn row(n: u64, value: usize, samples: u64, presize: bool) {
 fn sweep(what: &str, value: usize, sizes: &[u64], samples: u64, presize: bool) {
     println!("\n{what}, {value} byte values, async\n");
     println!(
-        "{:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8}",
+        "{:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8}",
         "records",
         "ins p50",
         "ins p99",
@@ -180,6 +182,7 @@ fn sweep(what: &str, value: usize, sizes: &[u64], samples: u64, presize: bool) {
         "worst",
         "b/upd",
         "amp",
+        "fill",
         "load s"
     );
     for &n in sizes {
@@ -187,7 +190,8 @@ fn sweep(what: &str, value: usize, sizes: &[u64], samples: u64, presize: bool) {
     }
     println!("\nMicroseconds. worst is the highest of the four means, which is the");
     println!("number that has to stay flat down the column for the milestone to pass.");
-    println!("b/upd is log bytes per update, amp is the file over the logical payload.");
+    println!("b/upd is log bytes per update, amp is the file over the logical payload,");
+    println!("fill is keys over index slots, which is what a lookup walks a chain for.");
 }
 
 fn main() {

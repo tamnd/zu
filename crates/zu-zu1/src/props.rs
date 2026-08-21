@@ -842,26 +842,41 @@ pub(crate) fn free_props_keeping_labels(db: &mut Zu1File, root: BlockPtr) -> Res
     free_props_parts(db, root, false, &[])
 }
 
+/// What a fold carried out of one column of the old directory and into
+/// the new one, and therefore what it is not this function's to free.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ColumnKept {
+    /// The value segment is named by the new directory, either because
+    /// nothing touched the column or because the rewrite kept the
+    /// blocks it did not have to write again. Either way the rewrite is
+    /// what freed whatever it dropped, since it is the only thing that
+    /// knows which blocks those were.
+    pub values: bool,
+    /// The validity mask came across whole, which only a column nothing
+    /// wrote into does: a rewritten column writes a fresh mask.
+    pub validity: bool,
+}
+
 /// Frees a props chain apart from the parts the caller is carrying
 /// into the directory that replaces it, whether that is the label
-/// bitset or a column: `keep_cols[i]` says the `i`th column's segments
-/// are named by the new directory too, so its blocks stay where they
-/// are and the two directories share the bytes. A slice shorter than
-/// the column list keeps nothing past its end.
+/// bitset or a column: `kept[i]` says which of the `i`th column's
+/// segments the new directory names too, so their blocks stay where
+/// they are and the two directories share the bytes. A slice shorter
+/// than the column list keeps nothing past its end.
 pub(crate) fn free_props_reusing(
     db: &mut Zu1File,
     root: BlockPtr,
     keep_labels: bool,
-    keep_cols: &[bool],
+    kept: &[ColumnKept],
 ) -> Result<()> {
-    free_props_parts(db, root, !keep_labels, keep_cols)
+    free_props_parts(db, root, !keep_labels, kept)
 }
 
 fn free_props_parts(
     db: &mut Zu1File,
     root: BlockPtr,
     labels: bool,
-    keep_cols: &[bool],
+    kept: &[ColumnKept],
 ) -> Result<()> {
     let directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
     if labels {
@@ -870,14 +885,16 @@ fn free_props_parts(
         }
     }
     for (ci, col) in directory.columns.iter().enumerate() {
-        if keep_cols.get(ci) == Some(&true) {
-            continue;
+        let kept = kept.get(ci).copied().unwrap_or_default();
+        if !kept.values {
+            for &ptr in &col.meta.blocks {
+                db.free_block(ptr)?;
+            }
         }
-        for &ptr in &col.meta.blocks {
-            db.free_block(ptr)?;
-        }
-        for &ptr in col.validity.iter().flat_map(|m| &m.blocks) {
-            db.free_block(ptr)?;
+        if !kept.validity {
+            for &ptr in col.validity.iter().flat_map(|m| &m.blocks) {
+                db.free_block(ptr)?;
+            }
         }
     }
     for ptr in meta::chain_blocks(db, root)? {
@@ -3037,10 +3054,11 @@ mod tests {
             uncompressed_bytes: 16,
             min: 1,
             max: 2,
-            crc: 0,
+            live_bytes: 0,
             structural: crate::segment::Structural::MiniBlock,
             sorted: false,
             blocks: vec![7],
+            crcs: vec![0],
         };
         let mut old = Vec::new();
         old.extend_from_slice(&1u16.to_le_bytes());
@@ -3254,10 +3272,11 @@ mod tests {
             uncompressed_bytes: 8,
             min: 0,
             max: 0,
-            crc: 0,
+            live_bytes: 0,
             structural: crate::segment::Structural::MiniBlock,
             sorted: false,
             blocks: vec![7],
+            crcs: vec![0],
         };
         let mut old = Vec::new();
         old.extend_from_slice(&2u16.to_le_bytes());

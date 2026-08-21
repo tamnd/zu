@@ -12,7 +12,7 @@ $ zu copy --reorder degree <edges> <keyed> --format json
 $ zu stat <graph>
 file:            <graph>
 uuid:            <uuid>
-format:          zu1 v1, min reader v1
+format:          zu1 v2, min reader v2
 block size:      256 KiB
 epoch:           2
 high water:      block 8
@@ -29,13 +29,13 @@ rel table:       edge (4 edges, node to node)
   colors:        none, run zu analyze
 
 $ zu stat <graph> --format json
-{"file":"<graph>","format_version":1,"epoch":2,"block_size":262144,"blocks":9,"bytes":2359296,"schema_bytes":1048576,"free_bytes":0,"data_bytes":1310720,"node_tables":[{"name":"node","nodes":4}],"rel_tables":[{"name":"edge","from":"node","to":"node","edges":4}]}
+{"file":"<graph>","format_version":2,"epoch":2,"block_size":262144,"blocks":9,"bytes":2359296,"schema_bytes":1048576,"free_bytes":0,"data_bytes":1310720,"node_tables":[{"name":"node","nodes":4}],"rel_tables":[{"name":"edge","from":"node","to":"node","edges":4}]}
 
 $ zu verify <graph>
-<graph>: ok, 707 meta bytes verified
+<graph>: ok, 755 meta bytes verified
 
 $ zu verify <graph> --format json
-{"file":"<graph>","ok":true,"meta_bytes":707}
+{"file":"<graph>","ok":true,"meta_bytes":755}
 
 $ zu query <graph> -c 'MATCH (n:node) RETURN count(n) AS nodes'
 nodes
@@ -90,10 +90,10 @@ $ zu convert <edges> <csv> --format json
 $ zu version
 zu <version>
 c abi <abi>
-zu1 format 1
+zu1 format 2
 features: arrow
 engines: zu1, sqlite
 
 $ zu version --format json
-{"zu":"<version>","c_abi":"<abi>","format_version":1,"features":["arrow"],"engines":["zu1","sqlite"]}
+{"zu":"<version>","c_abi":"<abi>","format_version":2,"features":["arrow"],"engines":["zu1","sqlite"]}
 

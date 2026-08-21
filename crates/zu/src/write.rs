@@ -83,12 +83,24 @@ const THRESHOLD_BLOCKS: u64 = 256;
 /// statement in a few hundred does that whatever the number is.
 const DEFERRED_COMMITS: u32 = 256;
 
-/// How many cells the deferred commits may hold between them.
+/// How many changes the deferred commits may hold between them.
+///
+/// Cells is the historical name and it undercounts: `written_cells`
+/// charges one for a single cell and one per row for an appended batch,
+/// so a row of a wide table costs the same as a cell of a narrow one
+/// here while carrying a lot more.
 ///
 /// The patch is rebuilt when a commit adds to it, so this bounds the
-/// per-commit cost of deferring as well as the memory: a few hundred
-/// cells is a copy of a few kilobytes, against the column rewrite and
-/// the two segment writes a fold costs.
+/// per-commit copy as well as the memory, and the bound is worth
+/// writing down rather than calling small. A `Cell` is 24 bytes, a
+/// column entry `(u32, Cell)` is 32, so a row of a ten column table is
+/// 320 bytes of `Vec` plus whatever its strings hold, and 1024 of them
+/// is about 320 KiB copied on every commit that adds to a full patch.
+/// That is the ceiling and not the usual case, which is a handful of
+/// cells and a copy too small to measure, but it is what has to stay
+/// under the column rewrite and the two segment writes a fold costs.
+/// The string bytes are bounded separately below, which is what keeps
+/// a patch of a thousand long strings from being the real number.
 const DEFERRED_CELLS: usize = 1024;
 
 /// How many bytes of string the cells among them may hold.

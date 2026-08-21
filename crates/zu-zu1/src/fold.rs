@@ -39,9 +39,12 @@ use crate::graph::{
 use crate::keys::write_key_index_live;
 use crate::meta;
 use crate::props::{
-    PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing, load_props_at,
+    ColumnKept, PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing,
+    load_props_at,
 };
-use crate::segment::{CHUNK_ROWS, read_segment, rewrite_segment, write_segment};
+use crate::segment::{
+    CHUNK_ROWS, SegmentMeta, read_range, read_segment, rewrite_segment, write_segment,
+};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
 
@@ -472,11 +475,21 @@ fn fold_props(
     // because a column that has to grow has to be rewritten to grow.
     let touched = mvcc.touched_cols(table, epoch);
     let grew = new_count != base;
-    let mut reused = vec![false; dir.columns.len()];
+    // A rewritten column keeps the blocks it did not have to write
+    // again and frees the rest itself, so what the caller must not do
+    // is free that column's blocks wholesale. Its validity mask is
+    // written fresh either way, so that half is still the caller's.
+    let mut kept = vec![
+        ColumnKept {
+            values: true,
+            validity: false,
+        };
+        dir.columns.len()
+    ];
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
         if !grew && !touched.contains(&(ci as u32)) {
-            reused[ci] = true;
+            kept[ci].validity = true;
             columns.push(col.clone());
             continue;
         }
@@ -493,57 +506,52 @@ fn fold_props(
         // holds are words or byte strings and the column's type says
         // which of the two it must be.
         let meta = if col.is_lane() {
-            let mut values = Vec::with_capacity(new_count as usize);
-            read_segment(db, &col.meta, &mut values)?;
-            // Which chunks of the segment the fold is about to change,
-            // so that the rest keep the bytes they already encode to
-            // rather than going back through the cascade selector.
-            let mut dirty = BTreeSet::new();
-            let mut touch = |offset: u64| {
-                dirty.insert(offset as usize / CHUNK_ROWS);
-            };
+            // The lane side carries the rows a statement wrote rather
+            // than the column they are in, for the same reason the blob
+            // side does: reading the column to change one cell of it is
+            // the cost the rewrite exists to avoid.
+            //
             // The overlay says which rows it holds rather than being
             // asked about each one in turn. Asking row by row is a
             // probe per row of the table to find the handful a
             // statement wrote, and that is the whole of what a one
             // cell write into a wide table used to cost.
+            let mut updates = BTreeMap::new();
             for (offset, cell) in mvcc.col_updates(table, ci as u32, base, epoch) {
                 match cell {
                     Cell::Int(x) => {
-                        values[offset as usize] = x;
+                        updates.insert(offset, x);
                         valid.set(offset);
                     }
                     // A removed row keeps a word where its value was,
                     // because the lane is fixed width and a reader that
                     // has been told the bit is clear never looks at it.
                     Cell::Null => {
-                        values[offset as usize] = 0;
+                        updates.insert(offset, 0);
                         valid.clear(offset);
                     }
                     Cell::Str(_) => return Err(mismatch(&col.name, offset)),
                 }
-                touch(offset);
             }
-            // The rows the appends added, which are new and so are all
-            // of them dirty. `cell` rather than the batch directly,
-            // because a statement can write over a row another one in
-            // the same fold window appended.
+            // The rows the appends added. `cell` rather than the batch
+            // directly, because a statement can write over a row
+            // another one in the same fold window appended.
+            let mut appended = Vec::with_capacity((new_count - base) as usize);
             for offset in base..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
                     Some(Cell::Int(x)) => {
-                        values.push(x);
+                        appended.push(x);
                         valid.set(offset);
                     }
                     Some(Cell::Null) => {
-                        values.push(0);
+                        appended.push(0);
                         valid.clear(offset);
                     }
                     Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
                     None => return Err(missing(&col.name, offset)),
                 }
-                touch(offset);
             }
-            rewrite_segment(db, &col.meta, &values, &dirty)?
+            rewrite_segment(db, &col.meta, &updates, &appended)?
         } else {
             // The blob side carries the rows a statement wrote rather
             // than the column they are in, because reading the column
@@ -602,20 +610,23 @@ fn fold_props(
     // The bitset comes through on the same terms a column does: the
     // same rows, and nothing renamed one of them.
     let keep_labels = !grew && changes.is_empty();
-    let labels = match (&dir.labels, changes.is_empty()) {
-        (None, true) => None,
-        (Some(meta), _) if keep_labels => Some(meta.clone()),
-        (base_labels, _) => {
-            let mut words = Vec::with_capacity(new_count as usize);
-            if let Some(meta) = base_labels {
-                read_segment(db, meta, &mut words)?;
-            }
-            words.resize(new_count as usize, 1u64 << primary);
+    let labels = match &dir.labels {
+        None if changes.is_empty() => None,
+        Some(meta) if keep_labels => Some(meta.clone()),
+        // The first change is what makes a bitset exist, and that is the
+        // one time the whole of it is written.
+        None => {
+            let mut words = vec![1u64 << primary; new_count as usize];
             apply_label_changes(&changes, &mut words, table, labels_of)?;
             Some(write_segment(db, &words)?)
         }
+        Some(meta) => Some(rewrite_labels(
+            db, meta, &changes, base, new_count, table, labels_of,
+        )?),
     };
-    free_props_reusing(db, root, keep_labels, &reused)?;
+    // The bitset either came across untouched or was written over in
+    // place, and both keep the blocks it already had.
+    free_props_reusing(db, root, true, &kept)?;
     let new_dir = PropsDirectory {
         node_count: new_count,
         columns,
@@ -636,47 +647,130 @@ fn apply_label_changes(
     labels_of: &Labels,
 ) -> Result<()> {
     let rows = words.len();
-    let primary = 1u64 << labels_of.primary;
     for (&offset, &(add, remove)) in changes {
-        let undeclared = add & !labels_of.declared;
-        if undeclared != 0 {
-            return Err(ZuError::InvalidArgument(format!(
-                "a label change puts {undeclared:#x} on a row of table {table}, \
-                 which has not declared it"
-            )));
-        }
-        if remove & primary != 0 {
-            return Err(ZuError::InvalidArgument(format!(
-                "a label change takes the name of table {table} off one of its own rows"
-            )));
-        }
         let word = words.get_mut(offset as usize).ok_or_else(|| {
             ZuError::InvalidArgument(format!(
                 "a label change names row {offset} of table {table}, which holds {rows} rows"
             ))
         })?;
-        let after = (*word | add) & !remove;
-        // A closed graph type is a promise about every element the
-        // graph holds, so it is checked here, where the label set the
-        // row ends with is known. The type an element belongs to is
-        // allowed to change, which is what a key label set change is;
-        // what is not allowed is ending up in none of them.
-        if let Some(ty) = labels_of.graph_type
-            && ty.holder(ElementKind::Node, after).is_none()
-        {
-            return Err(ZuError::gql(
-                codes::CG2000,
-                format!(
-                    "the element at row {offset} of '{}' would carry {} after this change, and no element type of graph type '{}' describes a node carrying that",
-                    labels_of.name,
-                    spell(after, labels_of.names),
-                    ty.name
-                ),
-            ));
-        }
-        *word = after;
+        *word = changed_word(*word, offset, add, remove, table, labels_of)?;
     }
     Ok(())
+}
+
+/// Writes a stored bitset over with the rows a txn renamed and the rows
+/// it appended, and touches nothing else. A bitset over a million rows
+/// costs a chunk per named row plus the chunks past the old end, where
+/// reading it whole to put one label on one row cost the million.
+fn rewrite_labels(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    changes: &BTreeMap<u64, (u64, u64)>,
+    base: u64,
+    new_count: u64,
+    table: u32,
+    labels_of: &Labels,
+) -> Result<SegmentMeta> {
+    // A change naming a row past the end is the caller's mistake, and it
+    // is caught here rather than by the read below, which would report
+    // it as a range rather than as a row.
+    if let Some((&last, _)) = changes.iter().next_back()
+        && last >= new_count
+    {
+        return Err(ZuError::InvalidArgument(format!(
+            "a label change names row {last} of table {table}, which holds {new_count} rows"
+        )));
+    }
+    // Rows the table already held are read back a chunk at a time. Two
+    // changes in one chunk cost one read, the words between them come
+    // along for free, and a chunk no change named is never read at all.
+    let named: Vec<u64> = changes.keys().copied().take_while(|&o| o < base).collect();
+    let mut updates = BTreeMap::new();
+    let mut words = Vec::with_capacity(CHUNK_ROWS);
+    let mut i = 0;
+    while i < named.len() {
+        let chunk = named[i] as usize / CHUNK_ROWS;
+        let mut j = i;
+        while j + 1 < named.len() && named[j + 1] as usize / CHUNK_ROWS == chunk {
+            j += 1;
+        }
+        words.clear();
+        read_range(db, meta, named[i], named[j] + 1, &mut words)?;
+        for &offset in &named[i..=j] {
+            let (add, remove) = changes[&offset];
+            let word = words[(offset - named[i]) as usize];
+            updates.insert(
+                offset,
+                changed_word(word, offset, add, remove, table, labels_of)?,
+            );
+        }
+        i = j + 1;
+    }
+    // An appended row carries its table's own label and nothing else
+    // until something says otherwise, so the appended range is a run of
+    // equal words and the rewrite writes only the chunks past the old
+    // end.
+    let mut appended = Vec::with_capacity((new_count - base) as usize);
+    for offset in base..new_count {
+        appended.push(match changes.get(&offset) {
+            Some(&(add, remove)) => changed_word(
+                1u64 << labels_of.primary,
+                offset,
+                add,
+                remove,
+                table,
+                labels_of,
+            )?,
+            None => 1u64 << labels_of.primary,
+        });
+    }
+    rewrite_segment(db, meta, &updates, &appended)
+}
+
+/// What one row carries once a change has named it, and the whole of
+/// what a change is allowed to say. The two masks are disjoint, so the
+/// order of the two halves does not matter and the row ends with
+/// exactly what the last statement to name it said.
+fn changed_word(
+    word: u64,
+    offset: u64,
+    add: u64,
+    remove: u64,
+    table: u32,
+    labels_of: &Labels,
+) -> Result<u64> {
+    let undeclared = add & !labels_of.declared;
+    if undeclared != 0 {
+        return Err(ZuError::InvalidArgument(format!(
+            "a label change puts {undeclared:#x} on a row of table {table}, \
+             which has not declared it"
+        )));
+    }
+    if remove & (1u64 << labels_of.primary) != 0 {
+        return Err(ZuError::InvalidArgument(format!(
+            "a label change takes the name of table {table} off one of its own rows"
+        )));
+    }
+    let after = (word | add) & !remove;
+    // A closed graph type is a promise about every element the graph
+    // holds, so it is checked here, where the label set the row ends
+    // with is known. The type an element belongs to is allowed to
+    // change, which is what a key label set change is; what is not
+    // allowed is ending up in none of them.
+    if let Some(ty) = labels_of.graph_type
+        && ty.holder(ElementKind::Node, after).is_none()
+    {
+        return Err(ZuError::gql(
+            codes::CG2000,
+            format!(
+                "the element at row {offset} of '{}' would carry {} after this change, and no element type of graph type '{}' describes a node carrying that",
+                labels_of.name,
+                spell(after, labels_of.names),
+                ty.name
+            ),
+        ));
+    }
+    Ok(after)
 }
 
 /// Merges one table's overlay tombstones with its persisted chain and
@@ -1180,6 +1274,32 @@ mod tests {
         id
     }
 
+    /// Puts a bitset onto a table a word at a time, which is how a test
+    /// holds a big one without spelling out a label list per row. The
+    /// caller has already declared every bit it sets.
+    fn store_words(db: &mut Zu1File, table: u32, words: &[u64]) {
+        let mut index = TableIndex::load(db).unwrap();
+        let mut directory = match index.get(table) {
+            Some(root) => {
+                let directory = load_props_at(db, root).unwrap();
+                free_chain(db, root).unwrap();
+                index.remove(table);
+                directory
+            }
+            None => PropsDirectory {
+                node_count: words.len() as u64,
+                columns: Vec::new(),
+                labels: None,
+            },
+        };
+        directory.labels = Some(write_segment(db, words).unwrap());
+        index.set(table, meta::write_chain(db, &directory.encode()).unwrap());
+        free_chain(db, db.db_header().table_index_root).unwrap();
+        let root = meta::write_chain(db, &index.encode()).unwrap();
+        db.db_header_mut().table_index_root = root;
+        db.checkpoint().unwrap();
+    }
+
     fn read_age(db: &mut Zu1File, person: u32, row: u64) -> u64 {
         let dir = load_props(db, person).unwrap().unwrap();
         let mut reader = PropsReader::new(dir);
@@ -1340,6 +1460,61 @@ mod tests {
         assert_eq!(read_name(&mut f.db, f.person, 0), b"ada", "props untouched");
         let path = dir.path().join("fold.zu1");
         drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A label change on a big table writes the chunk that holds the row
+    /// and leaves the rest of the bitset where it is. The blocks the
+    /// bitset already filled are the measure: the fold keeps the ones it
+    /// had no reason to write again, so the first one still points at the
+    /// same place afterwards.
+    #[test]
+    fn a_label_change_keeps_the_bitset_blocks_it_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("wide.zu1")).unwrap();
+        const ROWS: u64 = 100_000;
+        bulk_load_as(&mut db, "person", "knows", ROWS, &[(0, 1)]).unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.node_by_name("person").unwrap().id;
+        for i in 0..29 {
+            declare(&mut db, person, &format!("L{i}"));
+        }
+        // Rows carry scattered label sets rather than one label each, so
+        // the chunks come out bit packed at their full width and the
+        // bitset spans more than one block instead of folding down to a
+        // dictionary.
+        let word = |i: u64| 1 | (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) & 0x3FFF_FFFE;
+        let words: Vec<u64> = (0..ROWS).map(word).collect();
+        store_words(&mut db, person, &words);
+        let before = load_props(&mut db, person)
+            .unwrap()
+            .unwrap()
+            .labels
+            .unwrap();
+        assert!(before.blocks.len() > 1, "bitset spans one block only");
+        let mut wal = Wal::open(&dir.path().join("wide.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_labels(person, 5, 1 << 3, 0).unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let directory = load_props(&mut db, person).unwrap().unwrap();
+        let after = directory.labels.clone().unwrap();
+        assert_eq!(
+            after.blocks[0], before.blocks[0],
+            "the fold wrote the bitset again"
+        );
+        let mut reader = PropsReader::new(directory);
+        assert_eq!(
+            reader.label_word(&mut db, 5).unwrap().unwrap(),
+            word(5) | 1 << 3
+        );
+        assert_eq!(
+            reader.label_word(&mut db, 99_999).unwrap().unwrap(),
+            word(99_999)
+        );
+        let path = dir.path().join("wide.zu1");
+        drop(db);
         crate::verify(&path).unwrap();
     }
 

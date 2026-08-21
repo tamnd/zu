@@ -40,10 +40,18 @@ pub const MAGIC: [u8; 8] = [0xE5, 0x9B, 0xB3, b'Z', b'U', b'1', 0x00, 0x0A];
 pub const BLOCK_SIZE: u32 = 262_144;
 
 /// Current format version.
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// Version 2 moved a segment's chunk index from the front of the
+/// payload to the back and made it an extent per chunk rather than a
+/// running end, and moved the checksum from one value over the payload
+/// to one per block. That is what lets a commit write the chunks it
+/// changed instead of the columns it touched. A version 1 file cannot
+/// be read as a version 2 one and is refused by name rather than
+/// misread.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Oldest reader version that can open files we write.
-pub const MIN_READER_VERSION: u16 = 1;
+pub const MIN_READER_VERSION: u16 = 2;
 
 /// Walks the whole file checking every crc: file header, database
 /// headers, the catalog, the table index, and each rel table's group

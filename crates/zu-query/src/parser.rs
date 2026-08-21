@@ -428,34 +428,9 @@ const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
 /// wrong answer, since the path would then swallow the word and no
 /// schema of that name exists.
 const OPENS_A_CLAUSE: &[&str] = &[
-    "USE",
-    "VALUE",
-    "TABLE",
-    "BINDING",
-    "GRAPH",
-    "PROPERTY",
-    "MATCH",
-    "OPTIONAL",
-    "CALL",
-    "INSERT",
-    "MERGE",
-    "SET",
-    "REMOVE",
-    "DELETE",
-    "DETACH",
-    "NODETACH",
-    "UNWIND",
-    "FOR",
-    "FILTER",
-    "LET",
-    "WITH",
-    "ORDER",
-    "OFFSET",
-    "SKIP",
-    "LIMIT",
-    "FINISH",
-    "RETURN",
-    "NEXT",
+    "USE", "VALUE", "TABLE", "BINDING", "GRAPH", "PROPERTY", "MATCH", "OPTIONAL", "CALL", "INSERT",
+    "MERGE", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "UNWIND", "FOR", "FILTER", "LET",
+    "WITH", "ORDER", "OFFSET", "SKIP", "LIMIT", "FINISH", "RETURN", "NEXT",
 ];
 
 fn opens_a_clause(word: &str) -> bool {
@@ -6215,9 +6190,11 @@ mod tests {
         }
         // The equals is what says the type is over, so a definition
         // written without one has no type rather than a missing one.
-        assert!(parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
-            .ty
-            .is_none());
+        assert!(
+            parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
+                .ty
+                .is_none()
+        );
     }
 
     /// GP16. The `AT` clause stands in front of the query, ahead of the
@@ -6225,7 +6202,10 @@ mod tests {
     #[test]
     fn an_at_clause_names_the_schema_a_query_resolves_in() {
         for (source, want) in [
-            ("AT CURRENT_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Current),
+            (
+                "AT CURRENT_SCHEMA MATCH (p) RETURN p AS p",
+                SchemaRef::Current,
+            ),
             ("AT HOME_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Home),
             (
                 "AT /app MATCH (p) RETURN p AS p",

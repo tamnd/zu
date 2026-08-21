@@ -23,6 +23,7 @@ use std::path::Path;
 use zu::query::Value;
 use zu::session::Session;
 
+use crate::arrow::Export;
 use crate::case::{Case, Expect, Suite};
 use crate::value::{Cell, Tables, from_engine, same, show};
 
@@ -97,7 +98,23 @@ pub fn run(suites: &[Suite], dir: &Path) -> Report {
     let mut report = Report::default();
     for suite in suites {
         for case in &suite.cases {
-            report.ran.push(one(suite, case, dir));
+            let ran = one(suite, case, dir);
+            // A failure leaves its database behind, which is the one
+            // thing somebody reading the report will want to open.
+            // Everything else goes as it finishes, because a corpus of
+            // twelve hundred cases is twelve hundred files and holding
+            // them all until the run ends is gigabytes of a disk that
+            // has other work to do. The C runner does the same.
+            if ran.outcome != Outcome::Failed {
+                let path = dir.join(format!("{}-{}.zu", suite.name, case.name));
+                let _ = std::fs::remove_file(&path);
+                // The WAL sidecar goes with it. A database is `<db>`
+                // and its log is `<db>.wal`, and a log left beside a
+                // name the next run creates again is a log that run
+                // would adopt.
+                let _ = std::fs::remove_file(path.with_extension("zu.wal"));
+            }
+            report.ran.push(ran);
         }
     }
     report
@@ -179,8 +196,16 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
             // returns are rows of.
             let tables = Named(session.catalog());
             match compare(columns, rows, &got, &tables) {
-                None => ran(Outcome::Passed, String::new()),
                 Some(detail) => ran(Outcome::Failed, detail),
+                // The export is checked on the result the rows were
+                // read from rather than on a second run of the
+                // statement, because it is the same result a client
+                // exports: one statement, two ways of reading what it
+                // gave back.
+                None => match exported(&case.arrow, got, &tables, rows.len()) {
+                    None => ran(Outcome::Passed, String::new()),
+                    Some(detail) => ran(Outcome::Failed, detail),
+                },
             }
         }
     }
@@ -197,6 +222,100 @@ impl Tables for Named<'_> {
             .map(|t| t.name.as_str())
             .or_else(|| self.0.rel_by_id(table).map(|t| t.name.as_str()))
     }
+}
+
+/// The same names, in the shape the export asks for them.
+///
+/// The export keeps the two kinds apart and the encoding does not,
+/// because a node and an edge are two Arrow types with two struct
+/// shapes and one spelling in a case. Both answers come off the one
+/// catalog either way.
+#[cfg(feature = "arrow")]
+impl zu_arrow::Tables for Named<'_> {
+    fn node(&self, id: u32) -> Option<&str> {
+        self.0.node_by_id(id).map(|t| t.name.as_str())
+    }
+
+    fn rel(&self, id: u32) -> Option<&str> {
+        self.0.rel_by_id(id).map(|t| t.name.as_str())
+    }
+}
+
+/// What the export gave that the case did not want, or `None` when it
+/// gave what the case wants and when the case says nothing about it.
+///
+/// The result is taken rather than borrowed, which is the export that
+/// copies nothing and the one a client uses. It is also the end of the
+/// result: nothing reads rows out of it after this, which is why the
+/// row comparison happens first.
+#[cfg(feature = "arrow")]
+fn exported(
+    want: &Option<Export>,
+    result: zu::query::QueryResult,
+    tables: &Named<'_>,
+    rows: usize,
+) -> Option<String> {
+    use arrow::ffi::FFI_ArrowSchema;
+    use arrow::ffi_stream::ArrowArrayStreamReader;
+    use arrow::record_batch::RecordBatchReader;
+
+    let want = want.as_ref()?;
+    let table = match zu_arrow::Table::taken(result, tables) {
+        Ok(table) => table,
+        Err(why) => {
+            return match want {
+                Export::Refused => None,
+                Export::Columns(_) => Some(format!("arrow refused the result: {why}")),
+            };
+        }
+    };
+    let want = match want {
+        Export::Columns(fields) => fields,
+        Export::Refused => {
+            return Some("arrow exported the result where the case wants a refusal".to_string());
+        }
+    };
+    // Out through the C Data Interface and back in, rather than read
+    // off the arrays: the stream is what a client gets, and a schema
+    // that only exists as arrow's Rust types is not one anybody
+    // outside this process has seen.
+    let stream = table.into_stream(zu_arrow::BATCH);
+    let reader = match ArrowArrayStreamReader::try_new(stream) {
+        Ok(reader) => reader,
+        Err(why) => return Some(format!("arrow would not open the stream: {why}")),
+    };
+    let schema = match FFI_ArrowSchema::try_from(reader.schema().as_ref()) {
+        Ok(schema) => schema,
+        Err(why) => return Some(format!("arrow would not describe the schema: {why}")),
+    };
+    if let Some(detail) = crate::arrow::schema(&schema, want) {
+        return Some(detail);
+    }
+    let mut given = 0;
+    for batch in reader {
+        match batch {
+            Ok(batch) => given += batch.num_rows(),
+            Err(why) => return Some(format!("arrow would not give the rows: {why}")),
+        }
+    }
+    match given == rows {
+        true => None,
+        false => Some(format!(
+            "arrow gives {given} rows where the case wants {rows}"
+        )),
+    }
+}
+
+/// The same, for a build with no export in it, which checks the rows
+/// of a case and nothing about its `arrow:`.
+#[cfg(not(feature = "arrow"))]
+fn exported(
+    _want: &Option<Export>,
+    _result: zu::query::QueryResult,
+    _tables: &Named<'_>,
+    _rows: usize,
+) -> Option<String> {
+    None
 }
 
 /// Whether an error means the engine does not implement the statement

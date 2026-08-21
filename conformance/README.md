@@ -73,6 +73,7 @@ cases:
 | `columns` | case | with `rows` | The projected names, in order. The names are part of the answer. |
 | `rows` | case | with `columns` | The rows, in order. Written as `rows:` with nothing under it when the case expects none, which is a real expectation and needs a spelling. |
 | `raises` | case | no | A GQLSTATUS code the statement must raise. Mutually exclusive with `columns`. |
+| `arrow` | case | no | What the same result looks like on the way out through Arrow: the schema of the export, field by field, or `refused` for a result Arrow has no type for. |
 
 ## What a load looks like
 
@@ -131,6 +132,37 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 
 `LIST` is the one type a parameter cannot be today. The C ABI has `zu_bind_null`, `zu_bind_bool`, `zu_bind_i64`, `zu_bind_f64`, `zu_bind_str` and `zu_bind_temporal`, and no call that carries a composite, so a case binding a list would be a case the C runner could not run. The gap is in the ABI rather than in the engine, and the cases arrive when the call does.
 
+## What an export looks like
+
+A client that reads rows one at a time and a client that hands a million of them to a dataframe are the same client, and only the first of those two paths is covered by a case that asserts values. The other one has a contract of its own: a column of dates is a `Date32` and not a string of digits, a year-month duration is a month-day-nano interval because that is the interval every reader implements, a node is a struct of the table it is in and the row it is, and a time with an offset is refused rather than quietly moved to UTC. None of that shows up in a row.
+
+```yaml
+  - name: a-node-is-the-table-it-is-in-and-the-row-it-is
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "person#0"
+    arrow:
+      - name: n
+        format: "+s"
+        children:
+          - name: table
+            format: u
+          - name: offset
+            format: L
+```
+
+A field is a `name`, a `format`, and the fields under it when the format is a nested one. The format is the C Data Interface's own string, `l` for an int64 and `+s` for a struct, because that is the one spelling every language sees the same: a client in Python reads it off a pyarrow field, a client in C reads it out of the struct, and neither has to agree with the other about what to call a type first. A nested format is written with its fields and a flat one without them, and a case that gets that backwards is refused when the file loads rather than reported as a failure. A list has exactly one field under it and the case writes it out, because Arrow names it `item` and a client that named it `element` would export something no reader lines up with what another client wrote.
+
+`arrow: refused` is the other thing a case can say, for a result Arrow has no type for. Today that is a time with an offset, since Arrow has a time and a timestamp and nothing in between, and dropping the offset would move the value.
+
+What a runner checks is the schema and how many rows came back through the stream, against the same statement the rows were compared over. Values are not read back: a consumer that decoded every array by hand in each of nine languages would be nine new decoders under test, which is more of our own code and not more of the contract, and the rows the case already asserts are those same values by another road. The export is checked after the rows and not before, because the export takes the result and the strings a cell handed back go with it.
+
+A client whose language has no Arrow build reads the key and skips the check, which is what a runner built without the export does here too. That is a runner covering less of the corpus rather than a runner disagreeing with another one, and it is the reason the key is optional rather than a second file.
+
 ## What is in it
 
 | Suite | What it pins |
@@ -153,6 +185,7 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 | `pattern` | What a pattern selects: labels and inline properties, direction, an undirected walk, a quantified one, a subquery that only asks whether something exists, and the rows an optional match keeps. |
 | `result` | The shape of an answer rather than the values in it: what a column is named, how many rows come back, what paging and DISTINCT do to them, and where a grouping puts its boundary. |
 | `error` | The condition a statement raises, which is part of its answer rather than a message about it, so two engines that both refuse a statement can be compared on why they refused it. |
+| `arrow` | The result on the way out through the export rather than through the cell accessors: what Arrow type each column type becomes, what a node, an edge and a path look like as structs, and the one value the export refuses. |
 
 A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet. The few cases that write through a statement instead are the ones asking what a bound value looks like after a round trip through the store, and they declare their table the only way a statement can, which is a bare `INSERT` in `setup:` with the properties the case is about.
 
@@ -192,7 +225,7 @@ None of the three can be a parameter or a load column. A parameter and a column 
 
 `DECIMAL` and `BYTES` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1751 values counting the ones inside lists and paths, and both print them the same way.
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1794 values counting the ones inside lists and paths, and both print them the same way.
 
 ## What the Rust runner does not check
 

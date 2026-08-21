@@ -27,13 +27,17 @@
  * so that two clients disagreeing about a case is a diff rather than a
  * reading exercise, and CI diffs the two over every case and over
  * conformance/c/wrong, which is the failures the corpus cannot show
- * because it passes. Two places are outside that. A load that cannot go
- * in is refused by the ABI and reported in the ABI's words, because the
- * two runners refuse it in different places: the Rust one knows the
- * line the column was written on and the loader knows the column. And a
+ * because it passes. Three places are outside that. A load that cannot
+ * go in is refused by the ABI and reported in the ABI's words, because
+ * the two runners refuse it in different places: the Rust one knows the
+ * line the column was written on and the loader knows the column. A
  * cell holding a record is named rather than printed, since the
- * encoding has no spelling for one and a cv has no arm for one.
- * Neither can happen in a case that passes.
+ * encoding has no spelling for one and a cv has no arm for one. And an
+ * export the engine has no Arrow type for is reported in the ABI's
+ * words too, which are the same words with the ABI's own "invalid
+ * argument" in front of them, since a refusal reaches this side as a
+ * zu_error and reaches the other side as the export's own error. None
+ * of the three can happen in a case that passes.
  *
  * An outcome is one of three things. Passed and failed are obvious.
  * Unsupported is a statement the engine refuses with a GQLSTATUS in
@@ -446,6 +450,220 @@ static int compare(run *r, const zy_node *columns, const zy_node *rows, zu_resul
     if ((uint64_t)want_count != got_count) {
         return say(detail, len, "%lu rows where the case wants %lu", (unsigned long)got_count,
                    (unsigned long)want_count);
+    }
+    return 0;
+}
+
+/* ---- the export ----
+ *
+ * The same result on the way out through Arrow, which a case describes
+ * with `arrow:` and which crates/zu-corpus/src/arrow.rs says the whole
+ * of the why about. What is checked here is the schema, in the C Data
+ * Interface's own format strings, and how many rows came back through
+ * the stream: this side reads those strings out of the struct where the
+ * reference runner reads them off an FFI_ArrowSchema, and the two are
+ * the same bytes, which is the point of asserting the format string
+ * rather than a name for the type. */
+
+/* One field of the schema, as the case wrote it. The strings point into
+ * the document, which outlives the case, so only the arrays are the
+ * arena's. */
+typedef struct afield {
+    zy_str name;
+    zy_str format;
+    const struct afield *children;
+    size_t count;
+} afield;
+
+static int arrow_fields(run *r, const zy_node *node, const afield **out, size_t *count,
+                        char *detail, size_t len);
+
+static int arrow_field(run *r, const zy_node *node, afield *out, char *detail, size_t len) {
+    static const char *const KEYS[3] = {"name", "format", "children"};
+    const zy_node *name, *format, *children;
+    zy_str extra;
+
+    if (node->kind != ZY_MAP) {
+        return say(detail, len, "an Arrow field is a mapping of `name` and `format`");
+    }
+    extra = zy_unknown(node, KEYS, 3);
+    if (extra.ptr != NULL) {
+        return say(detail, len, "an Arrow field has no key \"%s\"", extra.ptr);
+    }
+    name = zy_get(node, "name");
+    format = zy_get(node, "format");
+    if (name == NULL || name->kind != ZY_SCALAR) {
+        return say(detail, len, "an Arrow field has a `name:`");
+    }
+    if (format == NULL || format->kind != ZY_SCALAR || format->text.len == 0) {
+        return say(detail, len, "an Arrow field has a `format:`");
+    }
+    out->name = name->text;
+    out->format = format->text;
+    out->children = NULL;
+    out->count = 0;
+    children = zy_get(node, "children");
+    if (children == NULL) {
+        return 0;
+    }
+    return arrow_fields(r, children, &out->children, &out->count, detail, len);
+}
+
+static int arrow_fields(run *r, const zy_node *node, const afield **out, size_t *count,
+                        char *detail, size_t len) {
+    afield *fields;
+    size_t i;
+
+    if (node->kind != ZY_SEQ) {
+        return say(detail, len, "`arrow:` is a sequence of fields");
+    }
+    fields = (afield *)slots(r, node->count, sizeof(afield));
+    if (fields == NULL) {
+        return say(detail, len, "the fields did not read");
+    }
+    for (i = 0; i < node->count; i++) {
+        if (arrow_field(r, &node->items[i], &fields[i], detail, len) != 0) {
+            return -1;
+        }
+    }
+    *out = fields;
+    *count = node->count;
+    return 0;
+}
+
+/* The fields under one place of the schema against the ones the case
+ * wrote, where the place is the dotted path of the field they are under
+ * and the empty one is the result itself. The first difference and not
+ * all of them, for the reason the row comparison gives. */
+static int arrow_schema(const char *prefix, struct ArrowSchema **got, size_t found,
+                        const afield *want, size_t count, char *detail, size_t len) {
+    char place[512];
+    size_t i;
+
+    if (prefix[0] == '\0') {
+        snprintf(place, sizeof place, "the result");
+    } else {
+        snprintf(place, sizeof place, "\"%s\"", prefix);
+    }
+    if (found != count) {
+        return say(detail, len, "arrow gives %lu fields in %s where the case wants %lu",
+                   (unsigned long)found, place, (unsigned long)count);
+    }
+    for (i = 0; i < count; i++) {
+        /* A field of a schema may carry no name at all, which is not
+         * something this export produces and is still not a reason to
+         * follow a NULL into a comparison. */
+        const char *name = got[i]->name != NULL ? got[i]->name : "";
+        const char *format = got[i]->format != NULL ? got[i]->format : "";
+        char path[512];
+        if (strcmp(name, want[i].name.ptr) != 0) {
+            return say(detail, len, "arrow field %lu in %s is named \"%s\" where the case wants \"%s\"",
+                       (unsigned long)(i + 1), place, name, want[i].name.ptr);
+        }
+        if (prefix[0] == '\0') {
+            snprintf(path, sizeof path, "%s", want[i].name.ptr);
+        } else {
+            snprintf(path, sizeof path, "%s.%s", prefix, want[i].name.ptr);
+        }
+        if (strcmp(format, want[i].format.ptr) != 0) {
+            return say(detail, len, "arrow field \"%s\" is \"%s\" where the case wants \"%s\"", path,
+                       format, want[i].format.ptr);
+        }
+        if (arrow_schema(path, got[i]->children, (size_t)got[i]->n_children, want[i].children,
+                         want[i].count, detail, len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* What the export gave that the case did not want, or 0 if the two
+ * agree.
+ *
+ * This spends the result, which is why it takes the handle through a
+ * pointer to it and why it runs after the rows have been compared:
+ * zu_result_arrow writes NULL back on every path and the buffers a cell
+ * string was borrowed from belong to the stream afterwards. The caller
+ * still frees what it has, which is then NULL and a no-op. */
+static int arrow_export(run *r, zu_result **result, const zy_node *arrow, uint64_t rows,
+                        char *detail, size_t len) {
+    struct ArrowArrayStream stream;
+    struct ArrowSchema schema;
+    struct ArrowArray batch;
+    const afield *want = NULL;
+    size_t count = 0;
+    int refused = 0, wrong;
+    uint64_t given = 0;
+    zu_status status;
+    zu_error *e = NULL;
+    refusal f;
+
+    if (arrow->kind == ZY_SCALAR) {
+        if (!zy_eq(arrow->text, "refused")) {
+            return say(detail, len, "`arrow:` is the columns the export gives, or `refused`");
+        }
+        refused = 1;
+    } else if (arrow_fields(r, arrow, &want, &count, detail, len) != 0) {
+        return -1;
+    }
+
+    status = zu_result_arrow(r->conn, result, 0, &stream, &e);
+    /* A library built without the export answers this and nothing else,
+     * and a runner that graded it would be grading how the library was
+     * built rather than what it does. The reference runner skips the
+     * same check for the same reason, so the two still agree. */
+    if (status == ZU_UNSUPPORTED) {
+        zu_error_free(e);
+        return 0;
+    }
+    if (status != ZU_OK) {
+        take(status, e, &f);
+        if (refused) {
+            return 0;
+        }
+        /* The one report here that is not word for word the reference
+         * runner's, for the reason at the top of this file: what the
+         * ABI hands back is the export's own account with the ABI's
+         * category in front of it. */
+        return say(detail, len, "arrow refused the result: %s", f.message);
+    }
+    if (refused) {
+        stream.release(&stream);
+        return say(detail, len, "arrow exported the result where the case wants a refusal");
+    }
+    if (stream.get_schema(&stream, &schema) != 0) {
+        const char *why = stream.get_last_error(&stream);
+        say(detail, len, "arrow would not describe the schema: %s", why != NULL ? why : "no reason");
+        stream.release(&stream);
+        return -1;
+    }
+    /* The stream's schema is the struct of the columns, so what the
+     * case wrote is compared against the fields under it. */
+    wrong = arrow_schema("", schema.children, (size_t)schema.n_children, want, count, detail, len);
+    schema.release(&schema);
+    if (wrong != 0) {
+        stream.release(&stream);
+        return -1;
+    }
+    for (;;) {
+        if (stream.get_next(&stream, &batch) != 0) {
+            const char *why = stream.get_last_error(&stream);
+            say(detail, len, "arrow would not give the rows: %s", why != NULL ? why : "no reason");
+            stream.release(&stream);
+            return -1;
+        }
+        /* A batch that was never filled is the end of the stream, which
+         * is how the interface says so rather than through a status. */
+        if (batch.release == NULL) {
+            break;
+        }
+        given += (uint64_t)batch.length;
+        batch.release(&batch);
+    }
+    stream.release(&stream);
+    if (given != rows) {
+        return say(detail, len, "arrow gives %lu rows where the case wants %lu",
+                   (unsigned long)given, (unsigned long)rows);
     }
     return 0;
 }
@@ -922,9 +1140,21 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         return ahead_of_the_engine(&f) ? OUT_UNSUPPORTED : OUT_FAILED;
     }
     /* The comparison happens before the result is freed, because a
-     * string that came back is borrowed from it. */
+     * string that came back is borrowed from it. The export happens
+     * after it and not before, because the export takes the result and
+     * those same strings go with it; what it leaves behind is a NULL
+     * the free below is a no-op on. */
     {
         outcome out = compare(r, columns, rows, result, detail, len) == 0 ? OUT_PASSED : OUT_FAILED;
+        const zy_node *arrow = zy_get(node, "arrow");
+        if (out == OUT_PASSED && arrow != NULL) {
+            const zy_node *want = NULL;
+            size_t count = 0;
+            (void)zy_seq_or_empty(rows, &want, &count);
+            if (arrow_export(r, &result, arrow, (uint64_t)count, detail, len) != 0) {
+                out = OUT_FAILED;
+            }
+        }
         zu_result_free(result);
         return out;
     }

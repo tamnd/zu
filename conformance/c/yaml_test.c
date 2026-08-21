@@ -325,8 +325,8 @@ static void what_the_reader_does_not_read_it_refuses_and_says_where(void) {
  * into a shape no runner can walk fails on the machine of whoever wrote
  * it rather than in nine client repositories. */
 static const char *const file_keys[] = {"schema", "suite", "doc", "load", "cases"};
-static const char *const case_keys[] = {"name",  "doc",     "setup", "params",
-                                        "query", "columns", "rows",  "raises"};
+static const char *const case_keys[] = {"name",   "doc",  "setup",  "params", "query",
+                                        "columns", "rows", "raises", "arrow"};
 
 static size_t read_case_file(const char *path) {
     char err[512];

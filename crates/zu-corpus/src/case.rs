@@ -16,6 +16,7 @@
 //! what came back. A client that decodes a date correctly and encodes
 //! it a day early passes every case that has no parameters in it.
 
+use crate::arrow::{self, Export};
 use crate::load::Load;
 use crate::value::{self, Cell};
 use crate::yaml::{self, Node};
@@ -59,6 +60,12 @@ pub struct Case {
     pub params: Vec<(String, Value)>,
     pub query: String,
     pub expect: Expect,
+    /// What the same result looks like on the way out through Arrow,
+    /// for a case that says. Most do not: the export gives one answer
+    /// per column type and a handful of cases pin every one of them,
+    /// so the rest would be repeating a type the corpus already
+    /// covers.
+    pub arrow: Option<Export>,
     pub line: usize,
 }
 
@@ -153,7 +160,7 @@ fn case(node: &Node) -> Result<Case, String> {
     }
     if let Some(key) = node
         .unknown(&[
-            "name", "doc", "setup", "params", "query", "columns", "rows", "raises",
+            "name", "doc", "setup", "params", "query", "columns", "rows", "raises", "arrow",
         ])
         .first()
     {
@@ -242,6 +249,28 @@ fn case(node: &Node) -> Result<Case, String> {
         )));
     }
 
+    let export = node.get("arrow").map(arrow::parse).transpose()?;
+    match (&expect, &export) {
+        // A statement that raises produces no result, so there is
+        // nothing for an export to be about.
+        (Expect::Raises(_), Some(_)) => {
+            return Err(at(
+                "a case that raises has no result, and an export is what a result gives"
+                    .to_string(),
+            ));
+        }
+        (Expect::Rows { columns, .. }, Some(Export::Columns(fields)))
+            if fields.len() != columns.len() =>
+        {
+            return Err(at(format!(
+                "an export of {} columns against {} the statement projects",
+                fields.len(),
+                columns.len()
+            )));
+        }
+        _ => {}
+    }
+
     Ok(Case {
         name,
         doc,
@@ -249,6 +278,7 @@ fn case(node: &Node) -> Result<Case, String> {
         params,
         query,
         expect,
+        arrow: export,
         line,
     })
 }

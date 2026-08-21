@@ -15,6 +15,17 @@ harness = false
 [dependencies]
 zu.workspace = true
 zu-common.workspace = true
+# The export the `arrow:` of a case is about. It is a feature rather
+# than a plain dependency because it costs a megabyte to link and the
+# corpus is read by tools that only want the cases; on by default,
+# since a runner that skips the export checks part of the corpus
+# without saying so.
+zu-arrow = { workspace = true, features = ["ffi"], optional = true }
+arrow = { workspace = true, features = ["ffi"], optional = true }
+
+[features]
+default = ["arrow"]
+arrow = ["dep:zu-arrow", "dep:arrow"]
 
 [dev-dependencies]
 tempfile.workspace = true

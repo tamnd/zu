@@ -91,8 +91,8 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<Vec<u64>> {
         )));
     }
     let mut offsets = Vec::with_capacity(count as usize);
-    for raw in bytes[10..].chunks_exact(8) {
-        let offset = u64::from_le_bytes(raw.try_into().unwrap());
+    for raw in bytes[10..].as_chunks::<8>().0 {
+        let offset = u64::from_le_bytes(*raw);
         if let Some(&last) = offsets.last()
             && offset <= last
         {

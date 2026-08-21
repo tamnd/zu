@@ -14,12 +14,13 @@
 //! The table is two million people with a `born` date strided over
 //! forty years, a `shift` day-time duration taking one of seven values,
 //! and an `age` column that is the same filter written over a number.
-//! Six queries run over it: a bound on the date, a selective bound on
+//! Eight queries run over it: a bound on the date, a selective bound on
 //! the same column, an equality on the duration, a grouping keyed by
 //! the duration, an equality on a duration a length of time was added
-//! to, and the integer bound, which is what the date bound is measured
-//! against, since the two do the same work and the difference between
-//! them is whatever the lane costs.
+//! to, the length of time between the stored date and a fixed one
+//! counted each of the two ways, and the integer bound, which is what
+//! the date bound is measured against, since the two do the same work
+//! and the difference between them is whatever the lane costs.
 //!
 //! Each one runs twice, once through the pipeline and once with
 //! ZU_EXEC2=0, which is where all of them ran before this change.
@@ -161,8 +162,14 @@ fn main() {
     let one_shift = (0..NODES)
         .filter(|&i| shift_of(i) == 3_600_000_000_000)
         .count() as i64;
+    // 2008-12-01, which is the last day a whole month back from
+    // 2009-01-01, December having thirty one of them. A row on or
+    // before it is a month or more away and a row after it is less, so
+    // this is the exact count the month bench asks for without a
+    // calendar being written out here.
+    let a_month_back = (0..NODES).filter(|&i| born_of(i) <= 14_214).count() as i64;
 
-    let cases: [(&str, &str, i64, bool); 6] = [
+    let cases: [(&str, &str, i64, bool); 8] = [
         (
             "date bound",
             "MATCH (p:person) WHERE p.born < DATE '1990-01-01' RETURN count(p) AS n",
@@ -198,6 +205,27 @@ fn main() {
         // more than it does. Two durations of a kind are two counts of
         // the same unit, so the sum is the integer sum and the pair
         // reads as the cost of the arithmetic rather than of the lane.
+        // The length of time from the stored date to a fixed one,
+        // counted each of the two ways. The nanosecond count is a
+        // multiplication and a subtraction per row and nothing else.
+        // The month count is a walk over the calendar, which is real
+        // work per row and is here to be seen costing it rather than
+        // assumed away: months are of different lengths, so there is no
+        // scaling that turns one count into the other.
+        (
+            "duration between, in nanoseconds",
+            "MATCH (p:person) WHERE DURATION_BETWEEN(p.born, DATE '2009-01-01') \
+             > DURATION 'PT0S' RETURN count(p) AS n",
+            NODES as i64 - rare,
+            false,
+        ),
+        (
+            "duration between, in months",
+            "MATCH (p:person) WHERE DURATION_BETWEEN(p.born, DATE '2009-01-01') YEAR TO MONTH \
+             >= DURATION 'P1M' RETURN count(p) AS n",
+            a_month_back,
+            false,
+        ),
         (
             "duration arithmetic",
             "MATCH (p:person) WHERE p.shift + DURATION 'PT1H' = DURATION 'PT2H' \

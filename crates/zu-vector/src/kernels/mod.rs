@@ -15,6 +15,7 @@ mod hash;
 mod math;
 mod setops;
 mod strings;
+mod temporal;
 
 pub use agg::{count_valid, max_i64, min_i64, sum_f64, sum_i64};
 pub use arith::{BinOp, binary};
@@ -27,3 +28,4 @@ pub use strings::{
     StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet, cut, element_ids, fold, length, normalize,
     normalized, trim,
 };
+pub use temporal::duration_between;

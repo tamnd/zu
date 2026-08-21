@@ -718,15 +718,25 @@ impl SqliteStore {
     /// when another connection commits, `total_changes` when this one
     /// writes, so the sum advances on every mutation from anywhere.
     pub fn epoch(&self) -> Result<u64> {
-        let data_version: u64 = self
-            .conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .map_err(sql_err)?;
-        let own: u64 = self
-            .conn
-            .query_row("SELECT total_changes()", [], |row| row.get(0))
-            .map_err(sql_err)?;
-        Ok(data_version + own)
+        // Read as what SQLite stores, which is a signed 64 bit integer:
+        // rusqlite 0.40 stopped reading a column straight into a u64
+        // and it is right to, since no column can hold the top half of
+        // one. Both of these are counts that start at zero and go up,
+        // so the widening loses nothing, and a negative would mean the
+        // pragma answered something that is not a count at all rather
+        // than a count this cannot represent.
+        let counter = |sql: &'static str| -> Result<u64> {
+            let raw: i64 = self
+                .conn
+                .query_row(sql, [], |row| row.get(0))
+                .map_err(sql_err)?;
+            u64::try_from(raw).map_err(|_| {
+                ZuError::Io(std::io::Error::other(format!(
+                    "{sql} answered {raw}, which is not a count"
+                )))
+            })
+        };
+        Ok(counter("PRAGMA data_version")? + counter("SELECT total_changes()")?)
     }
 
     /// Checkpoints and truncates the WAL, the whole of this engine's

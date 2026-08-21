@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "Apache-2.0"
 repository = "https://github.com/tamnd/zu"
 authors = ["Tam Nguyen <tamnd87@gmail.com>"]
@@ -29,9 +29,9 @@ zu-corpus = { path = "crates/zu-corpus" }
 thiserror = "2"
 crc32c = "0.6"
 zstd = "0.13"
-ruzstd = "0.8"
+ruzstd = "0.9"
 object_store = { version = "0.14", default-features = false }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 arrow-array = "59"
 arrow-schema = "59"

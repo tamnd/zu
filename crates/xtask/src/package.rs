@@ -343,6 +343,40 @@ fn dashed(option: &str) -> String {
     }
 }
 
+/// rustc's list as CMake reads a list, which is not one item per word.
+///
+/// A semicolon list is items, and CMake decides per item what it is:
+/// one that starts with a dash is a flag and goes to the linker as
+/// written, and one that does not is a library name and reaches the
+/// linker as `-l` and the name. `-framework CoreFoundation` is two
+/// words and one item, so splitting it on the space hands CMake a flag
+/// and a library, and what comes out the far end is `-framework
+/// -lCoreFoundation` and a link that stops on a framework by that name
+/// not existing (#493). pkg-config has the opposite rule, which is why
+/// the two fields are built from the same list in different shapes.
+///
+/// Anything that takes the next word this way belongs here, and on the
+/// three platforms this ships to `-framework` is the whole of it: MSVC
+/// writes its options with the value attached after a colon and the ELF
+/// targets print bare `-l` names.
+fn cmake_items(syslibs: &[String]) -> Vec<String> {
+    let mut items: Vec<String> = Vec::with_capacity(syslibs.len());
+    let mut rest = syslibs.iter();
+    while let Some(option) = rest.next() {
+        match (option.as_str(), rest.clone().next()) {
+            // A trailing `-framework` with nothing after it is rustc
+            // printing something this does not understand, and passing
+            // it on unchanged says so at the link rather than here.
+            ("-framework", Some(name)) => {
+                items.push(format!("-framework {name}"));
+                rest.next();
+            }
+            _ => items.push(option.clone()),
+        }
+    }
+    items
+}
+
 /// One platform's package, laid out and written.
 #[derive(Debug, Clone)]
 pub struct Package<'a> {
@@ -461,13 +495,14 @@ impl<'a> Package<'a> {
             "    IMPORTED_LOCATION \"{prefix}/lib/{}\"\n",
             self.platform.staticlib
         ));
-        // As rustc printed them, up to the spelling `dashed` fixes,
-        // because a link item CMake does not recognize is passed through
-        // as written and what rustc printed is already the flag the
-        // linker wants on every platform.
+        // As rustc printed them, up to the spelling `dashed` fixes and
+        // the words `cmake_items` keeps together, because a link item
+        // CMake does not recognize is passed through as written and what
+        // rustc printed is already the flag the linker wants on every
+        // platform.
         out.push_str(&format!(
             "    INTERFACE_LINK_LIBRARIES \"{}\"\n",
-            self.syslibs.join(";")
+            cmake_items(&self.syslibs).join(";")
         ));
         out.push_str(&format!(
             "    INTERFACE_INCLUDE_DIRECTORIES \"{prefix}/include\")\n"
@@ -863,6 +898,42 @@ mod tests {
                 .cmake_config()
                 .contains("INTERFACE_LINK_LIBRARIES \"-lgcc_s;-lc;-lm\"")
         );
+    }
+
+    /// A framework is two words to the linker and one thing to name, and
+    /// each generated file has its own idea of where a thing ends.
+    #[test]
+    fn a_framework_reaches_both_build_systems_as_one_thing() {
+        let (table, target) = package("aarch64-apple-darwin");
+        let platform = table.platform(&target).expect("a row");
+        // What rustc prints for this target, which has the pair in the
+        // middle of it rather than at either end.
+        let package = Package::new(
+            platform,
+            "0.5.0",
+            "-liconv -framework CoreFoundation -lSystem -lc -lm",
+        );
+        // pkg-config reads a line of words, so the pair stays two of
+        // them and the field is what rustc said.
+        assert!(
+            package
+                .pkg_config()
+                .contains("Libs.private: -liconv -framework CoreFoundation -lSystem -lc -lm\n"),
+            "{}",
+            package.pkg_config()
+        );
+        // CMake reads a list, and the pair is one item of it. Split
+        // across two, the name is an item with no dash on it, which
+        // CMake sends to the linker as `-lCoreFoundation` behind a
+        // `-framework` that now has nothing to name.
+        let cmake = package.cmake_config();
+        assert!(
+            cmake.contains(
+                "INTERFACE_LINK_LIBRARIES \"-liconv;-framework CoreFoundation;-lSystem;-lc;-lm\""
+            ),
+            "{cmake}"
+        );
+        assert!(!cmake.contains("-framework;"), "{cmake}");
     }
 
     /// The one property every file in the layout depends on: the `.pc`

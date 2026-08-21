@@ -626,6 +626,16 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE ID(p) < 5 RETURN upper(ELEMENT_ID(p)) AS e ORDER BY e",
         "MATCH (a:person)-[:knows]->(b:person) \
          WHERE ID(a) < 20 RETURN ELEMENT_ID(a) AS x, ELEMENT_ID(b) AS y ORDER BY x, y",
+        // SIZE over a string, which counts what CHAR_LENGTH counts and
+        // runs the same kernel. A column, an order, a group key, a
+        // condition, and one over a string the statement itself made,
+        // so the kernel is reached through a register as well as
+        // straight off a stored column.
+        "MATCH (p:person) RETURN size(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE size(p.name) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN size(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE size(upper(p.name)) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE size(ELEMENT_ID(p)) > 6 RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and

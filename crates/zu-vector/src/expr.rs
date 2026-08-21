@@ -33,7 +33,18 @@ pub enum OwnedValue {
     Int(i64),
     Float(f64),
     Str(Box<[u8]>),
-    Node { table: u16, row: u64 },
+    Node {
+        table: u16,
+        row: u64,
+    },
+    /// A temporal value: one word, and the lane that says what the
+    /// count in it is a count of. The lane is on the constant rather
+    /// than worked out from the word because nothing about a number of
+    /// days tells you it is days.
+    Lane {
+        phys: PhysType,
+        word: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -411,6 +422,7 @@ fn const_vector(arena: &mut MorselArena, v: &OwnedValue, len: usize) -> Result<V
             len,
         ),
         OwnedValue::Str(bytes) => const_str(arena, bytes, len),
+        OwnedValue::Lane { phys, word } => ValueVector::constant(arena, *phys, *word, len),
         OwnedValue::Bool(_) | OwnedValue::Null => {
             return Err(ZuError::InvalidArgument(
                 "bool and null constants land with the executor port".into(),

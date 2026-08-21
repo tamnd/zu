@@ -1387,3 +1387,60 @@ cases:
       - values:
           - type: STRING
             value: "di"
+
+  - name: grouping-on-a-stored-duration
+    doc: A stored duration used as a grouping key, which asks the engine to hold the value in whatever it groups by and hand it back as a duration rather than as the count of nanoseconds underneath it. Every row of this column is different, so what the case pins is the value and not the counting.
+    query: MATCH (n:person) RETURN n.took AS d, count(*) AS c ORDER BY d
+    columns:
+      - d
+      - c
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: DURATION
+            value: "PT1S"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: DURATION
+            value: "P1D"
+          - type: INT64
+            value: "1"
+
+  - name: ordering-by-a-stored-date
+    doc: The rows sorted by a stored date, which orders by the instant rather than by the way the date is written: the earliest here is written with the smallest digits and the latest with the largest, so a client sorting the text passes, and the leap day sits between them where only a client sorting the value puts it.
+    query: MATCH (n:person) RETURN n.name AS who ORDER BY n.born DESC
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: a-stored-date-in-a-filter-across-an-edge
+    doc: A date on the far side of an edge, compared against a literal. The value has to survive the walk as well as the read, which is a different path through an engine than a filter on the pattern's first node.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE b.born > DATE '1980-01-01' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"

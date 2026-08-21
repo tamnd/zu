@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use zu_common::types::LogicalType;
-use zu_common::{IdMap, Result};
+use zu_common::{IdMap, Result, Temporal};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey, UnaryOp};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundItem, BoundQuery, Cut, Func, Math, Schema, TableFunc, Trim,
@@ -25,7 +25,7 @@ use zu_query::binder::{
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{
-    ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
+    ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, TemporalLane, ZonePred,
 };
 use zu_vector::{
     BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
@@ -834,6 +834,16 @@ fn is_window(node: &LogicalPlan) -> bool {
 /// one group. Neither is a group anybody writes on purpose, and a
 /// stored column can hold both, so the grouping goes back to the
 /// engine that already agrees with itself about them.
+/// A temporal value as a constant of its lane, `None` for a zoned one,
+/// which is two numbers and does not fit a lane.
+fn lane_const(t: &Temporal) -> Option<OwnedValue> {
+    let lane = TemporalLane::of(&t.logical_type())?;
+    Some(OwnedValue::Lane {
+        phys: lane.phys(),
+        word: lane.word(t)?,
+    })
+}
+
 fn keyable(r: ScalarRef) -> bool {
     !matches!(
         r,
@@ -4414,6 +4424,7 @@ impl Compiler<'_> {
                     ColType::Int => PhysType::Int64,
                     ColType::Float => PhysType::Float64,
                     ColType::Str => PhysType::Str,
+                    ColType::Temporal(lane) => lane.phys(),
                 },
             ),
             ScalarRef::Node { .. } => return Ok(None),
@@ -4467,10 +4478,22 @@ impl Compiler<'_> {
             BoundExpr::Literal(Literal::Str(s)) => {
                 b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some)
             }
+            // A temporal literal is the word its lane rides in, which is
+            // what the column it is compared against holds. A zoned one
+            // has no lane and declines here, the same way a zoned column
+            // never resolves in the first place.
+            BoundExpr::Literal(Literal::Temporal(t)) => match lane_const(t) {
+                Some(v) => b.push_const(v).map(Some),
+                None => Ok(None),
+            },
             BoundExpr::Param(ix) => match self.params.get(*ix) {
                 Some(Value::Int(n)) => b.push_const(OwnedValue::Int(*n)).map(Some),
                 Some(Value::Float(f)) => b.push_const(OwnedValue::Float(*f)).map(Some),
                 Some(Value::Str(s)) => b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some),
+                Some(Value::Temporal(t)) => match lane_const(t) {
+                    Some(v) => b.push_const(v).map(Some),
+                    None => Ok(None),
+                },
                 _ => Ok(None),
             },
             // A property, or a variable that stands for a column: the
@@ -5007,6 +5030,7 @@ impl ProgBuilder {
             OwnedValue::Int(_) => PhysType::Int64,
             OwnedValue::Float(_) => PhysType::Float64,
             OwnedValue::Str(_) => PhysType::Str,
+            OwnedValue::Lane { phys, .. } => *phys,
             _ => PhysType::Int64,
         };
         let dst = self.push_type(ty)?;

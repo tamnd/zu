@@ -68,6 +68,15 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
         })
         .collect();
     let tag_refs: Vec<&[u8]> = tags.iter().map(|v| v.as_slice()).collect();
+    // The temporal lanes: a date and a day-time duration, which are the
+    // two shapes of the four that a query is most likely to ask about.
+    // The dates run either side of the epoch so that the sign of the
+    // count is exercised rather than assumed away, and the durations
+    // repeat so that grouping on one has groups to make.
+    let born: Vec<i32> = (0..N).map(|i| (i as i32 * 97) - 100_000).collect();
+    let shift: Vec<i64> = (0..N)
+        .map(|i| ((i % 7) as i64) * 3_600_000_000_000)
+        .collect();
     store_props(
         &mut db,
         "person",
@@ -76,6 +85,11 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
             ("score", PropValues::Int(&score)),
             ("name", PropValues::Str(&name_refs)),
             ("tag", PropValues::Str(&tag_refs)),
+            ("born", PropValues::Date(&born)),
+            (
+                "shift",
+                PropValues::Duration(zu_common::DurationKind::DayTime, &shift),
+            ),
         ],
     )
     .unwrap();
@@ -1085,6 +1099,25 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
          AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age AND c.id > 3 }) \
          RETURN count(*) AS n",
+        // The temporal lanes. A date is days and a duration is a count
+        // of its own unit, and both ride the word an integer rides, so
+        // what these check is that the meaning survives the trip: the
+        // filter compares counts, the projection hands back values, and
+        // the group keys off a word.
+        "MATCH (p:person) WHERE p.born < DATE '1970-01-01' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.born >= DATE '1980-06-15' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.born = DATE '1970-01-02' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age = 13 RETURN p.born AS born",
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.born AS born ORDER BY id",
+        "MATCH (p:person) WHERE p.shift = DURATION 'PT3H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 30 RETURN p.shift AS shift, count(p) AS n ORDER BY shift",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 AND b.born > DATE '1970-01-01' \
+         RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.id < 50 RETURN DISTINCT p.shift AS shift ORDER BY shift",
+        "MATCH (p:person) WHERE p.id < 50 RETURN p.born AS born ORDER BY born DESC LIMIT 5",
+        "MATCH (p:person) RETURN count(p.born) AS n",
+        "MATCH (p:person) WHERE p.born < DATE '1970-01-01' RETURN p.born AS born ORDER BY born \
+         LIMIT 3",
     ]
 }
 
@@ -1093,6 +1126,14 @@ fn covered_queries() -> &'static [&'static str] {
 /// to. Sharded the same way and for the same reason.
 fn fallback_queries() -> &'static [&'static str] {
     &[
+        // An extreme or a total over a temporal column. The
+        // accumulators hold words and answer integers, so a minimum
+        // over a column of days would come back as a number of days
+        // rather than as the date it stands for. Only the count, which
+        // answers a number whatever it counted, is claimed.
+        "MATCH (p:person) RETURN min(p.born) AS d",
+        "MATCH (p:person) RETURN max(p.born) AS d",
+        "MATCH (p:person) RETURN min(p.shift) AS d",
         // ORDER BY over something the projection does not return has
         // no output column to read, so it stays with the old engine.
         "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",

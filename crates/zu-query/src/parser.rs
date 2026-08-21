@@ -1172,9 +1172,13 @@ impl Parser<'_> {
     /// left belongs to somebody else, which is the semicolon after the
     /// statement, the `NEXT` that hands its result to the statement
     /// behind it, and the conjunction that joins it to another operand.
+    /// The closing brace is here because a statement may be written
+    /// inside a block, and the brace that ends the block ends the
+    /// statement in it as surely as the end of the text would.
     fn at_statement_end(&self) -> bool {
         self.peek().is_none()
             || self.at(&TokenKind::Semicolon)
+            || self.at(&TokenKind::RBrace)
             || self.at_kw("NEXT")
             || self.at_conjunction()
     }
@@ -1427,6 +1431,41 @@ impl Parser<'_> {
         Ok(query)
     }
 
+    /// The variable scope clause of an inline call (ISO 13.4), which
+    /// says what the block is allowed to read of the row it runs for.
+    ///
+    /// `None` is a block written with no clause at all and `Some` is
+    /// the list, which may be empty: `CALL () { ... }` is a block that
+    /// reads nothing, and it is written that way on purpose rather than
+    /// by leaving the parentheses off.
+    fn parse_variable_scope(&mut self) -> Result<Option<Vec<String>>> {
+        if !self.eat(&TokenKind::LParen) {
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            names.push(self.expect_name("a variable name in the scope of a CALL")?);
+            while self.eat(&TokenKind::Comma) {
+                names.push(self.expect_name("a variable name in the scope of a CALL")?);
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Some(names))
+    }
+
+    /// The block of an inline call: a whole query between braces.
+    ///
+    /// Unlike the query inside a `VALUE` or an `EXISTS` it need not end
+    /// with a `RETURN`, because a block that returns nothing is a
+    /// perfectly good one. It says the row it ran for goes on unchanged
+    /// or, where the block wrote something, that the writing happened.
+    fn parse_call_block(&mut self) -> Result<Query> {
+        self.expect(&TokenKind::LBrace)?;
+        let (query, _) = self.parse_query_body()?;
+        self.expect(&TokenKind::RBrace)?;
+        Ok(query)
+    }
+
     /// The body of a composite query and how its last statement ended,
     /// stopping wherever the operands run out. What may follow is the
     /// caller's business: the end of the text for a statement, a
@@ -1593,6 +1632,19 @@ impl Parser<'_> {
                 }
                 clauses.push(Clause::Delete { targets, detach });
             } else if self.eat_kw("CALL") {
+                // Which of the two calls this is, read off the one
+                // token after the word. A block or a scope clause is
+                // the inline call, and a name is the table function,
+                // there being nothing else a call can start with.
+                if self.at(&TokenKind::LBrace) || self.at(&TokenKind::LParen) {
+                    let scope = self.parse_variable_scope()?;
+                    let body = self.parse_call_block()?;
+                    clauses.push(Clause::CallInline {
+                        scope,
+                        body: Box::new(body),
+                    });
+                    continue;
+                }
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
                 let mut args = Vec::new();
@@ -6393,6 +6445,58 @@ mod tests {
                 ("distance".to_string(), None),
             ]
         );
+    }
+
+    /// The word CALL starts two different clauses and the one token
+    /// after it is what tells them apart, so the three ways an inline
+    /// call is written are read here beside the table function they
+    /// share a keyword with.
+    #[test]
+    fn an_inline_call_is_a_block_and_what_it_may_read() {
+        for (source, want) in [
+            ("MATCH (a) CALL { MATCH (b) RETURN b } RETURN a", None),
+            (
+                "MATCH (a) CALL (a) { MATCH (a)-[:knows]->(b) RETURN b } RETURN a",
+                Some(vec!["a".to_string()]),
+            ),
+            (
+                "MATCH (a) CALL () { MATCH (b) RETURN b } RETURN a",
+                Some(Vec::new()),
+            ),
+        ] {
+            let q = parsed(source);
+            let Clause::CallInline { scope, body } = &q.clauses()[1] else {
+                panic!("an inline CALL in {source}");
+            };
+            assert_eq!(*scope, want, "{source}");
+            assert!(body.result().is_some(), "{source}");
+        }
+    }
+
+    /// The block is part of the text, so what the query names includes
+    /// what the block names. The table an INSERT writes is declared off
+    /// this walk, and a block is not a place a write hides in.
+    #[test]
+    fn the_clauses_of_a_query_include_the_clauses_of_a_block() {
+        let q = parsed("MATCH (a:person) CALL (a) { INSERT (b:pet) } RETURN a");
+        assert_eq!(q.clauses().len(), 3);
+        assert!(
+            q.clauses()
+                .iter()
+                .any(|c| matches!(c, Clause::Insert { .. })),
+            "the INSERT inside the block"
+        );
+    }
+
+    /// A block need not end with a RETURN, which is what makes it
+    /// different from the query inside a VALUE or an EXISTS.
+    #[test]
+    fn a_block_that_returns_nothing_parses() {
+        let q = parsed("MATCH (a:person) CALL (a) { INSERT (b:pet) } RETURN a");
+        let Clause::CallInline { body, .. } = &q.clauses()[1] else {
+            panic!("an inline CALL");
+        };
+        assert!(body.result().is_none());
     }
 
     #[test]

@@ -2567,6 +2567,7 @@ fn bind_linear(
         captures: Vec::new(),
         groups: HashMap::new(),
         forked: BTreeSet::new(),
+        hidden: Vec::new(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -2671,6 +2672,17 @@ struct Binder<'a> {
     /// because a binding nothing reads is a binding nothing can tell
     /// apart from any other.
     forked: BTreeSet<String>,
+    /// The names an enclosing `CALL` scope clause took out of reach,
+    /// and the slots they are in.
+    ///
+    /// A block that may not read a name still runs on a row that holds
+    /// it, and the clauses after the call read it again, so the value
+    /// has to come along through the block whether or not the block can
+    /// see it. Every place that asks what the row carries asks the
+    /// scope, which is the right question everywhere else, so this is
+    /// what the scope has stopped answering: not a second scope, a note
+    /// of what was put away and where.
+    hidden: Vec<(String, usize)>,
 }
 
 /// A group variable: what the elements are and where the row holds them.
@@ -2947,6 +2959,284 @@ impl Binder<'_> {
         })
     }
 
+    /// Binds `CALL { ... }`, the inline procedure call of ISO 13.2 and
+    /// features GP01, GP02 and GP03.
+    ///
+    /// The block binds into the statement around it rather than into a
+    /// plan of its own, and that is the whole design. A block runs once
+    /// for each row that reaches it and reads that row, which is what a
+    /// clause standing there does anyway, so the clauses of the block
+    /// are the clauses of the statement and the optimizer sees one
+    /// query. The plan a three deep nest produces is the plan the
+    /// flattened text produces, character for character, because after
+    /// this function there is no nest left to see.
+    ///
+    /// What the scope clause says is settled here and costs nothing at
+    /// runtime. A name the block may not read is a name the binder
+    /// cannot find, so the block is refused while it is being read; the
+    /// rows go on carrying every value they carried, because the
+    /// clauses after the call still read them.
+    ///
+    /// What the block's `RETURN` names is added to the row rather than
+    /// put in place of it, which is the difference between this and a
+    /// `WITH`, and it binds the way a `LET` binds: the names in hand go
+    /// through the projection and the new ones follow them.
+    fn bind_call_inline(
+        &mut self,
+        scope: &Option<Vec<String>>,
+        body: &ast::Query,
+    ) -> Result<BoundClause> {
+        let simple = self.splicable(body)?;
+        let outer_scope = self.scope.clone();
+        let outer_groups = std::mem::take(&mut self.groups);
+        let outer_forked = std::mem::take(&mut self.forked);
+        // The row is still whole underneath; this is only what the
+        // block is allowed to see of it.
+        let put_away = self.hidden.len();
+        if let Some(names) = scope {
+            let mut narrowed = HashMap::new();
+            for name in names {
+                let Some(&slot) = outer_scope.get(name) else {
+                    return Err(invalid(format!(
+                        "the scope of a CALL names '{name}', which nothing in front of it bound: name a variable the statement already has, or leave the parentheses off and the block reads them all"
+                    )));
+                };
+                narrowed.insert(name.clone(), slot);
+            }
+            for (name, &slot) in &outer_scope {
+                if !narrowed.contains_key(name) {
+                    self.hidden.push((name.clone(), slot));
+                }
+            }
+            self.scope = narrowed;
+        } else {
+            self.groups.clone_from(&outer_groups);
+            self.forked.clone_from(&outer_forked);
+        }
+        // The names the block itself binds start here, which is what
+        // `RETURN *` stands for and what tells a returned name from a
+        // name the row already carried.
+        let own = self.variables.len();
+
+        let mut bound = Vec::new();
+        let outcome = (|| -> Result<()> {
+            for clause in &simple.clauses {
+                bound.push(self.bind_clause(clause)?);
+                bound.append(&mut self.pending);
+            }
+            Ok(())
+        })();
+        // A block that failed to bind leaves the statement's scope as
+        // it found it, so the message the caller gets is about the
+        // block and not about everything after it.
+        if let Err(e) = outcome {
+            self.scope = outer_scope;
+            self.groups = outer_groups;
+            self.forked = outer_forked;
+            self.hidden.truncate(put_away);
+            return Err(e);
+        }
+
+        let escaping = match &simple.result {
+            Some(projection) => self.bind_call_result(projection, own)?,
+            None => Vec::new(),
+        };
+        self.scope = outer_scope;
+        self.groups = outer_groups;
+        self.forked = outer_forked;
+        self.hidden.truncate(put_away);
+        if let Some(clause) = self.wider(escaping)? {
+            bound.push(clause);
+        }
+        if bound.is_empty() {
+            return Err(invalid(
+                "the block of a CALL is empty, so there is nothing for it to do: write a statement in it".into(),
+            ));
+        }
+        let first = bound.remove(0);
+        self.pending.extend(bound);
+        Ok(first)
+    }
+
+    /// The one simple statement an inline call's block holds, or the
+    /// reason it cannot be read as one.
+    ///
+    /// A block that chains with `NEXT` or joins with a set operator
+    /// answers a table of its own and cannot be spliced into the
+    /// statement around it, and neither can one that names a graph,
+    /// since the clauses beside it are running against another. Each of
+    /// those is a block that needs a plan of its own, which is the next
+    /// piece of this work rather than a thing to get half right here.
+    fn splicable<'q>(&self, body: &'q ast::Query) -> Result<&'q ast::Simple> {
+        if body.use_graph.is_some() {
+            return Err(invalid(
+                "the block of a CALL cannot name a graph of its own yet: take the USE out of it, or write the block as a statement of its own".into(),
+            ));
+        }
+        let ast::Composite::Linear(linear) = &body.body else {
+            return Err(invalid(
+                "the block of a CALL cannot join its statements with UNION, EXCEPT or INTERSECT yet: what those answer is a table of its own rather than more of the row".into(),
+            ));
+        };
+        let [simple] = linear.statements.as_slice() else {
+            return Err(invalid(
+                "the block of a CALL cannot chain with NEXT yet: what a NEXT answers is a table of its own rather than more of the row".into(),
+            ));
+        };
+        if let Some(projection) = &simple.result {
+            let refused = if projection.distinct {
+                Some("say DISTINCT")
+            } else if !projection.group_by.is_empty() {
+                Some("group its rows")
+            } else if !projection.order_by.is_empty() {
+                Some("order its rows")
+            } else if projection.skip.is_some() || projection.limit.is_some() {
+                Some("take a page of its rows")
+            } else {
+                None
+            };
+            if let Some(what) = refused {
+                return Err(invalid(format!(
+                    "the RETURN of a CALL block cannot {what} yet: the block runs for one row and adds to it, so what it answers has no order of its own to speak of"
+                )));
+            }
+        }
+        Ok(simple)
+    }
+
+    /// The items a block's `RETURN` lets out, bound in the block's own
+    /// scope and not yet named outside it.
+    ///
+    /// `own` is where the block's variables start, which is what
+    /// `RETURN *` means: everything the block itself bound, and none of
+    /// what the row already carried, since naming one of those again
+    /// would leave the clause after the call with two of them.
+    fn bind_call_result(
+        &mut self,
+        projection: &ast::Projection,
+        own: usize,
+    ) -> Result<Vec<(String, BoundExpr, Type)>> {
+        let mut out = Vec::new();
+        if projection.star {
+            let mut mine: Vec<(usize, String)> = self
+                .scope
+                .iter()
+                .filter(|(_, slot)| **slot >= own)
+                .map(|(name, slot)| (*slot, name.clone()))
+                .collect();
+            mine.sort_unstable();
+            for (slot, name) in mine {
+                out.push((name, BoundExpr::Var(slot), self.variables[slot].ty.clone()));
+            }
+        }
+        for item in &projection.items {
+            let mut ctx = ExprCtx::new(true);
+            let (expr, ty) = self.bind_expr(&item.expr, &mut ctx)?;
+            if ctx.saw_aggregate {
+                return Err(invalid(
+                    "the RETURN of a CALL block cannot aggregate yet: a set function reads a group of rows and the block runs for one".into(),
+                ));
+            }
+            // A name is what the block is letting out, so an item that
+            // is not already one has to be given one. This is the rule
+            // a WITH goes by rather than the rule a RETURN goes by, and
+            // for the same reason: what is being written is a variable
+            // the clauses after it read, not a column of an answer.
+            let name = match (&item.alias, &item.expr) {
+                (Some(alias), _) => alias.clone(),
+                (None, Expr::Variable(v)) => v.clone(),
+                (None, other) => {
+                    return Err(invalid(format!(
+                        "the RETURN of a CALL block names what the row carries away, so {} needs an alias: write it AS a name",
+                        text(other)
+                    )));
+                }
+            };
+            out.push((name, expr, ty));
+        }
+        Ok(out)
+    }
+
+    /// What puts a block's answer on the row, which most of the time is
+    /// nothing at all.
+    ///
+    /// A block that lets out elements it bound is letting out slots the
+    /// row is already carrying, so there is nothing to compute and no
+    /// operator to run: the name goes in the scope beside the slot it
+    /// stands for and the clauses after the call read it there. That is
+    /// how a three deep nest plans as the flattened text plans, since
+    /// after the binder there is nothing of the nest left over.
+    ///
+    /// A block that names a value rather than an element does need a
+    /// projection, and then everything in hand goes through it, the way
+    /// it goes through a `LET`: what a call answers is added to the row
+    /// rather than put in place of it.
+    fn wider(&mut self, escaping: Vec<(String, BoundExpr, Type)>) -> Result<Option<BoundClause>> {
+        for (name, _, _) in &escaping {
+            if self.scope.contains_key(name) {
+                return Err(invalid(format!(
+                    "the block of a CALL lets out '{name}', which the row already carries, so the clause after it would have two of them to read: write the item AS another name"
+                )));
+            }
+        }
+        if escaping
+            .iter()
+            .all(|(_, e, _)| matches!(e, BoundExpr::Var(_)))
+        {
+            for (name, expr, _) in escaping {
+                let BoundExpr::Var(slot) = expr else {
+                    unreachable!("every item is a variable")
+                };
+                self.scope.insert(name, slot);
+            }
+            return Ok(None);
+        }
+        let mut named: Vec<(usize, String)> = self
+            .scope
+            .iter()
+            .map(|(name, &slot)| (slot, name.clone()))
+            .chain(self.hidden.iter().map(|(name, slot)| (*slot, name.clone())))
+            .collect();
+        named.sort_unstable();
+        let mut items: Vec<BoundItem> = named
+            .into_iter()
+            .map(|(slot, name)| BoundItem {
+                expr: BoundExpr::Var(slot),
+                ty: self.variables[slot].ty.clone(),
+                name,
+                slot: Some(slot),
+                aggregate: false,
+            })
+            .collect();
+        for (name, expr, ty) in escaping {
+            // A variable keeps the slot it is already in, so letting it
+            // out is a name for it and not a copy of it.
+            let slot = match expr {
+                BoundExpr::Var(slot) => {
+                    self.scope.insert(name.clone(), slot);
+                    slot
+                }
+                _ => self.declare(&name, ty.clone())?,
+            };
+            items.push(BoundItem {
+                expr,
+                ty,
+                name,
+                slot: Some(slot),
+                aggregate: false,
+            });
+        }
+        Ok(Some(BoundClause::Project {
+            distinct: false,
+            items,
+            order_by: Vec::new(),
+            order_aggs: Vec::new(),
+            skip: None,
+            limit: None,
+            filter: None,
+        }))
+    }
+
     fn bind_clause(&mut self, clause: &Clause) -> Result<BoundClause> {
         match clause {
             Clause::Match {
@@ -3093,6 +3383,7 @@ impl Binder<'_> {
                 })
             }
             Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
+            Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
             // predicate is queued as exactly this. Binding it to that
@@ -4304,7 +4595,12 @@ impl Binder<'_> {
     /// and the clauses after it read those rows rather than the store,
     /// so every slot they might read has to come along.
     fn carried(&self) -> Vec<usize> {
-        let mut carry: Vec<usize> = self.scope.values().copied().collect();
+        let mut carry: Vec<usize> = self
+            .scope
+            .values()
+            .copied()
+            .chain(self.hidden.iter().map(|(_, slot)| *slot))
+            .collect();
         // A path variable is assembled from the slots of its walk, and
         // the ones the query never named are in no scope, so they come
         // along by way of the shape.
@@ -6454,6 +6750,110 @@ mod tests {
             .iter()
             .find(|v| v.name == name)
             .unwrap_or_else(|| panic!("variable {name}"))
+    }
+
+    /// The scope clause is settled while the block is being read and
+    /// costs nothing after that, so a name the block may not read is a
+    /// name the binder cannot find. Every one of these is a message
+    /// about the block rather than about the clause after it.
+    #[test]
+    fn a_block_reads_what_its_scope_clause_says_and_no_more() {
+        let hidden = bind_err(
+            "MATCH (a:Person) CALL () { MATCH (b:Person) WHERE b.age > a.age RETURN b AS b } RETURN b",
+        );
+        assert!(hidden.contains("'a'"), "{hidden}");
+        let unbound =
+            bind_err("MATCH (a:Person) CALL (z) { MATCH (b:Person) RETURN b AS b } RETURN b");
+        assert!(unbound.contains("'z'"), "{unbound}");
+        // Named in the scope clause, so the block reads it.
+        let ok = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS b } RETURN b.name AS name",
+        );
+        assert!(ok.variables.iter().any(|v| v.name == "b"));
+    }
+
+    /// A block that answers a table of its own is one that cannot be
+    /// bound into the statement around it, so each of these says which
+    /// part of the block is the problem rather than refusing the word
+    /// CALL. They are the pieces of the family still to come.
+    #[test]
+    fn a_block_the_statement_cannot_absorb_says_which_part_it_was() {
+        for (source, want) in [
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b NEXT MATCH (b)-[:KNOWS]->(c:Person) RETURN c AS c } RETURN c",
+                "NEXT",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b UNION MATCH (c:Person) RETURN c AS b } RETURN b",
+                "UNION",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN DISTINCT b AS b } RETURN b",
+                "DISTINCT",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b ORDER BY b.age } RETURN b",
+                "order its rows",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b LIMIT 3 } RETURN b",
+                "page",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN count(*) AS n } RETURN n",
+                "aggregate",
+            ),
+        ] {
+            let err = bind_err(source);
+            assert!(err.contains(want), "wanted {want} in {err}");
+        }
+    }
+
+    /// What leaves a block is a name for something, so an item that is
+    /// not already a name needs one, and a name the row already carries
+    /// cannot arrive on it twice.
+    #[test]
+    fn what_a_block_lets_out_is_named_once_each() {
+        let unnamed =
+            bind_err("MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b.age } RETURN a");
+        assert!(unnamed.contains("alias"), "{unnamed}");
+        let twice =
+            bind_err("MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS a } RETURN a");
+        assert!(twice.contains("already carries"), "{twice}");
+    }
+
+    /// An element a block lets out keeps the slot it was found in, so
+    /// letting it out is a name for it rather than a copy of it, and
+    /// the block leaves no projection behind at all. A block that names
+    /// a value does leave one, and everything in hand goes through it.
+    #[test]
+    fn a_block_that_lets_out_an_element_leaves_no_operator() {
+        let elements = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS friend } RETURN friend.name AS name",
+        );
+        let projections = elements
+            .clauses
+            .iter()
+            .filter(|c| matches!(c, BoundClause::Project { .. }))
+            .count();
+        assert_eq!(projections, 1, "only the RETURN: {:?}", elements.clauses);
+        // The name the block let it out under is a name for the slot
+        // the match found it in, so there is no second variable for it.
+        assert!(
+            elements.variables.iter().all(|v| v.name != "friend"),
+            "{:?}",
+            elements.variables
+        );
+
+        let value = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b.age + 1 AS older } RETURN older",
+        );
+        let projections = value
+            .clauses
+            .iter()
+            .filter(|c| matches!(c, BoundClause::Project { .. }))
+            .count();
+        assert_eq!(projections, 2, "the block's and the RETURN's");
     }
 
     /// A chain binds to one list of clauses: the result of a statement

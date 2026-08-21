@@ -208,7 +208,17 @@ impl Query {
         let mut out = Vec::new();
         self.body.walk(&mut |linear| {
             for simple in &linear.statements {
-                out.extend(simple.clauses.iter());
+                for clause in &simple.clauses {
+                    out.push(clause);
+                    // The block of an inline call is part of the text
+                    // and its statements are statements of the query,
+                    // so a reader asking what the query names has to be
+                    // told about them. An INSERT inside a block writes
+                    // the same graph an INSERT beside it writes.
+                    if let Clause::CallInline { body, .. } = clause {
+                        out.extend(body.clauses());
+                    }
+                }
             }
         });
         out
@@ -486,6 +496,28 @@ pub enum Clause {
         /// `(column, alias)` pairs; the column names are fixed by the
         /// function, the alias is what later clauses see.
         yields: Vec<(String, Option<String>)>,
+    },
+    /// `CALL { MATCH (a)-[:knows]->(f) RETURN f AS friend }`, the
+    /// inline procedure call of ISO 13.2 and features GP01, GP02 and
+    /// GP03.
+    ///
+    /// The block is a statement of its own written inside another one.
+    /// It runs once for each row that reaches it, the names it is
+    /// allowed to read tie it to that row, and what its `RETURN` names
+    /// is added to the row rather than put in place of it. That last
+    /// part is what makes it a `CALL` and not a `WITH`: the row goes on
+    /// carrying everything it carried, wider by what the block
+    /// answered.
+    ///
+    /// `scope` is the variable scope clause, which says what the block
+    /// may read of the row. `None` is a block written with no clause at
+    /// all, which reads everything (GP02), and `Some` is the list the
+    /// reader wrote (GP03). An empty list is a block that reads nothing
+    /// of the row, which is a whole statement standing on its own, and
+    /// it is written `CALL () { ... }`.
+    CallInline {
+        scope: Option<Vec<String>>,
+        body: Box<Query>,
     },
     With {
         projection: Projection,

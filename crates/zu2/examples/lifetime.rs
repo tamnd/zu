@@ -103,7 +103,10 @@ fn main() {
             );
         }
         if round > 200 {
-            println!("survived 200 rounds and {} MiB written", written / (1 << 20));
+            println!(
+                "survived 200 rounds and {} MiB written",
+                written / (1 << 20)
+            );
             break;
         }
     }

@@ -269,7 +269,10 @@ fn reopening_a_log_with_too_few_pages_names_the_number() {
     match Db::open(&path, small_log()) {
         Err(Error::NeedsPages { needs, max }) => {
             assert_eq!(max, 2, "it named a ceiling nobody asked for");
-            assert!(needs > max, "it asked for {needs} pages and had room for {max}");
+            assert!(
+                needs > max,
+                "it asked for {needs} pages and had room for {max}"
+            );
             let db = Db::open(
                 &path,
                 Options {

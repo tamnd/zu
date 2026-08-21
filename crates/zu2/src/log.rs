@@ -389,7 +389,10 @@ impl Log {
         let mut marker = [0u8; 8];
         file::read_exact_at(&self.file, &mut marker, 0)?;
         let word = u64::from_le_bytes(marker);
-        Ok(((word >> FORMAT_SHIFT) as u8, (word & ADDRESS_MASK).max(FIRST)))
+        Ok((
+            (word >> FORMAT_SHIFT) as u8,
+            (word & ADDRESS_MASK).max(FIRST),
+        ))
     }
 
     /// The format this log is reading and writing.

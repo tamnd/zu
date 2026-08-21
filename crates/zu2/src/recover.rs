@@ -49,8 +49,8 @@ use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::db::{Core, restore_pages};
 use crate::error::{Error, Result};
 use crate::graph;
-use crate::log;
 use crate::index::{self, EMPTY, Index, SLOTS};
+use crate::log;
 use crate::record::{self, RecordRef};
 
 /// Pages the scan changed a record in, which have to go back to the
@@ -96,10 +96,7 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     // one and a file that is not going to open should not pay for it.
     if let Some(above) = hole_above(core, stopped, len) {
         if !salvage {
-            return Err(Error::LogHole {
-                at: stopped,
-                above,
-            });
+            return Err(Error::LogHole { at: stopped, above });
         }
         core.recovered
             .discarded

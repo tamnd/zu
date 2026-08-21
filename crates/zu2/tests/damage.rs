@@ -101,7 +101,9 @@ fn damage(path: &std::path::Path, at: u64, shape: usize) {
         1 => patch(
             path,
             at,
-            &(0..4096u32).map(|i| (i * 31 + 7) as u8).collect::<Vec<u8>>(),
+            &(0..4096u32)
+                .map(|i| (i * 31 + 7) as u8)
+                .collect::<Vec<u8>>(),
         ),
         _ => patch(path, at, &[byte_at(path, at) ^ 0x40]),
     }

@@ -46,6 +46,16 @@ jobs:
         with:
           toolchain: nightly-2026-08-14
       - uses: Swatinem/rust-cache@v2
+      # The generator reads the JSON rustdoc leaves in target/doc, and
+      # the cache above restores that directory after the checkout, so
+      # its files carry a newer timestamp than the sources they were
+      # built from and cargo calls them fresh. rustdoc then never runs
+      # and the model is checked against whatever the API looked like
+      # when the cache was filled. That is not hypothetical: fifty
+      # public names from #405 lived outside the model for weeks with
+      # this job green. Taking the directory away costs one rustdoc run
+      # and is the difference between a gate and a decoration (#488).
+      - run: rm -rf target/doc
       # docs/api/model.json is what the reference pages, the SDK
       # feature matrix, zu.h and the api-map.toml completeness check
       # are all generated from, so it is committed and this job holds

@@ -1,0 +1,162 @@
+schema: 4
+suite: procedure
+doc: The inline procedure call, which is a statement written inside another one. The fixture is the pattern suite's, four people and three edges with one of them running from a node to itself, because what these cases are about is not the graph but the scope: what a block may read of the row it runs for, what it hands back, and what the row carries away. A block runs once for each row that reaches it and adds to that row rather than replacing it, so every count here is a count of the rows on the far side of a call.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+    - from: 3
+      to: 3
+
+cases:
+  - name: a-block-that-reads-nothing-of-the-row
+    doc: A block with a scope clause naming nothing reads nothing of the row it runs for, so it answers the same thing every time and the call is every person against every person. Sixteen rows out of four and four is the arithmetic of a call that is not tied to anything.
+    query: MATCH (a:person) CALL () { MATCH (b:person) RETURN b.name AS f } RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "16"
+
+  - name: a-block-with-no-scope-clause-reads-the-whole-row
+    doc: A block written with no parentheses at all may read everything the row carries, which is the implicit scope. The block below reads the person the row is for and walks out of it, so the call answers a row per edge rather than a row per pairing.
+    query: MATCH (a:person) CALL { MATCH (a)-[:knows]->(b:person) RETURN b.name AS f } RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-block-widens-the-row-rather-than-replacing-it
+    doc: What the block returns is added to the row and the row goes on carrying what it carried, which is the difference between a call and a WITH. The person the row was for is still there to be projected after the call, beside the friend the block found.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN b.name AS f } RETURN a.name AS x, f AS y ORDER BY x, y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: a-row-the-block-answers-nothing-for-is-gone
+    doc: The block is not optional, so a row it finds nothing for leaves no row behind it. Three of the four people have an edge out of them and the fourth does not, so the call takes that one away the way a match beside it would have.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN b.name AS f } RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-star-is-what-the-block-itself-bound
+    doc: A block that returns everything returns what it bound rather than what it was handed, since a name the row already carries cannot arrive on it twice. So the star below is the friend the block walked to and not the person it started from.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN * } RETURN a.name AS x, b.name AS y ORDER BY x, y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: a-block-may-name-a-value-as-well-as-an-element
+    doc: What leaves a block is a name for something, and an expression written under a name is one as much as a variable is. The age below is read inside the block and named there, and it is a column of the answer without the statement around it reading the friend at all.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN b.age + 1 AS older } RETURN a.name AS x, older ORDER BY x
+    columns:
+      - x
+      - older
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "41"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "51"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "41"
+
+  - name: a-block-inside-a-block-inside-a-block
+    doc: A block is a statement and a statement may hold a block, so the nesting goes as deep as the text does. Each of the three below walks one edge, and what the innermost one binds arrives on the row the outermost one started, which is what says the scopes nest rather than shadow.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) CALL (b) { MATCH (b)-[:knows]->(c:person) CALL (c) { MATCH (c)-[:knows]->(d:person) RETURN d.name AS f } RETURN f } RETURN f } RETURN a.name AS x, f AS y ORDER BY x, y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: a-filter-inside-a-block-is-a-filter
+    doc: The clauses a block holds are the clauses of the statement it is written in, so a condition inside one narrows the rows the call answers and nothing else. Only one of the three edges arrives at somebody older than forty five.
+    query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) WHERE b.age > 45 RETURN b.name AS f } RETURN a.name AS x, f AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy

@@ -1628,6 +1628,40 @@ mod tests {
         explain(&plan, &query, &schema())
     }
 
+    /// A block is not an optimization barrier, which is the whole
+    /// performance specification for the procedure family: a call with
+    /// an inline body is bound into the statement around it, so the
+    /// walk inside it sits in the same join ordering search as the walk
+    /// beside it. Three of them nested inside each other plan as the
+    /// flattened text plans, operator for operator, because after the
+    /// binder there is no nest left to plan.
+    #[test]
+    fn a_nest_of_blocks_plans_as_the_flattened_text_plans() {
+        let nested = explained(
+            "MATCH (a:Person) \
+             CALL (a) { \
+               MATCH (a)-[:KNOWS]->(b:Person) \
+               CALL (b) { \
+                 MATCH (b)-[:KNOWS]->(c:Person) \
+                 CALL (c) { \
+                   MATCH (c)-[:IS_LOCATED_IN]->(d:Place) RETURN d AS d \
+                 } \
+                 RETURN d AS d \
+               } \
+               RETURN d AS d \
+             } \
+             RETURN d.name AS name",
+        );
+        let flat = explained(
+            "MATCH (a:Person) \
+             MATCH (a)-[:KNOWS]->(b:Person) \
+             MATCH (b)-[:KNOWS]->(c:Person) \
+             MATCH (c)-[:IS_LOCATED_IN]->(d:Place) \
+             RETURN d.name AS name",
+        );
+        assert_eq!(nested, flat, "nested:\n{nested}\nflat:\n{flat}");
+    }
+
     /// A chain of three statements plans as one pipeline: the result
     /// each statement ends with hands its rows straight to the expand
     /// the next one starts with, and nothing in between collects a

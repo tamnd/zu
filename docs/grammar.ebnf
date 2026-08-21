@@ -123,7 +123,25 @@ property_type   = name , ( "::" | "TYPED" ) , value_type ;
    rather than two. *)
 
 reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
-                | let_clause | with_clause ;
+                | let_clause | with_clause | call_clause ;
+
+(* GP01, GP02 and GP03, ISO 13.2 and 13.4. The inline procedure call: a
+   statement written inside another one. It runs once for each row that
+   reaches it, and what its RETURN names is added to that row rather
+   than put in place of it, which is what tells it from a WITH.
+
+   The variable scope clause says what the block may read of the row.
+   No clause at all is a block that reads all of it (GP02), a list is
+   the names the reader wrote (GP03), and an empty list is a block that
+   reads nothing, which is a whole statement standing on its own.
+
+   The word is a table function's too, and that reading is the one a
+   name after CALL gets. Which of the two a call is is settled by the
+   one token after the word: a brace or a parenthesis is this, and a
+   name is the other. *)
+call_clause     = "CALL" , [ variable_scope ] , "{" ,
+                  [ use_clause ] , composite_query , "}" ;
+variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 match_clause    = ( "MATCH" , pattern , [ where_clause ]
                   | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]

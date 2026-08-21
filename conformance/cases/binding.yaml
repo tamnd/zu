@@ -128,6 +128,21 @@ cases:
           - type: INT64
             value: "3"
 
+  - name: a-binding-table-variable-that-names-another
+    doc: GP09. A definition may read the ones in front of it, so a binding table variable defined as another binding table variable is that table and not a one row table holding it. The FOR runs over the rows either way, which is what makes this worth a case: an engine that wrapped the value would answer one row here rather than three, and every other reading of the name would still look right.
+    query: "BINDING TABLE t = { MATCH (p:person) WHERE p.age > 35 RETURN p.name AS name } BINDING TABLE again = t FOR r IN again RETURN count(*) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-binding-table-variable-defined-with-something-else
+    doc: A definition written as an expression stands for whatever the expression is, and the name is going to be read as a table, so an expression that is not one is refused where it is written rather than at the first reader. The nested query form is the one that turns rows into a table and this is not it.
+    query: "BINDING TABLE t = 1 + 1 RETURN cardinality(t) AS a"
+    raises: "22G03"
+
   - name: a-graph-variable-is-a-reference
     doc: GP11. A graph variable names a graph and what it holds is a reference to one rather than the graph itself, which is why it can be a value at all. The graph named here is the one the session is working in.
     query: GRAPH g = CURRENT_PROPERTY_GRAPH RETURN (g IS NOT NULL) AS a
@@ -149,7 +164,7 @@ cases:
             value: "4"
 
   - name: a-graph-variable-that-names-another
-    doc: GP13. A definition may read the ones in front of it whatever it defines, so a graph variable defined as another graph variable is the graph that one names. Nothing here can tell one name from two, and that is the point: the case is here so that an engine which resolved only the first name would still have to answer this.
+    doc: GP12. A definition may read the ones in front of it whatever it defines, so a graph variable defined as another graph variable is the graph that one names. Nothing here can tell one name from two, and that is the point: the case is here so that an engine which resolved only the first name would still have to answer this.
     query: GRAPH a = CURRENT_PROPERTY_GRAPH GRAPH b = a USE b MATCH (p:person) RETURN count(p) AS x
     columns:
       - x
@@ -157,6 +172,21 @@ cases:
       - values:
           - type: INT64
             value: "4"
+
+  - name: a-graph-variable-defined-by-a-query-that-returns-a-reference
+    doc: GP13. A graph expression may be a value query, and a query has not run when the graph the statement compiles against is settled, so the general case is refused. This one is not the general case: a body that is a bare RETURN of a graph reference answers what the reference answers and says so in the text, so it is read where a reference is read and the USE below it works. The case is here to fix which queries count, because the answer is the shape and not the engine's mood.
+    query: "PROPERTY GRAPH g = VALUE { RETURN CURRENT_PROPERTY_GRAPH } USE g MATCH (p:person) RETURN count(p) AS x"
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-graph-variable-defined-by-a-query-with-a-clause-in-it
+    doc: The line the case above draws, from the other side. A query with a clause in it answers what the rows say rather than what the text says, so it is settled when the definition runs and the USE that reads it is refused.
+    query: "PROPERTY GRAPH g = VALUE { UNWIND [1] AS n RETURN CURRENT_PROPERTY_GRAPH } USE g MATCH (p:person) RETURN count(p) AS x"
+    raises: "42001"
 
   - name: a-graph-variable-a-use-names-defined-out-of-a-query
     doc: Which graph a statement runs against is settled before the statement is compiled, the schema of that graph being what the names in it are bound against, so a definition a USE reads has to answer while the text is being read. A query has not run by then, and compiling against one graph and running against another is worse than a refusal.

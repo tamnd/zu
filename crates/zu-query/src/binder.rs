@@ -1137,6 +1137,16 @@ pub struct BoundBinding {
     /// saying so where the definition was made is worth more than
     /// letting a reader further in find a value of the wrong kind.
     pub ty: Option<LogicalType>,
+    /// Whether the rows the query answers are the binding table, which
+    /// is true of a definition written with a nested query and false
+    /// of one written with an expression. A nested query is the one
+    /// place in the engine where a result becomes a value, and that is
+    /// GP10. An expression already stands for a table, GP09, and
+    /// collecting its rows would build a one row table holding a
+    /// table rather than reading the table it names. Always false for
+    /// the other two kinds, which stand for one value however they
+    /// were written.
+    pub collects: bool,
     /// What the definition says, as a query. An initializer that was
     /// written as an expression is the query that returns it, because
     /// one shape here is one path through the executor.
@@ -2463,8 +2473,8 @@ fn bind_bindings(
         // resolved then. A graph defined by a query says it when the
         // definition runs, which is later, so the handle is absent and
         // a call that wanted one is refused by name.
-        let graph = match (&def.kind, &def.init) {
-            (ast::BindingKind::Graph, ast::BindingInit::Expr(ast::Expr::GraphRef(reference))) => {
+        let graph = match (&def.kind, def.init.graph_ref()) {
+            (ast::BindingKind::Graph, Some(reference)) => {
                 graph_of_ref_in(schema, visible, reference).ok()
             }
             _ => None,
@@ -2480,6 +2490,8 @@ fn bind_bindings(
             kind: def.kind,
             param,
             ty: def.ty.clone(),
+            collects: def.kind == ast::BindingKind::Table
+                && matches!(def.init, ast::BindingInit::Query(_)),
             query: bound,
         });
     }

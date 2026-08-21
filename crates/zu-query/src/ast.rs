@@ -284,6 +284,59 @@ pub enum BindingInit {
     Query(Box<Query>),
 }
 
+impl BindingInit {
+    /// The graph reference a definition names, when it names one at all
+    /// (GP12 and GP13).
+    ///
+    /// The plain case is `GRAPH g = my_graph`, where the initializer is
+    /// the reference. The other case is `GRAPH g = VALUE { RETURN
+    /// CURRENT_PROPERTY_GRAPH }`, where it is a query, and a graph defined
+    /// by a query is settled when the definition runs rather than while
+    /// the statement is bound, which is too late for the `USE` that reads
+    /// the name. That is true of a query in general and is not true of
+    /// this one: a body that is a bare `RETURN` of a graph reference
+    /// answers what the reference answers, so the reference is read out
+    /// here and the name is as good as one written plainly. Anything the
+    /// answer could depend on, a clause, a second statement, a `GROUP BY`
+    /// or a page, puts the query back in the general case.
+    pub fn graph_ref(&self) -> Option<&GraphRef> {
+        let query = match self {
+            BindingInit::Expr(Expr::GraphRef(reference)) => return Some(reference),
+            BindingInit::Expr(Expr::ValueQuery(query)) => &**query,
+            BindingInit::Query(query) => &**query,
+            BindingInit::Expr(_) => return None,
+        };
+        if !query.bindings.is_empty() || query.use_graph.is_some() || query.at_schema.is_some() {
+            return None;
+        }
+        let Composite::Linear(linear) = &query.body else {
+            return None;
+        };
+        let [simple] = linear.statements.as_slice() else {
+            return None;
+        };
+        if !simple.clauses.is_empty() {
+            return None;
+        }
+        let projection = simple.result.as_ref()?;
+        if projection.star
+            || !projection.group_by.is_empty()
+            || !projection.order_by.is_empty()
+            || projection.skip.is_some()
+            || projection.limit.is_some()
+        {
+            return None;
+        }
+        let [item] = projection.items.as_slice() else {
+            return None;
+        };
+        match &item.expr {
+            Expr::GraphRef(reference) => Some(reference),
+            _ => None,
+        }
+    }
+}
+
 impl Query {
     /// Every primitive statement in the query, in written order,
     /// whichever statement of a `NEXT` chain it stands in.

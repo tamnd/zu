@@ -240,6 +240,13 @@ jobs:
 
   test:
     strategy:
+      # Three platforms is exactly the case where the second failure is
+      # the interesting one, and the default cancels the other two rows
+      # within half a minute of the first: a macOS row losing a race
+      # took the Linux and Windows results with it and left no way to
+      # tell whether they would have passed (#503). A runner minute is
+      # cheaper than the full rerun it costs to find out.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}

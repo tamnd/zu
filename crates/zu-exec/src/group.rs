@@ -33,6 +33,7 @@
 //! ascending-key output is reproduced.
 
 use zu_query::exec::Value;
+use zu_query::snapshot::TemporalLane;
 use zu_vector::kernels::hash64;
 
 use crate::compile::AggSpec;
@@ -44,6 +45,11 @@ use crate::sink::Acc;
 pub(crate) enum PartKind {
     /// An integer or a dense row id: one word.
     Int,
+    /// A date, a time, a datetime or a duration: one word, the same
+    /// word an integer takes and compared the same way, with the lane
+    /// carried so the group can be handed back as the value it was
+    /// rather than as the count underneath it.
+    Temporal(TemporalLane),
     /// A node: table id and row offset, two words.
     Node,
     /// A string: byte offset and length into the batch's or the table's
@@ -54,7 +60,7 @@ pub(crate) enum PartKind {
 impl PartKind {
     pub(crate) fn words(self) -> usize {
         match self {
-            PartKind::Int => 1,
+            PartKind::Int | PartKind::Temporal(_) => 1,
             PartKind::Node | PartKind::Str => 2,
         }
     }
@@ -376,7 +382,7 @@ impl GroupTable {
         let mut w = 0;
         for &part in &self.parts {
             match part {
-                PartKind::Int => self.keys.push(words[w]),
+                PartKind::Int | PartKind::Temporal(_) => self.keys.push(words[w]),
                 PartKind::Node => {
                     self.keys.push(words[w]);
                     self.keys.push(words[w + 1]);
@@ -402,7 +408,7 @@ impl GroupTable {
         let mut w = 0;
         for &part in &self.parts {
             match part {
-                PartKind::Int | PartKind::Node => {
+                PartKind::Int | PartKind::Temporal(_) | PartKind::Node => {
                     if stored[w..w + part.words()] != words[w..w + part.words()] {
                         return false;
                     }
@@ -431,7 +437,7 @@ impl GroupTable {
         let mut w = 0;
         for &part in &self.parts {
             h = match part {
-                PartKind::Int => hash64(h ^ words[w]),
+                PartKind::Int | PartKind::Temporal(_) => hash64(h ^ words[w]),
                 PartKind::Node => hash64(hash64(h ^ words[w]) ^ words[w + 1]),
                 PartKind::Str => {
                     let (off, len) = (words[w] as usize, words[w + 1] as usize);
@@ -462,7 +468,7 @@ impl GroupTable {
         let mut w = 0;
         for &part in &self.parts {
             h = match part {
-                PartKind::Int => hash64(h ^ words[w]),
+                PartKind::Int | PartKind::Temporal(_) => hash64(h ^ words[w]),
                 PartKind::Node => hash64(hash64(h ^ words[w]) ^ words[w + 1]),
                 PartKind::Str => {
                     let (off, len) = (words[w] as usize, words[w + 1] as usize);
@@ -574,6 +580,7 @@ impl GroupTable {
                 let slot = self.slots[at as usize];
                 let key = match self.parts[0] {
                     PartKind::Int => Value::Int(slot[0] as i64),
+                    PartKind::Temporal(lane) => Value::Temporal(lane.value(slot[0] as i64)),
                     PartKind::Node | PartKind::Str => {
                         unreachable!("counting mode is one fixed-width word")
                     }
@@ -590,6 +597,9 @@ impl GroupTable {
             for &part in &self.parts {
                 vals.push(match part {
                     PartKind::Int => Value::Int(self.keys[base + w] as i64),
+                    PartKind::Temporal(lane) => {
+                        Value::Temporal(lane.value(self.keys[base + w] as i64))
+                    }
                     PartKind::Node => Value::Node {
                         table: self.keys[base + w] as u32,
                         offset: self.keys[base + w + 1],

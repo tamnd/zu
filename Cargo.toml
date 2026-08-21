@@ -51,6 +51,32 @@ all = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
 
+# A test run here is compute and not glue, so the tests are worth
+# optimising even though nothing ships out of this profile. The
+# differential parity file asks the old row-at-a-time engine a cross
+# product over three thousand rows on each side, and unoptimised its
+# longest shard alone is ninety six seconds of the hundred and forty
+# the zu lib suite takes. At opt-level 1 that shard is seven and the
+# whole suite is twelve. Debug assertions and overflow checks stay on,
+# which is the part of a debug build a test is here for.
+#
+# Line tables rather than full debug info: a backtrace still names the
+# file and the line, which is what a failing test is read for, and the
+# linker has a fraction of the bytes to move. The zu crate has around
+# fifty integration tests and each one is a binary that links the whole
+# graph, so what the linker moves is most of what an edit waits on.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+# Dependencies build once and are then read for weeks, so they are
+# worth optimising properly. This covers the bundled SQLite
+# amalgamation, arrow and parquet, which are the ones with the most
+# code in them.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
 # One codegen unit per crate rather than the sixteen cargo splits a
 # release into. The units are compiled apart and each one carries its
 # own copy of whatever it inlined, so the same generic instantiated in

@@ -461,12 +461,17 @@ impl Table {
 /// Whether a toolchain is a channel rather than a version.
 ///
 /// A channel is what rustup calls the moving target, and a job that
-/// names one is saying it wants whatever that is today: the format
-/// check runs on the newest stable on purpose, and the fuzzer and miri
+/// names one is saying it wants whatever that is today: the `next`
+/// canary reads the newest stable on purpose, and the fuzzer and miri
 /// want the newest nightly. There is no version written down, so there
 /// is nothing for the table to hold it to, and demanding a pin here
 /// would be demanding the opposite of what those jobs are for. A dated
 /// nightly is a version and is held like any other.
+///
+/// Naming nothing is the third answer and now the common one. Those
+/// jobs take the action's `pinned` default and build with what
+/// rust-toolchain.toml says, which is a site this table does hold, so
+/// they are pinned without writing a version anywhere (#489).
 fn is_channel(value: &str) -> bool {
     matches!(value, "stable" | "beta" | "nightly")
 }

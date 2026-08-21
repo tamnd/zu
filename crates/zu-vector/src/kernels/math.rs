@@ -827,6 +827,36 @@ mod tests {
         ValueVector::flat_from(arena, PhysType::Float64, vals)
     }
 
+    /// The same numbers to within a few of the last bit.
+    ///
+    /// A power, a logarithm and a rounding to a decimal place are not
+    /// exact operations, and what the last bit comes out as belongs to
+    /// whoever implemented them. On hardware that is the platform's
+    /// libm and the answers land on the round number a reader expects.
+    /// Under miri it is miri, which does not have a libm and does not
+    /// pretend to: it computes an answer and then moves it by up to
+    /// four of the last bits on purpose, so that a test which depends
+    /// on one platform's rounding says so. These did. 7 to the 3rd came
+    /// back as 343.00000000000006 and three tests were red on the job
+    /// that exists to find aliasing bugs in the unsafe code these
+    /// kernels are made of, and a job that is expected to be red is a
+    /// job nobody reads on the day it finds one (#490).
+    ///
+    /// Eight of the last bits, which is twice what miri will move an
+    /// answer by, and relative rather than absolute so that it means
+    /// the same thing at 343 as at 1.23: the last bit of the first is
+    /// 5.7e-14 and of the second is 2.2e-16.
+    fn near(found: &[f64], want: &[f64]) {
+        assert_eq!(found.len(), want.len(), "{found:?} against {want:?}");
+        for (f, w) in found.iter().zip(want) {
+            let slack = 8.0 * f64::EPSILON * w.abs().max(1.0);
+            assert!(
+                (f - w).abs() <= slack,
+                "{found:?} is not {want:?}, {f} is off by more than {slack}"
+            );
+        }
+    }
+
     /// An integer argument keeps its type through all five, which is
     /// what stops a number above two to the fifty third losing a digit
     /// to a float nobody asked for.
@@ -879,7 +909,7 @@ mod tests {
 
         let v = floats(&mut arena, &[1.234, 1.236]);
         let out = unary(&mut arena, MathOp::Round(2), &v, None).unwrap();
-        assert_eq!(out.values::<f64>(), &[1.23, 1.24]);
+        near(out.values::<f64>(), &[1.23, 1.24]);
     }
 
     /// The distance of the bottom integer from nought is one past the
@@ -963,7 +993,7 @@ mod tests {
 
         let v = floats(&mut arena, &[100.0, 1000.0]);
         let out = unary(&mut arena, MathOp::Log10, &v, None).unwrap();
-        assert_eq!(out.values::<f64>(), &[2.0, 3.0]);
+        near(out.values::<f64>(), &[2.0, 3.0]);
     }
 
     /// The five that have an answer for every number there is say so,
@@ -1138,12 +1168,12 @@ mod tests {
 
         let out = pair(&mut arena, MathPair::Power, &l, &r, None).unwrap();
         assert_eq!(out.phys, PhysType::Float64);
-        assert_eq!(out.values::<f64>(), &[343.0, -343.0, 64.0]);
+        near(out.values::<f64>(), &[343.0, -343.0, 64.0]);
 
         let base = ints(&mut arena, &[2, 2, 2]);
         let of = ints(&mut arena, &[8, 4, 1]);
         let out = pair(&mut arena, MathPair::Log, &base, &of, None).unwrap();
-        assert_eq!(out.values::<f64>(), &[3.0, 2.0, 0.0]);
+        near(out.values::<f64>(), &[3.0, 2.0, 0.0]);
     }
 
     /// The remainder of an approximate number keeps the sign of the
@@ -1212,7 +1242,7 @@ mod tests {
         let l = floats(&mut arena, &[-2.0]);
         let r = floats(&mut arena, &[3.0]);
         let out = pair(&mut arena, MathPair::Power, &l, &r, None).unwrap();
-        assert_eq!(out.values::<f64>(), &[-8.0]);
+        near(out.values::<f64>(), &[-8.0]);
     }
 
     /// A base is a base when it is above nought and is not one, and the

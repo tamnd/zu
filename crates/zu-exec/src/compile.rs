@@ -844,6 +844,21 @@ fn keyable(r: ScalarRef) -> bool {
     )
 }
 
+/// Whether two levels hold one element, as far as the tables can say
+/// on their own. `None` is the pair the rows decide.
+///
+/// A level has one table for every row it will ever produce, so two
+/// levels on different tables hold different nodes whatever their rows
+/// turn out to be, and two names for one level hold the one node. What
+/// is left is two levels on one table, and there the rows are the whole
+/// of the answer.
+fn settled_pair(levels: &[LevelBuild], l: usize, r: usize) -> Option<bool> {
+    if l == r {
+        return Some(true);
+    }
+    (levels[l].table != levels[r].table).then_some(false)
+}
+
 /// Whether anything above the sink reads column `at` of the row the
 /// sink writes. Only the stages are asked: a window step indexes the
 /// row the stage below it emitted, which is a different row and a
@@ -3819,6 +3834,30 @@ impl Compiler<'_> {
                     None => Ok(None),
                 }
             }
+            // ID of a node, which is the number `.id` answers written
+            // as a call, so it resolves to the same row.
+            //
+            // The argument goes through this function rather than being
+            // read as a variable, which is what turns the shapes that
+            // are not a node away: a yielded value and a seek key are
+            // columns of level 0 and come back as columns, an edge
+            // variable belongs to no level here, and the old engine
+            // answers null for an edge anyway.
+            BoundExpr::Call {
+                func: Func::Id,
+                distinct: false,
+                star: false,
+                args,
+                ..
+            } => {
+                let [arg] = args.as_slice() else {
+                    return Ok(None);
+                };
+                Ok(match self.item_ref(arg)? {
+                    Some(ScalarRef::Node { level }) => Some(ScalarRef::RowId { level }),
+                    _ => None,
+                })
+            }
             _ => self.register_expr(expr),
         }
     }
@@ -4069,6 +4108,20 @@ impl Compiler<'_> {
                 return Ok(Some(dst));
             }
         }
+        // GF11, the two questions about which elements a row bound.
+        // Both are the same pairwise walk over the arguments, and both
+        // answer a truth value, so they are written straight into a
+        // predicate register the way a comparison is.
+        if let BoundExpr::Call {
+            func: func @ (Func::Same | Func::AllDifferent),
+            args,
+            distinct: false,
+            star: false,
+            ..
+        } = expr
+        {
+            return self.identity_reg(b, *func, args, level);
+        }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
         };
@@ -4130,6 +4183,100 @@ impl Compiler<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// SAME and ALL_DIFFERENT over the nodes a row bound, compiled into
+    /// a predicate register.
+    ///
+    /// An element is its table and its row, and a level has one table
+    /// for every row it will ever produce. So half of each pair is
+    /// settled before a row is read: two levels on different tables
+    /// hold different nodes whatever the rows turn out to be, and two
+    /// names for one level hold the same node. Those pairs answer
+    /// without a compare, and either function is false outright as soon
+    /// as one pair goes the wrong way. What is left is a row against a
+    /// row, which is one integer comparison.
+    ///
+    /// An edge argument declines. An edge is its table, the pair it
+    /// runs between and which copy of that pair it is, and none of
+    /// those is a number this level carries.
+    fn identity_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        func: Func,
+        args: &[BoundExpr],
+        level: usize,
+    ) -> Result<Option<Reg>> {
+        let same = matches!(func, Func::Same);
+        let mut levels = Vec::with_capacity(args.len());
+        for arg in args {
+            let Some(ScalarRef::Node { level }) = self.item_ref(arg)? else {
+                return Ok(None);
+            };
+            if self.levels.get(level).is_none() {
+                return Ok(None);
+            }
+            levels.push(level);
+        }
+        if levels.len() < 2 {
+            return Ok(None);
+        }
+        let mut compares = Vec::new();
+        for (at, &l) in levels.iter().enumerate() {
+            for &r in &levels[at + 1..] {
+                match settled_pair(&self.levels, l, r) {
+                    Some(held) if held == same => continue,
+                    Some(_) => {
+                        let dst = b.push_type(PhysType::Bool)?;
+                        b.ops.push(ExprOp::All { on: false, dst });
+                        return Ok(Some(dst));
+                    }
+                    None => compares.push((l, r)),
+                }
+            }
+        }
+        let op = if same { CmpOp::Eq } else { CmpOp::Ne };
+        let mut acc: Option<Reg> = None;
+        for (l, r) in compares {
+            // A row that a level below broadcasts in may be null,
+            // which an OPTIONAL MATCH that missed leaves behind. The
+            // compare kernel clears the answer's validity there and
+            // the row is off, which is the null the old engine
+            // answers for an argument it could not read.
+            let Some(l) = self.ref_reg(b, ScalarRef::RowId { level: l }, level, true)? else {
+                return Ok(None);
+            };
+            let Some(r) = self.ref_reg(b, ScalarRef::RowId { level: r }, level, true)? else {
+                return Ok(None);
+            };
+            let dst = b.push_type(PhysType::Bool)?;
+            b.ops.push(ExprOp::Compare { op, l, r, dst });
+            acc = Some(match acc {
+                None => dst,
+                Some(prev) => {
+                    let both = b.push_type(PhysType::Bool)?;
+                    b.ops.push(ExprOp::And {
+                        l: prev,
+                        r: dst,
+                        dst: both,
+                    });
+                    both
+                }
+            });
+        }
+        // Every pair was settled by the tables, and settled the way the
+        // function asked, so the answer is the same for every row. It
+        // is written as an op rather than left out because the program
+        // hands back its last op's register and the filter above wants
+        // one to read.
+        Ok(Some(match acc {
+            Some(reg) => reg,
+            None => {
+                let dst = b.push_type(PhysType::Bool)?;
+                b.ops.push(ExprOp::All { on: true, dst });
+                dst
+            }
+        }))
     }
 
     /// Reads a mark column back as a predicate register. The block may
@@ -4215,6 +4362,64 @@ impl Compiler<'_> {
         Ok(Some(dst))
     }
 
+    /// A resolved item read into a register: the chunk vector it names,
+    /// broadcast in from the level that holds it when that is not the
+    /// one the program runs on.
+    ///
+    /// The row a level carries is vector 0 there, which is why a row id
+    /// and a stored column are one read with two positions rather than
+    /// two kinds of thing.
+    fn ref_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        r: ScalarRef,
+        level: usize,
+        outer: bool,
+    ) -> Result<Option<Reg>> {
+        let (from, mut col, ty) = match r {
+            // A property is never a constant, so this is the arm
+            // nothing reaches rather than a shape to build a program
+            // out of.
+            ScalarRef::Const { .. } => return Ok(None),
+            ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
+            ScalarRef::Col { level, vec, ty } => (
+                level,
+                vec,
+                match ty {
+                    ColType::Int => PhysType::Int64,
+                    ColType::Float => PhysType::Float64,
+                    ColType::Str => PhysType::Str,
+                },
+            ),
+            ScalarRef::Node { .. } => return Ok(None),
+        };
+        if from != level {
+            // A level above this one is not built yet, and a string end
+            // would have to carry its buffers into the broadcast, so
+            // both go back to the old engine.
+            //
+            // Under a comparison the broadcast may be null: the kernel
+            // clears the whole column's validity and that is the answer
+            // the old engine gives. Inside arithmetic it may not,
+            // because the arith kernels do not propagate validity and a
+            // null end would come back a number. A stored column is the
+            // case where that cannot arise, since a column holding a
+            // null does not resolve at all.
+            let numeric = matches!(ty, PhysType::Int64 | PhysType::Float64);
+            let never_null = self.stored_col(from, col);
+            if from > level || !numeric || !(outer || never_null) {
+                return Ok(None);
+            }
+            col = self.register_outer(level, from, col);
+        }
+        let Ok(col) = u8::try_from(col) else {
+            return Ok(None);
+        };
+        let dst = b.push_type(ty)?;
+        b.ops.push(ExprOp::LoadCol { col, dst });
+        Ok(Some(dst))
+    }
+
     /// One operand of a predicate, compiled into a register.
     ///
     /// `outer` says whether a property of a level below `level` may be
@@ -4247,53 +4452,17 @@ impl Compiler<'_> {
             // value a CALL yielded and the key a batch of seeks found
             // are both columns of level 0, and a variable naming a node
             // is not a value at all, which the node arm below declines.
-            BoundExpr::Property { .. } | BoundExpr::Var(_) => {
+            //
+            // ID of a node joins them because it is the same read: the
+            // number it answers is the row the level already carries,
+            // and `item_ref` hands it back as that row.
+            BoundExpr::Property { .. }
+            | BoundExpr::Var(_)
+            | BoundExpr::Call { func: Func::Id, .. } => {
                 let Some(r) = self.item_ref(expr)? else {
                     return Ok(None);
                 };
-                let (from, mut col, ty) = match r {
-                    // A property is never a constant, so this is the
-                    // arm nothing reaches rather than a shape to build
-                    // a program out of.
-                    ScalarRef::Const { .. } => return Ok(None),
-                    ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
-                    ScalarRef::Col { level, vec, ty } => (
-                        level,
-                        vec,
-                        match ty {
-                            ColType::Int => PhysType::Int64,
-                            ColType::Float => PhysType::Float64,
-                            ColType::Str => PhysType::Str,
-                        },
-                    ),
-                    ScalarRef::Node { .. } => return Ok(None),
-                };
-                if from != level {
-                    // A level above this one is not built yet, and a
-                    // string end would have to carry its buffers into
-                    // the broadcast, so both go back to the old engine.
-                    //
-                    // Under a comparison the broadcast may be null: the
-                    // kernel clears the whole column's validity and that
-                    // is the answer the old engine gives. Inside
-                    // arithmetic it may not, because the arith kernels
-                    // do not propagate validity and a null end would
-                    // come back a number. A stored column is the case
-                    // where that cannot arise, since a column holding a
-                    // null does not resolve at all.
-                    let numeric = matches!(ty, PhysType::Int64 | PhysType::Float64);
-                    let never_null = self.stored_col(from, col);
-                    if from > level || !numeric || !(outer || never_null) {
-                        return Ok(None);
-                    }
-                    col = self.register_outer(level, from, col);
-                }
-                let Ok(col) = u8::try_from(col) else {
-                    return Ok(None);
-                };
-                let dst = b.push_type(ty)?;
-                b.ops.push(ExprOp::LoadCol { col, dst });
-                Ok(Some(dst))
+                self.ref_reg(b, r, level, outer)
             }
             // A cast the values cannot notice. GA05 put CAST in filter
             // position and a cast is a per-row conversion with a
@@ -5235,6 +5404,28 @@ mod tests {
             table: 0,
             cols: cols.into_iter().map(|c| (String::new(), c)).collect(),
         }
+    }
+
+    /// Half of what SAME and ALL_DIFFERENT ask is answered by the
+    /// tables before a row is read, and the fixtures the parity suite
+    /// runs over hold one table each, so this is where the other table
+    /// gets a say.
+    #[test]
+    fn a_pair_of_levels_on_different_tables_is_two_elements() {
+        let mut people = level(Vec::new());
+        people.table = 7;
+        let mut places = level(Vec::new());
+        places.table = 9;
+        let levels = vec![people, places];
+        // One level named twice is one element, whatever its table.
+        assert_eq!(settled_pair(&levels, 0, 0), Some(true));
+        assert_eq!(settled_pair(&levels, 1, 1), Some(true));
+        // Two tables cannot hold one node.
+        assert_eq!(settled_pair(&levels, 0, 1), Some(false));
+        assert_eq!(settled_pair(&levels, 1, 0), Some(false));
+        // Two levels on one table, which is the pair the rows decide.
+        let same_table = vec![level(Vec::new()), level(Vec::new())];
+        assert_eq!(settled_pair(&same_table, 0, 1), None);
     }
 
     fn closes(ops: &[Op]) -> Vec<Option<usize>> {

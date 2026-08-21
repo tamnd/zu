@@ -581,6 +581,37 @@ fn covered_queries() -> &'static [&'static str] {
         // every row the filter sees.
         "MATCH (p:person) WHERE LEFT(p.name, p.age) = p.name RETURN count(*) AS n",
         "MATCH (p:person) WHERE char_length(RIGHT(p.tag, p.age)) > 4 RETURN count(*) AS n",
+        // The element family. ID of a node is the row the level
+        // already carries, so it reads where a stored column reads and
+        // the places a number can stand are the places it stands: a
+        // projection, a filter, an order, a group key and the argument
+        // of an aggregate.
+        "MATCH (p:person) RETURN ID(p) AS i ORDER BY i LIMIT 20",
+        "MATCH (p:person) WHERE ID(p) < 100 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE ID(p) = 7 RETURN p.name AS s",
+        "MATCH (p:person) WHERE ID(p) > 2900 RETURN ID(p) AS i, p.age AS a ORDER BY i",
+        "MATCH (p:person) RETURN max(ID(p)) AS m",
+        "MATCH (p:person) RETURN min(ID(p)) AS m",
+        "MATCH (p:person) WHERE p.age > 50 RETURN count(DISTINCT ID(p)) AS n",
+        "MATCH (p:person) WHERE ID(p) < 40 RETURN ID(p) AS i, count(*) AS n ORDER BY i",
+        // Two levels, where the number is what tells the ends of a hop
+        // apart. A ring in the fixture makes both directions non-empty.
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ID(a) < ID(b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ID(a) = ID(b) RETURN count(*) AS n",
+        // SAME and ALL_DIFFERENT, which ask the same question the
+        // comparison above asks and say so in one word. Two names for
+        // one level and a hop's two ends are the two shapes, and the
+        // three argument spelling walks the pairs.
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ALL_DIFFERENT(a, b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE SAME(a, b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE SAME(a, a) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ALL_DIFFERENT(a, a) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+         WHERE ALL_DIFFERENT(a, b, c) AND ID(a) < 20 RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+         WHERE SAME(a, c) AND ID(a) < 20 RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) \
+         WHERE ALL_DIFFERENT(a, b) AND a.age > 50 RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and

@@ -109,6 +109,36 @@ macro_rules! minmax {
                         consider(v.constant_value::<i64>());
                     }
                 }
+                // A column with nothing missing in it, which is the
+                // scan this reduction is on the hot path of, and the
+                // one shape here written for the vectorizer rather than
+                // for the reader. The accumulator is an i64 and not an
+                // Option of one, and the row is a select rather than a
+                // branch, which is the pair of things that turn into a
+                // lane wide minimum. The loop below it, folding an
+                // Option that is empty until the first row over a
+                // validity nobody here has to ask about, takes a row at
+                // a time and measured 0 vector instructions on both
+                // architectures; this one takes 31 on aarch64.
+                //
+                // Where it lands is the ISA's to say. NEON compares two
+                // 64 bit lanes with cmgt and selects with bsl, so the
+                // reduction folds. A generic x86-64 build has neither:
+                // the packed 64 bit compare is SSE4.2 and the packed 64
+                // bit minimum is AVX-512, and with only SSE2 to hand
+                // LLVM leaves the loop scalar. The disassembly gate
+                // knows that and asks for lanes on the one where they
+                // are reachable.
+                (VecEncoding::Flat, None) if v.validity.is_none() => {
+                    let vals = v.values::<i64>();
+                    if let Some((&first, rest)) = vals.split_first() {
+                        let mut acc = first;
+                        for &x in rest {
+                            acc = if x $better acc { x } else { acc };
+                        }
+                        consider(acc);
+                    }
+                }
                 (VecEncoding::Flat, None) => {
                     for (i, &x) in v.values::<i64>().iter().enumerate() {
                         if v.is_valid(i) {

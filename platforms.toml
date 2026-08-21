@@ -167,6 +167,15 @@ doc = "WASI, for the runtimes that are not a browser. Built by the repositories 
 # looks at. The two artifacts this repository builds are gated by the
 # libzu workflow on every tier 1 platform; the others are recorded here
 # because there is one table and not four.
+#
+# A row with a target is an exception for that platform, and it exists
+# because the same code is not the same number of bytes everywhere: an
+# object format carries its own overhead and a linker keeps what it
+# could not merge. That is a fact about the toolchain, so the ceiling
+# moves for the one platform it is true of and the rest keep theirs.
+# The exception has to name a platform this table has and an artifact
+# with a general ceiling, since either mistake leaves a row that looks
+# gated and holds nothing.
 
 [[budget]]
 artifact = "libzu"
@@ -179,6 +188,13 @@ artifact = "zu"
 mib = 15
 repo = "zu"
 doc = "The CLI, which is the same engine plus a shell and an argument parser."
+
+[[budget]]
+artifact = "zu"
+target = "x86_64-pc-windows-msvc"
+mib = 16
+repo = "zu"
+doc = "The same CLI on MSVC, which is a megabyte and a half more of the same code. One tree measures 15.20 MiB here against 11.36 on darwin, and the shared library beside it 7.53 against 5.00, so the difference is the object format and the linker rather than anything the source did. A ceiling set high enough for the widest format would stop holding the six platforms that are not it, so the exception is written where it belongs and the rest keep 15."
 
 [[budget]]
 artifact = "wheel"

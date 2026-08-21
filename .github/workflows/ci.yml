@@ -200,6 +200,15 @@ jobs:
             exit 0
           fi
           cargo semver-checks check-release -p zu -p zu-corpus --baseline-rev "$base" --release-type patch
+      # The tool builds the baseline in a checkout of its own under
+      # target, and takes it away again while it works. The cache action
+      # walks target when the job ends, and a directory that went while
+      # it was being read is an ENOENT that fails a job whose gates all
+      # passed. Nothing wants that tree cached anyway: it is a second
+      # copy of this repository at a commit already in git.
+      - name: Take the baseline checkout away before the cache reads it
+        if: always()
+        run: rm -rf target/semver-checks
 
   deny:
     runs-on: ubuntu-latest
@@ -276,6 +285,17 @@ jobs:
 
   miri:
     runs-on: ubuntu-latest
+    # Miri puts a random error of its own into the operations the
+    # platform does not give a guaranteed precision for, which is how a
+    # program that leans on one machine's libm gets caught. The kernels
+    # here do not lean on it, and the math tests assert the answers a
+    # power and a logarithm have on every machine: two to the third is
+    # three whatever the library did to get there. Under the random
+    # error those reads come back a bit out and the job goes red over
+    # arithmetic nobody wrote. This job is here for the unsafe, so the
+    # floats are told to behave and the aliasing is what is watched.
+    env:
+      MIRIFLAGS: -Zmiri-deterministic-floats
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust

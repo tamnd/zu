@@ -99,6 +99,16 @@ pub struct GraphName {
     pub name: String,
 }
 
+/// A procedure's name and the schema it is in, named the way a graph is
+/// named because a procedure is a catalog object the same way a graph
+/// is. A reference with no path in it is resolved in the schema the
+/// call says it is at, and in the root schema when it says nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
 /// The type a graph is created with (GG01 to GG04).
 #[derive(Debug, Clone, PartialEq)]
 pub enum GraphTypeRef {
@@ -551,10 +561,16 @@ pub enum Clause {
     /// It does not group and it does not drop a row, so the rows a
     /// match answered are the rows a yield answers, narrower.
     Yield { items: Vec<YieldItem> },
-    /// `CALL name(args) YIELD col [AS alias], ...`, a table function
-    /// producing rows (docs/07 §4).
+    /// `CALL [AT /schema] name(args) YIELD col [AS alias], ...`, the
+    /// named procedure call of ISO 13.1 and feature GP04.
+    ///
+    /// The name is a catalog object reference and not a word, so it may
+    /// be written in full as a path and it is resolved in a schema.
     Call {
-        name: String,
+        /// The `AT` clause, which says the schema the reference is
+        /// resolved in when the reference does not say it itself.
+        at: Option<String>,
+        proc: ProcRef,
         args: Vec<Expr>,
         /// `(column, alias)` pairs; the column names are fixed by the
         /// function, the alias is what later clauses see.

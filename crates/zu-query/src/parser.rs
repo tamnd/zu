@@ -20,10 +20,10 @@ use crate::ast::{
     BinaryOp, BindingDef, BindingInit, BindingKind, Brackets, CatalogStmt, Clause, Composite,
     Conjunction, DeleteTarget, EdgeEnd, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
     GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
-    MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection,
-    ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat,
-    Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide,
-    TxnStmt, UnaryOp, YieldItem,
+    MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
+    Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
+    Repeat, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn,
+    TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -839,11 +839,51 @@ impl Parser<'_> {
     /// A graph's name, which may be written as a path saying which
     /// schema it is in.
     fn parse_graph_name(&mut self) -> Result<GraphName> {
+        let (schema, name) = self.parse_object_name("a graph name")?;
+        Ok(GraphName { schema, name })
+    }
+
+    /// The schema an `AT` clause names and the procedure name after it.
+    ///
+    /// Whitespace is nothing to the lexer, so `AT / pagerank` and
+    /// `AT /pagerank` are the same tokens and the path swallows the
+    /// name. What tells them apart is what comes next: a call's name is
+    /// followed by its arguments, so a path with nothing but a
+    /// parenthesis behind it was a schema and a name written together,
+    /// and it is split back into the two. A call that did write both,
+    /// `AT /algo pagerank(...)`, never reaches the split, because the
+    /// path stops where the name begins.
+    fn parse_at_and_name(&mut self) -> Result<(Option<String>, ProcRef)> {
+        let path = self.parse_schema_path()?;
+        if !self.at(&TokenKind::LParen) {
+            return Ok((Some(path), self.parse_proc_ref()?));
+        }
+        let cut = path.rfind('/').expect("a path begins with a slash");
+        let name = path[cut + 1..].to_string();
+        if name.is_empty() {
+            return Err(self.error("a procedure name after AT and the schema"));
+        }
+        let schema = if cut == 0 {
+            "/".to_string()
+        } else {
+            path[..cut].to_string()
+        };
+        Ok((Some(schema), ProcRef { schema: None, name }))
+    }
+
+    /// A procedure's name, which is a catalog object reference and so is
+    /// read exactly the way a graph's name is.
+    fn parse_proc_ref(&mut self) -> Result<ProcRef> {
+        let (schema, name) = self.parse_object_name("a procedure name after CALL")?;
+        Ok(ProcRef { schema, name })
+    }
+
+    /// A catalog object's name, either bare or written out as a path.
+    /// The schema is what the path says without its last segment, and a
+    /// name with one segment is in the root.
+    fn parse_object_name(&mut self, what: &str) -> Result<(Option<String>, String)> {
         if !self.at(&TokenKind::Slash) {
-            return Ok(GraphName {
-                schema: None,
-                name: self.expect_name("a graph name")?,
-            });
+            return Ok((None, self.expect_name(what)?));
         }
         let mut segments = Vec::new();
         while self.eat(&TokenKind::Slash) {
@@ -855,10 +895,7 @@ impl Parser<'_> {
         } else {
             format!("/{}", segments.join("/"))
         };
-        Ok(GraphName {
-            schema: Some(schema),
-            name,
-        })
+        Ok((Some(schema), name))
     }
 
     /// An absolute directory path, which is what a schema is named by.
@@ -1730,7 +1767,16 @@ impl Parser<'_> {
                     });
                     continue;
                 }
-                let name = self.expect_name("a table function name after CALL")?;
+                // `AT` names the schema the reference is resolved in,
+                // which is what a call written without a path in its
+                // name is asking about. It comes before the name, the
+                // way it does in the standard, because it is part of
+                // reading the name and not part of the call.
+                let (at, proc) = if self.eat_kw("AT") {
+                    self.parse_at_and_name()?
+                } else {
+                    (None, self.parse_proc_ref()?)
+                };
                 self.expect(&TokenKind::LParen)?;
                 let mut args = Vec::new();
                 if !self.at(&TokenKind::RParen) {
@@ -1754,7 +1800,12 @@ impl Parser<'_> {
                         break;
                     }
                 }
-                clauses.push(Clause::Call { name, args, yields });
+                clauses.push(Clause::Call {
+                    at,
+                    proc,
+                    args,
+                    yields,
+                });
             } else if self.eat_kw("UNWIND") {
                 // The Cypher spelling, which names the value after the
                 // list rather than before it and carries no counter,
@@ -6512,10 +6563,18 @@ mod tests {
     #[test]
     fn call_parses_args_and_yield_aliases() {
         let q = parsed("CALL sssp('KNOWS', 42) YIELD node AS n, distance RETURN n, distance");
-        let Clause::Call { name, args, yields } = &q.clauses()[0] else {
+        let Clause::Call {
+            at,
+            proc,
+            args,
+            yields,
+        } = &q.clauses()[0]
+        else {
             panic!("CALL");
         };
-        assert_eq!(name, "sssp");
+        assert_eq!(*at, None);
+        assert_eq!(proc.schema, None, "a bare name says no schema");
+        assert_eq!(proc.name, "sssp");
         assert_eq!(
             *args,
             vec![
@@ -6529,6 +6588,39 @@ mod tests {
                 ("node".to_string(), Some("n".to_string())),
                 ("distance".to_string(), None),
             ]
+        );
+    }
+
+    /// A procedure's name is a catalog object reference, so it may be
+    /// written out as a path, and the schema it is looked up in may be
+    /// said with AT instead. Both spellings reach the binder as a
+    /// schema and a name, which is what makes them one thing there.
+    #[test]
+    fn a_procedure_is_named_by_a_path_or_by_the_schema_it_is_at() {
+        let named = |source: &str| {
+            let q = parsed(source);
+            let Clause::Call { at, proc, .. } = &q.clauses()[0] else {
+                panic!("CALL in {source}");
+            };
+            (at.clone(), proc.schema.clone(), proc.name.clone())
+        };
+        assert_eq!(
+            named("CALL /pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (None, Some("/".to_string()), "pagerank".to_string()),
+            "one segment is a name in the root schema"
+        );
+        assert_eq!(
+            named("CALL /algo/pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (None, Some("/algo".to_string()), "pagerank".to_string())
+        );
+        assert_eq!(
+            named("CALL AT /algo pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (Some("/algo".to_string()), None, "pagerank".to_string())
+        );
+        assert_eq!(
+            named("CALL AT / pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (Some("/".to_string()), None, "pagerank".to_string()),
+            "the root schema is one slash and nothing else"
         );
     }
 

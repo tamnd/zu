@@ -160,3 +160,33 @@ cases:
             value: bo
           - type: STRING
             value: cy
+
+  - name: a-named-procedure-called-by-its-path
+    doc: GP04, the other kind of call. The name after CALL is a catalog object reference and not a word the engine knows, so it may be written out as a path the way a graph's name is, and one segment is a name in the root schema. Every node comes back, whatever component it landed in.
+    query: CALL /wcc('knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-named-procedure-at-a-schema
+    doc: The AT clause says which schema the name is looked up in, which is what a call written without a path in its name is asking about. The root is where the built-in procedures are, so a call at the root and a call with no AT at all resolve to the same procedure.
+    query: CALL AT / wcc('knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-procedure-looked-for-in-the-wrong-schema
+    doc: A name that resolves nowhere is a reference condition, and looking in a schema that does not hold the procedure is exactly that. The refusal is different from the one an unknown name gets, because the caller spelled the name right and looked in the wrong place.
+    query: CALL /app/wcc('knows') YIELD node, component RETURN count(*) AS a
+    raises: "42002"
+
+  - name: a-procedure-nobody-declared
+    doc: A name no schema holds, which is the shape of every typo in a procedure name and of every call to something this engine does not have.
+    query: CALL nonsense('knows') YIELD node, component RETURN count(*) AS a
+    raises: "42002"

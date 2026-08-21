@@ -1373,6 +1373,22 @@ pub fn run_on(
     params: &[(&str, Value)],
     engine: Engine,
 ) -> Result<QueryResult> {
+    run_pinned(source, db, params, engine, env_options().wcoj)
+}
+
+/// [`run_on`] with the join pinned as well, for a caller comparing the
+/// fused close against the binary pair.
+///
+/// Same reason the engine is an argument: `ZU_WCOJ` is process wide and
+/// a test that set it was choosing the join for every other test in the
+/// binary for as long as the call took (#474).
+pub fn run_pinned(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+    engine: Engine,
+    wcoj: exec::Wcoj,
+) -> Result<QueryResult> {
     match not_a_query(source)? {
         Some(NotAQuery::Catalog(stmt)) => {
             crate::catalog_stmt::apply(db, &stmt, params)?;
@@ -1391,7 +1407,10 @@ pub fn run_on(
     }
     let p = prepare(source, db, params)?;
     let how = How {
-        options: env_options(),
+        options: exec::Options {
+            wcoj,
+            ..env_options()
+        },
         engine,
     };
     // A match written several ways is a plan per way over the rows the

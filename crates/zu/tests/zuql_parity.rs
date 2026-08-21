@@ -8,8 +8,10 @@
 //! verbatim with no translation.
 
 use zu::query::run as run_zu1;
+use zu::query::{Engine, run_pinned as run_zu1_pinned};
 use zu::sqlite::run as run_sqlite;
-use zu_query::exec::Value;
+use zu::sqlite::run_pinned as run_sqlite_pinned;
+use zu_query::exec::{Value, Wcoj};
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
@@ -186,17 +188,17 @@ fn both_engines_answer_the_corpus_identically() {
         );
     }
 
-    // The triangle close again with the binary join pinned: ZU_WCOJ=0
+    // The triangle close again with the binary join pinned, which
     // overrides the optimizer's mark, and the answer must match the
-    // intersection run the corpus just did. This binary holds exactly
-    // one test, so the process-global variable races with nothing.
+    // intersection run the corpus just did. Pinned per call rather than
+    // through ZU_WCOJ: the environment is process wide and setting one
+    // here would pick the join for whatever else the binary is running
+    // at the time (#474).
     let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
                   RETURN count(*) AS triangles";
     let fused = run_zu1(source, &mut zu, &[]).unwrap();
-    unsafe { std::env::set_var("ZU_WCOJ", "0") };
-    let z = run_zu1(source, &mut zu, &[]).unwrap();
-    let s = run_sqlite(source, &sq, &[]).unwrap();
-    unsafe { std::env::remove_var("ZU_WCOJ") };
+    let z = run_zu1_pinned(source, &mut zu, &[], Engine::Pipeline, Wcoj::Off).unwrap();
+    let s = run_sqlite_pinned(source, &sq, &[], Wcoj::Off).unwrap();
     assert_eq!(z.rows, s.rows, "binary parity diverged on: {source}");
     assert_eq!(
         z.rows, fused.rows,

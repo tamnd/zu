@@ -138,6 +138,36 @@ cases:
           - type: BOOL
             value: true
 
+  - name: a-graph-variable-a-use-names
+    doc: GP12. What a graph variable is for is standing where a graph reference stands, and the plainest of those places is the USE clause. The clause is written behind the definitions here because that is the only place it can be written when it reads one of them, and ISO puts it there: the graph clause belongs to the statement and the definitions are the head in front of it.
+    query: PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p:person) RETURN count(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-graph-variable-that-names-another
+    doc: GP13. A definition may read the ones in front of it whatever it defines, so a graph variable defined as another graph variable is the graph that one names. Nothing here can tell one name from two, and that is the point: the case is here so that an engine which resolved only the first name would still have to answer this.
+    query: GRAPH a = CURRENT_PROPERTY_GRAPH GRAPH b = a USE b MATCH (p:person) RETURN count(p) AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-graph-variable-a-use-names-defined-out-of-a-query
+    doc: Which graph a statement runs against is settled before the statement is compiled, the schema of that graph being what the names in it are bound against, so a definition a USE reads has to answer while the text is being read. A query has not run by then, and compiling against one graph and running against another is worse than a refusal.
+    query: "PROPERTY GRAPH g = { RETURN 1 AS a } USE g MATCH (p:person) RETURN count(p) AS x"
+    raises: "42001"
+
+  - name: a-use-in-front-of-the-definitions-and-behind-them
+    doc: A statement runs against one graph, so it names one once. Both places are places a USE may be written, and writing one in each is refused rather than one of them being read and the other dropped.
+    query: USE CURRENT_PROPERTY_GRAPH GRAPH g = HOME_PROPERTY_GRAPH USE g MATCH (p:person) RETURN count(p) AS x
+    raises: "42001"
+
   - name: a-definition-written-with-the-type-it-answers
     doc: A definition may be written with a type, which is a statement about what the query is going to answer and is checked against the answer. It is the same decision IS TYPED makes, so a type means one thing wherever it is written.
     query: "VALUE oldest INT = { MATCH (p:person) RETURN max(p.age) AS a } RETURN oldest AS x"

@@ -236,6 +236,21 @@ cases:
           - type: INT64
             value: "4"
 
+  - name: a-graph-clause-on-a-leading-call-body
+    doc: GP11 through GP13. A body may define a graph variable and then say the statements under it run against that graph, and both the definition and the clause travel with the body when it is put in the chain in front of what was written after the call. The graph named here is the one the session is working in, which is the one the case fixture loaded.
+    query: "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p:person) RETURN count(p) AS n } RETURN n AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-read-behind-a-call-body-that-named-a-graph
+    doc: A statement runs against one graph, so the graph a hoisted body named is the graph the whole chain runs against, and a statement written behind the call was written outside it and against the graph the session is working in. One that only projects what the call answered cannot tell the two apart and is let through, and one that reads the graph is refused rather than read against a graph nobody wrote it for.
+    query: "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g RETURN 1 AS n } MATCH (p:person) RETURN count(p) AS a"
+    raises: "42001"
+
   - name: a-procedure-nobody-declared
     doc: A name no schema holds, which is the shape of every typo in a procedure name and of every call to something this engine does not have.
     query: CALL nonsense('knows') YIELD node, component RETURN count(*) AS a

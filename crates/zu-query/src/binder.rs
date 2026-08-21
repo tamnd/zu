@@ -2322,6 +2322,46 @@ fn graph_of_ref(schema: &Schema, reference: &GraphRef) -> Result<GraphHandle> {
     }
 }
 
+/// The same, with the binding variables in scope where the reference
+/// was written looked in first (GP13).
+///
+/// A bare name is a graph variable's before it is the catalog's,
+/// because a definition is a name the statement itself gave and it is
+/// the nearer of the two. That is what lets one graph variable be
+/// defined as another, and it is why a `USE` and a procedure argument
+/// both reach a name a definition above them made.
+///
+/// A variable defined by a query has no handle here: which graph it is
+/// is settled when the definition runs, and this is being asked while
+/// the statement is being bound. It is refused by name rather than
+/// looked for in the catalog, where a graph of that name would be the
+/// wrong graph and a silent one.
+fn graph_of_ref_in(
+    schema: &Schema,
+    visible: &[Visible],
+    reference: &GraphRef,
+) -> Result<GraphHandle> {
+    let GraphRef::Named(name) = reference else {
+        return graph_of_ref(schema, reference);
+    };
+    if name.schema.is_some() {
+        return graph_of_ref(schema, reference);
+    }
+    let Some(found) = visible
+        .iter()
+        .rev()
+        .find(|v| v.name == name.name && v.kind == ast::BindingKind::Graph)
+    else {
+        return graph_of_ref(schema, reference);
+    };
+    found.graph.clone().ok_or_else(|| {
+        invalid(format!(
+            "'{}' is a graph variable defined by a query, so which graph it is is settled when the definition runs and not while the statement is being bound: define it as a graph reference to name it here",
+            name.name
+        ))
+    })
+}
+
 /// Binds one binding variable definition block, appending a parameter
 /// position and a definition for each name it defines.
 ///
@@ -2411,7 +2451,7 @@ fn bind_bindings(
         // a call that wanted one is refused by name.
         let graph = match (&def.kind, &def.init) {
             (ast::BindingKind::Graph, ast::BindingInit::Expr(ast::Expr::GraphRef(reference))) => {
-                graph_of_ref(schema, reference).ok()
+                graph_of_ref_in(schema, visible, reference).ok()
             }
             _ => None,
         };
@@ -5812,9 +5852,10 @@ impl Binder<'_> {
     }
 
     /// The handle a graph reference expression names, which is
-    /// [`graph_of_ref`] against this binder's schema.
+    /// [`graph_of_ref_in`] against this binder's schema and the
+    /// definitions in scope where the reference was written.
     fn resolve_graph_ref(&self, reference: &GraphRef) -> Result<GraphHandle> {
-        graph_of_ref(self.schema, reference)
+        graph_of_ref_in(self.schema, &self.visible, reference)
     }
 
     fn bind_expr(&mut self, expr: &Expr, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {

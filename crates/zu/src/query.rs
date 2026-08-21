@@ -1197,23 +1197,102 @@ pub(crate) fn graph_of(
     query: &zu_query::ast::Query,
     params: &[(&str, Value)],
 ) -> Result<u32> {
+    let Some(named) = &query.use_graph else {
+        return Ok(working);
+    };
+    graph_of_ref(catalog, working, named, &query.bindings, params)
+}
+
+/// The graph one reference names, which is the body of [`graph_of`]
+/// and is separate from it so that a graph variable's definition can
+/// be resolved with the same four answers its reader had (GP11).
+///
+/// `bindings` are the definitions the statement was written with, and
+/// they are what a name is looked up in before the catalog is: a
+/// definition is a name the statement itself gave, so it stands in
+/// front of a graph the catalog happens to hold under that name.
+fn graph_of_ref(
+    catalog: &Catalog,
+    working: u32,
+    named: &zu_query::ast::GraphRef,
+    bindings: &[zu_query::ast::BindingDef],
+    params: &[(&str, Value)],
+) -> Result<u32> {
     use zu_query::ast::GraphRef;
-    match &query.use_graph {
-        None | Some(GraphRef::Current) => Ok(working),
-        Some(GraphRef::Home) => Ok(catalog.home_graph_id()),
-        Some(GraphRef::Named(name)) => {
-            let schema = name.schema.as_deref().unwrap_or("/");
-            catalog
-                .graph(schema, &name.name)
-                .map(|g| g.id)
-                .ok_or_else(|| {
-                    ZuError::gql(
-                        codes::C42002,
-                        format!("USE names '{}', which is no graph in '{schema}'", name.name),
-                    )
-                })
+    match named {
+        GraphRef::Current => Ok(working),
+        GraphRef::Home => Ok(catalog.home_graph_id()),
+        GraphRef::Named(name) if name.schema.is_none() => {
+            match graph_variable(bindings, &name.name) {
+                Some(upto) => graph_of_variable(catalog, working, upto, params),
+                None => graph_of_name(catalog, "/", &name.name),
+            }
         }
-        Some(GraphRef::Param(name)) => graph_of_param(catalog, name, params),
+        GraphRef::Named(name) => {
+            graph_of_name(catalog, name.schema.as_deref().unwrap_or("/"), &name.name)
+        }
+        GraphRef::Param(name) => graph_of_param(catalog, name, params),
+    }
+}
+
+/// The graph the catalog holds in that schema under that name.
+fn graph_of_name(catalog: &Catalog, schema: &str, name: &str) -> Result<u32> {
+    catalog.graph(schema, name).map(|g| g.id).ok_or_else(|| {
+        ZuError::gql(
+            codes::C42002,
+            format!("USE names '{name}', which is no graph in '{schema}'"),
+        )
+    })
+}
+
+/// The definition of the graph variable of that name, and the ones
+/// written in front of it, which are the ones it may read.
+///
+/// A definition may only read what stands above it, so the search is
+/// over the definitions in written order and what it answers carries
+/// the head of the list with it.
+fn graph_variable<'a>(
+    bindings: &'a [zu_query::ast::BindingDef],
+    name: &str,
+) -> Option<&'a [zu_query::ast::BindingDef]> {
+    let at = bindings
+        .iter()
+        .position(|def| def.name == name && def.kind == zu_query::ast::BindingKind::Graph)?;
+    Some(&bindings[..=at])
+}
+
+/// The graph a `GRAPH g = ...` definition names (GP11 through GP13).
+///
+/// Which graph a statement runs against is settled before the
+/// statement is compiled, the schema of that graph being what the
+/// names in it are bound against, so a definition read by a `USE` has
+/// to answer here rather than where the other definitions are worked
+/// out. That is the whole of what it may be written as: a graph
+/// reference, which is a word or a name or a parameter and is settled
+/// in the same breath. A definition written as a query is refused, and
+/// by name, because the alternative is compiling the statement against
+/// one graph and running it against another.
+fn graph_of_variable(
+    catalog: &Catalog,
+    working: u32,
+    upto: &[zu_query::ast::BindingDef],
+    params: &[(&str, Value)],
+) -> Result<u32> {
+    let (def, above) = upto.split_last().expect("a definition was found");
+    match &def.init {
+        zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::GraphRef(named)) => {
+            graph_of_ref(catalog, working, named, above, params)
+        }
+        zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::Param(name)) => {
+            graph_of_param(catalog, name, params)
+        }
+        _ => Err(ZuError::gql(
+            codes::C42001,
+            format!(
+                "USE names '{}', which is defined with something other than a graph reference: which graph a statement runs against is settled before the statement is compiled, so a graph variable a USE reads is written as CURRENT_PROPERTY_GRAPH, HOME_PROPERTY_GRAPH, a name in the catalog, another graph variable, or a parameter",
+                def.name
+            ),
+        )),
     }
 }
 

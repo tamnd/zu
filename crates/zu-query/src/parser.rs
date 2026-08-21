@@ -428,34 +428,9 @@ const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
 /// wrong answer, since the path would then swallow the word and no
 /// schema of that name exists.
 const OPENS_A_CLAUSE: &[&str] = &[
-    "USE",
-    "VALUE",
-    "TABLE",
-    "BINDING",
-    "GRAPH",
-    "PROPERTY",
-    "MATCH",
-    "OPTIONAL",
-    "CALL",
-    "INSERT",
-    "MERGE",
-    "SET",
-    "REMOVE",
-    "DELETE",
-    "DETACH",
-    "NODETACH",
-    "UNWIND",
-    "FOR",
-    "FILTER",
-    "LET",
-    "WITH",
-    "ORDER",
-    "OFFSET",
-    "SKIP",
-    "LIMIT",
-    "FINISH",
-    "RETURN",
-    "NEXT",
+    "USE", "VALUE", "TABLE", "BINDING", "GRAPH", "PROPERTY", "MATCH", "OPTIONAL", "CALL", "INSERT",
+    "MERGE", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "UNWIND", "FOR", "FILTER", "LET",
+    "WITH", "ORDER", "OFFSET", "SKIP", "LIMIT", "FINISH", "RETURN", "NEXT",
 ];
 
 fn opens_a_clause(word: &str) -> bool {
@@ -518,6 +493,8 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         lifted: Vec::new(),
         hoisted: None,
         hoisted_at: None,
+        hoisted_use: None,
+        hoisted_bindings: Vec::new(),
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -593,6 +570,19 @@ struct Parser<'a> {
     /// The schema clause that body was written with, which belongs to
     /// the query the statements go into.
     hoisted_at: Option<SchemaRef>,
+    /// The graph clause that body was written with, and how many
+    /// statements came out of the body with it.
+    ///
+    /// The count is what says which statements of the chain the clause
+    /// was written around: zu runs one graph per query, so a graph
+    /// clause taken out of a body governs everything in the chain, and
+    /// the statements behind the body were written outside it. Those
+    /// may only project what the body answered, and the count is how
+    /// [`Parser::parse_query_body`] finds them to say so.
+    hoisted_use: Option<(GraphRef, usize)>,
+    /// The definitions that body was written with, which come out with
+    /// the graph clause because the clause may read one of them.
+    hoisted_bindings: Vec<BindingDef>,
 }
 
 /// A catalog statement lifted out of a call body (GP18).
@@ -1742,12 +1732,21 @@ impl Parser<'_> {
     /// spliced body may not: count its rows, order them, take a page of
     /// them, or be several statements itself.
     ///
-    /// Four things hold it back. A scope clause naming variables is
+    /// Three things hold it back. A scope clause naming variables is
     /// asking about a row that has none, and it is refused rather than
-    /// quietly made to mean nothing. A body naming a graph of its own,
-    /// or one written out of set operators, is not a chain to be put in
-    /// one. And a body that does not end with `RETURN` answers no rows
-    /// for a `NEXT` to read, so it stays where it was written.
+    /// quietly made to mean nothing. A body written out of set
+    /// operators is not a chain to be put in one. And a body that does
+    /// not end with `RETURN` answers no rows for a `NEXT` to read, so
+    /// it stays where it was written.
+    ///
+    /// A body naming a graph of its own (GP11 through GP13) has to come
+    /// out here, since a spliced body runs against the graph the
+    /// statement around it does and this one does not. Its definitions
+    /// come out with it, the graph clause being allowed to read one,
+    /// and what that costs is checked in
+    /// [`Self::parse_query_body`]: the clause governs the whole chain
+    /// the statements go into, so the statements written behind the
+    /// call may only project what it answered.
     fn hoist_a_leading_call(
         &mut self,
         scope: &Option<Vec<String>>,
@@ -1755,9 +1754,11 @@ impl Parser<'_> {
         ending: Ending,
     ) -> Option<Query> {
         if scope.as_ref().is_some_and(|names| !names.is_empty())
-            || body.use_graph.is_some()
-            || !body.bindings.is_empty()
             || ending != Ending::Result
+            // A body carrying definitions and no graph clause is left
+            // where it was written, a spliced block already being able
+            // to define names of its own (GP17).
+            || (body.use_graph.is_none() && !body.bindings.is_empty())
         {
             return Some(body);
         }
@@ -1775,6 +1776,8 @@ impl Parser<'_> {
                 // with is one whose word is the first token written, so
                 // no clause of the query in front of it wrote one.
                 self.hoisted_at = at_schema;
+                self.hoisted_use = use_graph.map(|graph| (graph, linear.statements.len()));
+                self.hoisted_bindings = bindings;
                 self.hoisted = Some((linear.statements, ending));
                 None
             }
@@ -1905,15 +1908,68 @@ impl Parser<'_> {
     /// this is a fold rather than a precedence climb: each operand read
     /// joins onto everything read before it.
     fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
+        // Anything a call body has already given up belongs to the
+        // query being read around this one, which is the query this is
+        // written inside rather than this one, so it is put aside for
+        // the length of this read and handed back at the end.
+        let waiting = (
+            self.hoisted_at.take(),
+            self.hoisted_use.take(),
+            std::mem::take(&mut self.hoisted_bindings),
+        );
+        let read = self.parse_query_body_inner();
+        (self.hoisted_at, self.hoisted_use, self.hoisted_bindings) = waiting;
+        read
+    }
+
+    fn parse_query_body_inner(&mut self) -> Result<(Query, Ending)> {
         // ISO 9.2 writes the schema clause in front of the graph
         // clause, and both in front of the definitions.
         let at_schema = self.parse_at_schema()?;
         let use_graph = self.parse_use_graph()?;
-        let bindings = self.parse_binding_block()?;
+        let mut bindings = self.parse_binding_block()?;
+        // The graph clause belongs to the statement rather than to the
+        // head, so ISO lets it stand behind the definitions as well as
+        // in front of them, and it has to: a clause naming a graph a
+        // definition above it defined can only be written there.
+        let use_graph = match (use_graph, self.here(), self.parse_use_graph()?) {
+            (None, _, behind) => behind,
+            (front, _, None) => front,
+            (Some(_), at, Some(_)) => {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format_args!(
+                        "a statement runs against one graph, so it names one once: there is a USE in front of the definitions already"
+                    ),
+                ));
+            }
+        };
         let (linear, ending) = self.parse_linear()?;
         // The schema clause of a body taken out of a call the statement
         // begins with, which is this query's now.
         let at_schema = at_schema.or_else(|| self.hoisted_at.take());
+        // The graph clause and the definitions of that body, which are
+        // this query's for the same reason. The clause governs every
+        // statement of the chain, so the ones written behind the call
+        // may only project what it answered.
+        let mut hoisted_a_use = false;
+        let use_graph = match (use_graph, self.hoisted_use.take()) {
+            (Some(_), Some(_)) => {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "the block of a CALL names a graph and so does the statement it begins, and a statement runs against one graph: take one of the two USE clauses out".to_string(),
+                ));
+            }
+            (None, Some((graph, hoisted))) => {
+                self.refuse_a_read_behind_a_hoisted_use(&linear, hoisted)?;
+                bindings.append(&mut self.hoisted_bindings);
+                hoisted_a_use = true;
+                Some(graph)
+            }
+            (mine, None) => mine,
+        };
         let mut body = Composite::Linear(linear);
         let mut ending = ending;
         loop {
@@ -1928,6 +1984,17 @@ impl Parser<'_> {
                     at,
                     format_args!(
                         "{} joins two result tables, so the statement in front of it has to end with RETURN",
+                        conjunction_name(how)
+                    ),
+                ));
+            }
+            if hoisted_a_use {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format_args!(
+                        "the graph the block of the leading CALL named governs the whole statement, so there is nothing for {} to join it to: write the call as a statement of its own",
                         conjunction_name(how)
                     ),
                 ));
@@ -1948,6 +2015,32 @@ impl Parser<'_> {
                 body,
             },
             ending,
+        ))
+    }
+
+    /// Refuses a statement written behind a leading call whose body
+    /// named a graph, where that statement reads the graph.
+    ///
+    /// `hoisted` is how many statements of the chain came out of the
+    /// body. What the body named governs all of them, zu running one
+    /// graph per query, and the statements behind it were written
+    /// outside the call and against the graph the session is working
+    /// in. A statement that only projects what the call answered
+    /// cannot tell the two apart, so it is let through, and one that
+    /// reads the graph is refused rather than quietly read against a
+    /// graph nobody wrote it for.
+    fn refuse_a_read_behind_a_hoisted_use(&self, linear: &Linear, hoisted: usize) -> Result<()> {
+        if linear
+            .statements
+            .iter()
+            .skip(hoisted)
+            .all(|simple| simple.clauses.is_empty())
+        {
+            return Ok(());
+        }
+        Err(ZuError::gql(
+            codes::C42001,
+            "the block of the leading CALL names a graph, and the graph a statement names is the graph the whole statement runs against, so what is written behind the call may only project what the call answered: write the call as a statement of its own".to_string(),
         ))
     }
 
@@ -6215,9 +6308,11 @@ mod tests {
         }
         // The equals is what says the type is over, so a definition
         // written without one has no type rather than a missing one.
-        assert!(parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
-            .ty
-            .is_none());
+        assert!(
+            parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
+                .ty
+                .is_none()
+        );
     }
 
     /// GP16. The `AT` clause stands in front of the query, ahead of the
@@ -6225,7 +6320,10 @@ mod tests {
     #[test]
     fn an_at_clause_names_the_schema_a_query_resolves_in() {
         for (source, want) in [
-            ("AT CURRENT_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Current),
+            (
+                "AT CURRENT_SCHEMA MATCH (p) RETURN p AS p",
+                SchemaRef::Current,
+            ),
             ("AT HOME_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Home),
             (
                 "AT /app MATCH (p) RETURN p AS p",
@@ -6264,6 +6362,67 @@ mod tests {
         let q = parsed("CALL { AT /app MATCH (p:Person) RETURN COUNT(*) AS n } RETURN n AS n");
         assert_eq!(q.at_schema, Some(SchemaRef::Path("/app".into())));
         assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// GP12. The graph clause belongs to the statement rather than to
+    /// the head, so ISO lets it stand behind the definitions as well as
+    /// in front of them, and a clause naming a graph a definition above
+    /// it defined can only be written there.
+    #[test]
+    fn a_use_clause_stands_on_either_side_of_the_definitions() {
+        let front = parsed("USE g MATCH (p:Person) RETURN p AS p");
+        let behind =
+            parsed("GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p:Person) RETURN p AS p");
+        assert!(matches!(front.use_graph, Some(GraphRef::Named(_))));
+        assert_eq!(front.use_graph, behind.use_graph);
+        assert_eq!(behind.bindings.len(), 1);
+        // A statement runs against one graph, so it names one once.
+        let err = parse("USE h GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p) RETURN p AS p")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names one once"), "{err}");
+    }
+
+    /// GP11 through GP13. A body naming a graph of its own comes out of
+    /// the call the way a schema clause does, and its definitions come
+    /// with it, the clause being allowed to read one.
+    #[test]
+    fn a_use_clause_on_a_hoisted_call_body_becomes_the_querys_own() {
+        let q = parsed(
+            "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g \
+             MATCH (p:Person) RETURN COUNT(*) AS n } RETURN n AS n",
+        );
+        assert_eq!(
+            q.use_graph,
+            Some(GraphRef::Named(GraphName {
+                schema: None,
+                name: "g".to_string(),
+            }))
+        );
+        assert_eq!(q.bindings.len(), 1);
+        assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// What that costs. The clause governs the whole chain the
+    /// statements go into, so a statement written behind the call, and
+    /// therefore outside it, may only project what the call answered.
+    #[test]
+    fn a_read_behind_a_hoisted_use_is_refused() {
+        let err = parse(
+            "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g RETURN 1 AS n } \
+             MATCH (p:Person) RETURN COUNT(*) AS c",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may only project"), "{err}");
+        // A statement that only projects cannot tell the two graphs
+        // apart, so it is let through.
+        assert!(
+            parse("CALL { USE g RETURN 1 AS n } RETURN n AS n")
+                .unwrap()
+                .use_graph
+                .is_some()
+        );
     }
 
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes

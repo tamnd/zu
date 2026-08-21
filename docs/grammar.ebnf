@@ -19,7 +19,13 @@ statement       = statement_block | transaction_statement ;
 statement_block = block_part , { "NEXT" , block_part } , [ ";" ] ;
 block_part      = query | catalog_statement ;
 query           = [ at_schema_clause ] , [ use_clause ] ,
-                  { binding_variable_definition } , composite_query ;
+                  { binding_variable_definition } , [ use_clause ] ,
+                  composite_query ;
+(* The graph clause is written on either side of the definitions and
+   once in all, ISO putting it on the statement rather than on the head
+   the definitions are. It has to be readable behind them: a clause
+   naming a graph a definition above it defined can be written nowhere
+   else. *)
 
 (* GT01 and GT02, ISO 15.1 to 15.3. Where a transaction begins and
    ends. These three are not parts of a block: a block runs as one
@@ -86,7 +92,15 @@ at_schema_clause
    in. A parameter is what makes this a reference rather than a word,
    because which graph it is is settled when the parameter arrives and
    not while the statement is being read. A query with no USE is
-   against the graph the session is working in. *)
+   against the graph the session is working in.
+
+   A name here is a graph variable's before it is the catalog's (GP12
+   and GP13), a definition being the nearer of the two, so one graph
+   variable may be defined as another and a USE may read either. Which
+   graph a statement runs against is settled before the statement is
+   compiled, the schema of that graph being what the names in it are
+   bound against, so a variable a USE reads has to be defined as a
+   graph reference; one defined by a query is refused by name. *)
 use_clause      = "USE" , graph_ref ;
 graph_ref       = "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
                   | "HOME_PROPERTY_GRAPH" | "HOME_GRAPH"
@@ -221,8 +235,9 @@ reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
 call_clause     = "CALL" , ( inline_procedure_call | named_procedure_call ) ;
 inline_procedure_call
                 = [ variable_scope ] , "{" , [ leading_catalog_part ] ,
-                  [ at_schema_clause ] , [ use_clause ] , composite_query ,
-                  "}" ;
+                  [ at_schema_clause ] , [ use_clause ] ,
+                  { binding_variable_definition } , [ use_clause ] ,
+                  composite_query , "}" ;
 leading_catalog_part
                 = catalog_statement , "NEXT" ,
                   { catalog_statement , "NEXT" } ;
@@ -240,7 +255,17 @@ leading_catalog_part
    with is taken out of the call whole, so the clause its body carries
    becomes the clause of the query the statements land in; a body that
    is spliced into the statement around it resolves names where that
-   statement does, so a clause there is refused rather than ignored. *)
+   statement does, so a clause there is refused rather than ignored.
+
+   The graph clause has to travel it, a spliced body running against
+   the graph the statement around it does and a body that named one not
+   doing that, and its definitions come out with it since the clause
+   may read one. What that costs is that the clause governs the whole
+   chain the statements land in, zu running one graph per query, so a
+   statement written behind such a call may only project what the call
+   answered: one that reads the graph was written outside the call and
+   against another graph, and it is refused rather than read against
+   the graph nobody wrote it for. *)
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 (* GP04, ISO 13.1. The named procedure call. The name is a catalog

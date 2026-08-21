@@ -445,11 +445,17 @@ pub fn parse(source: &str) -> Result<Query> {
             codes::C42001,
             "a transaction statement says where a transaction begins or ends and reads nothing, so it runs through the session rather than the query path".to_string(),
         )),
+        Statement::Block(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a statement block holds a catalog statement among its parts, so it runs through the session rather than the query path".to_string(),
+        )),
     }
 }
 
-/// Parses one statement, which is either a query or a catalog
-/// statement. The first word tells them apart.
+/// Parses one statement: a query, a catalog statement, a transaction
+/// statement, or a block of them chained by `NEXT`. The first word
+/// tells the first three apart, and a `NEXT` handing over to a catalog
+/// statement is what makes it the fourth.
 pub fn parse_statement(source: &str) -> Result<Statement> {
     let tokens = lex(source)?;
     let mut parser = Parser {
@@ -467,11 +473,25 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         let stmt = parser.parse_txn_stmt()?;
         return Ok(Statement::Transaction(stmt));
     }
-    if parser.at_catalog_stmt() {
-        let stmt = parser.parse_catalog_stmt()?;
-        return Ok(Statement::Catalog(stmt));
+    let start = parser.here();
+    let (first, mut ending) = parser.parse_block_part()?;
+    if !parser.at_kw("NEXT") {
+        parser.finish(ending)?;
+        return Ok(first);
     }
-    Ok(Statement::Query(parser.parse_query()?))
+    // GP18, ISO 13.6. A linear statement is all query or all catalog,
+    // so a chain that is neither is a statement block, and this is the
+    // one place it can be told: the parts have been read and one of
+    // them changes the catalog.
+    let mut parts = vec![source[start..parser.here()].trim().to_string()];
+    while parser.eat_kw("NEXT") {
+        let at = parser.here();
+        let (_, next) = parser.parse_block_part()?;
+        ending = next;
+        parts.push(source[at..parser.here()].trim().to_string());
+    }
+    parser.finish(ending)?;
+    Ok(Statement::Block(parts))
 }
 
 struct Parser<'a> {
@@ -675,10 +695,16 @@ impl Parser<'_> {
     /// GRAPH` and `OR REPLACE` ahead of either, are all catalog
     /// statements.
     fn at_catalog_stmt(&self) -> bool {
-        if !self.at_kw("CREATE") && !self.at_kw("DROP") {
+        self.catalog_stmt_at(0)
+    }
+
+    /// The same test, `offset` tokens further on, which is what the
+    /// word after a `NEXT` is asked (GP18).
+    fn catalog_stmt_at(&self, offset: usize) -> bool {
+        if !self.kw_at(offset, "CREATE") && !self.kw_at(offset, "DROP") {
             return false;
         }
-        let mut at = 1;
+        let mut at = offset + 1;
         if self.kw_at(at, "OR") && self.kw_at(at + 1, "REPLACE") {
             at += 2;
         }
@@ -686,6 +712,15 @@ impl Parser<'_> {
             at += 1;
         }
         self.kw_at(at, "GRAPH") || self.kw_at(at, "SCHEMA")
+    }
+
+    /// Whether the `NEXT` standing here hands over to a catalog
+    /// statement, which is where a linear query statement ends and a
+    /// statement block carries on (GP18). A linear query statement is
+    /// query statements and nothing else, so the chain stops here and
+    /// the entry point picks the next part up.
+    fn next_hands_to_catalog(&self) -> bool {
+        self.at_kw("NEXT") && self.catalog_stmt_at(1)
     }
 
     /// The five statements that change what a file declares: a schema
@@ -718,17 +753,25 @@ impl Parser<'_> {
                 self.parse_graph_stmt(creating, or_replace)?
             }
         };
-        self.eat(&TokenKind::Semicolon);
-        if let Some(token) = self.peek() {
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                token.start,
-                format_args!(
-                    "nothing may follow a catalog statement, found {}",
-                    token.kind.describe()
-                ),
-            ));
+        // Two things may follow and both belong to the caller: the
+        // semicolon that ends the text, and a `NEXT` handing over to
+        // the rest of a statement block (GP18). Neither is eaten here,
+        // so the block reads a part that stops where the part stops;
+        // anything else is a mistake named here rather than left to a
+        // caller that would have to guess what was written.
+        if !self.at_kw("NEXT") {
+            let past = usize::from(self.at(&TokenKind::Semicolon));
+            if let Some(token) = self.tokens.get(self.pos + past) {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    token.start,
+                    format_args!(
+                        "nothing may follow a catalog statement, found {}",
+                        token.kind.describe()
+                    ),
+                ));
+            }
         }
         Ok(stmt)
     }
@@ -1411,14 +1454,16 @@ impl Parser<'_> {
         Ok(LetItem { name, expr })
     }
 
-    /// A composite query statement: the `USE` in front of it, and the
-    /// linear query statements it joins.
-    ///
-    /// The conjunctions are left associative and share one level, so
-    /// this is a fold rather than a precedence climb: each operand read
-    /// joins onto everything read before it.
-    fn parse_query(&mut self) -> Result<Query> {
-        let (query, ending) = self.parse_query_body()?;
+    /// Where the parser stands, as a byte offset into the source, which
+    /// is the end of the text when it has read all of it. It is what
+    /// cuts one part of a statement block out of the whole (GP18).
+    fn here(&self) -> usize {
+        self.peek().map_or(self.source.len(), |t| t.start)
+    }
+
+    /// The end of the text, which is where a statement ends: the
+    /// optional semicolon after it, and nothing else past that.
+    fn finish(&mut self, ending: Ending) -> Result<()> {
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
             let what = match ending {
@@ -1433,7 +1478,33 @@ impl Parser<'_> {
                 format_args!("nothing may follow {what}, found {}", token.kind.describe()),
             ));
         }
-        Ok(query)
+        Ok(())
+    }
+
+    /// One part of a statement block: a catalog statement or a query,
+    /// and how it ended.
+    ///
+    /// A transaction statement is not one of them. A block runs as a
+    /// unit, so it is already inside a transaction, and a word that
+    /// began or ended one halfway through would be saying the unit is
+    /// two.
+    fn parse_block_part(&mut self) -> Result<(Statement, Ending)> {
+        if self.at_txn_stmt() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.here(),
+                format_args!(
+                    "a statement block runs as one transaction, so a word that begins or ends one is written on its own rather than among its parts"
+                ),
+            ));
+        }
+        if self.at_catalog_stmt() {
+            let stmt = self.parse_catalog_stmt()?;
+            return Ok((Statement::Catalog(stmt), Ending::Write));
+        }
+        let (query, ending) = self.parse_query_body()?;
+        Ok((Statement::Query(query), ending))
     }
 
     /// The query a `VALUE { ... }` carries, the brace unconsumed
@@ -1498,9 +1569,33 @@ impl Parser<'_> {
     /// or, where the block wrote something, that the writing happened.
     fn parse_call_block(&mut self) -> Result<Query> {
         self.expect(&TokenKind::LBrace)?;
+        self.refuse_catalog_in_a_call()?;
         let (query, _) = self.parse_query_body()?;
+        self.refuse_catalog_in_a_call()?;
         self.expect(&TokenKind::RBrace)?;
         Ok(query)
+    }
+
+    /// A catalog statement inside a call body is refused (GP18).
+    ///
+    /// ISO lets a procedure body hold one and a statement written to a
+    /// session is a procedure body here, so that is where it goes. A
+    /// call body is not that: it runs once for every row that reaches
+    /// it, and a graph is made once or not at all, so a block that made
+    /// one would work for a call over one row and raise for a call over
+    /// two.
+    fn refuse_catalog_in_a_call(&self) -> Result<()> {
+        if !self.at_catalog_stmt() && !self.next_hands_to_catalog() {
+            return Ok(());
+        }
+        Err(ZuError::gql_in(
+            codes::C42001,
+            self.source,
+            self.here(),
+            format_args!(
+                "a call body runs once for every row that reaches it and a catalog statement makes or unmakes a thing once, so it is written beside the call rather than inside it"
+            ),
+        ))
     }
 
     /// The binding variable definition block (ISO 13.3, GP17): the
@@ -1581,9 +1676,14 @@ impl Parser<'_> {
     }
 
     /// The body of a composite query and how its last statement ended,
-    /// stopping wherever the operands run out. What may follow is the
-    /// caller's business: the end of the text for a statement, a
+    /// stopping wherever the operands run out: the `USE` in front of
+    /// it, and the linear query statements it joins. What may follow is
+    /// the caller's business: the end of the text for a statement, a
     /// closing brace for a nested query.
+    ///
+    /// The conjunctions are left associative and share one level, so
+    /// this is a fold rather than a precedence climb: each operand read
+    /// joins onto everything read before it.
     fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
         let use_graph = self.parse_use_graph()?;
         let bindings = self.parse_binding_block()?;
@@ -1641,7 +1741,10 @@ impl Parser<'_> {
                     ),
                 ));
             }
-            if !self.eat_kw("NEXT") {
+            // A catalog statement past the NEXT is not part of this
+            // chain, so the NEXT is left where it is for the statement
+            // block to read (GP18).
+            if self.next_hands_to_catalog() || !self.eat_kw("NEXT") {
                 return Ok((Linear { statements }, ending));
             }
         }
@@ -5659,6 +5762,68 @@ mod tests {
             parse_err("COMMIT").contains("runs through the session"),
             "the query path does not run a statement that ends a transaction"
         );
+    }
+
+    fn block_parts(source: &str) -> Vec<String> {
+        match parse_statement(source).expect("parse") {
+            Statement::Block(parts) => parts,
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// GP18. A `NEXT` handing over to a catalog statement is where a
+    /// linear query statement ends, so the chain is cut there and each
+    /// side of the cut is a part of the block.
+    #[test]
+    fn a_next_onto_a_catalog_statement_cuts_the_statement_into_parts() {
+        assert_eq!(
+            block_parts(
+                "CREATE GRAPH TYPE t { (:Person) } NEXT INSERT (p:Person) \
+                 NEXT MATCH (q:Person) RETURN q AS q NEXT DROP GRAPH TYPE t"
+            ),
+            vec![
+                "CREATE GRAPH TYPE t { (:Person) }",
+                "INSERT (p:Person) NEXT MATCH (q:Person) RETURN q AS q",
+                "DROP GRAPH TYPE t",
+            ],
+        );
+        assert_eq!(
+            block_parts("MATCH (p:Person) RETURN p AS p NEXT CREATE GRAPH g ANY;"),
+            vec!["MATCH (p:Person) RETURN p AS p", "CREATE GRAPH g ANY"],
+        );
+    }
+
+    /// The cut is only made where a catalog statement stands, so a
+    /// chain of query statements is the one statement it always was.
+    #[test]
+    fn a_next_onto_a_query_stays_inside_the_one_statement() {
+        let q = parsed("MATCH (p:Person) RETURN p AS p NEXT MATCH (p)-[:KNOWS]->(f) RETURN f AS f");
+        assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// A block runs as one transaction, so a word that begins or ends
+    /// one is not a part of it.
+    #[test]
+    fn a_transaction_word_is_not_a_part_of_a_block() {
+        assert!(
+            catalog_err("CREATE GRAPH g ANY NEXT COMMIT").contains("runs as one transaction"),
+            "the refusal says why the word has no place there"
+        );
+    }
+
+    /// A catalog statement inside a call body is refused with the
+    /// reason, since a call body runs once per row.
+    #[test]
+    fn a_catalog_statement_is_not_written_inside_a_call_body() {
+        for source in [
+            "CALL () { CREATE GRAPH g ANY }",
+            "MATCH (p:Person) CALL (p) { INSERT (:Person) NEXT DROP GRAPH g } RETURN p AS p",
+        ] {
+            assert!(
+                catalog_err(source).contains("written beside the call rather than inside it"),
+                "{source}"
+            );
+        }
     }
 
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes

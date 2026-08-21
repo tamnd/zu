@@ -1310,6 +1310,9 @@ pub(crate) enum NotAQuery {
     Catalog(zu_query::ast::CatalogStmt),
     /// One that says where a transaction begins or ends.
     Transaction(zu_query::ast::TxnStmt),
+    /// GP18. Several statements chained by `NEXT`, one of which changes
+    /// the catalog, each carried as its own text.
+    Block(Vec<String>),
 }
 
 /// What this source is when it is not a query, `None` when it is one.
@@ -1321,6 +1324,7 @@ pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
     match zu_query::parser::parse_statement(source)? {
         zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
         zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
+        zu_query::ast::Statement::Block(parts) => Ok(Some(NotAQuery::Block(parts))),
         zu_query::ast::Statement::Query(_) => Ok(None),
     }
 }
@@ -1402,6 +1406,13 @@ pub fn run_with(
         Some(NotAQuery::Transaction(_)) => {
             return Err(ZuError::InvalidArgument(
                 "a transaction runs across statements, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
+            ));
+        }
+        // A block is several statements taken back together when one of
+        // them raises, which is a transaction and needs the same thing.
+        Some(NotAQuery::Block(_)) => {
+            return Err(ZuError::InvalidArgument(
+                "a statement block runs its parts as one transaction, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
         None => {}

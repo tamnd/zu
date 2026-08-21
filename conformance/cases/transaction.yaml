@@ -160,3 +160,33 @@ cases:
       - values:
           - type: INT64
             value: "1"
+
+  - name: a-statement-block-runs-its-parts-in-order
+    doc: GP18. Several statements chained by NEXT are one statement block, and a catalog statement may stand among the data statements. The graph the middle part makes is the graph the last part reads, so a client that ran the parts out of order, or that ran them against the catalog as it stood when the text arrived, answers a condition here rather than a row.
+    query: "INSERT (:thing {n: 1}) NEXT CREATE GRAPH twin ANY AS COPY OF CURRENT_PROPERTY_GRAPH NEXT USE twin MATCH (t:thing) RETURN count(t) AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-statement-block-that-begins-with-the-catalog-statement
+    doc: The mixing goes the other way round too, which is the case a client that special cased a leading catalog statement into a statement of its own would fail. The block answers what its last part answered and the parts in front of it answer nothing to anybody.
+    query: "CREATE GRAPH side ANY NEXT INSERT (:thing {n: 1}) NEXT MATCH (t:thing) RETURN count(t) AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-statement-block-is-one-transaction
+    doc: A part that raises takes the whole block with it, so the block is a transaction and not a list of statements sent one after another. The condition is the one the last part raised, not one about blocks.
+    query: "CREATE GRAPH side ANY NEXT INSERT (:thing {n: 1}) NEXT RETURN 1 / 0 AS n"
+    raises: "22012"
+
+  - name: a-transaction-word-is-not-a-part-of-a-block
+    doc: A block runs as one transaction, so a word that begins or ends one has nothing to say among its parts and is a syntax condition rather than a block that quietly committed halfway.
+    query: "CREATE GRAPH side ANY NEXT COMMIT"
+    raises: "42001"

@@ -2084,3 +2084,51 @@ vec_str_cut_grows_s = 0.04
 # margin is written for that rather than for the number. Raise floors,
 # never lower them.
 vec_str_element_id_grows_s = 0.02
+
+# What a write costs with its housekeeping in the number rather than
+# beside it.
+#
+# Every other write key here is measured over 200 statements on a store
+# loaded a moment earlier, and a window that short falls entirely inside
+# the first deferred batch: no fold runs in it, no checkpoint runs in
+# it, and the growth column reads zero because nothing that grows a file
+# has happened yet. Those numbers are honest about the deferred path and
+# quiet about the rest of it, which is why the sustained run exists. It
+# ramps past the point where the file stops growing and then measures
+# 2500 statements, long enough to hold folds at their own rate and more
+# than one checkpoint. The same SET measures 75 us of processor time in
+# the short window and 144 in this one, so a bit under half of what a
+# write really costs was falling outside the old window.
+#
+# The absolute ceilings are loose for the same reason the ones above are
+# loose: a commit ends in a full sync, this laptop has measured that
+# sync anywhere from 22 to 67 us of processor time between two runs an
+# hour apart, and the gate boxes are shared vCPUs. They are here to
+# catch another sync or another structure being rebuilt. Lower these
+# ceilings, never raise them.
+sustained_stmt_us = 250000.0
+sustained_stmt_cpu_us = 800.0
+sustained_stmt_cpu_nosync_us = 600.0
+sustained_stmt_kb = 64.0
+
+# What the store grew by per statement while all that was going on.
+# A SET that writes back the value it read leaves a table of the same
+# shape, so a store that has reached its steady size must not grow at
+# all whatever it folds: the blocks a fold takes have to come out of the
+# free list a checkpoint published. Measured 0. Unlike set_stmt_growth_b
+# above, this window contains the folds, so the zero means the blocks
+# are coming back rather than that nothing has taken any yet.
+sustained_stmt_growth_b = 512.0
+
+# The store at its biggest against the store as it was loaded.
+#
+# A fold takes fresh blocks for whatever it rewrites and gives back none
+# of them until a checkpoint publishes, because until then the header a
+# crash would find still reads what they replaced. So this ratio is the
+# transient garbage the deferred write path carries, and it is bounded
+# by the checkpoint threshold and by nothing else. It read 18.3 once, a
+# store of 3.9 MB running to 71.8, on a threshold that was a flat 256
+# blocks whatever the store was; a quarter of the file held between a
+# floor and that ceiling puts it at 2.27. Lower this ceiling, never
+# raise it.
+sustained_file_x = 3.0

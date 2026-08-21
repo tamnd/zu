@@ -20,7 +20,7 @@ use zu_common::types::LogicalType;
 use zu_common::{IdMap, Result};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey, UnaryOp};
 use zu_query::binder::{
-    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Math, Schema, TableFunc, Trim,
+    BoundClause, BoundExpr, BoundItem, BoundQuery, Cut, Func, Math, Schema, TableFunc, Trim,
 };
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
@@ -29,7 +29,7 @@ use zu_query::snapshot::{
 };
 use zu_vector::{
     BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
-    StrFold, StrLen, StrNorm, StrTrim, TrimSet,
+    StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet,
 };
 
 use crate::join::JoinTable;
@@ -3293,6 +3293,7 @@ impl Compiler<'_> {
                         | Func::Upper
                         | Func::Lower
                         | Func::Trim(_)
+                        | Func::Cut(_)
                         | Func::Normalize(_),
                     ..
                 }
@@ -4476,6 +4477,36 @@ impl Compiler<'_> {
                 });
                 Ok(Some(dst))
             }
+            // ISO 20.24's substring function, which in GQL is LEFT and
+            // RIGHT and nothing else. The count is an ordinary argument
+            // rather than a word the statement wrote, so it compiles to
+            // a register of its own and a column is one of the things
+            // that can arrive in it, which is what separates this from
+            // the trim's set and the normalization's form.
+            BoundExpr::Call {
+                func: Func::Cut(cut),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 2 => {
+                let end = match cut {
+                    Cut::Left => StrCut::Left,
+                    Cut::Right => StrCut::Right,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(n) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = end.answer_type(b.types[src as usize], b.types[n as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrCut { end, src, n, dst });
+                Ok(Some(dst))
+            }
             // GF08, the half of it that answers a string. NORMALIZE is
             // the string function whose answer is neither a part of the
             // argument nor the same length as it, so the vector it
@@ -4847,6 +4878,13 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         | ExprOp::StrTrim { .. }
         | ExprOp::StrNorm { .. }
         | ExprOp::StrNormalized { .. } => false,
+        // A cut is the one string op whose condition is about a value
+        // rather than about what the statement wrote, a string having
+        // no negative number of characters and a column being able to
+        // hold one. A count written out is settled here the way a
+        // written divisor is, and every other count stands behind a
+        // filter.
+        ExprOp::StrCut { n, .. } => !written_nonneg(&ops[..i], *n),
         _ => false,
     })
 }
@@ -4867,6 +4905,24 @@ fn written_nonzero(before: &[ExprOp], reg: Reg) -> bool {
                 v: OwnedValue::Float(f),
                 dst,
             } if *dst == reg => Some(*f != 0.0),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a register was last loaded with a number at nought or
+/// above, which is the question a substring's count asks. A count the
+/// statement wrote is the ordinary case and the only one that can be
+/// settled without looking at a row.
+fn written_nonneg(before: &[ExprOp], reg: Reg) -> bool {
+    before
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            ExprOp::LoadConst {
+                v: OwnedValue::Int(n),
+                dst,
+            } if *dst == reg => Some(*n >= 0),
             _ => None,
         })
         .unwrap_or(false)

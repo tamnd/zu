@@ -25,7 +25,9 @@ pub use arena::{BLOCK_BYTES, MorselArena, Pod, RawBuf};
 pub use bitmap::Bitmap;
 pub use chunk::{ChunkSet, DataChunk};
 pub use expr::{ExprOp, OwnedValue, Program, Reg, const_str};
-pub use kernels::{BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, StrNorm, StrTrim, TrimSet};
+pub use kernels::{
+    BinOp, CmpOp, MathOp, MathPair, StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet,
+};
 pub use sel::SelVector;
 pub use str::{Dictionary, INLINE_LEN, NO_BUFFERS, StrBuffers, StrBuilder, StrView};
 pub use vector::{

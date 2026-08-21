@@ -2044,3 +2044,19 @@ vec_str_trim_grows_s = 0.03
 # earlier run at load 5.8 measuring 0.49. Raise floors, never lower
 # them.
 vec_str_normalize_grows_s = 0.08
+
+# Four characters off the front of a 2048-row flat string vector, which
+# is the substring function and the trim's trick a second time: an
+# answer is a part of its argument, so it points back into the
+# argument's own bytes and no buffer is filled. The walk is bounded by
+# the count rather than by the column, so a cut of four characters is
+# four steps however long the strings are, and the bench prints it
+# beside the trim of the same column to show what the trim was paying
+# for its set test. The same call with the count coming from a column
+# prints beside it with no target, since the difference between the two
+# is one number read a row. Floor sits well under the observed run,
+# which was 0.16 at load 5.3 on ten cores, with a wider margin than the
+# kernels above it because that is the only run it has been read off
+# and a busy machine has measured a third of a light one elsewhere in
+# this file. Raise floors, never lower them.
+vec_str_cut_grows_s = 0.04

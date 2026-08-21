@@ -558,6 +558,29 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE p.name IS NORMALIZED NFKD RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 50 AND p.tag IS NORMALIZED NFC RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 50 OR p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        // The substring function, which in GQL is these two. A count
+        // the statement wrote cannot be negative, so these are the
+        // string calls that stand in a projection, and one written
+        // inside the other is how a query asks for the middle.
+        "MATCH (p:person) RETURN LEFT(p.name, 2) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.name, 1) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(p.tag, 3) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.tag, 2) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(p.name, 0) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.name, 40) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(RIGHT(p.name, 2), 1) AS s, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it was cut from.
+        "MATCH (p:person) WHERE LEFT(p.name, 1) = 'p' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN RIGHT(p.name, 1) AS d, count(*) AS n ORDER BY d",
+        "MATCH (p:person) WHERE char_length(LEFT(p.tag, 3)) > 2 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE RIGHT(p.name, 40) = p.name RETURN count(*) AS n",
+        // A count that is a column, which the fixture's ages supply and
+        // none of them is negative. A filter is where a count nobody
+        // wrote is allowed to stand, since both engines evaluate it for
+        // every row the filter sees.
+        "MATCH (p:person) WHERE LEFT(p.name, p.age) = p.name RETURN count(*) AS n",
+        "MATCH (p:person) WHERE char_length(RIGHT(p.tag, p.age)) > 4 RETURN count(*) AS n",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
@@ -1181,6 +1204,12 @@ fn fallback_queries() -> &'static [&'static str] {
         // vector. In a filter the same expression is claimed, which is
         // where a query writes it.
         "MATCH (p:person) RETURN p.tag IS NORMALIZED NFC AS b, p.id AS id ORDER BY id LIMIT 20",
+        // A count that is a column, in a projection. A string has no
+        // negative number of characters, and a computed column is
+        // filled before the filter that would have dropped the row
+        // asking for one, so this is the substring function's version
+        // of the division whose divisor is a column.
+        "MATCH (p:person) RETURN LEFT(p.name, p.age) AS s, p.id AS id ORDER BY id LIMIT 20",
     ]
 }
 

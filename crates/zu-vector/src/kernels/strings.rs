@@ -26,19 +26,21 @@
 //! bytes they have to put somewhere. A trim puts none anywhere, since
 //! what it answers is a part of what it was handed and those bytes are
 //! already in a buffer somebody is holding, so its answers point back
-//! into the argument. A fold writes as much as it was handed, an ASCII
-//! fold never changing a byte's width. Anything that can change a
-//! length, which is what a normal form does, has to write out an
-//! amount it cannot know in advance, and that is the case the builder
-//! exists for.
+//! into the argument, and the two substring functions are the same
+//! thing counted from one end. A fold writes as much as it was handed,
+//! an ASCII fold never changing a byte's width. Anything that can
+//! change a length, which is what a normal form does, has to write out
+//! an amount it cannot know in advance, and that is the case the
+//! builder exists for.
 
 use std::sync::Arc;
 
 use zu_common::unicode::{self, NormalForm};
-use zu_common::{Result, ZuError};
+use zu_common::{Result, ZuError, gqlstatus::codes};
 
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
+use crate::sel::SelVector;
 use crate::str::{INLINE_LEN, NO_BUFFERS, StrBuffers, StrBuilder, StrView};
 use crate::vector::{Aux, PhysType, ValueVector, VecEncoding};
 
@@ -808,6 +810,298 @@ pub fn normalized(
     Ok(())
 }
 
+/// Which end of a string a substring function counts from.
+///
+/// `LEFT` and `RIGHT` are the whole of the substring function in GQL,
+/// `SUBSTRING` being a word the standard has reserved and left without
+/// a meaning, so a query that wants the middle of a string writes one
+/// of these inside the other. They are one kernel because the only
+/// thing that differs is which end the walk starts at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrCut {
+    /// `LEFT(s, n)`: the first n characters.
+    Left,
+    /// `RIGHT(s, n)`: the last n characters.
+    Right,
+}
+
+impl StrCut {
+    fn name(self) -> &'static str {
+        match self {
+            StrCut::Left => "left",
+            StrCut::Right => "right",
+        }
+    }
+
+    /// The type the answers land in. A part of a string is a string,
+    /// and the count has to be a whole number by the time it gets here:
+    /// a float count is one the row engine either truncates or raises
+    /// over, and both of those are its own words, so a column of them
+    /// goes back to it.
+    pub fn answer_type(self, arg: PhysType, count: PhysType) -> Option<PhysType> {
+        match (arg, count) {
+            (PhysType::Str, PhysType::Int64) => Some(PhysType::Str),
+            _ => None,
+        }
+    }
+
+    /// Whether a row could have no answer. A count is a number a row
+    /// can hold and a negative one raises `22011`, so the answer here
+    /// is yes and the compiler settles the case where the statement
+    /// wrote the count out.
+    pub fn may_raise(self) -> bool {
+        true
+    }
+}
+
+/// Where the first `count` characters of `bytes` end.
+///
+/// The walk is over what it takes rather than over what it was handed,
+/// which is what makes a cut cheap on a long string: `LEFT(s, 3)` looks
+/// at three characters however many the column holds. A character is
+/// one lead byte and the continuation bytes behind it, and a byte that
+/// is not UTF-8 counts as a character of its own, which is the only
+/// answer available and never reached through the row engine's types.
+#[inline(always)]
+fn prefix_end(bytes: &[u8], count: usize) -> usize {
+    let mut at = 0;
+    for _ in 0..count {
+        if at == bytes.len() {
+            break;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at] & 0xC0 == 0x80 {
+            at += 1;
+        }
+    }
+    at
+}
+
+/// Where the last `count` characters of `bytes` begin, walked from the
+/// back the same way.
+#[inline(always)]
+fn suffix_start(bytes: &[u8], count: usize) -> usize {
+    let mut at = bytes.len();
+    for _ in 0..count {
+        if at == 0 {
+            break;
+        }
+        at -= 1;
+        while at > 0 && bytes[at] & 0xC0 == 0x80 {
+            at -= 1;
+        }
+    }
+    at
+}
+
+/// The part of `bytes` a cut keeps: where it starts and how long it is.
+#[inline(always)]
+fn taken(cut: StrCut, bytes: &[u8], count: usize) -> (usize, usize) {
+    match cut {
+        StrCut::Left => (0, prefix_end(bytes, count)),
+        StrCut::Right => {
+            let at = suffix_start(bytes, count);
+            (at, bytes.len() - at)
+        }
+    }
+}
+
+/// The count a row asks for, clamped at nought.
+///
+/// A negative count has already raised by the time this runs, unless
+/// the row is one nobody selected or one whose string is null, and
+/// neither of those has an answer anybody reads.
+#[inline(always)]
+fn count_at(n: &ValueVector, row: usize) -> usize {
+    let c = match n.encoding {
+        VecEncoding::Constant => n.constant_value::<i64>(),
+        _ => n.values::<i64>()[row],
+    };
+    c.max(0) as usize
+}
+
+/// Raises what the row engine raises for the first selected row that
+/// asks for a negative number of characters.
+///
+/// The order matters and is the row engine's. A null string answers
+/// null before the count is looked at, so `LEFT(null, -1)` is null and
+/// not a condition, and a null count answers null as well. What is left
+/// is a row holding a string and a negative number, which is the one
+/// the standard gives `22011` to.
+///
+/// The fold comes first: a chunk whose counts are all at nought or
+/// above has no such row in it whatever the strings are, and that is
+/// every chunk a statement with a written count produces.
+fn check_counts(
+    cut: StrCut,
+    s: &ValueVector,
+    n: &ValueVector,
+    sel: Option<&SelVector>,
+    len: usize,
+) -> Result<()> {
+    let lowest = match n.encoding {
+        VecEncoding::Constant => n.constant_value::<i64>(),
+        _ => n.values::<i64>()[..len].iter().copied().min().unwrap_or(0),
+    };
+    if lowest >= 0 {
+        return Ok(());
+    }
+    let visit = |row: usize| -> Result<()> {
+        if !s.is_valid(row) || !n.is_valid(row) {
+            return Ok(());
+        }
+        let asked = match n.encoding {
+            VecEncoding::Constant => n.constant_value::<i64>(),
+            _ => n.values::<i64>()[row],
+        };
+        if asked < 0 {
+            return Err(ZuError::gql(
+                codes::C22011,
+                format!(
+                    "{}() was asked for {asked} characters, and a string has no negative number of them",
+                    cut.name()
+                ),
+            ));
+        }
+        Ok(())
+    };
+    match sel {
+        Some(sel) => {
+            for &row in sel.as_slice() {
+                visit(row as usize)?;
+            }
+        }
+        None => {
+            for row in 0..len {
+                visit(row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate `cut(s, n)` into a new flat string vector.
+///
+/// This is the trim's trick a second time. What a cut answers is a part
+/// of what it was handed, so a flat or a constant argument's answers
+/// are views back into the argument's own bytes and the answer vector
+/// holds the same buffers rather than a copy of them. What is new is
+/// that the part is decided by a second column rather than by something
+/// the statement wrote, so the two encodings multiply: a count that is
+/// the same for the whole chunk lets a dictionary cut its table once,
+/// and a count that varies makes a coded column write a row at a time,
+/// since two rows over one entry no longer answer the same thing.
+///
+/// A dictionary is the one shape that has to write at all, an entry of
+/// a table not being bytes a view can name. Everything else copies
+/// nothing.
+pub fn cut(
+    arena: &mut MorselArena,
+    cut: StrCut,
+    s: &ValueVector,
+    n: &ValueVector,
+    sel: Option<&SelVector>,
+) -> Result<ValueVector> {
+    debug_assert_eq!(s.len, n.len);
+    if cut.answer_type(s.phys, n.phys).is_none() {
+        return Err(ZuError::InvalidArgument(format!(
+            "no {}() kernel for {:?} and {:?}",
+            cut.name(),
+            s.phys,
+            n.phys
+        )));
+    }
+    if matches!(n.encoding, VecEncoding::Dict { .. }) {
+        return Err(ZuError::InvalidArgument(
+            "substring counts on dict vectors: materialize first".into(),
+        ));
+    }
+    let len = s.len as usize;
+    check_counts(cut, s, n, sel, len)?;
+    let one_count = matches!(n.encoding, VecEncoding::Constant);
+    let bufs = s.str_buffers().unwrap_or(&NO_BUFFERS);
+    let mut out = ValueVector::flat_uninit(arena, PhysType::Str, len);
+    // Set only where the answers' bytes had to be written somewhere,
+    // which is the dictionary and nothing else.
+    let mut made = None;
+    match s.encoding {
+        VecEncoding::Constant => {
+            let view = s.constant_value::<StrView>();
+            let bytes = view.bytes(bufs);
+            let dst = out.values_mut::<StrView>();
+            if one_count {
+                let (at, took) = taken(cut, bytes, count_at(n, 0));
+                dst[..len].fill(view.sub(bytes, at, took));
+            } else {
+                for (row, slot) in dst[..len].iter_mut().enumerate() {
+                    let (at, took) = taken(cut, bytes, count_at(n, row));
+                    *slot = view.sub(bytes, at, took);
+                }
+            }
+        }
+        VecEncoding::Dict { .. } => {
+            let dict = s.dictionary();
+            let codes = s.codes_u16();
+            let mut build = StrBuilder::with_capacity(long_bytes(s));
+            let dst = out.values_mut::<StrView>();
+            if one_count {
+                let count = count_at(n, 0);
+                let table: Vec<StrView> = (0..dict.len())
+                    .map(|i| {
+                        let entry = dict.get(i as u32);
+                        let (at, took) = taken(cut, entry, count);
+                        build.push(&entry[at..at + took])
+                    })
+                    .collect();
+                for (slot, code) in dst[..len].iter_mut().zip(codes) {
+                    *slot = table[*code as usize];
+                }
+            } else {
+                for (row, slot) in dst[..len].iter_mut().enumerate() {
+                    let entry = dict.get(codes[row] as u32);
+                    let (at, took) = taken(cut, entry, count_at(n, row));
+                    *slot = build.push(&entry[at..at + took]);
+                }
+            }
+            made = Some(build.finish());
+        }
+        VecEncoding::Flat => {
+            let views = s.values::<StrView>();
+            let dst = out.values_mut::<StrView>();
+            for (row, (slot, view)) in dst[..len].iter_mut().zip(views).enumerate() {
+                let bytes = view.bytes(bufs);
+                let (at, took) = taken(cut, bytes, count_at(n, row));
+                *slot = view.sub(bytes, at, took);
+            }
+        }
+    }
+    out.aux = match made {
+        Some(bufs) => Aux::Str(Arc::new(bufs)),
+        // The argument's buffers, held rather than copied, because the
+        // answers are pointing into them.
+        None => match &s.aux {
+            Aux::Str(bufs) => Aux::Str(Arc::clone(bufs)),
+            _ => Aux::None,
+        },
+    };
+    // Either argument being null makes the answer null, which is two
+    // columns' worth of validity rather than one.
+    out.validity = match (&s.validity, &n.validity) {
+        (None, None) => None,
+        (left, right) => {
+            let mut copy = Bitmap::new_in(arena, len, true);
+            if let Some(valid) = left {
+                copy.and_with(valid);
+            }
+            if let Some(valid) = right {
+                copy.and_with(valid);
+            }
+            Some(copy)
+        }
+    };
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1396,5 +1690,200 @@ mod tests {
             panic!("a number was tested as a string");
         };
         assert!(err.to_string().contains("is_normalized"));
+    }
+
+    /// A count that is the same for the whole chunk, which is what a
+    /// statement writing the number out produces.
+    fn same_count(arena: &mut MorselArena, n: i64, len: usize) -> ValueVector {
+        ValueVector::constant(arena, PhysType::Int64, n, len)
+    }
+
+    /// A count a row, which is what a column in the second argument
+    /// produces.
+    fn counts(arena: &mut MorselArena, vals: &[i64]) -> ValueVector {
+        ValueVector::flat_from(arena, PhysType::Int64, vals)
+    }
+
+    /// The two ends of the one walk, counted in characters rather than
+    /// in bytes, so an accented letter and an emoji each count once and
+    /// neither is cut in half.
+    #[test]
+    fn a_cut_counts_characters_and_not_bytes() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["h\u{e9}llo", "\u{1f642}ab", "plain"]);
+        let two = same_count(&mut arena, 2, 3);
+        let left = cut(&mut arena, StrCut::Left, &v, &two, None).unwrap();
+        assert_eq!(left.phys, PhysType::Str);
+        assert_eq!(read(&left), ["h\u{e9}", "\u{1f642}a", "pl"]);
+        let right = cut(&mut arena, StrCut::Right, &v, &two, None).unwrap();
+        assert_eq!(read(&right), ["lo", "ab", "in"]);
+    }
+
+    /// A cut asked for more characters than there are answers the whole
+    /// string, and one asked for none answers the empty string, which
+    /// are the two ends of the range and both of them are answers
+    /// rather than conditions.
+    #[test]
+    fn the_ends_of_the_range_are_answers_and_not_conditions() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["abc", "", "h\u{e9}llo"]);
+        let plenty = same_count(&mut arena, 40, 3);
+        let out = cut(&mut arena, StrCut::Left, &v, &plenty, None).unwrap();
+        assert_eq!(read(&out), ["abc", "", "h\u{e9}llo"]);
+        let none = same_count(&mut arena, 0, 3);
+        let out = cut(&mut arena, StrCut::Right, &v, &none, None).unwrap();
+        assert_eq!(read(&out), ["", "", ""]);
+    }
+
+    /// The trim's trick again: a part of a string is bytes that are
+    /// already in a buffer somebody is holding, so a flat column is cut
+    /// without a byte being copied and the answer holds the argument's
+    /// own buffers.
+    #[test]
+    fn a_plain_column_is_cut_without_a_byte_being_copied() {
+        let mut arena = MorselArena::new();
+        let long = "a plain string well past the twelve bytes a view holds";
+        let v = str_vector(&mut arena, &[long, "short"]);
+        let count = same_count(&mut arena, 30, 2);
+        let out = cut(&mut arena, StrCut::Right, &v, &count, None).unwrap();
+        assert_eq!(read(&out), [&long[long.len() - 30..], "short"]);
+        let (Aux::Str(theirs), Aux::Str(ours)) = (&v.aux, &out.aux) else {
+            panic!("a chunk with a long string in it carries buffers");
+        };
+        assert!(Arc::ptr_eq(theirs, ours));
+    }
+
+    /// One string standing for the chunk is cut once where the count is
+    /// one number, and a row at a time where the count is a column,
+    /// since two rows over one string no longer answer the same thing.
+    #[test]
+    fn a_constant_is_cut_once_or_a_row_at_a_time() {
+        let mut arena = MorselArena::new();
+        let mut v = ValueVector::constant(
+            &mut arena,
+            PhysType::Str,
+            StrView::inline("h\u{e9}llo".as_bytes()),
+            3,
+        );
+        v.aux = Aux::None;
+        let two = same_count(&mut arena, 2, 3);
+        let out = cut(&mut arena, StrCut::Left, &v, &two, None).unwrap();
+        assert_eq!(read(&out), ["h\u{e9}", "h\u{e9}", "h\u{e9}"]);
+        let varying = counts(&mut arena, &[1, 3, 5]);
+        let out = cut(&mut arena, StrCut::Left, &v, &varying, None).unwrap();
+        assert_eq!(read(&out), ["h", "h\u{e9}l", "h\u{e9}llo"]);
+    }
+
+    /// A dictionary is the one shape that has to write, an entry of a
+    /// table not being bytes a view can name. One count cuts the table
+    /// once and the rows gather over the answers; a count a row cuts a
+    /// row at a time. Both have to answer what the same strings flat
+    /// would have answered.
+    #[test]
+    fn a_dictionary_is_cut_a_table_at_a_time_or_a_row_at_a_time() {
+        let mut arena = MorselArena::new();
+        let entries = ["a longer entry than a view holds", "bo", "h\u{e9}llo"];
+        let dict = Arc::new(Dictionary::from_sorted(entries.iter()));
+        let codes = [2u16, 0, 1, 0];
+        let v = ValueVector::dict_str(&mut arena, &codes, dict);
+        let flat = str_vector(&mut arena, &codes.map(|c| entries[c as usize]));
+        let four = same_count(&mut arena, 4, 4);
+        let out = cut(&mut arena, StrCut::Left, &v, &four, None).unwrap();
+        assert_eq!(
+            read(&out),
+            read(&cut(&mut arena, StrCut::Left, &flat, &four, None).unwrap())
+        );
+        assert_eq!(read(&out)[0], "h\u{e9}ll");
+        let varying = counts(&mut arena, &[1, 2, 2, 40]);
+        let out = cut(&mut arena, StrCut::Right, &v, &varying, None).unwrap();
+        assert_eq!(
+            read(&out),
+            read(&cut(&mut arena, StrCut::Right, &flat, &varying, None).unwrap())
+        );
+        assert_eq!(read(&out)[3], "a longer entry than a view holds");
+    }
+
+    /// Either argument being null makes the answer null, which is two
+    /// columns' worth of validity rather than one.
+    #[test]
+    fn a_null_on_either_side_answers_null() {
+        let mut arena = MorselArena::new();
+        let mut v = str_vector(&mut arena, &["abc", "def", "ghi"]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(0);
+        v.validity = Some(valid);
+        let mut n = counts(&mut arena, &[2, 2, 2]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        n.validity = Some(valid);
+        let out = cut(&mut arena, StrCut::Left, &v, &n, None).unwrap();
+        assert!(!out.is_valid(0), "a null string answers null");
+        assert!(!out.is_valid(1), "a null count answers null");
+        assert!(out.is_valid(2));
+        assert_eq!(read(&out)[2], "gh");
+    }
+
+    /// A string has no negative number of characters, and the condition
+    /// the standard gives that is the row engine's, in the row engine's
+    /// words, so a statement cannot tell which engine answered it.
+    #[test]
+    fn a_negative_count_raises_the_standards_condition() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["abc", "def"]);
+        let n = counts(&mut arena, &[1, -2]);
+        let Err(err) = cut(&mut arena, StrCut::Right, &v, &n, None) else {
+            panic!("a negative count was answered");
+        };
+        assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("22011".into()));
+        assert!(err.to_string().contains("right()"), "{err}");
+        assert!(err.to_string().contains("-2"), "{err}");
+    }
+
+    /// The rows the condition is raised over are the rows the row
+    /// engine evaluated: a row nobody selected is not one of them, and
+    /// neither is a row whose string is null, since a null answers null
+    /// before the count is looked at.
+    #[test]
+    fn a_row_that_was_never_evaluated_raises_nothing() {
+        let mut arena = MorselArena::new();
+        let mut v = str_vector(&mut arena, &["abc", "def", "ghi"]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        v.validity = Some(valid);
+        let n = counts(&mut arena, &[3, -1, -1]);
+        let mut bits = Bitmap::new_in(&mut arena, 3, false);
+        bits.set(0);
+        bits.set(1);
+        let sel = SelVector::from_bitmap(&mut arena, &bits);
+        let out = cut(&mut arena, StrCut::Left, &v, &n, Some(&sel)).unwrap();
+        assert_eq!(read(&out)[0], "abc");
+        let Err(err) = cut(&mut arena, StrCut::Left, &v, &n, None) else {
+            panic!("the unselected row's count was never looked at");
+        };
+        assert!(err.to_string().contains("left()"), "{err}");
+    }
+
+    /// A cut says it can raise, which is what keeps it out of a
+    /// projection unless the compiler settled the count. A number is
+    /// not a string here either, and neither is a string a count.
+    #[test]
+    fn a_cut_can_raise_and_wants_a_string_and_a_number() {
+        assert!(StrCut::Left.may_raise() && StrCut::Right.may_raise());
+        assert_eq!(
+            StrCut::Left.answer_type(PhysType::Str, PhysType::Int64),
+            Some(PhysType::Str)
+        );
+        assert!(
+            StrCut::Left
+                .answer_type(PhysType::Str, PhysType::Float64)
+                .is_none()
+        );
+        let mut arena = MorselArena::new();
+        let v = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, 2]);
+        let n = counts(&mut arena, &[1, 1]);
+        let Err(err) = cut(&mut arena, StrCut::Left, &v, &n, None) else {
+            panic!("a number was cut as a string");
+        };
+        assert!(err.to_string().contains("left()"), "{err}");
     }
 }

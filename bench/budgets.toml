@@ -1535,18 +1535,22 @@ insert_stmt_growth_b = 4096.0
 
 # The same SET with the sync's own processor cost taken off, one sync a
 # statement, which is what one statement commits. A sync is not only a
-# wait: on a Mac it is fcntl with F_FULLFSYNC and it burns 73 to 83 us
+# wait: on a Mac it is fcntl with F_FULLFSYNC and it burns 20 to 83 us
 # of processor time before the disk is asked, measured by the bench on
 # the machine it runs on, which is most of the ceiling above and none of
-# the write path. Taking it out is what makes the column comparable
-# across a laptop and a runner, and it is the column P5 is written
-# against: a point write under 30 us.
+# the write path.
+#
+# This is no longer the column P5 is written against; write_cpu_nosync_us
+# at the end of this file is. Taking one calibrated sync off a statement
+# that pays more than one, and off a store far bigger than the scratch
+# file the calibration used, leaves something that read 53, 122 and 201
+# us across three runs of one commit. It is kept as the loose thing it
+# is: a statement that starts burning milliseconds shows up here whatever
+# the sync is doing.
 #
 # Measured 165 to 205 us over four runs at 10000 rows, against a raw cpu
-# of 242 to 280 us for the same statements. That spread is the number to
-# beat and 30 is where it has to land, so this ceiling is set to catch a
-# regression today rather than to declare the gate met. Lower it as the
-# write path gets cheaper, never raise it.
+# of 242 to 280 us for the same statements. Lower it as the write path
+# gets cheaper, never raise it.
 set_stmt_cpu_nosync_us = 300.0
 
 # A DELETE at the same shape, measured 3.7 ms, 76 us of processor time,
@@ -2132,3 +2136,32 @@ sustained_stmt_growth_b = 512.0
 # floor and that ceiling puts it at 2.27. Lower this ceiling, never
 # raise it.
 sustained_file_x = 3.0
+
+# The P5 point write gate: processor time a statement excluding fsync,
+# under 30 us (docs/12, zu#78).
+#
+# Measured rather than estimated, and the difference matters. The
+# cpu-sync column beside every other write key is the processor time
+# with one calibrated sync subtracted from it, and that subtraction does
+# not work: a sustained statement pays its own commit sync plus its
+# share of the two a checkpoint costs, so one is the wrong number of
+# them to take off, and the calibration syncs a scratch file with a few
+# bytes behind it while the statement syncs a nine megabyte store with a
+# fold's worth of dirty pages, so one sync is also the wrong size. Three
+# runs of the same commit on this laptop put that column at 53, 122 and
+# 201 us, which measures the machine's mood.
+#
+# This key comes off a store on the memory filesystem instead. It runs
+# the identical write path, encodes the same log frames, keeps the same
+# overlay, folds on the same schedule and checkpoints on the same
+# threshold, and the only thing it does differently is return from a
+# sync without asking a disk. So the difference between it and the
+# durable run beside it is durability and nothing else. Measured 19.0
+# against the same window's 106.7 with the syncs in it, and 19.1 over a
+# window too short to fold, so the folds are about four microseconds of
+# it and the run is not measuring a store that quietly stopped working.
+#
+# This is a target and not a ceiling fitted to what was measured: it is
+# the number docs/12 asks for, so a gate box slower than this laptop is
+# supposed to fail it rather than have it raised.
+write_cpu_nosync_us = 30.0

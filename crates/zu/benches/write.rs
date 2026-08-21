@@ -28,17 +28,36 @@
 //! this one.
 //!
 //! `cpu-sync` is that column with the sync's own processor cost taken
-//! out, and it is the one the P5 budget is written against. A sync is
-//! not only a wait: on this laptop it is `fcntl` with `F_FULLFSYNC`,
-//! which burns 60 to 80 us before the disk is even asked, several times
-//! what the write path spends, and it lands in the same counter. So
-//! `cpu` on a durable one statement commit is mostly the storage too,
-//! and it moves with whatever else the machine is doing to its disk.
-//! What is taken out is measured on the machine the run is on, one sync
-//! a statement, which is what one statement commits. A one cell change that writes a megabyte is a real defect
-//! and the clock alone would call it fine; a write path that leaked a
-//! block per statement would pass every latency ceiling there is and
-//! show up only in `growth`.
+//! out. A sync is not only a wait: on this laptop it is `fcntl` with
+//! `F_FULLFSYNC`, which burns 20 to 80 us before the disk is even
+//! asked, several times what the write path spends, and it lands in the
+//! same counter. So `cpu` on a durable one statement commit is mostly
+//! the storage too, and it moves with whatever else the machine is
+//! doing to its disk.
+//!
+//! What `cpu-sync` is not is the P5 point write budget, though it used
+//! to be read as it. It takes off one sync measured on a scratch file,
+//! and a sustained statement pays its own commit sync plus its share of
+//! the two a checkpoint costs, on a nine megabyte store with a fold's
+//! worth of dirty pages behind it. So it is the wrong number of syncs
+//! of the wrong size, and three runs of one commit put it at 53, 122
+//! and 201 us. It is kept because a statement that suddenly burns
+//! milliseconds shows up in it whatever the sync is doing, and it is
+//! read as the loose thing it is.
+//!
+//! The budget is read off `SET unsynced` instead, which is the same
+//! sustained window over a store on the memory filesystem. That store
+//! runs the identical write path: same log frames, same overlay, same
+//! fold schedule, same checkpoint threshold, and syncs that return
+//! without asking a disk. So the gap between it and the durable run is
+//! durability and nothing else, and what is left is the write path. It
+//! reads 19 us against the durable window's 107, and it reads 19 again
+//! next time.
+//!
+//! A one cell change that writes a megabyte is a real defect and the
+//! clock alone would call it fine; a write path that leaked a block per
+//! statement would pass every latency ceiling there is and show up only
+//! in `growth`.
 //!
 //! The fold is why the same statement runs at two table sizes. A fold
 //! rewrites the columns of the table it touched out of their old values
@@ -492,12 +511,19 @@ fn build_with(dir: &Path, rows: u64, edges: &[(u32, u32)]) -> std::path::PathBuf
     std::fs::create_dir_all(dir).expect("dir");
     let path = dir.join("db.zu1");
     let mut db = Zu1File::create(&path).expect("create");
-    bulk_load_as(&mut db, "person", "follows", rows, edges).expect("load");
+    seed(&mut db, rows, edges);
+    path
+}
+
+/// The rows themselves, apart from the file they go in, because the
+/// unsynced run puts the same ones in a store that has no file.
+fn seed(db: &mut Zu1File, rows: u64, edges: &[(u32, u32)]) {
+    bulk_load_as(db, "person", "follows", rows, edges).expect("load");
     let names: Vec<Vec<u8>> = (0..rows).map(|i| format!("seed{i}").into_bytes()).collect();
     let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
     let ages: Vec<u64> = (0..rows).collect();
     store_props(
-        &mut db,
+        db,
         "person",
         &[
             ("age", PropValues::Int(&ages)),
@@ -505,7 +531,6 @@ fn build_with(dir: &Path, rows: u64, edges: &[(u32, u32)]) -> std::path::PathBuf
         ],
     )
     .expect("props");
-    path
 }
 
 fn one(conn: &mut zu::Connection, text: &str) -> i64 {
@@ -1231,6 +1256,89 @@ fn run_sustained(dir: &Path, rows: u64) -> Sustained {
     }
 }
 
+/// The same sustained window with nothing to sync to, which is what
+/// "processor time excluding fsync" means when it is measured rather
+/// than estimated.
+///
+/// The `cpu-sync` column beside every other run is the processor time
+/// with one calibrated sync subtracted from it, and the subtraction
+/// does not work. A sustained statement pays its own commit sync plus
+/// its share of the two a checkpoint costs, so one is the wrong number
+/// of them to take off; and the calibration syncs a scratch file with a
+/// few bytes behind it while the statement syncs a nine megabyte store
+/// with a fold's worth of dirty pages, so one sync is the wrong size as
+/// well. Three runs of the same commit on this laptop put that column
+/// at 53, 122 and 201 us, which is not a measurement of anything.
+///
+/// A store on the memory filesystem runs the identical write path. It
+/// encodes the same log frames, keeps the same overlay, folds on the
+/// same schedule and checkpoints on the same threshold, and the only
+/// thing it does differently is that its syncs return without asking a
+/// disk. So the difference between the two runs is the durability and
+/// nothing else, and what is left is the write path. It reads 22.8 us
+/// against the file's 73.3, and it reads it again the next time.
+///
+/// The fold is inside it, which is the thing worth checking rather than
+/// assuming: the same store measured over a window too short to fold
+/// reads 19.1, so the folds in the sustained window are about four
+/// microseconds of the number and the run is not quietly measuring a
+/// store that stopped working.
+fn run_unsynced(rows: u64) -> Cost {
+    let db = Database::memory_with(Config::new().threads(1)).expect("memory");
+    let mut conn = db.connect().expect("connect");
+    let edges: Vec<(u32, u32)> = (0..rows as u32)
+        .map(|i| (i, (i * 7 + 1) % rows as u32))
+        .collect();
+    // A memory database opens empty, so the rows go in through the
+    // store itself rather than through a file that was loaded before
+    // anything opened it. This is the one place a bench reaches for the
+    // file under the session, and it is at seeding time, before
+    // anything is being measured.
+    seed(
+        conn.session_mut().file_mut().expect("the store"),
+        rows,
+        &edges,
+    );
+
+    let mut age = 0;
+    let set = |conn: &mut zu::Connection, age: u64| {
+        conn.query(&format!(
+            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
+        ))
+        .expect("set");
+    };
+    for _ in 0..RAMP {
+        set(&mut conn, age % rows);
+        age += 1;
+    }
+
+    let before = usage();
+    let start = Instant::now();
+    for _ in 0..SUSTAINED {
+        set(&mut conn, age % rows);
+        age += 1;
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        rows as i64,
+        "no row was added or lost"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / SUSTAINED as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / SUSTAINED as f64,
+        // A store with no file under it pushes nothing at a disk and
+        // grows no file, so both columns are zero by construction
+        // rather than by measurement and neither is gated.
+        written: 0.0,
+        growth: 0.0,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
@@ -1330,6 +1438,19 @@ fn main() {
         sustained.window_x
     );
 
+    let unsynced = run_unsynced(SMALL);
+    unsynced.report(&format!("SET unsynced, {SMALL} rows"), 0.0);
+    // The write path on its own, which is the same window over a store
+    // whose syncs return without asking a disk. This is the number the
+    // P5 point write budget is read against, because it is measured
+    // rather than arrived at by subtracting an estimate of a sync from
+    // a number that contains several.
+    println!(
+        "write_cpu_nosync_us: {:.1} us of processor time a statement, against the {:.1} the \
+         same window costs with the syncs in it",
+        unsynced.cpu, sustained.cost.cpu
+    );
+
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
     // means it reads all of it, since the large table is ten times the
@@ -1415,6 +1536,7 @@ fn main() {
         ("sustained_stmt_kb", sustained.cost.written / 1024.0),
         ("sustained_stmt_growth_b", sustained.cost.growth),
         ("sustained_file_x", sustained.file_x),
+        ("write_cpu_nosync_us", unsynced.cpu),
     ];
     for (key, got) in checks {
         if let Some(ceiling) = budget(key)

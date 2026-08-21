@@ -3933,6 +3933,36 @@
       "doc": "The rows, untyped."
     },
     {
+      "id": "zu::query::Engine",
+      "kind": "enum",
+      "name": "Engine",
+      "doc": "Which executor a read runs on.\n\nThe pipeline executor covers most plans and hands the rest to the row\nat a time one, which is what [`run`] does. Pinning the row executor\nis how the differential tests get their oracle rows, and a caller\nsays so here rather than through the environment: a variable is\nprocess wide, cargo runs a file's tests in one process and in\nparallel, and a test that set one was changing what its siblings\nwere measuring while they ran (#474)."
+    },
+    {
+      "id": "zu::query::Engine::Pipeline",
+      "kind": "variant",
+      "name": "Pipeline",
+      "of": "zu::query::Engine",
+      "signature": "Pipeline",
+      "doc": "The pipeline executor wherever it covers the plan."
+    },
+    {
+      "id": "zu::query::Engine::Rows",
+      "kind": "variant",
+      "name": "Rows",
+      "of": "zu::query::Engine",
+      "signature": "Rows",
+      "doc": "The row at a time executor, whatever the plan."
+    },
+    {
+      "id": "zu::query::Engine::from_env",
+      "kind": "method",
+      "name": "from_env",
+      "of": "zu::query::Engine",
+      "signature": "fn from_env() -> Engine",
+      "doc": "What the environment asks for. `ZU_EXEC2=0` pins the row\nexecutor and anything else takes the pipeline one."
+    },
+    {
       "id": "zu::query::Flow",
       "kind": "enum",
       "name": "Flow",
@@ -5054,6 +5084,13 @@
       "doc": "Executes one query with per-operator counters and returns the\nrendered EXPLAIN ANALYZE listing: pulls, rows, the estimate and its\nq-error, the average vector length, and self time per operator, per\nstage. The grammar has no EXPLAIN keyword yet, so this is the API\nentry point."
     },
     {
+      "id": "zu::query::explain_analyze_on",
+      "kind": "function",
+      "name": "explain_analyze_on",
+      "signature": "fn explain_analyze_on(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], engine: Engine) -> zu_common::Result<String>",
+      "doc": "[`explain_analyze`], on the executor the caller names."
+    },
+    {
       "id": "zu::query::merge_frames",
       "kind": "function",
       "name": "merge_frames",
@@ -5073,6 +5110,20 @@
       "name": "run",
       "signature": "fn run(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)]) -> zu_common::Result<QueryResult>",
       "doc": "Parses, plans, optimizes, and executes one query against an open\nzu1 file, returning the result rows. Scan-driven stages run on the\nmorsel scheduler with `min(cores, 8)` workers; `ZU_THREADS` in the\nenvironment overrides the count, `ZU_THREADS=1` forces sequential\nexecution."
+    },
+    {
+      "id": "zu::query::run_on",
+      "kind": "function",
+      "name": "run_on",
+      "signature": "fn run_on(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], engine: Engine) -> zu_common::Result<QueryResult>",
+      "doc": "[`run`], on the executor the caller names."
+    },
+    {
+      "id": "zu::query::run_pinned",
+      "kind": "function",
+      "name": "run_pinned",
+      "signature": "fn run_pinned(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], engine: Engine, wcoj: exec::Wcoj) -> zu_common::Result<QueryResult>",
+      "doc": "[`run_on`] with the join pinned as well, for a caller comparing the\nfused close against the binary pair.\n\nSame reason the engine is an argument: `ZU_WCOJ` is process wide and\na test that set it was choosing the join for every other test in the\nbinary for as long as the call took (#474)."
     },
     {
       "id": "zu::query::schema_of",
@@ -5129,6 +5180,14 @@
       "name": "close_stmt",
       "of": "zu::session::Session",
       "signature": "fn close_stmt(&mut self, stmt: u64) -> bool"
+    },
+    {
+      "id": "zu::session::Session::engine",
+      "kind": "method",
+      "name": "engine",
+      "of": "zu::session::Session",
+      "signature": "fn engine(&self) -> query::Engine",
+      "doc": "Which executor this session's reads run on."
     },
     {
       "id": "zu::session::Session::epoch",
@@ -5303,6 +5362,14 @@
       "of": "zu::session::Session",
       "signature": "fn run_streaming(&mut self, source: &str, params: &[(&str, Value)], batch_rows: usize, sink: &mut dyn FnMut) -> Result<Streamed>",
       "doc": "Runs one query and hands its rows to `sink` in batches as they\nare made, instead of returning them.\n\nA statement that has to see every row before it can give one,\nwhich is ORDER BY, DISTINCT and the aggregates, runs whole and is\nhanded over in batches afterwards, and so does a statement that\nwrites, because a write runs as the parts it was split into and\nthe rows come out of the last of them. Which happened is in\n[`Streamed::streamed`], and the caller's loop is the same either\nway."
+    },
+    {
+      "id": "zu::session::Session::set_engine",
+      "kind": "method",
+      "name": "set_engine",
+      "of": "zu::session::Session",
+      "signature": "fn set_engine(&mut self, engine: query::Engine)",
+      "doc": "Pins one. The differential tests read the same statement twice\nand compare, and this is how they ask for the second reading\nwithout announcing it to every other test in the process (#474)."
     },
     {
       "id": "zu::session::Session::set_options",
@@ -6047,6 +6114,13 @@
       "name": "run",
       "signature": "fn run(source: &str, store: &zu_sqlite::SqliteStore, params: &[(&str, zu_query::exec::Value)]) -> zu_common::Result<zu_query::exec::QueryResult>",
       "doc": "Parses, plans, optimizes, and executes one query against an open\nsqlite store, returning the result rows. Execution is sequential:\nthe store holds one connection, so there is no fork for morsel\nworkers to ride."
+    },
+    {
+      "id": "zu::sqlite::run_pinned",
+      "kind": "function",
+      "name": "run_pinned",
+      "signature": "fn run_pinned(source: &str, store: &zu_sqlite::SqliteStore, params: &[(&str, zu_query::exec::Value)], wcoj: exec::Wcoj) -> zu_common::Result<zu_query::exec::QueryResult>",
+      "doc": "[`run`] with the join pinned, so the parity corpus can hold both\nengines to the same one without putting it in the environment for\nevery other test in the binary to find (#474)."
     },
     {
       "id": "zu::sqlite::schema_of",

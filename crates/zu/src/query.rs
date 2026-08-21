@@ -1277,9 +1277,11 @@ fn graph_variable<'a>(
 /// to answer here rather than where the other definitions are worked
 /// out. That is the whole of what it may be written as: a graph
 /// reference, which is a word or a name or a parameter and is settled
-/// in the same breath. A definition written as a query is refused, and
-/// by name, because the alternative is compiling the statement against
-/// one graph and running it against another.
+/// in the same breath. GP13's query form counts as one exactly as far
+/// as `BindingInit::graph_ref` says it does, which is a query that
+/// returns a reference and nothing else. Any other query is refused,
+/// and by name, because the alternative is compiling the statement
+/// against one graph and running it against another.
 fn graph_of_variable(
     catalog: &Catalog,
     working: u32,
@@ -1287,10 +1289,10 @@ fn graph_of_variable(
     params: &[(&str, Value)],
 ) -> Result<u32> {
     let (def, above) = upto.split_last().expect("a definition was found");
+    if let Some(named) = def.init.graph_ref() {
+        return graph_of_ref(catalog, working, named, above, params);
+    }
     match &def.init {
-        zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::GraphRef(named)) => {
-            graph_of_ref(catalog, working, named, above, params)
-        }
         zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::Param(name)) => {
             graph_of_param(catalog, name, params)
         }

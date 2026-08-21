@@ -133,12 +133,17 @@ fn the_answer_is_the_one_the_graph_would_have_given_from_inside() {
 /// A graph a query answered is refused rather than read, because which
 /// rel table the call walks is settled while the statement is bound
 /// and a query has not run by then. The refusal says so.
+///
+/// The clause in the query is what makes it a run rather than a
+/// reading: a body that is a bare `RETURN` of a graph reference says
+/// which graph in its text and is read where a reference is read, so
+/// it is the wrong query to write a refusal against.
 #[test]
 fn a_graph_only_a_run_would_know_is_refused_by_name() {
     let (_dir, mut session) = opened("proc-graph-late.zu1");
     let detail = refused(
         &mut session,
-        "GRAPH g = { RETURN CURRENT_PROPERTY_GRAPH AS g } \
+        "GRAPH g = { MATCH (p:person) RETURN CURRENT_PROPERTY_GRAPH AS g LIMIT 1 } \
          CALL wcc(g, 'knows') YIELD node, component RETURN count(*) AS n",
     );
     assert!(

@@ -8436,7 +8436,7 @@ fn fill_bindings(
         let built = crate::plan::build(&binding.query)?;
         let plan = crate::optimizer::optimize(built, &binding.query, schema)?;
         let value = match binding.kind {
-            crate::ast::BindingKind::Table => {
+            crate::ast::BindingKind::Table if binding.collects => {
                 let result = run_stages(
                     &plan,
                     &binding.query,
@@ -8470,7 +8470,13 @@ fn fill_bindings(
             crate::ast::BindingKind::Value => {
                 matches!(value, Value::Graph(_) | Value::BindingTable(_))
             }
-            crate::ast::BindingKind::Table => false,
+            // A table written as a nested query is whatever its rows
+            // are, so there is nothing to check. One written as an
+            // expression has to be a table already, because the name
+            // is going to be read as one.
+            crate::ast::BindingKind::Table => {
+                !binding.collects && !matches!(value, Value::BindingTable(_) | Value::Null)
+            }
         };
         if wrong {
             return Err(ZuError::gql(

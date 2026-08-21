@@ -1883,9 +1883,21 @@ impl Parser<'_> {
         if word {
             self.pos += 1;
         }
+        // GP13. A graph expression is a graph reference or an object
+        // expression, and `VALUE { ... }` is the one object expression
+        // that carries a query, so it is read as an expression rather
+        // than handed to the reference reader, which has no rule that
+        // begins with a brace and would refuse it for the wrong
+        // reason. Everything else written after a `GRAPH` names a
+        // graph, so it still goes to the reference reader.
+        let value_query = self.at_kw("VALUE")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
         let init = if self.at(&TokenKind::LBrace) {
             BindingInit::Query(Box::new(self.parse_call_block(false)?.0))
-        } else if kind == BindingKind::Graph {
+        } else if kind == BindingKind::Graph && !value_query {
             BindingInit::Expr(Expr::GraphRef(self.parse_graph_ref()?))
         } else {
             BindingInit::Expr(self.parse_expr()?)

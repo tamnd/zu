@@ -6241,10 +6241,10 @@ fn shift(instant: &Temporal, kind: DurationKind, count: i64) -> Result<Value> {
             })?)
         }
         (Temporal::LocalTime(nanos), DurationKind::DayTime) => {
-            Temporal::LocalTime((nanos + count).rem_euclid(temporal::NANOS_PER_DAY))
+            Temporal::LocalTime(clock_shift(*nanos, count))
         }
         (Temporal::ZonedTime { nanos, offset }, DurationKind::DayTime) => Temporal::ZonedTime {
-            nanos: (nanos + count).rem_euclid(temporal::NANOS_PER_DAY),
+            nanos: clock_shift(*nanos, count),
             offset: *offset,
         },
         (Temporal::LocalDatetime(nanos), DurationKind::DayTime) => {
@@ -6291,6 +6291,20 @@ fn shift(instant: &Temporal, kind: DurationKind, count: i64) -> Result<Value> {
     Ok(Value::Temporal(out))
 }
 
+/// A time of day moved round the clock by any length of time at all.
+///
+/// A time has no date behind it, so a duration past the end of the day
+/// wraps rather than overflowing, and there is no length of time this
+/// cannot answer for: the answer is always a reading of a clock. The
+/// sum is taken a size up so that the wrap is the only thing that
+/// happens to it, since a time near midnight plus a duration near the
+/// top of the word is past the top of the word on the way to an answer
+/// that was never in doubt.
+fn clock_shift(nanos: i64, count: i64) -> i64 {
+    let day = i128::from(temporal::NANOS_PER_DAY);
+    ((i128::from(nanos) + i128::from(count)).rem_euclid(day)) as i64
+}
+
 /// An instant in nanoseconds shifted, refusing a result off the
 /// calendar rather than wrapping into a year the type cannot spell.
 fn add_nanos(nanos: i64, count: i64) -> Result<i64> {
@@ -6315,7 +6329,13 @@ fn add_months_to_nanos(nanos: i64, months: i64) -> Result<i64> {
         .ok()
         .and_then(|d| temporal::add_months(d, months))
         .ok_or_else(|| datetime_overflow("the shifted instant leaves the calendar".into()))?;
-    Ok(i64::from(days) * temporal::NANOS_PER_DAY + rest)
+    // The calendar is the wider of the two bounds. A date in the year
+    // 3000 is a date the standard has and a datetime this build cannot
+    // hold, so a shift that lands there passes the check above and
+    // fails here, and the two say different things because they are
+    // different limits.
+    temporal::instant_at(days, rest)
+        .ok_or_else(|| datetime_overflow("the shifted instant does not fit".into()))
 }
 
 /// `22012 data exception, division by zero`, for both `/` and `%`. The

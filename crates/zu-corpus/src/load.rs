@@ -257,7 +257,7 @@ impl Column {
                 other => {
                     return Err(at(format!(
                         "holds {}, and a column of those cannot be loaded yet",
-                        value::show(other)
+                        value::show(&value::Cell::Plain(other.clone()))
                     )));
                 }
             }
@@ -363,7 +363,20 @@ fn column(node: &Node, count: u64) -> Result<Column, String> {
         .seq()
         .ok_or_else(|| at("`values:` is a sequence of payloads".to_string()))?
         .iter()
-        .map(|v| value::payload(&ty, v))
+        .map(|v| {
+            let line = v.line();
+            let cell = value::payload(&ty, v)?;
+            // A column is values going into a database rather than
+            // coming back out of one, and nothing puts a node into a
+            // column: a node is a row, and the rows are what the load
+            // is making.
+            cell.plain().ok_or_else(|| {
+                format!(
+                    "line {line}: a column cannot hold a graph value, and this holds {}",
+                    value::show(&cell)
+                )
+            })
+        })
         .collect::<Result<_, _>>()?;
     if values.len() as u64 != count {
         return Err(at(format!(
@@ -457,9 +470,18 @@ mod tests {
             ),
             (
                 format!(
-                    "{HEAD}  columns:\n    - name: age\n      type: NODE\n      values:\n        - \"30\"\n        - \"40\"\n"
+                    "{HEAD}  columns:\n    - name: age\n      type: DECIMAL\n      values:\n        - \"30\"\n        - \"40\"\n"
                 ),
                 "the encoding reserves",
+            ),
+            // A node is a row, and the rows are what the load is
+            // making, so a column of them is a case that means nothing
+            // however well it spells them.
+            (
+                format!(
+                    "{HEAD}  columns:\n    - name: friend\n      type: NODE\n      values:\n        - \"person#0\"\n        - \"person#1\"\n"
+                ),
+                "cannot hold a graph value",
             ),
             (
                 format!("load:\n  nodes: person\n  edges: knows\n  count: 0\n{col}"),

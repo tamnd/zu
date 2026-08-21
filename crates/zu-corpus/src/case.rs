@@ -17,7 +17,7 @@
 //! it a day early passes every case that has no parameters in it.
 
 use crate::load::Load;
-use crate::value;
+use crate::value::{self, Cell};
 use crate::yaml::{self, Node};
 
 use zu::query::Value;
@@ -35,7 +35,7 @@ pub enum Expect {
     /// an ORDER BY.
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Vec<Cell>>,
     },
     /// The five character GQLSTATUS code the statement has to raise.
     Raises(String),
@@ -290,12 +290,23 @@ fn params(node: &Node) -> Result<Vec<(String, Value)>, String> {
         if out.iter().any(|(n, _)| *n == name) {
             return Err(format!("line {line}: two parameters are called {name:?}"));
         }
-        out.push((name, value::typed(item)?));
+        let cell = value::typed(item)?;
+        // A node is a row that exists, so a parameter naming one would
+        // be naming a row the case has not written yet. The engine has
+        // no parameter for one either, which is the same fact from the
+        // other side.
+        let bound = cell.plain().ok_or_else(|| {
+            format!(
+                "line {line}: a parameter cannot be a graph value, and this is {}",
+                value::show(&cell)
+            )
+        })?;
+        out.push((name, bound));
     }
     Ok(out)
 }
 
-fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
+fn rows(node: &Node) -> Result<Vec<Vec<Cell>>, String> {
     let Some(rows) = node.get("rows") else {
         // A statement that returns no rows is a case worth having, and
         // writing it as an absent `rows:` would make it the same shape
@@ -352,7 +363,7 @@ mod tests {
             case.expect,
             Expect::Rows {
                 columns: vec!["n".to_string()],
-                rows: vec![vec![Value::Int(i64::MAX)]],
+                rows: vec![vec![Cell::Plain(Value::Int(i64::MAX))]],
             }
         );
     }

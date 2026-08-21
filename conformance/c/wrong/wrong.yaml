@@ -70,6 +70,18 @@ cases:
           - type: INT64
             value: "2"
 
+  - name: wrong-node
+    doc: A case naming the wrong row of the right table, which is the graph value a report has to print as a name and an offset rather than as whatever the engine holds inside.
+    setup:
+      - "INSERT (:thing {n: 1})"
+    query: MATCH (n:thing) RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "thing#1"
+
   - name: ahead-of-the-engine
     doc: A statement this engine does not implement, which is the third outcome and neither of the other two.
     query: MERGE (n:person)

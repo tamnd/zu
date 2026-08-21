@@ -43,7 +43,18 @@ typedef enum cv_kind {
     CV_FLOAT,
     CV_STR,
     CV_TEMPORAL,
-    CV_LIST
+    CV_LIST,
+    /* A node and an edge carry the name of their table rather than its
+     * id, because the id is a number the file decided and every client
+     * builds its own file. The name is what a case can assert, so the
+     * runner asks the connection for it and compares names. */
+    CV_NODE,
+    CV_EDGE,
+    /* A walk: nodes and edges alternating, a node at both ends. Same
+     * shape as a list and a different kind, because a path that
+     * compared equal to the list of its parts would be a case passing
+     * for the wrong reason. */
+    CV_PATH
 } cv_kind;
 
 /* Which temporal a value is, and therefore what its count means. A
@@ -94,12 +105,25 @@ struct cv {
             int64_t count;
             int offset;
         } temporal;
-        /* CV_LIST, the one composite type and therefore the one place a
-         * decoder has to recurse. */
+        /* CV_LIST and CV_PATH, the composite types and therefore the
+         * places a decoder has to recurse. */
         struct {
             const cv *items;
             size_t count;
         } list;
+        /* CV_NODE */
+        struct {
+            zy_str table;
+            uint64_t offset;
+        } node;
+        /* CV_EDGE. Which of two parallel edges it is is not carried,
+         * because that is the order the loader wrote them in and not
+         * anything the case chose. */
+        struct {
+            zy_str table;
+            uint64_t src;
+            uint64_t dst;
+        } edge;
     } as;
 };
 

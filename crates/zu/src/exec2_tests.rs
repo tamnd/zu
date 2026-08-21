@@ -1272,6 +1272,16 @@ fn fallback_queries() -> &'static [&'static str] {
          RETURN b.id AS bid } RETURN a.id AS a, bid AS b",
         "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b.id AS bid } \
          RETURN count(bid) AS n",
+        // GF10 and GF12. An item that reads a set function without being
+        // one is a grouping and a projection standing behind it, and the
+        // stage this pipeline runs above a grouping emits columns of the
+        // tuple the sink holds rather than working anything out of them.
+        // A column that is a sum times ten is not one of those, so the
+        // statement goes back whole. Once bare, once with a key, and
+        // once where the same set function is written twice.
+        "MATCH (p:person) RETURN count(p) * 10 AS n",
+        "MATCH (p:person) RETURN p.age AS age, count(p) + 1 AS n ORDER BY age LIMIT 20",
+        "MATCH (p:person) RETURN sum(p.age) + count(p) AS n, sum(p.age) AS s",
         // A trim set that is a column is a different set a row, and
         // the kernel prepares one set for the chunk.
         "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",

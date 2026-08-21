@@ -31,6 +31,13 @@ fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
 }
 
+/// Whether an expression is a set function and nothing else, which is
+/// what an item of a grouping may be: the accumulator answers the
+/// column, so there is nothing left over to work out per group.
+fn is_set_function(expr: &BoundExpr) -> bool {
+    matches!(expr, BoundExpr::Call { func, .. } if func.is_aggregate())
+}
+
 /// A small count written the way a sentence writes it, since a refusal
 /// is read by a person and a person reading about two arguments does
 /// not want the digit.
@@ -4396,6 +4403,14 @@ impl Binder<'_> {
         }
         let mut has_aggregate = items.iter().any(|i| i.aggregate);
         let mut grouped_without_aggregate = false;
+        // GF10 and GF12. An item that reads a set function without being
+        // one, `CARDINALITY(COLLECT_LIST(v.n))`, is a scalar read of
+        // what the grouping answered rather than an accumulator of its
+        // own, so the set functions come out into items of their own and
+        // what is left of the expression becomes a projection standing
+        // behind the grouping. What comes back is that grouping, and
+        // `items` is what reads it.
+        let grouping = self.lift_over_the_grouping(&mut items);
 
         // An explicit GROUP BY says what a group is, and the items say
         // what a row of one holds, so the two have to agree: every
@@ -4415,6 +4430,14 @@ impl Binder<'_> {
                 let (bound, _) = self.bind_expr(key, &mut ctx)?;
                 keys.push((bound, text(key)));
             }
+            // Where the clause was split in two, the grouping is the
+            // half that groups, so that is the half the keys are asked
+            // about: what stands behind it reads columns rather than
+            // rows and has no say in what a group is.
+            let items: &[BoundItem] = match &grouping {
+                Some(grouping) => grouping,
+                None => &items,
+            };
             for item in items.iter().filter(|item| !item.aggregate) {
                 if !keys.iter().any(|(key, _)| *key == item.expr) {
                     return Err(invalid(format!(
@@ -4474,6 +4497,11 @@ impl Binder<'_> {
             let mut ctx = ExprCtx::new(true);
             let (mut bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
             if ctx.saw_aggregate {
+                if grouping.is_some() {
+                    return Err(not_yet(
+                        "a sort key holding a set function beside an item that reads one without being one, which is a value the grouping would answer and the projection behind it would sort by,",
+                    ));
+                }
                 self.hoist_sort_aggregates(&mut bound, &items, &mut order_aggs);
             }
             order_by.push(key.with_expr(bound));
@@ -4528,7 +4556,7 @@ impl Binder<'_> {
                 item.slot = None;
             }
         }
-        Ok(BoundClause::Project {
+        let projected = BoundClause::Project {
             distinct: projection.distinct || grouped_without_aggregate,
             items,
             order_by,
@@ -4536,7 +4564,95 @@ impl Binder<'_> {
             skip,
             limit,
             filter,
+        };
+        let Some(grouping) = grouping else {
+            return Ok(projected);
+        };
+        // The half that reads runs behind the half that groups, which
+        // is where `pending` puts it. Everything the clause was written
+        // with is on the half that reads, the grouping being only what
+        // the accumulators answer.
+        self.pending.push(projected);
+        Ok(BoundClause::Project {
+            distinct: false,
+            items: grouping,
+            order_by: Vec::new(),
+            order_aggs: Vec::new(),
+            skip: None,
+            limit: None,
+            filter: None,
         })
+    }
+
+    /// Takes the set functions out of the items that read one without
+    /// being one, and answers the grouping they become.
+    ///
+    /// A set function answers one value per group and a scalar function
+    /// reads one value, so `CARDINALITY(COLLECT_LIST(v.n))` is two
+    /// things that run at two times: the list is accumulated over the
+    /// rows of the group and the count is taken of what came out. One
+    /// clause cannot be both, an accumulator reading a row at a time and
+    /// a projection reading a group at a time, so the clause becomes
+    /// two. The grouping carries the keys and every set function under
+    /// the items, each in a column of its own, and the items that come
+    /// back read those columns.
+    ///
+    /// Nothing happens where no item reads a set function without being
+    /// one, which is nearly every projection there is, and then the
+    /// clause stays the one clause it was written as.
+    ///
+    /// A key and a bare set function are columns of the grouping
+    /// already, so what stands behind it is the name for the column and
+    /// costs nothing. Their slots are settled here rather than where the
+    /// other items get theirs, since the expressions being lifted need a
+    /// slot to read.
+    fn lift_over_the_grouping(&mut self, items: &mut Vec<BoundItem>) -> Option<Vec<BoundItem>> {
+        if !items
+            .iter()
+            .any(|item| item.aggregate && !is_set_function(&item.expr))
+        {
+            return None;
+        }
+        let mut grouping: Vec<BoundItem> = Vec::new();
+        let mut hoisted: Vec<BoundItem> = Vec::new();
+        let mut behind: Vec<BoundItem> = Vec::new();
+        for item in std::mem::take(items) {
+            if !item.aggregate || is_set_function(&item.expr) {
+                let slot = match item.expr {
+                    BoundExpr::Var(slot) => slot,
+                    _ => self.new_slot(item.name.clone(), item.ty.clone()),
+                };
+                behind.push(BoundItem {
+                    expr: BoundExpr::Var(slot),
+                    ty: item.ty.clone(),
+                    name: item.name.clone(),
+                    slot: None,
+                    aggregate: false,
+                });
+                grouping.push(BoundItem {
+                    slot: Some(slot),
+                    ..item
+                });
+                continue;
+            }
+            // The same hoist a sort key gets, and for the same reason:
+            // what is left where the call stood is a column the grouping
+            // fills, and an item already carrying that call is the
+            // column, so the statement pays for one accumulator however
+            // many times the query wrote it.
+            let mut expr = item.expr;
+            self.hoist_sort_aggregates(&mut expr, &grouping, &mut hoisted);
+            behind.push(BoundItem {
+                expr,
+                ty: item.ty,
+                name: item.name,
+                slot: None,
+                aggregate: false,
+            });
+        }
+        grouping.extend(hoisted);
+        *items = behind;
+        Some(grouping)
     }
 
     /// GF20. Takes the aggregates out of one sort key and leaves a name

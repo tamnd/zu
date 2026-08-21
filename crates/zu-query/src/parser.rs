@@ -12,16 +12,18 @@
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
 use zu_common::{
-    Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result, Temporal, ZuError,
+    DurationKind, Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result,
+    Temporal, ZuError,
 };
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd, ElementDefKind,
-    ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, Group,
-    GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal,
-    PathMode, PathPattern, PatternList, Projection, ProjectionItem, PropertyDef, Query,
-    RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto, SetItem, SetOp,
-    Simple, SortKey, Statement, Subpath, TxnStmt, UnaryOp, YieldItem,
+    BinaryOp, Brackets, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd,
+    ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef,
+    GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern,
+    NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection, ProjectionItem,
+    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto,
+    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp,
+    YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -1170,9 +1172,13 @@ impl Parser<'_> {
     /// left belongs to somebody else, which is the semicolon after the
     /// statement, the `NEXT` that hands its result to the statement
     /// behind it, and the conjunction that joins it to another operand.
+    /// The closing brace is here because a statement may be written
+    /// inside a block, and the brace that ends the block ends the
+    /// statement in it as surely as the end of the text would.
     fn at_statement_end(&self) -> bool {
         self.peek().is_none()
             || self.at(&TokenKind::Semicolon)
+            || self.at(&TokenKind::RBrace)
             || self.at_kw("NEXT")
             || self.at_conjunction()
     }
@@ -1425,6 +1431,41 @@ impl Parser<'_> {
         Ok(query)
     }
 
+    /// The variable scope clause of an inline call (ISO 13.4), which
+    /// says what the block is allowed to read of the row it runs for.
+    ///
+    /// `None` is a block written with no clause at all and `Some` is
+    /// the list, which may be empty: `CALL () { ... }` is a block that
+    /// reads nothing, and it is written that way on purpose rather than
+    /// by leaving the parentheses off.
+    fn parse_variable_scope(&mut self) -> Result<Option<Vec<String>>> {
+        if !self.eat(&TokenKind::LParen) {
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            names.push(self.expect_name("a variable name in the scope of a CALL")?);
+            while self.eat(&TokenKind::Comma) {
+                names.push(self.expect_name("a variable name in the scope of a CALL")?);
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Some(names))
+    }
+
+    /// The block of an inline call: a whole query between braces.
+    ///
+    /// Unlike the query inside a `VALUE` or an `EXISTS` it need not end
+    /// with a `RETURN`, because a block that returns nothing is a
+    /// perfectly good one. It says the row it ran for goes on unchanged
+    /// or, where the block wrote something, that the writing happened.
+    fn parse_call_block(&mut self) -> Result<Query> {
+        self.expect(&TokenKind::LBrace)?;
+        let (query, _) = self.parse_query_body()?;
+        self.expect(&TokenKind::RBrace)?;
+        Ok(query)
+    }
+
     /// The body of a composite query and how its last statement ended,
     /// stopping wherever the operands run out. What may follow is the
     /// caller's business: the end of the text for a statement, a
@@ -1591,6 +1632,19 @@ impl Parser<'_> {
                 }
                 clauses.push(Clause::Delete { targets, detach });
             } else if self.eat_kw("CALL") {
+                // Which of the two calls this is, read off the one
+                // token after the word. A block or a scope clause is
+                // the inline call, and a name is the table function,
+                // there being nothing else a call can start with.
+                if self.at(&TokenKind::LBrace) || self.at(&TokenKind::LParen) {
+                    let scope = self.parse_variable_scope()?;
+                    let body = self.parse_call_block()?;
+                    clauses.push(Clause::CallInline {
+                        scope,
+                        body: Box::new(body),
+                    });
+                    continue;
+                }
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
                 let mut args = Vec::new();
@@ -3769,6 +3823,37 @@ impl Parser<'_> {
         {
             return Ok(Expr::GraphRef(GraphRef::Home));
         }
+        // ISO 20.27 and 20.29, the temporal value functions. Where the
+        // brackets may stand is part of each one, which is why they are
+        // read here rather than resolved by name: CURRENT_DATE takes
+        // none, DATE(...) takes them, and LOCAL_TIME takes them or not.
+        // Reading them here takes nothing away from a query, since
+        // every one of the words is reserved and a variable of one of
+        // those names is a variable the standard does not allow.
+        //
+        // A word written with brackets it does not take, or without
+        // brackets it needs, falls through to the call path on purpose.
+        // CURRENT_DATE() is a query asking for a function that does not
+        // exist, and the refusal that says so by name reads better than
+        // one about a bracket that could not go where it was put; a
+        // bare DATE is a name, and stays one, the way it is a name in
+        // front of a date string.
+        if let Some(func) = temporal_word(&name)
+            && match func.brackets() {
+                Brackets::Never => !self.at(&TokenKind::LParen),
+                Brackets::Always => self.at(&TokenKind::LParen),
+                Brackets::Optional => true,
+            }
+        {
+            return self.parse_temporal_fn(func);
+        }
+        // ISO 20.28, the datetime subtraction. It looks like a call
+        // until the closing bracket, and then a qualifier may follow
+        // where a call has nothing, so the call path cannot read it and
+        // the name is caught here instead.
+        if self.at(&TokenKind::LParen) && name.eq_ignore_ascii_case("duration_between") {
+            return self.parse_duration_between();
+        }
         // GE01 and GE02, the reference a caller passed in. `GRAPH $g`
         // and `BINDING TABLE $t` say what the parameter holds and
         // nothing else, which is what `USE GRAPH $g` beside `USE $g`
@@ -3790,7 +3875,7 @@ impl Parser<'_> {
         {
             return Ok(Expr::List(self.parse_bracketed_items()?));
         }
-        // The record constructor of ISO 20.19, whose name is optional
+        // The record constructor of ISO 20.18, whose name is optional
         // in the same way: `RECORD {a: 1}` and `{a: 1}` are the same
         // record. A brace after a name begins nothing else, so
         // `record` stays free to be a variable everywhere else.
@@ -3850,6 +3935,13 @@ impl Parser<'_> {
             // word and not a value, and a function would have received
             // a variable called NFC.
             self.parse_normalize()
+        } else if name.eq_ignore_ascii_case("TRIM") {
+            // ISO 20.24, and here for the reason NORMALIZE is: the
+            // explicit form names an end of the string with a word and
+            // separates its two operands with FROM, neither of which a
+            // call can say. The one argument form comes through here
+            // too and comes out as the call it is.
+            self.parse_trim()
         } else if name.eq_ignore_ascii_case("PROPERTY_EXISTS") {
             // G115, and here for the reason CAST is: the second
             // argument is a property name rather than an expression,
@@ -3999,7 +4091,7 @@ impl Parser<'_> {
     /// `None` means this was not a temporal literal at all and the
     /// caller should carry on reading a variable or a call.
     fn temporal_literal(&mut self, name: &str) -> Result<Option<Expr>> {
-        // ISO 21.5 writes a duration two ways, `DURATION 'P1D'` and the
+        // ISO 21.2 writes a duration two ways, `DURATION 'P1D'` and the
         // SQL spelling, and the SQL one is a grammar of its own rather
         // than another string to read.
         if name.eq_ignore_ascii_case("INTERVAL") {
@@ -4241,7 +4333,7 @@ impl Parser<'_> {
         Ok(args)
     }
 
-    /// `CASE`, ISO 19.4 and GE01, the word already read.
+    /// `CASE`, ISO 20.7 and GE01, the word already read.
     ///
     /// Both forms are read here, and which one this is is settled by
     /// what follows `CASE`: a `WHEN` means the searched form, and
@@ -4570,6 +4662,69 @@ impl Parser<'_> {
         Ok(Expr::Normalize { expr, form })
     }
 
+    /// `TRIM(s)`, `TRIM(c FROM s)` or `TRIM(LEADING c FROM s)`, the
+    /// parenthesis unconsumed and TRIM already read.
+    ///
+    /// Three spellings and one function. The trim specification and the
+    /// trim character are both optional, so what stands after the
+    /// parenthesis may be an end of the string, the character to take
+    /// off it, or the string itself, and only what follows says which.
+    fn parse_trim(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let side = self.eat_trim_side();
+        // With an end named, what follows is the character or the FROM,
+        // and the string is behind the FROM. Without one, the first
+        // expression is the character if a FROM follows it and the
+        // string if nothing does.
+        let (chars, source) = if side.is_some() {
+            let chars = match self.at_kw("FROM") {
+                true => None,
+                false => Some(Box::new(self.parse_expr()?)),
+            };
+            self.expect_kw("FROM")?;
+            (chars, self.parse_expr()?)
+        } else {
+            let first = self.parse_expr()?;
+            match self.eat_kw("FROM") {
+                true => (Some(Box::new(first)), self.parse_expr()?),
+                false => (None, first),
+            }
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::Trim {
+            side: side.unwrap_or(TrimSide::Both),
+            chars,
+            source: Box::new(source),
+        })
+    }
+
+    /// The trim specification, if one is written here.
+    ///
+    /// A word is only taken as one when something other than the end of
+    /// the call follows it, so `TRIM(leading)` reads the variable a
+    /// query wrote and `TRIM(LEADING FROM s)` reads the specification.
+    /// The three words are reserved in ISO and are ordinary identifiers
+    /// to this lexer, which is the arrangement every keyword here has.
+    fn eat_trim_side(&mut self) -> Option<TrimSide> {
+        let side = if self.at_kw("LEADING") {
+            TrimSide::Leading
+        } else if self.at_kw("TRAILING") {
+            TrimSide::Trailing
+        } else if self.at_kw("BOTH") {
+            TrimSide::Both
+        } else {
+            return None;
+        };
+        if matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            None | Some(TokenKind::RParen) | Some(TokenKind::Comma)
+        ) {
+            return None;
+        }
+        self.pos += 1;
+        Some(side)
+    }
+
     /// One of the four words ISO 19.7 names a normal form with. They are
     /// reserved words, so nothing else can be standing here, and a word
     /// that is not one of the four is named in the error rather than
@@ -4598,7 +4753,14 @@ impl Parser<'_> {
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {
         self.expect(&TokenKind::LParen)?;
+        // The set quantifier of a general set function, which the
+        // standard spells `DISTINCT | ALL`. `ALL` is what leaving it
+        // out means, so it is read and dropped rather than carried:
+        // the two spellings are one query and should be one plan.
         let distinct = self.eat_kw("DISTINCT");
+        if !distinct {
+            self.eat_kw("ALL");
+        }
         if self.eat(&TokenKind::Star) {
             self.expect(&TokenKind::RParen)?;
             return Ok(Expr::Call {
@@ -4625,6 +4787,117 @@ impl Parser<'_> {
             args,
         })
     }
+
+    /// One of the temporal value functions of ISO 20.27 and 20.29, with
+    /// the word read and its brackets, if it has any, standing.
+    ///
+    /// Empty brackets read the clock, which is what the word alone does
+    /// and is why `LOCAL_TIME` and `LOCAL_TIME()` are one function. A
+    /// duration has no such form, there being a date now and a time now
+    /// and no length of time now, so its brackets have to hold a value.
+    fn parse_temporal_fn(&mut self, func: TemporalFn) -> Result<Expr> {
+        let mut arg = None;
+        if self.eat(&TokenKind::LParen) {
+            if !self.at(&TokenKind::RParen) {
+                arg = Some(Box::new(self.parse_expr()?));
+            } else if !func.reads_the_clock() {
+                return Err(self.error(&format!(
+                    "a string for {}(), since there is no length of time now",
+                    func.word().to_uppercase()
+                )));
+            }
+            self.expect(&TokenKind::RParen)?;
+        }
+        Ok(Expr::Temporal { func, arg })
+    }
+
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28, with the name read and the bracket standing.
+    ///
+    /// The arguments are read the way a call's are and counted where a
+    /// call's are, on the row, so `DURATION_BETWEEN(a)` is refused with
+    /// the same words every other short call is refused with.
+    fn parse_duration_between(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::DurationBetween {
+            args,
+            kind: self.temporal_duration_qualifier()?,
+        })
+    }
+
+    /// The `YEAR TO MONTH` or `DAY TO SECOND` behind a datetime
+    /// subtraction, or nothing where none is written.
+    ///
+    /// Only those two runs are a temporal duration qualifier, which is
+    /// narrower than an interval qualifier: the answer is a whole
+    /// duration of one kind or the other and never a run of fields
+    /// inside one. The words are read only when a `TO` and a second
+    /// field stand behind the first, so nothing that is not a
+    /// qualifier is eaten and `MONTH TO DAY` still reaches a refusal
+    /// that names it.
+    fn temporal_duration_qualifier(&mut self) -> Result<Option<DurationKind>> {
+        let field = |at: usize| match self.tokens.get(at) {
+            Some(Token {
+                kind: TokenKind::Ident(word),
+                ..
+            }) => IntervalField::spelled(word),
+            _ => None,
+        };
+        let (Some(start), Some(end)) = (field(self.pos), field(self.pos + 2)) else {
+            return Ok(None);
+        };
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token { kind: TokenKind::Ident(word), .. }) if word.eq_ignore_ascii_case("TO"))
+        {
+            return Ok(None);
+        }
+        let at = self.pos;
+        self.pos += 3;
+        match (start, end) {
+            (IntervalField::Year, IntervalField::Month) => Ok(Some(DurationKind::YearMonth)),
+            (IntervalField::Day, IntervalField::Second) => Ok(Some(DurationKind::DayTime)),
+            _ => Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.tokens[at].start,
+                format_args!(
+                    "{} TO {} is not a duration qualifier, which is YEAR TO MONTH or DAY TO SECOND and nothing else",
+                    start.word(),
+                    end.word()
+                ),
+            )),
+        }
+    }
+}
+
+/// The datetime value function a word names, or nothing where the word
+/// names none and is an ordinary identifier. The five words are the
+/// names their rows carry, so there is one list of them and it is the
+/// one the plan prints from.
+fn temporal_word(name: &str) -> Option<TemporalFn> {
+    [
+        TemporalFn::CurrentDate,
+        TemporalFn::CurrentTime,
+        TemporalFn::CurrentTimestamp,
+        TemporalFn::LocalTime,
+        TemporalFn::LocalTimestamp,
+        TemporalFn::Date,
+        TemporalFn::ZonedTime,
+        TemporalFn::ZonedDatetime,
+        TemporalFn::LocalDatetime,
+        TemporalFn::Duration,
+    ]
+    .into_iter()
+    .find(|func| func.word().eq_ignore_ascii_case(name))
 }
 
 fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
@@ -6004,6 +6277,26 @@ mod tests {
         assert!(parse_err("RETURN NULLIF(a) AS n").contains("two arguments"));
     }
 
+    /// The set quantifier of a set function, both spellings and none.
+    /// ALL is the default written down, so the three calls that do not
+    /// say DISTINCT have to arrive as one and the same call.
+    #[test]
+    fn a_set_function_reads_its_set_quantifier() {
+        for (source, want) in [
+            ("count(n)", false),
+            ("count(ALL n)", false),
+            ("count(DISTINCT n)", true),
+            ("collect_list(ALL n.age)", false),
+            ("stddev_samp(ALL n.age)", false),
+        ] {
+            let q = parsed(&format!("MATCH (n) RETURN {source} AS v"));
+            let Expr::Call { distinct, .. } = &q.result().expect("RETURN").items[0].expr else {
+                panic!("{source} is a call");
+            };
+            assert_eq!(*distinct, want, "{source}");
+        }
+    }
+
     #[test]
     fn with_aggregation_pipeline() {
         let q = parsed(
@@ -6152,6 +6445,58 @@ mod tests {
                 ("distance".to_string(), None),
             ]
         );
+    }
+
+    /// The word CALL starts two different clauses and the one token
+    /// after it is what tells them apart, so the three ways an inline
+    /// call is written are read here beside the table function they
+    /// share a keyword with.
+    #[test]
+    fn an_inline_call_is_a_block_and_what_it_may_read() {
+        for (source, want) in [
+            ("MATCH (a) CALL { MATCH (b) RETURN b } RETURN a", None),
+            (
+                "MATCH (a) CALL (a) { MATCH (a)-[:knows]->(b) RETURN b } RETURN a",
+                Some(vec!["a".to_string()]),
+            ),
+            (
+                "MATCH (a) CALL () { MATCH (b) RETURN b } RETURN a",
+                Some(Vec::new()),
+            ),
+        ] {
+            let q = parsed(source);
+            let Clause::CallInline { scope, body } = &q.clauses()[1] else {
+                panic!("an inline CALL in {source}");
+            };
+            assert_eq!(*scope, want, "{source}");
+            assert!(body.result().is_some(), "{source}");
+        }
+    }
+
+    /// The block is part of the text, so what the query names includes
+    /// what the block names. The table an INSERT writes is declared off
+    /// this walk, and a block is not a place a write hides in.
+    #[test]
+    fn the_clauses_of_a_query_include_the_clauses_of_a_block() {
+        let q = parsed("MATCH (a:person) CALL (a) { INSERT (b:pet) } RETURN a");
+        assert_eq!(q.clauses().len(), 3);
+        assert!(
+            q.clauses()
+                .iter()
+                .any(|c| matches!(c, Clause::Insert { .. })),
+            "the INSERT inside the block"
+        );
+    }
+
+    /// A block need not end with a RETURN, which is what makes it
+    /// different from the query inside a VALUE or an EXISTS.
+    #[test]
+    fn a_block_that_returns_nothing_parses() {
+        let q = parsed("MATCH (a:person) CALL (a) { INSERT (b:pet) } RETURN a");
+        let Clause::CallInline { body, .. } = &q.clauses()[1] else {
+            panic!("an inline CALL");
+        };
+        assert!(body.result().is_none());
     }
 
     #[test]

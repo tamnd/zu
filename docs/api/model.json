@@ -357,6 +357,14 @@
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
     },
     {
+      "id": "zu::Connection::table_name",
+      "kind": "method",
+      "name": "table_name",
+      "of": "zu::Connection",
+      "signature": "fn table_name(&self, table: u32) -> Option<&str>",
+      "doc": "What a table id is called, or nothing when no table has that id.\n\nA node value is a table and a row offset and an edge value is a\ntable and two of them, because neither part identifies anything\non its own: two tables both number their rows from zero. The\nnumber is what the engine passes around and the name is what a\nuser asked about, so a binding that hands a node value out has\nto be able to turn one into the other, and until now the only\nway was to reach past this type into the session and read the\ncatalog. Node and rel tables share one id space, so this is one\ncall and not two.\n\nThe name is borrowed from the catalog, which the next statement\nthat creates or drops a table replaces, so a caller keeping one\npast the next statement copies it."
+    },
+    {
       "id": "zu::Connection::unregister",
       "kind": "method",
       "name": "unregister",
@@ -2130,6 +2138,14 @@
       "doc": "Nanoseconds since midnight in the offset's own day, and the\noffset from UTC in minutes."
     },
     {
+      "id": "zu::Temporal::between",
+      "kind": "method",
+      "name": "between",
+      "of": "zu::Temporal",
+      "signature": "fn between(from: Temporal, to: Temporal, kind: DurationKind) -> Option<Temporal>",
+      "doc": "The duration from `from` to `to`, of the kind asked for, or\n`None` when the two are not two instants of one shape or the\nanswer leaves the calendar.\n\nThis is what `DURATION_BETWEEN` answers and what a minus\nbetween two instants answers, so the operator and the function\ncannot drift apart.\n\nThe two operands have to be the same shape. A date and a time\nhave no length between them, and a local datetime and a zoned\none have none either, because a local value names a wall clock\nand not an instant, so the length would depend on a zone nobody\nwrote.\n\nA day-time answer is a count of nanoseconds and needs no\ncalendar. A year-month answer is the largest count of whole\nmonths that does not carry `from` past `to`, which is stated\nagainst zu's own month addition rather than against a\ncomparison of day numbers. The two readings differ: 31 March to\n30 April is one month here, because 31 March plus one month is\n30 April and lands exactly on it, and is nought under a rule\nthat compares the days of the month first. Stating it against\nthe addition is what makes `from + DURATION_BETWEEN(from, to)`\nland at or before `to` and one month more overshoot, and a law\nthat holds is worth more than agreement with a rule that does\nnot.\n\nA backwards answer truncates toward nought the same way, so the\ntwo directions are not mirror images when a month is clipped."
+    },
+    {
       "id": "zu::Temporal::logical_type",
       "kind": "method",
       "name": "logical_type",
@@ -2785,6 +2801,14 @@
       "of": "zu::db::Connection",
       "signature": "fn session_mut(&mut self) -> &mut Session",
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
+    },
+    {
+      "id": "zu::db::Connection::table_name",
+      "kind": "method",
+      "name": "table_name",
+      "of": "zu::db::Connection",
+      "signature": "fn table_name(&self, table: u32) -> Option<&str>",
+      "doc": "What a table id is called, or nothing when no table has that id.\n\nA node value is a table and a row offset and an edge value is a\ntable and two of them, because neither part identifies anything\non its own: two tables both number their rows from zero. The\nnumber is what the engine passes around and the name is what a\nuser asked about, so a binding that hands a node value out has\nto be able to turn one into the other, and until now the only\nway was to reach past this type into the session and read the\ncatalog. Node and rel tables share one id space, so this is one\ncall and not two.\n\nThe name is borrowed from the catalog, which the next statement\nthat creates or drops a table replaces, so a caller keeping one\npast the next statement copies it."
     },
     {
       "id": "zu::db::Connection::unregister",
@@ -3909,36 +3933,6 @@
       "doc": "The rows, untyped."
     },
     {
-      "id": "zu::query::Engine",
-      "kind": "enum",
-      "name": "Engine",
-      "doc": "Which executor a read runs on.\n\nThe pipeline executor covers most plans and hands the rest to the row\nat a time one, which is what [`run`] does. Pinning the row executor\nis how the differential tests get their oracle rows, and a caller\nsays so here rather than through the environment: a variable is\nprocess wide, cargo runs a file's tests in one process and in\nparallel, and a test that set one was changing what its siblings\nwere measuring while they ran (#474)."
-    },
-    {
-      "id": "zu::query::Engine::Pipeline",
-      "kind": "variant",
-      "name": "Pipeline",
-      "of": "zu::query::Engine",
-      "signature": "Pipeline",
-      "doc": "The pipeline executor wherever it covers the plan."
-    },
-    {
-      "id": "zu::query::Engine::Rows",
-      "kind": "variant",
-      "name": "Rows",
-      "of": "zu::query::Engine",
-      "signature": "Rows",
-      "doc": "The row at a time executor, whatever the plan."
-    },
-    {
-      "id": "zu::query::Engine::from_env",
-      "kind": "method",
-      "name": "from_env",
-      "of": "zu::query::Engine",
-      "signature": "fn from_env() -> Engine",
-      "doc": "What the environment asks for. `ZU_EXEC2=0` pins the row\nexecutor and anything else takes the pipeline one."
-    },
-    {
       "id": "zu::query::Flow",
       "kind": "enum",
       "name": "Flow",
@@ -4028,6 +4022,14 @@
       "of": "zu::query::QueryResult",
       "signature": "fn held(columns: Vec<String>, held: Held) -> Self",
       "doc": "The result of a statement whose sink filled columns."
+    },
+    {
+      "id": "zu::query::QueryResult::into_columns",
+      "kind": "method",
+      "name": "into_columns",
+      "of": "zu::query::QueryResult",
+      "signature": "fn into_columns(self) -> Result<Held, QueryResult>",
+      "doc": "The buffers the sink filled, taken rather than lent.\n\n[`QueryResult::columnar`] copies them, and has to: it hands back a\nview of a result that stays readable, so the buffer behind the view\nis still the result's and cannot be given away. That copy is a\nmemcpy of bytes that are already contiguous and already the right\nshape, which is cheap next to what it replaced and not cheap next\nto nothing. A caller turning the whole answer into Arrow and\nthrowing the result away is paying it for no reason.\n\nSo this takes the result by value and gives up its buffers. What\ncomes back is what the executor wrote, and an Arrow array built on\none of them holds the executor's own allocation rather than a copy\nof it, which is what makes an export of a hundred million integers\ncost the pointer and not the eight hundred megabytes.\n\nA result whose rows were built rather than filled has no buffers to\ngive, and comes back untouched rather than converted, because the\nconversion for that shape is [`QueryResult::columnar`] and it\nallocates the buffers fresh anyway, so there is nothing to save and\nno reason for this to have two answers.\n\n# Errors\n\nThe result itself, when the sink built rows instead of columns."
     },
     {
       "id": "zu::query::QueryResult::iter",
@@ -4402,6 +4404,13 @@
       "doc": "Parses and binds one query against a zu1 catalog.\n\nThe epoch the schema is stamped with is zero, and it can be: a\ncatalog on its own is not a snapshot, and nothing here runs, so no\ngraph reference this binds ever reaches a caller."
     },
     {
+      "id": "zu::query::check",
+      "kind": "function",
+      "name": "check",
+      "signature": "fn check(source: &str) -> zu_common::Result<()>",
+      "doc": "Whether the text is a statement at all, without a catalog and\nwithout a file.\n\nThis is the front end and nothing behind it, which is what an editor\nwith no database open can still say something true about. A name it\ncannot check is a name it does not look at: `MATCH (p:Person)` parses\nwhether or not a `Person` exists anywhere, so the answer is either a\nsyntax error at a place in the text or nothing. Everything past the\nparser needs a catalog, and [`bind`] is where that starts."
+    },
+    {
       "id": "zu::query::column",
       "kind": "module",
       "name": "column",
@@ -4755,7 +4764,7 @@
       "name": "borrow",
       "of": "zu::query::column::Held",
       "signature": "fn borrow(&self) -> Columns",
-      "doc": "This answer as the borrowed view a client reads.\n\nThe flat buffers are copied and the complex ones are borrowed,\nwhich is the one copy left on the export path: a memcpy of the\nbytes that are already contiguous and already the right shape,\nagainst the two strided walks of a row vector this replaced. It\ngoes when a client takes the result by value instead of by\nreference, and not before, because a caller is allowed to ask\ntwice."
+      "doc": "This answer as the borrowed view a client reads.\n\nThe flat buffers are copied and the complex ones are borrowed,\nwhich is the one copy left on the export path: a memcpy of the\nbytes that are already contiguous and already the right shape,\nagainst the two strided walks of a row vector this replaced. It\nis here because a caller is allowed to ask twice, and it goes\nwhen a caller says it will not: [`QueryResult::into_columns`]\ntakes the result by value and hands these buffers over instead\nof copying them."
     },
     {
       "id": "zu::query::column::Held::columns",
@@ -5045,13 +5054,6 @@
       "doc": "Executes one query with per-operator counters and returns the\nrendered EXPLAIN ANALYZE listing: pulls, rows, the estimate and its\nq-error, the average vector length, and self time per operator, per\nstage. The grammar has no EXPLAIN keyword yet, so this is the API\nentry point."
     },
     {
-      "id": "zu::query::explain_analyze_on",
-      "kind": "function",
-      "name": "explain_analyze_on",
-      "signature": "fn explain_analyze_on(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], engine: Engine) -> zu_common::Result<String>",
-      "doc": "[`explain_analyze`], on the executor the caller names."
-    },
-    {
       "id": "zu::query::merge_frames",
       "kind": "function",
       "name": "merge_frames",
@@ -5071,13 +5073,6 @@
       "name": "run",
       "signature": "fn run(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)]) -> zu_common::Result<QueryResult>",
       "doc": "Parses, plans, optimizes, and executes one query against an open\nzu1 file, returning the result rows. Scan-driven stages run on the\nmorsel scheduler with `min(cores, 8)` workers; `ZU_THREADS` in the\nenvironment overrides the count, `ZU_THREADS=1` forces sequential\nexecution."
-    },
-    {
-      "id": "zu::query::run_on",
-      "kind": "function",
-      "name": "run_on",
-      "signature": "fn run_on(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], engine: Engine) -> zu_common::Result<QueryResult>",
-      "doc": "[`run`], on the executor the caller names."
     },
     {
       "id": "zu::query::schema_of",
@@ -5134,14 +5129,6 @@
       "name": "close_stmt",
       "of": "zu::session::Session",
       "signature": "fn close_stmt(&mut self, stmt: u64) -> bool"
-    },
-    {
-      "id": "zu::session::Session::engine",
-      "kind": "method",
-      "name": "engine",
-      "of": "zu::session::Session",
-      "signature": "fn engine(&self) -> query::Engine",
-      "doc": "Which executor this session's reads run on."
     },
     {
       "id": "zu::session::Session::epoch",
@@ -5316,14 +5303,6 @@
       "of": "zu::session::Session",
       "signature": "fn run_streaming(&mut self, source: &str, params: &[(&str, Value)], batch_rows: usize, sink: &mut dyn FnMut) -> Result<Streamed>",
       "doc": "Runs one query and hands its rows to `sink` in batches as they\nare made, instead of returning them.\n\nA statement that has to see every row before it can give one,\nwhich is ORDER BY, DISTINCT and the aggregates, runs whole and is\nhanded over in batches afterwards, and so does a statement that\nwrites, because a write runs as the parts it was split into and\nthe rows come out of the last of them. Which happened is in\n[`Streamed::streamed`], and the caller's loop is the same either\nway."
-    },
-    {
-      "id": "zu::session::Session::set_engine",
-      "kind": "method",
-      "name": "set_engine",
-      "of": "zu::session::Session",
-      "signature": "fn set_engine(&mut self, engine: query::Engine)",
-      "doc": "Pins one. The differential tests read the same statement twice\nand compare, and this is how they ask for the second reading\nwithout announcing it to every other test in the process (#474)."
     },
     {
       "id": "zu::session::Session::set_options",

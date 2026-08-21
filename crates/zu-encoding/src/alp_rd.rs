@@ -146,8 +146,10 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<f64>) -> Result<()>
         .get(pos..pos + dict_len * 2)
         .ok_or_else(|| corrupt("truncated dictionary"))?;
     let dict: Vec<u64> = dict_bytes
-        .chunks_exact(2)
-        .map(|c| u64::from(u16::from_le_bytes(c.try_into().unwrap())))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u64::from(u16::from_le_bytes(*c)))
         .collect();
     pos += dict_len * 2;
     let head = bytes
@@ -240,8 +242,8 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<f64>) -> Result<()>
         out.truncate(base);
         return Err(corrupt("right part wider than the cut"));
     }
-    for (&p, chunk) in positions.iter().zip(exc_bytes.chunks_exact(2)) {
-        let left = u64::from(u16::from_le_bytes(chunk.try_into().unwrap()));
+    for (&p, chunk) in positions.iter().zip(exc_bytes.as_chunks::<2>().0) {
+        let left = u64::from(u16::from_le_bytes(*chunk));
         let slot = base + p as usize;
         let bits = left << right_bits | (out[slot].to_bits() & right_mask);
         out[slot] = f64::from_bits(bits);

@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: null
 doc: Three-valued logic, which is the part of the standard a client is most likely to have replaced with its host language's two-valued one without noticing. Every case here has an answer that is neither true nor false, or an answer that is one of them where a two-valued reading gives the other.
 
@@ -169,6 +169,15 @@ cases:
   - name: size-propagates
     doc: A function of a null is a null rather than an error or a zero, which is the rule for every function and is worth one case so nine clients agree what a null argument does.
     query: RETURN size(null) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: cardinality-propagates
+    doc: The other name for the count takes four kinds of argument and a null is none of them, so the rule that decides this is the null rule and not the type check. An engine that runs the type check first raises here instead of answering.
+    query: RETURN cardinality(null) AS n
     columns:
       - n
     rows:

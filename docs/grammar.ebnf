@@ -123,7 +123,25 @@ property_type   = name , ( "::" | "TYPED" ) , value_type ;
    rather than two. *)
 
 reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
-                | let_clause | with_clause ;
+                | let_clause | with_clause | call_clause ;
+
+(* GP01, GP02 and GP03, ISO 13.2 and 13.4. The inline procedure call: a
+   statement written inside another one. It runs once for each row that
+   reaches it, and what its RETURN names is added to that row rather
+   than put in place of it, which is what tells it from a WITH.
+
+   The variable scope clause says what the block may read of the row.
+   No clause at all is a block that reads all of it (GP02), a list is
+   the names the reader wrote (GP03), and an empty list is a block that
+   reads nothing, which is a whole statement standing on its own.
+
+   The word is a table function's too, and that reading is the one a
+   name after CALL gets. Which of the two a call is is settled by the
+   one token after the word: a brace or a parenthesis is this, and a
+   name is the other. *)
+call_clause     = "CALL" , [ variable_scope ] , "{" ,
+                  [ use_clause ] , composite_query , "}" ;
+variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 match_clause    = ( "MATCH" , pattern , [ where_clause ]
                   | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]
@@ -387,6 +405,45 @@ comparison      = concat , { comparison_op , concat
 normal_form     = "NFC" | "NFD" | "NFKC" | "NFKD" ;
 normalize       = "NORMALIZE" , "(" , expression ,
                   [ "," , normal_form ] , ")" ;
+(* ISO 20.27, mandatory. The temporal value functions, which come in
+   pairs: a word that asks the time and a word that reads the same type
+   out of a string. The first four are written bare, the grammar giving
+   them no parentheses, so CURRENT_DATE() is a call to a function nobody
+   defined, and LOCAL_TIME is the one the standard writes both ways. The
+   bracketed five must be bracketed, and their brackets may stand empty,
+   which reads the clock and answers what the word beside them answers.
+   Every clock reading in a statement is cut from one instant, read once
+   before the first row, so a statement holding two of them cannot have
+   them land on two different days.
+
+   ISO writes each parameter as a string or a record constructor. zu
+   reads the string and not yet the record. *)
+clock_fn        = "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+                | "LOCAL_TIMESTAMP" ;
+temporal_word   = "DATE" | "ZONED_TIME" | "LOCAL_TIME"
+                | "ZONED_DATETIME" | "LOCAL_DATETIME" ;
+temporal_fn     = clock_fn | "LOCAL_TIME"
+                | temporal_word , "(" , [ expression ] , ")" ;
+(* ISO 20.29, mandatory. The duration functions. DURATION reads a length
+   of time out of a string and has no empty form, there being a date now
+   and a time now and no length of time now, and ABS answers the length
+   of a duration without its sign, which is the same word the numbers
+   are given. *)
+duration_fn     = "DURATION" , "(" , expression , ")"
+                | "ABS" , "(" , expression , ")" ;
+(* ISO 20.28, mandatory. The length of time from the first datetime to
+   the second, which is the minus between them written the other way
+   round. The qualifier stands behind the closing bracket, where no
+   call has anything, and says which of the two duration kinds the
+   answer is; leaving it out reads as DAY TO SECOND. Only those two
+   runs of fields are a temporal duration qualifier, which is narrower
+   than the interval qualifier behind an interval string. The two
+   arguments have to be the same shape, since a date and a time have no
+   length between them and neither has a local datetime and a zoned
+   one. *)
+duration_qual   = "YEAR" , "TO" , "MONTH" | "DAY" , "TO" , "SECOND" ;
+duration_between = "DURATION_BETWEEN" , "(" , expression , "," ,
+                  expression , ")" , [ duration_qual ] ;
 (* ISO 12 and feature GA04. Two values of different types compare
    rather than answer unknown, and the order between the types is
    booleans, numbers, strings, temporals, nodes, edges, lists, records,
@@ -409,12 +466,13 @@ unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
                 | function_call | cast | property_exists | normalize
+                | temporal_fn | duration_fn | duration_between
                 | case_expr | coalesce | nullif
                 | path_constructor | exists_block
                 | value_query | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
-(* ISO 19.4 and mandatory feature GE01. Two forms: the searched one
+(* ISO 20.7 and mandatory feature GE01. Two forms: the searched one
    asks a condition per branch, and the simple one names a value and
    compares each branch with it. Whether a value stands before the
    first WHEN is what tells them apart. The branches are asked in the
@@ -486,7 +544,10 @@ record_fields   = "{" , [ name , "::" , value_type ,
    the store keeps, and the two agree only for ASCII. UPPER and LOWER
    fold, and the one argument TRIM takes the spaces off both ends. A
    number here is refused rather than measured by its spelling. *)
-function_call   = name , "(" , [ "DISTINCT" ] ,
+(* The set quantifier of ISO 20.9 belongs to the set functions and is
+   read here so one place parses a call. ALL is what leaving it out
+   means, so `COUNT(ALL n)` and `COUNT(n)` are one plan. *)
+function_call   = name , "(" , [ "DISTINCT" | "ALL" ] ,
                   [ "*" | expression , { "," , expression } ] , ")" ;
 list            = "[" , [ expression , { "," , expression } ] , "]" ;
 (* The same braces are an inline property predicate inside a pattern

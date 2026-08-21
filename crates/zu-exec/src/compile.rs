@@ -18,14 +18,19 @@ use std::sync::Arc;
 
 use zu_common::types::LogicalType;
 use zu_common::{IdMap, Result};
-use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
-use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
+use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey, UnaryOp};
+use zu_query::binder::{
+    BoundClause, BoundExpr, BoundItem, BoundQuery, Cut, Func, Math, Schema, TableFunc, Trim,
+};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{
     ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
 };
-use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
+use zu_vector::{
+    BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
+    StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet,
+};
 
 use crate::join::JoinTable;
 use crate::sip::SipFilter;
@@ -837,6 +842,21 @@ fn keyable(r: ScalarRef) -> bool {
             ..
         } | ScalarRef::Const { .. }
     )
+}
+
+/// Whether two levels hold one element, as far as the tables can say
+/// on their own. `None` is the pair the rows decide.
+///
+/// A level has one table for every row it will ever produce, so two
+/// levels on different tables hold different nodes whatever their rows
+/// turn out to be, and two names for one level hold the one node. What
+/// is left is two levels on one table, and there the rows are the whole
+/// of the answer.
+fn settled_pair(levels: &[LevelBuild], l: usize, r: usize) -> Option<bool> {
+    if l == r {
+        return Some(true);
+    }
+    (levels[l].table != levels[r].table).then_some(false)
 }
 
 /// Whether anything above the sink reads column `at` of the row the
@@ -1794,7 +1814,21 @@ impl Compiler<'_> {
                 }
                 SinkSpec::Rows { items: refs, post }
             }
-            Some(LogicalPlan::Aggregate { keys, aggs, .. }) => {
+            Some(LogicalPlan::Aggregate {
+                keys,
+                aggs,
+                order_aggs,
+                ..
+            }) => {
+                // GF20. An aggregate a sort key asked for and no column
+                // carries finalizes into a slot of its own, which this
+                // sink has no room for: its rows are the columns and
+                // nothing else. The old executor keeps those values
+                // beside the row, so the plan goes there whole rather
+                // than being sorted here by a column that is not in it.
+                if !order_aggs.is_empty() {
+                    return Ok(None);
+                }
                 let mut key_refs = Vec::with_capacity(keys.len());
                 for item in keys {
                     let Some(r) = self.item_ref(&item.expr)? else {
@@ -3243,20 +3277,44 @@ impl Compiler<'_> {
     /// column it reads, which is what lets one walk of the list build
     /// the chunk.
     ///
-    /// Integer results only. A property is an int or a string here, so
-    /// a float can only come from a literal, and a literal float
-    /// against an int column already fails the program builder's type
-    /// check; restricting the column keeps the sink reading the two
-    /// types it knows.
+    /// A number, of either width. An integer column and an integer
+    /// written beside it answer an integer, and a float anywhere in the
+    /// expression answers a float, which is the rule the row engine
+    /// follows and the one the numeric functions need: the answer of a
+    /// root or an angle is a float whatever arrived, so a projection
+    /// holding one would have nowhere to land without this.
     ///
-    /// Division and modulo decline. The kernel is total and clears the
-    /// row's validity when the divisor is zero, the old engine raises,
-    /// and a computed column runs before the filter that would have
-    /// dropped the offending row, so there is no way to match the old
-    /// answer here. They stay with the old engine until the error is
-    /// carried out of the kernel.
+    /// Or a string, which a fold and a trim answer. A computed string
+    /// column is read back exactly the way a stored one is, the vector
+    /// carrying the bytes its kernel made along with the views into
+    /// them, so nothing downstream of here has to know which of the two
+    /// it is looking at.
+    ///
+    /// Anything that could have no answer for a row declines. A
+    /// computed column is filled before the filter that would have
+    /// dropped the offending row, so a condition raised here is a
+    /// condition the old engine never reached, and the two answers
+    /// would differ on which engine took the plan. A divisor written as
+    /// a number that is not nought cannot raise and neither can most of
+    /// the numeric functions, so those shapes are the ones that arrive.
     fn register_expr(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
-        if !matches!(expr, BoundExpr::Binary { .. }) {
+        if !matches!(
+            expr,
+            BoundExpr::Binary { .. }
+                | BoundExpr::Call {
+                    func: Func::Math(_)
+                        | Func::CharLength
+                        | Func::OctetLength
+                        | Func::Size
+                        | Func::Upper
+                        | Func::Lower
+                        | Func::Trim(_)
+                        | Func::Cut(_)
+                        | Func::Normalize(_)
+                        | Func::ElementId,
+                    ..
+                }
+        ) {
             return Ok(None);
         }
         let Some(level) = self.expr_level(expr) else {
@@ -3269,18 +3327,16 @@ impl Compiler<'_> {
         let Some(root) = self.value_reg(&mut b, expr, level, false)? else {
             return Ok(None);
         };
-        if b.types[root as usize] != PhysType::Int64 {
-            return Ok(None);
-        }
-        if b.ops.iter().any(|op| {
-            matches!(
-                op,
-                ExprOp::Binary {
-                    op: BinOp::Div | BinOp::Mod,
-                    ..
-                }
-            )
-        }) {
+        let ty = match b.types[root as usize] {
+            PhysType::Int64 => ColType::Int,
+            PhysType::Float64 => ColType::Float,
+            // A string, which a fold answers. The vector carries the
+            // bytes it made along with the views, so the sink reads one
+            // back exactly the way it reads a stored column.
+            PhysType::Str => ColType::Str,
+            _ => return Ok(None),
+        };
+        if may_raise(&b.ops) {
             return Ok(None);
         }
         let prog = Program {
@@ -3293,7 +3349,7 @@ impl Compiler<'_> {
         Ok(Some(ScalarRef::Col {
             level,
             vec: self.levels[level].cols.len(),
-            ty: ColType::Int,
+            ty,
         }))
     }
 
@@ -3323,6 +3379,14 @@ impl Compiler<'_> {
             BoundExpr::Binary { lhs, rhs, .. } => {
                 self.walk_slots(lhs, f);
                 self.walk_slots(rhs, f);
+            }
+            // A call reads what its arguments read. Without this the
+            // level of `abs(p.x)` is no level at all, and a projection
+            // that named one would be registered against nothing.
+            BoundExpr::Call { args, .. } => {
+                for arg in args {
+                    self.walk_slots(arg, f);
+                }
             }
             _ => {}
         }
@@ -3772,6 +3836,30 @@ impl Compiler<'_> {
                     None => Ok(None),
                 }
             }
+            // ID of a node, which is the number `.id` answers written
+            // as a call, so it resolves to the same row.
+            //
+            // The argument goes through this function rather than being
+            // read as a variable, which is what turns the shapes that
+            // are not a node away: a yielded value and a seek key are
+            // columns of level 0 and come back as columns, an edge
+            // variable belongs to no level here, and the old engine
+            // answers null for an edge anyway.
+            BoundExpr::Call {
+                func: Func::Id,
+                distinct: false,
+                star: false,
+                args,
+                ..
+            } => {
+                let [arg] = args.as_slice() else {
+                    return Ok(None);
+                };
+                Ok(match self.item_ref(arg)? {
+                    Some(ScalarRef::Node { level }) => Some(ScalarRef::RowId { level }),
+                    _ => None,
+                })
+            }
             _ => self.register_expr(expr),
         }
     }
@@ -3975,6 +4063,67 @@ impl Compiler<'_> {
             b.ops.push(ExprOp::All { on: !*negated, dst });
             return Ok(Some(dst));
         }
+        // GF08's other half. Whether a string is in a normal form is
+        // the one string function whose answer is a truth value, and a
+        // chunk of truth values is not a column this executor carries,
+        // so the answer is written where a comparison writes its own:
+        // straight into a predicate register.
+        //
+        // The NOT that the negated spelling binds to is read here and
+        // handed to the kernel rather than run as an op of its own. A
+        // predicate bitmap has room for two answers and the language
+        // has three, so a row holding null is off in the bitmap either
+        // way, and a complement would have called it unnormalized.
+        {
+            let (inner, negated) = match expr {
+                BoundExpr::Unary {
+                    op: UnaryOp::Not,
+                    expr,
+                } => (&**expr, true),
+                other => (other, false),
+            };
+            if let BoundExpr::Call {
+                func: Func::IsNormalized(form),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } = inner
+                && args.len() == 1
+            {
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                if StrNorm::Test(*form)
+                    .answer_type(b.types[src as usize])
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let dst = b.push_type(PhysType::Bool)?;
+                b.ops.push(ExprOp::StrNormalized {
+                    form: *form,
+                    negated,
+                    src,
+                    dst,
+                });
+                return Ok(Some(dst));
+            }
+        }
+        // GF11, the two questions about which elements a row bound.
+        // Both are the same pairwise walk over the arguments, and both
+        // answer a truth value, so they are written straight into a
+        // predicate register the way a comparison is.
+        if let BoundExpr::Call {
+            func: func @ (Func::Same | Func::AllDifferent),
+            args,
+            distinct: false,
+            star: false,
+            ..
+        } = expr
+        {
+            return self.identity_reg(b, *func, args, level);
+        }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
         };
@@ -3988,14 +4137,15 @@ impl Compiler<'_> {
             let Some(r) = self.value_reg(b, rhs, level, true)? else {
                 return Ok(None);
             };
-            // The kernels compare within one physical type, and the one
-            // pair of types a query writes on purpose has been moved
-            // into a single type above, so what is left here is a
-            // mistyped compare and it keeps old-engine semantics by
-            // falling back.
-            if b.types[l as usize] != b.types[r as usize] {
+            // The kernels compare within one physical type, and the two
+            // pairs a query writes on purpose are moved into one type,
+            // the integer column against a written float above and a
+            // float against a written whole number here. What is left
+            // is a mistyped compare and it keeps old-engine semantics
+            // by falling back.
+            let Some((l, r)) = self.matched(b, l, r, lhs, rhs)? else {
                 return Ok(None);
-            }
+            };
             let dst = b.push_type(PhysType::Bool)?;
             b.ops.push(ExprOp::Compare { op: cmp, l, r, dst });
             return Ok(Some(dst));
@@ -4005,9 +4155,25 @@ impl Compiler<'_> {
                 let Some(l) = self.pred_reg(b, lhs, level)? else {
                     return Ok(None);
                 };
+                let second = b.ops.len();
                 let Some(r) = self.pred_reg(b, rhs, level)? else {
                     return Ok(None);
                 };
+                // The row engine stops at a conjunct that decided the
+                // row, so anything written behind one is something it
+                // never runs, and `n <> 0 AND 100 / n > 5` is how a
+                // query says which rows the division is for. The
+                // program has no such order: every op runs over the
+                // whole chunk, so a divisor of nought behind the guard
+                // would raise where the query said it could not. Such a
+                // plan goes back to the row engine whole. A divisor
+                // written as a number that is not nought cannot raise,
+                // which is the other way people write it, and most of
+                // the numeric functions cannot raise at all, so those
+                // shapes stay here.
+                if may_raise(&b.ops[second..]) {
+                    return Ok(None);
+                }
                 let dst = b.push_type(PhysType::Bool)?;
                 let op = if matches!(op, BinaryOp::And) {
                     ExprOp::And { l, r, dst }
@@ -4019,6 +4185,100 @@ impl Compiler<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// SAME and ALL_DIFFERENT over the nodes a row bound, compiled into
+    /// a predicate register.
+    ///
+    /// An element is its table and its row, and a level has one table
+    /// for every row it will ever produce. So half of each pair is
+    /// settled before a row is read: two levels on different tables
+    /// hold different nodes whatever the rows turn out to be, and two
+    /// names for one level hold the same node. Those pairs answer
+    /// without a compare, and either function is false outright as soon
+    /// as one pair goes the wrong way. What is left is a row against a
+    /// row, which is one integer comparison.
+    ///
+    /// An edge argument declines. An edge is its table, the pair it
+    /// runs between and which copy of that pair it is, and none of
+    /// those is a number this level carries.
+    fn identity_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        func: Func,
+        args: &[BoundExpr],
+        level: usize,
+    ) -> Result<Option<Reg>> {
+        let same = matches!(func, Func::Same);
+        let mut levels = Vec::with_capacity(args.len());
+        for arg in args {
+            let Some(ScalarRef::Node { level }) = self.item_ref(arg)? else {
+                return Ok(None);
+            };
+            if self.levels.get(level).is_none() {
+                return Ok(None);
+            }
+            levels.push(level);
+        }
+        if levels.len() < 2 {
+            return Ok(None);
+        }
+        let mut compares = Vec::new();
+        for (at, &l) in levels.iter().enumerate() {
+            for &r in &levels[at + 1..] {
+                match settled_pair(&self.levels, l, r) {
+                    Some(held) if held == same => continue,
+                    Some(_) => {
+                        let dst = b.push_type(PhysType::Bool)?;
+                        b.ops.push(ExprOp::All { on: false, dst });
+                        return Ok(Some(dst));
+                    }
+                    None => compares.push((l, r)),
+                }
+            }
+        }
+        let op = if same { CmpOp::Eq } else { CmpOp::Ne };
+        let mut acc: Option<Reg> = None;
+        for (l, r) in compares {
+            // A row that a level below broadcasts in may be null,
+            // which an OPTIONAL MATCH that missed leaves behind. The
+            // compare kernel clears the answer's validity there and
+            // the row is off, which is the null the old engine
+            // answers for an argument it could not read.
+            let Some(l) = self.ref_reg(b, ScalarRef::RowId { level: l }, level, true)? else {
+                return Ok(None);
+            };
+            let Some(r) = self.ref_reg(b, ScalarRef::RowId { level: r }, level, true)? else {
+                return Ok(None);
+            };
+            let dst = b.push_type(PhysType::Bool)?;
+            b.ops.push(ExprOp::Compare { op, l, r, dst });
+            acc = Some(match acc {
+                None => dst,
+                Some(prev) => {
+                    let both = b.push_type(PhysType::Bool)?;
+                    b.ops.push(ExprOp::And {
+                        l: prev,
+                        r: dst,
+                        dst: both,
+                    });
+                    both
+                }
+            });
+        }
+        // Every pair was settled by the tables, and settled the way the
+        // function asked, so the answer is the same for every row. It
+        // is written as an op rather than left out because the program
+        // hands back its last op's register and the filter above wants
+        // one to read.
+        Ok(Some(match acc {
+            Some(reg) => reg,
+            None => {
+                let dst = b.push_type(PhysType::Bool)?;
+                b.ops.push(ExprOp::All { on: true, dst });
+                dst
+            }
+        }))
     }
 
     /// Reads a mark column back as a predicate register. The block may
@@ -4104,6 +4364,64 @@ impl Compiler<'_> {
         Ok(Some(dst))
     }
 
+    /// A resolved item read into a register: the chunk vector it names,
+    /// broadcast in from the level that holds it when that is not the
+    /// one the program runs on.
+    ///
+    /// The row a level carries is vector 0 there, which is why a row id
+    /// and a stored column are one read with two positions rather than
+    /// two kinds of thing.
+    fn ref_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        r: ScalarRef,
+        level: usize,
+        outer: bool,
+    ) -> Result<Option<Reg>> {
+        let (from, mut col, ty) = match r {
+            // A property is never a constant, so this is the arm
+            // nothing reaches rather than a shape to build a program
+            // out of.
+            ScalarRef::Const { .. } => return Ok(None),
+            ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
+            ScalarRef::Col { level, vec, ty } => (
+                level,
+                vec,
+                match ty {
+                    ColType::Int => PhysType::Int64,
+                    ColType::Float => PhysType::Float64,
+                    ColType::Str => PhysType::Str,
+                },
+            ),
+            ScalarRef::Node { .. } => return Ok(None),
+        };
+        if from != level {
+            // A level above this one is not built yet, and a string end
+            // would have to carry its buffers into the broadcast, so
+            // both go back to the old engine.
+            //
+            // Under a comparison the broadcast may be null: the kernel
+            // clears the whole column's validity and that is the answer
+            // the old engine gives. Inside arithmetic it may not,
+            // because the arith kernels do not propagate validity and a
+            // null end would come back a number. A stored column is the
+            // case where that cannot arise, since a column holding a
+            // null does not resolve at all.
+            let numeric = matches!(ty, PhysType::Int64 | PhysType::Float64);
+            let never_null = self.stored_col(from, col);
+            if from > level || !numeric || !(outer || never_null) {
+                return Ok(None);
+            }
+            col = self.register_outer(level, from, col);
+        }
+        let Ok(col) = u8::try_from(col) else {
+            return Ok(None);
+        };
+        let dst = b.push_type(ty)?;
+        b.ops.push(ExprOp::LoadCol { col, dst });
+        Ok(Some(dst))
+    }
+
     /// One operand of a predicate, compiled into a register.
     ///
     /// `outer` says whether a property of a level below `level` may be
@@ -4136,52 +4454,50 @@ impl Compiler<'_> {
             // value a CALL yielded and the key a batch of seeks found
             // are both columns of level 0, and a variable naming a node
             // is not a value at all, which the node arm below declines.
-            BoundExpr::Property { .. } | BoundExpr::Var(_) => {
+            //
+            // ID of a node joins them because it is the same read: the
+            // number it answers is the row the level already carries,
+            // and `item_ref` hands it back as that row.
+            BoundExpr::Property { .. }
+            | BoundExpr::Var(_)
+            | BoundExpr::Call { func: Func::Id, .. } => {
                 let Some(r) = self.item_ref(expr)? else {
                     return Ok(None);
                 };
-                let (from, mut col, ty) = match r {
-                    // A property is never a constant, so this is the
-                    // arm nothing reaches rather than a shape to build
-                    // a program out of.
-                    ScalarRef::Const { .. } => return Ok(None),
-                    ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
-                    ScalarRef::Col { level, vec, ty } => (
-                        level,
-                        vec,
-                        match ty {
-                            ColType::Int => PhysType::Int64,
-                            ColType::Float => PhysType::Float64,
-                            ColType::Str => PhysType::Str,
-                        },
-                    ),
-                    ScalarRef::Node { .. } => return Ok(None),
-                };
-                if from != level {
-                    // A level above this one is not built yet, and a
-                    // string end would have to carry its buffers into
-                    // the broadcast, so both go back to the old engine.
-                    //
-                    // Under a comparison the broadcast may be null: the
-                    // kernel clears the whole column's validity and that
-                    // is the answer the old engine gives. Inside
-                    // arithmetic it may not, because the arith kernels
-                    // do not propagate validity and a null end would
-                    // come back a number. A stored column is the case
-                    // where that cannot arise, since a column holding a
-                    // null does not resolve at all.
-                    let numeric = matches!(ty, PhysType::Int64 | PhysType::Float64);
-                    let never_null = self.stored_col(from, col);
-                    if from > level || !numeric || !(outer || never_null) {
-                        return Ok(None);
-                    }
-                    col = self.register_outer(level, from, col);
-                }
-                let Ok(col) = u8::try_from(col) else {
+                self.ref_reg(b, r, level, outer)
+            }
+            // ELEMENT_ID of a node, which is the same two numbers ID
+            // reads written as the string the standard asks for. The
+            // table is the level's and is the same for every row it
+            // will ever produce, so the kernel writes it once for the
+            // chunk and a row's own number after it.
+            //
+            // An edge declines here as it declines above, and for a
+            // longer reason: an edge is its table, the pair it runs
+            // between and which copy of that pair it is, and a level
+            // carries none of those as a column.
+            BoundExpr::Call {
+                func: Func::ElementId,
+                distinct: false,
+                star: false,
+                args,
+                ..
+            } => {
+                let [arg] = args.as_slice() else {
                     return Ok(None);
                 };
-                let dst = b.push_type(ty)?;
-                b.ops.push(ExprOp::LoadCol { col, dst });
+                let Some(ScalarRef::Node { level: node }) = self.item_ref(arg)? else {
+                    return Ok(None);
+                };
+                let Some(table) = self.levels.get(node).map(|l| l.table) else {
+                    return Ok(None);
+                };
+                let Some(src) = self.ref_reg(b, ScalarRef::RowId { level: node }, level, outer)?
+                else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(PhysType::Str)?;
+                b.ops.push(ExprOp::ElementId { table, src, dst });
                 Ok(Some(dst))
             }
             // A cast the values cannot notice. GA05 put CAST in filter
@@ -4213,12 +4529,220 @@ impl Compiler<'_> {
                 let Some(r) = self.value_reg(b, rhs, level, false)? else {
                     return Ok(None);
                 };
+                let Some((l, r)) = self.matched(b, l, r, lhs, rhs)? else {
+                    return Ok(None);
+                };
                 let ty = b.types[l as usize];
-                if b.types[r as usize] != ty || !matches!(ty, PhysType::Int64 | PhysType::Float64) {
+                if !matches!(ty, PhysType::Int64 | PhysType::Float64) {
                     return Ok(None);
                 }
                 let dst = b.push_type(ty)?;
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
+                Ok(Some(dst))
+            }
+            // GF01 to GF03, the numeric functions. They are the
+            // numeric library's first kernels because they are the
+            // ones a filter is written over: `abs(a.x - b.x) < 3` is a
+            // scan the row engine used to take back for the sake of
+            // one call.
+            BoundExpr::Call {
+                func: Func::Math(math),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } => {
+                if let Some(op) = self.math_op(*math, args) {
+                    let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                        return Ok(None);
+                    };
+                    let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                        return Ok(None);
+                    };
+                    let dst = b.push_type(ty)?;
+                    b.ops.push(ExprOp::Math { op, src, dst });
+                    return Ok(Some(dst));
+                }
+                let Some(op) = math_pair(*math, args) else {
+                    return Ok(None);
+                };
+                let Some(l) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(r) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                // The kernel answers one pair of types, so a whole
+                // number the statement wrote beside an approximate
+                // column becomes an approximate number here rather
+                // than a branch in the loop.
+                let Some((l, r)) = self.matched(b, l, r, &args[0], &args[1])? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[l as usize], b.types[r as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::MathPair { op, l, r, dst });
+                Ok(Some(dst))
+            }
+            // GF04, the questions about a string whose answer is a
+            // number. They come before the rest of the string library
+            // because an answer that is a count needs no room in the
+            // arena for bytes, which is the question the folds and the
+            // trims still have to settle. `SIZE` is here because a
+            // string is one of the things it counts, and over a string
+            // it counts exactly what `CHAR_LENGTH` counts, so the two
+            // are the same kernel under two spellings. Over a list it
+            // is something else and there is no kernel for it yet,
+            // which needs no rule here: the length of anything that is
+            // not a string has no answer type, so those arguments fall
+            // back the way an unhandled expression does.
+            BoundExpr::Call {
+                func: func @ (Func::CharLength | Func::OctetLength | Func::Size),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let op = match func {
+                    Func::CharLength | Func::Size => StrLen::Chars,
+                    _ => StrLen::Octets,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrLen { op, src, dst });
+                Ok(Some(dst))
+            }
+            // GF04's other half, the two folds. These are the first
+            // calls whose answer is a string, so the vector they write
+            // carries bytes of its own rather than numbers alone.
+            BoundExpr::Call {
+                func: func @ (Func::Upper | Func::Lower),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let op = match func {
+                    Func::Upper => StrFold::Upper,
+                    _ => StrFold::Lower,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = op.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrFold { op, src, dst });
+                Ok(Some(dst))
+            }
+            // GF06 and GF05, the trim family: six spellings of one
+            // loop. Two of the six differences are settled here rather
+            // than in the kernel. A set that is not written out sends
+            // the query back, since a set that is a column would be a
+            // different set a row and the kernel prepares one; and a
+            // TRIM handed more than a single character raises `22027`,
+            // which the old engine says in its own words, so that shape
+            // goes back as well rather than being said twice.
+            BoundExpr::Call {
+                func: Func::Trim(trim),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if (1..=2).contains(&args.len()) => {
+                let chars = match args.get(1) {
+                    None => " ".to_string(),
+                    Some(arg) => match self.const_value(arg) {
+                        Some(Value::Str(s)) => s,
+                        _ => return Ok(None),
+                    },
+                };
+                let ends = match trim {
+                    Trim::Both | Trim::Btrim => StrTrim::Both,
+                    Trim::Leading | Trim::Ltrim => StrTrim::Leading,
+                    Trim::Trailing | Trim::Rtrim => StrTrim::Trailing,
+                };
+                let one_character = matches!(trim, Trim::Both | Trim::Leading | Trim::Trailing);
+                if one_character && chars.chars().count() != 1 {
+                    return Ok(None);
+                }
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = ends.answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrTrim {
+                    ends,
+                    set: Arc::new(TrimSet::new(&chars)),
+                    src,
+                    dst,
+                });
+                Ok(Some(dst))
+            }
+            // ISO 20.24's substring function, which in GQL is LEFT and
+            // RIGHT and nothing else. The count is an ordinary argument
+            // rather than a word the statement wrote, so it compiles to
+            // a register of its own and a column is one of the things
+            // that can arrive in it, which is what separates this from
+            // the trim's set and the normalization's form.
+            BoundExpr::Call {
+                func: Func::Cut(cut),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 2 => {
+                let end = match cut {
+                    Cut::Left => StrCut::Left,
+                    Cut::Right => StrCut::Right,
+                };
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(n) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = end.answer_type(b.types[src as usize], b.types[n as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrCut { end, src, n, dst });
+                Ok(Some(dst))
+            }
+            // GF08, the half of it that answers a string. NORMALIZE is
+            // the string function whose answer is neither a part of the
+            // argument nor the same length as it, so the vector it
+            // writes carries bytes of the kernel's own and nothing in
+            // it points back at the column it read.
+            BoundExpr::Call {
+                func: Func::Normalize(form),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 1 => {
+                let Some(src) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(ty) = StrNorm::Into(*form).answer_type(b.types[src as usize]) else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(ty)?;
+                b.ops.push(ExprOp::StrNorm {
+                    form: *form,
+                    src,
+                    dst,
+                });
                 Ok(Some(dst))
             }
             _ => Ok(None),
@@ -4292,6 +4816,83 @@ impl Compiler<'_> {
         match self.const_int(expr) {
             Some(c) => cmp_op(op).map(|cmp| (cmp, c)),
             None => narrow_float(op, self.const_float(expr)?),
+        }
+    }
+
+    /// Which vector op a numeric call is, or `None` where the kernels
+    /// have nothing for it.
+    ///
+    /// ROUND is the one with a second argument, and the digit count has
+    /// to be a number the statement wrote or bound: a count read off a
+    /// column would be a branch inside the loop these kernels exist to
+    /// keep branch free, and a query that rounds every row to a
+    /// different place is rare enough to leave to the row engine.
+    fn math_op(&self, math: Math, args: &[BoundExpr]) -> Option<MathOp> {
+        match (math, args.len()) {
+            (Math::Abs, 1) => Some(MathOp::Abs),
+            (Math::Ceil, 1) => Some(MathOp::Ceil),
+            (Math::Floor, 1) => Some(MathOp::Floor),
+            (Math::Sign, 1) => Some(MathOp::Sign),
+            (Math::Round, 1) => Some(MathOp::Round(0)),
+            (Math::Round, 2) => self.const_int(&args[1]).map(MathOp::Round),
+            (Math::Sqrt, 1) => Some(MathOp::Sqrt),
+            (Math::Exp, 1) => Some(MathOp::Exp),
+            (Math::Ln, 1) => Some(MathOp::Ln),
+            (Math::Log10, 1) => Some(MathOp::Log10),
+            (Math::Sin, 1) => Some(MathOp::Sin),
+            (Math::Cos, 1) => Some(MathOp::Cos),
+            (Math::Tan, 1) => Some(MathOp::Tan),
+            (Math::Cot, 1) => Some(MathOp::Cot),
+            (Math::Asin, 1) => Some(MathOp::Asin),
+            (Math::Acos, 1) => Some(MathOp::Acos),
+            (Math::Atan, 1) => Some(MathOp::Atan),
+            (Math::Degrees, 1) => Some(MathOp::Degrees),
+            (Math::Radians, 1) => Some(MathOp::Radians),
+            // POWER, LOG and MOD take two numbers, so each of them is a
+            // second column and the op below rather than this one.
+            _ => None,
+        }
+    }
+
+    /// The two sides of an operator as registers of one physical type,
+    /// or None where they are two types and nothing may be done about
+    /// it.
+    ///
+    /// The pair that arrives here is a value the kernels answer as a
+    /// float against a whole number the query wrote: `sqrt(p.x) > 10`
+    /// and `sqrt(p.x) * 2` are the ordinary spellings, and nobody
+    /// writes the ten as `10.0` because the value it stands for is ten
+    /// either way. The row engine reads such a pair by widening the
+    /// integer to a float and answering in floats, so the constant is
+    /// widened here and the comparison or the sum runs in the float
+    /// kernel. Widening the constant rather than the column is what
+    /// makes the two engines agree exactly: `as f64` is the conversion
+    /// the row engine performs on the same value.
+    fn matched(
+        &self,
+        b: &mut ProgBuilder,
+        l: Reg,
+        r: Reg,
+        lhs: &BoundExpr,
+        rhs: &BoundExpr,
+    ) -> Result<Option<(Reg, Reg)>> {
+        match (b.types[l as usize], b.types[r as usize]) {
+            (x, y) if x == y => Ok(Some((l, r))),
+            (PhysType::Float64, PhysType::Int64) => match self.const_int(rhs) {
+                Some(n) => {
+                    let r = b.push_const(OwnedValue::Float(n as f64))?;
+                    Ok(Some((l, r)))
+                }
+                None => Ok(None),
+            },
+            (PhysType::Int64, PhysType::Float64) => match self.const_int(lhs) {
+                Some(n) => {
+                    let l = b.push_const(OwnedValue::Float(n as f64))?;
+                    Ok(Some((l, r)))
+                }
+                None => Ok(None),
+            },
+            _ => Ok(None),
         }
     }
 
@@ -4441,6 +5042,105 @@ fn widens(from: PhysType, to: &LogicalType) -> bool {
         ) => bits.bits() >= 64,
         _ => false,
     }
+}
+
+/// Which vector op a numeric call of two arguments is. Unlike the
+/// single argument table this one is a free function, since none of the
+/// three needs anything the compiler knows.
+fn math_pair(math: Math, args: &[BoundExpr]) -> Option<MathPair> {
+    match (math, args.len()) {
+        (Math::Power, 2) => Some(MathPair::Power),
+        (Math::Log, 2) => Some(MathPair::Log),
+        (Math::Mod, 2) => Some(MathPair::Mod),
+        _ => None,
+    }
+}
+
+/// Whether these ops hold something a row could have no answer for: a
+/// division whose divisor is not written as a number that is not
+/// nought, or a numeric function with a condition behind it.
+fn may_raise(ops: &[ExprOp]) -> bool {
+    ops.iter().enumerate().any(|(i, op)| match op {
+        ExprOp::Binary {
+            op: BinOp::Div | BinOp::Mod,
+            r,
+            ..
+        } => !written_nonzero(&ops[..i], *r),
+        ExprOp::Math { op, .. } => op.may_raise(),
+        // MOD under its function spelling is the operator's answers, so
+        // it is the operator's question too: a written divisor that is
+        // not nought has a remainder for every row. A power and a
+        // logarithm have conditions no fold over one written number
+        // settles, so both of them stand behind a filter and nowhere
+        // else.
+        ExprOp::MathPair {
+            op: MathPair::Mod,
+            r,
+            ..
+        } => !written_nonzero(&ops[..i], *r),
+        ExprOp::MathPair { .. } => true,
+        // A count has an answer for every string there is, so it is a
+        // computed column like a floor or an angle. So does a fold, and
+        // so does a trim: the trim family's one condition is about the
+        // set a statement wrote and the compiler settles it there. So
+        // do both normalizations, every string having a normal form and
+        // either being in it or not. And so does an identifier: a node
+        // has one, and the two numbers it is written from are a level's
+        // own rather than anything a row can be wrong about.
+        ExprOp::StrLen { .. }
+        | ExprOp::StrFold { .. }
+        | ExprOp::StrTrim { .. }
+        | ExprOp::StrNorm { .. }
+        | ExprOp::StrNormalized { .. }
+        | ExprOp::ElementId { .. } => false,
+        // A cut is the one string op whose condition is about a value
+        // rather than about what the statement wrote, a string having
+        // no negative number of characters and a column being able to
+        // hold one. A count written out is settled here the way a
+        // written divisor is, and every other count stands behind a
+        // filter.
+        ExprOp::StrCut { n, .. } => !written_nonneg(&ops[..i], *n),
+        _ => false,
+    })
+}
+
+/// Whether a register was last loaded with a number that is not
+/// nought. The builder gives every op a register of its own, so the
+/// last load into one is the whole of what it holds.
+fn written_nonzero(before: &[ExprOp], reg: Reg) -> bool {
+    before
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            ExprOp::LoadConst {
+                v: OwnedValue::Int(n),
+                dst,
+            } if *dst == reg => Some(*n != 0),
+            ExprOp::LoadConst {
+                v: OwnedValue::Float(f),
+                dst,
+            } if *dst == reg => Some(*f != 0.0),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a register was last loaded with a number at nought or
+/// above, which is the question a substring's count asks. A count the
+/// statement wrote is the ordinary case and the only one that can be
+/// settled without looking at a row.
+fn written_nonneg(before: &[ExprOp], reg: Reg) -> bool {
+    before
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            ExprOp::LoadConst {
+                v: OwnedValue::Int(n),
+                dst,
+            } if *dst == reg => Some(*n >= 0),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn bin_op(op: BinaryOp) -> Option<BinOp> {
@@ -4750,6 +5450,28 @@ mod tests {
             table: 0,
             cols: cols.into_iter().map(|c| (String::new(), c)).collect(),
         }
+    }
+
+    /// Half of what SAME and ALL_DIFFERENT ask is answered by the
+    /// tables before a row is read, and the fixtures the parity suite
+    /// runs over hold one table each, so this is where the other table
+    /// gets a say.
+    #[test]
+    fn a_pair_of_levels_on_different_tables_is_two_elements() {
+        let mut people = level(Vec::new());
+        people.table = 7;
+        let mut places = level(Vec::new());
+        places.table = 9;
+        let levels = vec![people, places];
+        // One level named twice is one element, whatever its table.
+        assert_eq!(settled_pair(&levels, 0, 0), Some(true));
+        assert_eq!(settled_pair(&levels, 1, 1), Some(true));
+        // Two tables cannot hold one node.
+        assert_eq!(settled_pair(&levels, 0, 1), Some(false));
+        assert_eq!(settled_pair(&levels, 1, 0), Some(false));
+        // Two levels on one table, which is the pair the rows decide.
+        let same_table = vec![level(Vec::new()), level(Vec::new())];
+        assert_eq!(settled_pair(&same_table, 0, 1), None);
     }
 
     fn closes(ops: &[Op]) -> Vec<Option<usize>> {

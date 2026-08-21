@@ -1,0 +1,5 @@
+test/**
+.vscodeignore
+**/*.map
+**/.eslintrc.json
+node_modules/.bin/**

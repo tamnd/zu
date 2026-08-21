@@ -18,7 +18,7 @@ pub use id::{Epoch, GROUP_ROWS, NodeGroupId, NodeId, NodeOffset, RelId, TableId}
 pub use ids::{IdMap, IdSet};
 pub use interrupt::Interrupt;
 pub use order::int_key;
-pub use temporal::{IntervalField, IntervalQualifier, Temporal};
+pub use temporal::{Clock, IntervalField, IntervalQualifier, Temporal};
 pub use types::{
     DurationKind, Field, FloatBits, IntBits, LogicalType, PathType, PhysicalType, RecordType,
     type_by_name,
@@ -35,4 +35,4 @@ pub type Result<T> = std::result::Result<T, ZuError>;
 /// should have to depend on the other to say one number, and a CLI that
 /// linked the C ABI to read a string would export the whole of it.
 /// `cargo xtask package` holds `ZU_ABI_VERSION` in the header to this.
-pub const C_ABI_VERSION: &str = "0.11";
+pub const C_ABI_VERSION: &str = "0.13";

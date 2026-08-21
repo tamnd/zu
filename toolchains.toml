@@ -1,6 +1,6 @@
 schema = 1
 doc = "The versions zu builds against, one table for nine repositories."
-audited = "2026-08-17"
+audited = "2026-08-21"
 
 # One table, referenced rather than restated, so that "which version do
 # we build against" is never a question with two answers. A pinned
@@ -18,8 +18,8 @@ audited = "2026-08-17"
 
 [[component]]
 name = "rust"
-pinned = "1.97.1"
-floor = "1.97"
+pinned = "1.98.0"
+floor = "1.98"
 repos = ["zu", "zu-python", "zu-node", "zu-c", "zu-dotnet"]
 doc = "The compiler. Every repository with Rust in it builds with this one, including the five that reach it through PyO3, napi-rs or cbindgen."
 

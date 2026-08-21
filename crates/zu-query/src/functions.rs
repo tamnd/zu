@@ -20,10 +20,11 @@
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{Result, ZuError, unicode};
+use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
 
-use crate::ast::Literal;
-use crate::binder::{BoundExpr, Func, Math, Type};
+use crate::ast::{Literal, TemporalFn};
+use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Percentile, Trim, Type};
+use crate::cast;
 use crate::exec::{Value, settle};
 
 /// The code behind a scalar function: the arguments already evaluated,
@@ -48,17 +49,26 @@ pub enum Kind {
     /// A list, a string or a path: the three things that have a count
     /// of elements, which is what `SIZE` answers.
     Sized,
+    /// The four things ISO 20.10's `<cardinality expression argument>`
+    /// names: a binding table reference, a path, a list or a record.
+    /// What they have in common is that each one holds a countable
+    /// number of things, and `CARDINALITY` answers how many.
+    Countable,
     /// A path.
     Path,
     /// A node or an edge.
     Element,
+    /// A string first and a count of characters after it, which is what
+    /// the substring function takes and the one kind here whose
+    /// positions are not alike.
+    Counted,
 }
 
 impl Kind {
-    /// Whether an argument of this type is one this kind accepts.
-    /// `ANY` is accepted everywhere, because it is the type of a value
-    /// nobody has narrowed yet and refusing it would refuse a property
-    /// read.
+    /// Whether an argument of this type is one this kind accepts,
+    /// wherever it was written. `ANY` is accepted everywhere, because it
+    /// is the type of a value nobody has narrowed yet and refusing it
+    /// would refuse a property read.
     pub fn accepts(self, ty: &Type) -> bool {
         match self {
             Kind::Any => true,
@@ -66,8 +76,30 @@ impl Kind {
             Kind::Str => matches!(ty, Type::Any | Type::Str),
             Kind::List => matches!(ty, Type::Any | Type::List(_)),
             Kind::Sized => matches!(ty, Type::Any | Type::List(_) | Type::Str | Type::Path),
+            // A binding table reference has no arm of its own in
+            // [`Type`], because nothing in a statement writes one: it
+            // arrives as a parameter and a parameter is `ANY`. So the
+            // fourth argument form is the `Type::Any` here, and the
+            // kernel is what turns a value that is not one of the four
+            // away.
+            Kind::Countable => {
+                matches!(ty, Type::Any | Type::List(_) | Type::Path | Type::Record)
+            }
             Kind::Path => matches!(ty, Type::Any | Type::Path),
             Kind::Element => matches!(ty, Type::Any | Type::Node | Type::Rel),
+            Kind::Counted => Kind::Str.accepts(ty) || Kind::Number.accepts(ty),
+        }
+    }
+
+    /// Whether an argument of this type is one this kind accepts in the
+    /// position it was written in. Only [`Kind::Counted`] reads the
+    /// position: every other kind takes the same thing everywhere, so
+    /// for those this is [`Kind::accepts`] and nothing more.
+    pub fn accepts_at(self, at: usize, ty: &Type) -> bool {
+        match (self, at) {
+            (Kind::Counted, 0) => Kind::Str.accepts(ty),
+            (Kind::Counted, _) => Kind::Number.accepts(ty),
+            _ => self.accepts(ty),
         }
     }
 }
@@ -113,6 +145,11 @@ pub enum Ret {
     Same,
     /// A list of the type of the first argument.
     ListOf,
+    /// A temporal value. The binder's type lattice has no temporal
+    /// type, so every one of them binds as `ANY`, and a row saying that
+    /// is what it answers reads better than a row saying it answers the
+    /// type of an argument that might be the string it was read out of.
+    Temporal,
     /// The wider of the arguments: an integer where every argument is
     /// one and a float where any of them is, which is the rule the
     /// arithmetic operators follow and so is the rule `MOD` follows.
@@ -131,6 +168,7 @@ impl Ret {
             Ret::Str => Type::Str,
             Ret::Bool => Type::Bool,
             Ret::ListOfAny => Type::List(Box::new(Type::Any)),
+            Ret::Temporal => Type::Any,
             Ret::Same => first(),
             Ret::ListOf => Type::List(Box::new(first())),
             Ret::Wider => {
@@ -261,14 +299,80 @@ pub static REGISTRY: &[Signature] = &[
         by_name: true,
         kernel: None,
     },
+    // ISO 20.9 calls this COLLECT_LIST and openCypher calls it COLLECT.
+    // One row and two spellings, the standard's name first, so a plan
+    // and a refusal name the function the standard names and a query
+    // written against either spelling runs.
     Signature {
-        name: "collect",
-        aliases: &[],
+        name: "collect_list",
+        aliases: &["collect"],
         func: Func::Collect,
         arity: Arity::Exactly(1),
         arg: Kind::Any,
         needs: "needs a value",
         ret: Ret::ListOf,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    // GF10, ISO 20.9. Two rows because the divisor is a different
+    // function and not a different argument, and one accumulator
+    // behind both.
+    Signature {
+        name: "stddev_samp",
+        aliases: &[],
+        func: Func::Stddev(Deviation::Sample),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "stddev_pop",
+        aliases: &[],
+        func: Func::Stddev(Deviation::Population),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "percentile_cont",
+        aliases: &[],
+        func: Func::Percentile(Percentile::Continuous),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs numbers",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: true,
+        star: false,
+        by_name: true,
+        kernel: None,
+    },
+    Signature {
+        name: "percentile_disc",
+        aliases: &[],
+        func: Func::Percentile(Percentile::Discrete),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs numbers",
+        // The answer is one of the values that arrived rather than a
+        // point between two of them, so it comes back with the type
+        // they had: a percentile of integers is an integer.
+        ret: Ret::Same,
         deterministic: true,
         aggregate: true,
         star: false,
@@ -322,8 +426,8 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Cardinality,
         arity: Arity::Exactly(1),
-        arg: Kind::List,
-        needs: "needs a list",
+        arg: Kind::Countable,
+        needs: "needs a list, a path, a record or a binding table",
         ret: Ret::Int,
         deterministic: true,
         aggregate: false,
@@ -446,8 +550,8 @@ pub static REGISTRY: &[Signature] = &[
     Signature {
         name: "trim",
         aliases: &[],
-        func: Func::Trim,
-        arity: Arity::Exactly(1),
+        func: Func::Trim(Trim::Both),
+        arity: Arity::Between(1, 2),
         arg: Kind::Str,
         needs: "needs a string",
         ret: Ret::Str,
@@ -455,7 +559,308 @@ pub static REGISTRY: &[Signature] = &[
         aggregate: false,
         star: false,
         by_name: true,
-        kernel: Some(string_kernel),
+        kernel: Some(trim_kernel),
+    },
+    // The two ends, which a statement reaches by writing LEADING or
+    // TRAILING in the explicit form and cannot reach by name: there is
+    // no function called trim_leading in ISO, and inventing one here
+    // would be inventing a spelling for a thing the standard already
+    // spells.
+    Signature {
+        name: "trim_leading",
+        aliases: &[],
+        func: Func::Trim(Trim::Leading),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "trim_trailing",
+        aliases: &[],
+        func: Func::Trim(Trim::Trailing),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "btrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Btrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "ltrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Ltrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
+    },
+    Signature {
+        name: "rtrim",
+        aliases: &[],
+        func: Func::Trim(Trim::Rtrim),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Str,
+        needs: "needs a string",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(trim_kernel),
+    },
+    // The substring function, which in GQL is these two and nothing
+    // else: SUBSTRING is a word the standard has reserved and given no
+    // meaning yet, so a query that wants the middle of a string writes
+    // one of these inside the other.
+    Signature {
+        name: "left",
+        aliases: &[],
+        func: Func::Cut(Cut::Left),
+        arity: Arity::Exactly(2),
+        arg: Kind::Counted,
+        needs: "needs a string and a count of characters",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(cut_kernel),
+    },
+    Signature {
+        name: "right",
+        aliases: &[],
+        func: Func::Cut(Cut::Right),
+        arity: Arity::Exactly(2),
+        arg: Kind::Counted,
+        needs: "needs a string and a count of characters",
+        ret: Ret::Str,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(cut_kernel),
+    },
+    // ISO 20.27, the temporal value functions, and the DURATION of ISO
+    // 20.29. None of the ten is reachable by name, because the grammar
+    // does not write any of them the way it writes a call: four are
+    // bare words that may not be bracketed at all, so a query saying
+    // CURRENT_DATE() is asking for a function nobody defined and gets
+    // told so, five must be bracketed, and LOCAL_TIME is the one the
+    // standard writes both ways. The parser reads that difference and
+    // the registry never sees it.
+    //
+    // Each row takes one argument, which is the string the statement
+    // wrote or, where it wrote none, the instant it is running at. The
+    // row says which temporal type that argument is read as, so the ten
+    // are one kernel over two sources rather than ten conversions.
+    //
+    // They are deterministic in the only sense the folder means, one
+    // answer for one argument, and the ones that read a clock still
+    // never fold: the instant reaches them as a clock and the folder
+    // will not fold anything but literals.
+    Signature {
+        name: "current_date",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::CurrentDate),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "current_time",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::CurrentTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "current_timestamp",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::CurrentTimestamp),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "local_time",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::LocalTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "local_timestamp",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::LocalTimestamp),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "date",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::Date),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "zoned_time",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::ZonedTime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "zoned_datetime",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::ZonedDatetime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "local_datetime",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::LocalDatetime),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string, or the instant the statement is running at",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    Signature {
+        name: "duration",
+        aliases: &[],
+        func: Func::Temporal(TemporalFn::Duration),
+        arity: Arity::Exactly(1),
+        arg: Kind::Any,
+        needs: "needs a string spelling a length of time",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(temporal_kernel),
+    },
+    // ISO 20.28, the datetime subtraction. Two rows, for the reason the
+    // trims have six: the qualifier behind the brackets says which of
+    // the two duration kinds the answer is, and that is a different
+    // function and not a different argument. The row for months is not
+    // reachable by name, the only thing that picks it being the
+    // qualifier the parser read, and it carries the qualifier in its
+    // name the way `trim_leading` carries the end it trims, so that a
+    // refusal names the form the statement wrote.
+    Signature {
+        name: "duration_between",
+        aliases: &[],
+        func: Func::DurationBetween(DurationKind::DayTime),
+        arity: Arity::Exactly(2),
+        arg: Kind::Any,
+        needs: "needs two datetimes of one shape",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(duration_between_kernel),
+    },
+    Signature {
+        name: "duration_between_year_to_month",
+        aliases: &[],
+        func: Func::DurationBetween(DurationKind::YearMonth),
+        arity: Arity::Exactly(2),
+        arg: Kind::Any,
+        needs: "needs two datetimes of one shape",
+        ret: Ret::Temporal,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: false,
+        kernel: Some(duration_between_kernel),
     },
     Signature {
         name: "normalize",
@@ -931,10 +1336,8 @@ fn element_kernel(func: Func, args: &[Value]) -> Result<Value> {
             },
         ) => Ok(Value::Str(format!("e:{table}:{src}:{dst}:{ord}"))),
         (_, Value::Null) => Ok(Value::Null),
-        (Func::Id, other) => Err(invalid(format!("id() expects a node, got {other:?}"))),
-        (_, other) => Err(invalid(format!(
-            "element_id() expects a node or an edge, got {other:?}"
-        ))),
+        (Func::Id, other) => Err(bad_type(func, "a node", other)),
+        (_, other) => Err(bad_type(func, "a node or an edge", other)),
     }
 }
 
@@ -943,9 +1346,20 @@ fn element_kernel(func: Func, args: &[Value]) -> Result<Value> {
 ///
 /// SIZE counts the elements of a list, the characters of a string and
 /// the elements of a path, and reads a chain's stored length rather
-/// than materializing the list behind it. CARDINALITY is the same count
-/// over lists only, since a string has a length and not a cardinality
-/// and answering anyway would let a query that meant CHAR_LENGTH pass.
+/// than materializing the list behind it. The string is an extension:
+/// ISO 20.10 gives SIZE a `<list value expression>` and nothing else,
+/// and CHAR_LENGTH is the standard's spelling for a string. It stays
+/// because the openCypher queries that arrive here write it and mean
+/// the character count, and refusing them would gain nothing that
+/// CHAR_LENGTH does not already give.
+///
+/// CARDINALITY is the same count over the four argument forms of ISO
+/// 20.10's `<cardinality expression argument>`: the elements of a
+/// list, the elements of a path, the fields of a record and the rows
+/// of a binding table. It refuses a string, since a string has a
+/// length and not a cardinality and answering anyway would let a query
+/// that meant CHAR_LENGTH pass.
+///
 /// PATH_LENGTH counts edges, so a path of two nodes has three elements
 /// and a length of one. ELEMENTS hands back the walk in the order it
 /// was taken, which is the shape the path already holds, so the list is
@@ -957,19 +1371,30 @@ fn count_kernel(func: Func, args: &[Value]) -> Result<Value> {
         (Func::Size, Value::Chain(link)) => Ok(Value::Int(link.hops as i64)),
         (Func::Size, Value::List(items) | Value::Path(items)) => Ok(Value::Int(items.len() as i64)),
         (Func::Size, Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
-        (Func::Cardinality, Value::List(items)) => Ok(Value::Int(items.len() as i64)),
+        // A chain is the walk a variable length pattern took and it
+        // settles into the list of its edges, so the count it answers
+        // is the count that list has. Both of these read the hop count
+        // the chain already carries rather than walking it.
+        (Func::Cardinality, Value::Chain(link)) => Ok(Value::Int(link.hops as i64)),
+        (Func::Cardinality, Value::List(items) | Value::Path(items)) => {
+            Ok(Value::Int(items.len() as i64))
+        }
+        (Func::Cardinality, Value::Record(fields)) => Ok(Value::Int(fields.len() as i64)),
+        // The rows, not the cells. A table is a sequence of rows the
+        // way a list is a sequence of elements, and the columns are
+        // the shape of a row rather than a second thing to count.
+        (Func::Cardinality, Value::BindingTable(table)) => {
+            Ok(Value::Int(table.rows().len() as i64))
+        }
         (Func::PathLength, Value::Path(elements)) => Ok(Value::Int((elements.len() / 2) as i64)),
         (Func::Elements, Value::Path(elements)) => Ok(Value::List(elements.clone())),
-        (Func::Size, other) => Err(invalid(format!(
-            "size() expects a list or string, got {other:?}"
-        ))),
-        (Func::Cardinality, other) => Err(invalid(format!(
-            "cardinality() expects a list, got {other:?}"
-        ))),
-        (func, other) => Err(invalid(format!(
-            "{}() expects a path, got {other:?}",
-            name_of(func)
-        ))),
+        (Func::Size, other) => Err(bad_type(func, "a list or string", other)),
+        (Func::Cardinality, other) => Err(bad_type(
+            func,
+            "a list, a path, a record or a binding table",
+            other,
+        )),
+        (func, other) => Err(bad_type(func, "a path", other)),
     }
 }
 
@@ -985,10 +1410,14 @@ fn identity_kernel(func: Func, args: &[Value]) -> Result<Value> {
             Value::Null => return Ok(Value::Null),
             Value::Node { .. } | Value::Rel { .. } => {}
             other => {
-                return Err(invalid(format!(
-                    "{}() compares nodes and edges, got {other:?}",
-                    name_of(func)
-                )));
+                return Err(gql(
+                    codes::C22G03,
+                    format!(
+                        "{}() compares nodes and edges, got {}",
+                        name_of(func),
+                        crate::cast::value_type(other)
+                    ),
+                ));
             }
         }
     }
@@ -1001,19 +1430,14 @@ fn identity_kernel(func: Func, args: &[Value]) -> Result<Value> {
 }
 
 /// ISO 20.22 and 20.24, the questions about one string: its two
-/// lengths, its two folds, the spaces off its ends and the two about a
-/// normal form. A null in answers null, which is the rule every scalar
-/// here shares with the operators around them.
+/// lengths, its two folds and the two about a normal form. A null in
+/// answers null, which is the rule every scalar here shares with the
+/// operators around them.
 fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     let s = match settle(one(func, args)?.clone()) {
         Value::Str(s) => s,
         Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(invalid(format!(
-                "{}() expects a string, got {other:?}",
-                name_of(func)
-            )));
-        }
+        other => return Err(bad_type(func, "a string", &other)),
     };
     Ok(match func {
         // Characters, not bytes: what a reader counts is the scalar
@@ -1027,11 +1451,6 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
         // by a rule this engine has not written down yet.
         Func::Upper => Value::Str(s.to_ascii_uppercase()),
         Func::Lower => Value::Str(s.to_ascii_lowercase()),
-        // The one argument form trims spaces, which is what ISO 20.24
-        // says it trims: the trim character defaults to a space and the
-        // trim specification to BOTH. Naming either is GF06 and a
-        // spelling this does not read.
-        Func::Trim => Value::Str(s.trim_matches(' ').to_string()),
         // ISO 20.24 and 19.7, both answered by UAX 15 and the Unicode
         // Character Database, which is where the tables under these two
         // come from.
@@ -1046,11 +1465,256 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     })
 }
 
+/// ISO 20.24, the trim family: characters off the front of a string,
+/// off the back, or off both.
+///
+/// Six functions and one piece of code, because the whole of what
+/// tells them apart is which ends are trimmed and how many characters
+/// may be trimmed. `TRIM` takes one character and raises `22027` when
+/// it is handed a longer string, which is the condition the standard
+/// names and the reason `BTRIM`, `LTRIM` and `RTRIM` exist at all:
+/// those three take a set and trim any character of it. A trim
+/// character nobody wrote is a space, and trimming an empty set
+/// answers the string it was given.
+fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let trim = match func {
+        Func::Trim(trim) => trim,
+        other => {
+            return Err(invalid(format!("{}() is not a trim", name_of(other))));
+        }
+    };
+    let text = match str_arg(func, args.first())? {
+        Some(text) => text,
+        None => return Ok(Value::Null),
+    };
+    let chars = match args.get(1) {
+        None => Some(" ".to_string()),
+        Some(_) => str_arg(func, args.get(1))?,
+    };
+    let Some(chars) = chars else {
+        return Ok(Value::Null);
+    };
+    let one_character = matches!(trim, Trim::Both | Trim::Leading | Trim::Trailing);
+    if one_character && chars.chars().count() != 1 {
+        return Err(gql(
+            codes::C22027,
+            format!(
+                "{}() trims one character and was given {} of them, which is what btrim, ltrim and rtrim are for",
+                name_of(func),
+                chars.chars().count()
+            ),
+        ));
+    }
+    let set: Vec<char> = chars.chars().collect();
+    let front = matches!(trim, Trim::Both | Trim::Leading | Trim::Btrim | Trim::Ltrim);
+    let back = matches!(
+        trim,
+        Trim::Both | Trim::Trailing | Trim::Btrim | Trim::Rtrim
+    );
+    let mut out = text.as_str();
+    if front {
+        out = out.trim_start_matches(|c| set.contains(&c));
+    }
+    if back {
+        out = out.trim_end_matches(|c| set.contains(&c));
+    }
+    Ok(Value::Str(out.to_string()))
+}
+
+/// ISO 20.24, the substring function: the first characters of a string
+/// or the last of them.
+///
+/// The count is characters and not bytes, the way every length here is,
+/// so `LEFT(s, 2)` answers two characters however many bytes they took
+/// to write. A count above the length of the string answers the whole
+/// string, since there is nothing else to hand back and asking for more
+/// than there is is not an error the standard names. A negative count
+/// is `22011`, which is the one condition it does name for these, and a
+/// count that is not a whole number is the same condition, since the
+/// grammar takes any numeric expression there and half a character is
+/// not a thing a string has.
+fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let cut = match func {
+        Func::Cut(cut) => cut,
+        other => {
+            return Err(invalid(format!(
+                "{}() is not a substring function",
+                name_of(other)
+            )));
+        }
+    };
+    let Some(text) = str_arg(func, args.first())? else {
+        return Ok(Value::Null);
+    };
+    let given = args
+        .get(1)
+        .ok_or_else(|| invalid(format!("{}() was given no count", name_of(func))))?;
+    let count = match settle(given.clone()) {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(i) => i,
+        Value::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e18 => f as i64,
+        Value::Float(f) => {
+            return Err(gql(
+                codes::C22011,
+                format!(
+                    "{}() counts whole characters and was asked for {f} of them",
+                    name_of(func)
+                ),
+            ));
+        }
+        other => return Err(bad_type(func, "a number", &other)),
+    };
+    if count < 0 {
+        return Err(gql(
+            codes::C22011,
+            format!(
+                "{}() was asked for {count} characters, and a string has no negative number of them",
+                name_of(func)
+            ),
+        ));
+    }
+    let count = count as usize;
+    let held = text.chars().count();
+    let taken: String = match cut {
+        Cut::Left => text.chars().take(count).collect(),
+        Cut::Right => text.chars().skip(held.saturating_sub(count)).collect(),
+    };
+    Ok(Value::Str(taken))
+}
+
+/// The temporal value functions of ISO 20.27 and the `DURATION` of ISO
+/// 20.29: one value read ten ways.
+///
+/// The value arrives as the argument, so this kernel reads no clock and
+/// is as pure as every other one here. What makes the ten differ is
+/// only which type the value is read as, so a string is parsed at that
+/// type and an instant is converted to it, and both of those are rules
+/// written down once elsewhere rather than ten times here.
+///
+/// A null argument answers null. A statement can reach that now, since
+/// the string is one a statement wrote and a parameter can hold null,
+/// where the clock the binder plants never can.
+fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let Func::Temporal(which) = func else {
+        return Err(invalid(format!(
+            "{}() is not a temporal value function",
+            name_of(func)
+        )));
+    };
+    let read = match args.first().map(|value| settle(value.clone())) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Str(text)) => Temporal::parse(&which.target(), &text).ok_or_else(|| {
+            gql(
+                codes::C22007,
+                format!(
+                    "{}() cannot read {text:?} as {}",
+                    name_of(func),
+                    which.target()
+                ),
+            )
+        }),
+        Some(Value::Temporal(instant)) => {
+            cast::convert(instant, &which.target()).ok_or_else(|| {
+                gql(
+                    codes::C22G03,
+                    format!(
+                        "{}() cannot read {instant} as {}",
+                        name_of(func),
+                        which.target()
+                    ),
+                )
+            })
+        }
+        Some(other) => Err(bad_type(func, "a string", &other)),
+        None => Err(invalid(format!("{}() was given nothing", name_of(func)))),
+    }?;
+    Ok(Value::Temporal(read))
+}
+
+/// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO 20.28.
+///
+/// The answer runs from the first argument to the second, so it is
+/// positive when the second is the later of the two. The standard
+/// writes the two as `<datetime value expression 1>` and `<datetime
+/// value expression 2>` and the publicly readable part of it does not
+/// say which way round the subtraction goes, so zu reads the name: the
+/// duration between a and b is the one that carries a to b. That is
+/// also what every graph engine a query would be ported from answers.
+///
+/// The counting itself is `Temporal::between`, which is also what the
+/// minus operator over two instants answers, so a query written either
+/// way gets the same number.
+fn duration_between_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let Func::DurationBetween(kind) = func else {
+        return Err(invalid(format!(
+            "{}() is not a datetime subtraction",
+            name_of(func)
+        )));
+    };
+    let read = |at: usize| -> Result<Option<Temporal>> {
+        match args.get(at).map(|value| settle(value.clone())) {
+            Some(Value::Temporal(instant)) => Ok(Some(instant)),
+            Some(Value::Null) => Ok(None),
+            Some(other) => Err(bad_type(func, "a datetime", &other)),
+            None => Err(invalid("duration_between() was given no datetime".into())),
+        }
+    };
+    let (Some(from), Some(to)) = (read(0)?, read(1)?) else {
+        return Ok(Value::Null);
+    };
+    Temporal::between(from, to, kind)
+        .map(Value::Temporal)
+        .ok_or_else(|| {
+            gql(
+                codes::C22G03,
+                format!(
+                    "there is no {} from {from} to {to}",
+                    LogicalType::Duration(kind)
+                ),
+            )
+        })
+}
+
+/// The string an argument holds, or nothing where it holds a null.
+/// Every kernel over strings reads its arguments through this, so a
+/// null answers null in one place rather than in each of them.
+fn str_arg(func: Func, value: Option<&Value>) -> Result<Option<String>> {
+    let value = value.ok_or_else(|| invalid(format!("{}() was given no string", name_of(func))))?;
+    match settle(value.clone()) {
+        Value::Str(s) => Ok(Some(s)),
+        Value::Null => Ok(None),
+        other => Err(bad_type(func, "a string", &other)),
+    }
+}
+
 /// A GQL condition raised by a kernel. These are conditions the
 /// standard names, unlike the failures above, so they carry the code a
 /// client checks rather than a message it would have to read.
 fn gql(status: zu_common::GqlStatus, detail: String) -> ZuError {
     ZuError::gql(status, detail)
+}
+
+/// `22G03 invalid value type`, for an argument that is not of a type
+/// the function takes.
+///
+/// This is the condition the binder raises for the same mistake, and
+/// it is raised here for the arguments the binder cannot judge. A
+/// literal has a type the binder reads, so `SIZE(1)` never reaches a
+/// kernel; a property read is `ANY` until a row arrives, so
+/// `SIZE(n.id)` reaches one and the row is where the mistake becomes
+/// visible. Both are the same error and a client sorting them by code
+/// should not have to know which side caught it. The type is named
+/// rather than printed, because the value's own contents are not what
+/// the message is about.
+fn bad_type(func: Func, wants: &str, got: &Value) -> ZuError {
+    gql(
+        codes::C22G03,
+        format!(
+            "{}() expects {wants}, got {}",
+            name_of(func),
+            crate::cast::value_type(got)
+        ),
+    )
 }
 
 /// `22003 numeric value out of range`, for an answer that is a number
@@ -1080,10 +1744,7 @@ fn real(func: Func, value: &Value) -> Result<f64> {
     match value {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
-        other => Err(invalid(format!(
-            "{}() expects a number, got {other:?}",
-            name_of(func)
-        ))),
+        other => Err(bad_type(func, "a number", other)),
     }
 }
 
@@ -1145,6 +1806,19 @@ fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
             .map(Value::Int)
             .ok_or_else(|| out_of_range(func, format!("of {i} is one past the top of an integer"))),
         (Math::Abs, Value::Float(f)) => Ok(Value::Float(f.abs())),
+        // ISO 20.29's duration absolute value function, which is the
+        // same word over a length of time. A duration is a signed count
+        // of one unit, so the length of it is that count without its
+        // sign and the kind it counts in is untouched.
+        (Math::Abs, Value::Temporal(Temporal::Duration(kind, count))) => count
+            .checked_abs()
+            .map(|count| Value::Temporal(Temporal::Duration(*kind, count)))
+            .ok_or_else(|| {
+                out_of_range(
+                    func,
+                    format!("of {count} is one past the top of a duration"),
+                )
+            }),
         (Math::Sign, Value::Int(i)) => Ok(Value::Int(i.signum())),
         (Math::Sign, Value::Float(f)) => Ok(Value::Int(if *f > 0.0 {
             1
@@ -1173,10 +1847,7 @@ fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
             };
             finite(func, *f, answer)
         }
-        (_, other) => Err(invalid(format!(
-            "{}() expects a number, got {other:?}",
-            name_of(func)
-        ))),
+        (_, other) => Err(bad_type(func, "a number", other)),
     }
 }
 
@@ -1221,7 +1892,7 @@ fn real_kernel(func: Func, args: &[Value]) -> Result<Value> {
     }
     let x = real(func, &value)?;
     let answer = match math {
-        // ISO 20.20 defines the square root as the power of one half,
+        // ISO 20.22 defines the square root as the power of one half,
         // so a negative argument is the power function's condition
         // rather than a condition of its own.
         Math::Sqrt => {
@@ -1351,7 +2022,7 @@ fn pair_kernel(func: Func, args: &[Value]) -> Result<Value> {
             x.powf(y)
         }
         // LOG takes the base first and the number second, which is the
-        // order ISO 20.21 writes it in.
+        // order ISO 20.22 writes it in.
         Math::Log => {
             if x <= 0.0 || x == 1.0 {
                 return Err(gql(
@@ -1540,5 +2211,136 @@ mod tests {
             call("exp", &[Value::Float(f64::INFINITY)]).unwrap(),
             Value::Float(f64::INFINITY)
         );
+    }
+
+    /// The answer of a trim, by the function rather than by a name,
+    /// since the two ends of the explicit form have no name a statement
+    /// can write.
+    fn trimmed(trim: Trim, args: &[Value]) -> Result<Value> {
+        trim_kernel(Func::Trim(trim), args)
+    }
+
+    /// GF05 and GF06. Which end is trimmed is the function, and every
+    /// one of the six trims the characters it was given and stops at
+    /// the first character it was not.
+    #[test]
+    fn a_trim_takes_characters_off_the_ends_it_is_asked_for() {
+        let text = Value::Str("xxayx".into());
+        let x = Value::Str("x".into());
+        for (trim, want) in [
+            (Trim::Both, "ay"),
+            (Trim::Leading, "ayx"),
+            (Trim::Trailing, "xxay"),
+            (Trim::Btrim, "ay"),
+            (Trim::Ltrim, "ayx"),
+            (Trim::Rtrim, "xxay"),
+        ] {
+            let got = trimmed(trim, &[text.clone(), x.clone()]).unwrap();
+            assert_eq!(got, Value::Str(want.into()), "{trim:?}");
+        }
+        // A set of characters is a set: any of them is trimmed, in
+        // whatever order they stand and however often.
+        assert_eq!(
+            trimmed(
+                Trim::Btrim,
+                &[Value::Str("xyyxaxy".into()), Value::Str("xy".into())]
+            )
+            .unwrap(),
+            Value::Str("a".into())
+        );
+        // An empty set trims nothing, and neither does a character the
+        // string does not begin with.
+        assert_eq!(
+            trimmed(
+                Trim::Btrim,
+                &[Value::Str("ab".into()), Value::Str("".into())]
+            )
+            .unwrap(),
+            Value::Str("ab".into())
+        );
+        assert_eq!(
+            trimmed(
+                Trim::Ltrim,
+                &[Value::Str("ab".into()), Value::Str("b".into())]
+            )
+            .unwrap(),
+            Value::Str("ab".into())
+        );
+        // What nobody wrote is a space, for all six.
+        assert_eq!(
+            trimmed(Trim::Both, &[Value::Str("  a  ".into())]).unwrap(),
+            Value::Str("a".into())
+        );
+    }
+
+    /// GF05 is a feature of its own because TRIM trims one character
+    /// and says so: a longer trim character raises the condition the
+    /// standard names rather than being read as the set the three
+    /// multi-character functions take.
+    #[test]
+    fn trimming_more_than_one_character_is_a_condition() {
+        for trim in [Trim::Both, Trim::Leading, Trim::Trailing] {
+            let err = trimmed(trim, &[Value::Str("abx".into()), Value::Str("ab".into())])
+                .expect_err("a trim error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22027), "{trim:?}");
+        }
+        for (trim, want) in [
+            (Trim::Btrim, "x"),
+            (Trim::Ltrim, "x"),
+            // Nothing off the back, the string ending in a character
+            // the set does not hold.
+            (Trim::Rtrim, "abx"),
+        ] {
+            assert_eq!(
+                trimmed(trim, &[Value::Str("abx".into()), Value::Str("ab".into())]).unwrap(),
+                Value::Str(want.into()),
+                "{trim:?}"
+            );
+        }
+    }
+
+    /// ISO 20.24. LEFT counts from the front and RIGHT from the back,
+    /// both in characters, and a count past the end of the string
+    /// answers the string, there being nothing else to answer with.
+    #[test]
+    fn a_substring_is_counted_in_characters_from_the_end_it_names() {
+        let text = Value::Str("héllo".into());
+        for (name, count, want) in [
+            ("left", 2, "hé"),
+            ("right", 2, "lo"),
+            ("left", 0, ""),
+            ("right", 0, ""),
+            ("left", 5, "héllo"),
+            ("right", 5, "héllo"),
+            // More than the string holds is the string. The count is
+            // characters, so the accented one counts once here and takes
+            // two bytes in the store.
+            ("left", 40, "héllo"),
+            ("right", 40, "héllo"),
+        ] {
+            let got = call(name, &[text.clone(), Value::Int(count)]).unwrap();
+            assert_eq!(got, Value::Str(want.into()), "{name} of {count}");
+        }
+    }
+
+    /// A count no string has is `22011`, which is the one condition the
+    /// standard names for the substring function. A count written as a
+    /// whole float is a count, since the grammar takes any numeric
+    /// expression there, and one with a fraction on it is not.
+    #[test]
+    fn a_count_of_characters_no_string_has_is_a_condition() {
+        let text = Value::Str("abc".into());
+        for name in ["left", "right"] {
+            let err = call(name, &[text.clone(), Value::Int(-1)]).expect_err("a substring error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22011), "{name}");
+            let err =
+                call(name, &[text.clone(), Value::Float(1.5)]).expect_err("a substring error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22011), "{name}");
+            assert_eq!(
+                call(name, &[text.clone(), Value::Float(2.0)]).unwrap(),
+                Value::Str(if name == "left" { "ab" } else { "bc" }.into()),
+                "{name}"
+            );
+        }
     }
 }

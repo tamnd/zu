@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: temporal
 doc: Dates, times and durations, which every language already has a type for and no two of those types mean the same thing. A client mapping these onto the host language's own date is where a zone, a precision or a sign quietly goes missing.
 
@@ -809,3 +809,188 @@ cases:
       - values:
           - type: DURATION
             value: "-P1D"
+
+  - name: datetime-value-function-types
+    doc: The five words of ISO 20.27 and the five types they answer. Three carry a displacement and two do not, and an engine that answers a local time where a zoned one was asked for has thrown away the field a reader would have compared on.
+    query: RETURN CURRENT_DATE IS TYPED DATE AND CURRENT_TIME IS TYPED ZONED TIME AND CURRENT_TIMESTAMP IS TYPED ZONED DATETIME AND LOCAL_TIME IS TYPED LOCAL TIME AND LOCAL_TIMESTAMP IS TYPED LOCAL DATETIME AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-functions-agree
+    doc: One statement reads one clock, so the date it answers is the date its instant fell on. An engine reading the clock once per function can answer false here for a fraction of a second a day, which is the kind of failure that never shows up in a test run and shows up in production.
+    query: RETURN CURRENT_DATE = CAST(CURRENT_TIMESTAMP AS DATE) AND LOCAL_TIME = CAST(CURRENT_TIMESTAMP AS LOCAL TIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-function-is-not-folded
+    doc: The instant is the one the statement runs at and not the one it was compiled at. An engine holding a plan cache and folding this writes a time into the plan and hands it to every statement after, which this catches by asking for a time later than any build of it.
+    query: RETURN CURRENT_TIMESTAMP > ZONED DATETIME '2024-01-01T00:00:00Z' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: datetime-value-function-takes-no-parentheses
+    doc: The grammar writes these as bare words, so the brackets are a call to a function that does not exist. An engine accepting them is accepting a spelling no other engine has to.
+    query: RETURN CURRENT_DATE() AS n
+    raises: "42002"
+
+  - name: duration-between-day-to-second
+    doc: The datetime subtraction of ISO 20.28 with no qualifier, which reads as DAY TO SECOND. Thirty days lie between the two dates, and an engine counting the calendar months instead answers a month here.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P30D"
+
+  - name: duration-between-runs-from-the-first-to-the-second
+    doc: The answer carries the first argument to the second, so it is negative when the second is the earlier of the two. An engine subtracting the other way round answers every duration in a ported query with the wrong sign, which no type check catches.
+    query: RETURN DURATION_BETWEEN(DATE '2024-03-01', DATE '2024-01-31') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "-P30D"
+
+  - name: duration-between-agrees-with-the-minus
+    doc: The function and the operator count the same thing with the arguments the other way round, so an engine whose two paths were written twice is caught here rather than by a reader noticing years later.
+    query: RETURN DURATION_BETWEEN(LOCAL DATETIME '2024-01-01T00:00:00', LOCAL DATETIME '2024-01-01T01:00:00') = LOCAL DATETIME '2024-01-01T01:00:00' - LOCAL DATETIME '2024-01-01T00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: duration-between-year-to-month
+    doc: The qualifier behind the closing bracket says the answer counts months, and a month is whole or it is not counted, so a month and a day is one month.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') YEAR TO MONTH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1M"
+
+  - name: duration-between-zoned-reads-the-instant
+    doc: Two zoned datetimes written for two different wall clocks in two zones are seven hours apart, which is the instant between them and not the digits. An engine comparing the written times answers nothing here.
+    query: RETURN DURATION_BETWEEN(ZONED DATETIME '2024-01-01T00:00:00+07:00', ZONED DATETIME '2024-01-01T00:00:00Z') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT7H"
+
+  - name: duration-between-refuses-two-shapes
+    doc: A date and a time have no length between them, so the call is refused rather than answered by reading one of them as the other.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', LOCAL TIME '10:00:00') AS n
+    raises: "22G03"
+
+  - name: duration-between-takes-only-the-two-qualifiers
+    doc: A temporal duration qualifier is YEAR TO MONTH or DAY TO SECOND and neither of the other four runs of fields, which is narrower than the qualifier behind an interval string.
+    query: RETURN DURATION_BETWEEN(DATE '2024-01-31', DATE '2024-03-01') YEAR TO DAY AS n
+    raises: "42001"
+
+  - name: date-reads-a-string
+    doc: The constructor of ISO 20.27, which reads a date out of a string rather than off the clock. It answers what the literal of the same type answers, the string being the same string.
+    query: RETURN DATE('2024-01-15') AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-15"
+
+  - name: zoned-time-reads-a-string
+    doc: The same constructor at the time of day with a displacement on it. The displacement is part of the value and not a note about where it was written.
+    query: RETURN ZONED_TIME('10:00:00+07:00') AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "10:00:00+07:00"
+
+  - name: local-time-reads-a-string
+    doc: LOCAL_TIME is the one word of ISO 20.27 the standard writes both bare and bracketed, so this and the bare word are one function.
+    query: RETURN LOCAL_TIME('10:00:00') AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "10:00:00"
+
+  - name: zoned-datetime-reads-a-string
+    doc: The instant, read out of a string that names the displacement it was written at. An engine keeping the digits rather than the instant answers a different value the moment the two are compared.
+    query: RETURN ZONED_DATETIME('2024-01-15T10:00:00Z') AS ts
+    columns:
+      - ts
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-15T10:00:00Z"
+
+  - name: local-datetime-reads-a-string
+    doc: The date and time of day with no displacement at all, which is a wall clock and not an instant.
+    query: RETURN LOCAL_DATETIME('2024-01-15T10:00:00') AS ts
+    columns:
+      - ts
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-15T10:00:00"
+
+  - name: duration-reads-a-string
+    doc: The duration function of ISO 20.29. Which of the two kinds the answer is is the string's to say and not the call's, so a string of years and months answers a year-month duration.
+    query: RETURN DURATION('P1Y2M') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"
+
+  - name: empty-brackets-read-the-clock
+    doc: The brackets of a constructor may stand empty, which reads the clock, so DATE() is CURRENT_DATE and ZONED_DATETIME() is CURRENT_TIMESTAMP. Both are cut from the one instant the statement is running at, so they agree whatever time the test runs at.
+    query: RETURN DATE() = CURRENT_DATE AND ZONED_DATETIME() = CURRENT_TIMESTAMP AND LOCAL_DATETIME() = LOCAL_TIMESTAMP AS same
+    columns:
+      - same
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: duration-has-no-empty-form
+    doc: There is a date now and a time now and no length of time now, so the one constructor that reads no clock has to be given its string.
+    query: RETURN DURATION() AS n
+    raises: "42001"
+
+  - name: date-refuses-a-string-of-another-type
+    doc: A string is read at the type the word names and is not widened to reach one that parses. A time of day is not a date, so this is refused rather than answered.
+    query: RETURN DATE('10:00:00') AS d
+    raises: "22007"
+
+  - name: abs-of-a-duration-is-its-length
+    doc: The duration absolute value function of ISO 20.29, which is the same word the numbers are given. The kind the duration counts in is untouched, so a year-month duration stays one.
+    query: RETURN ABS(DURATION('-P1Y2M')) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"

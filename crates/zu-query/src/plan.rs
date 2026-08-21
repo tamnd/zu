@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use zu_common::Result;
+use zu_common::{DurationKind, Result};
 
 use crate::ast::{
     BinaryOp, Conjunction, Literal, PathMode, RelDirection, Selector, SetOp, SortKey, UnaryOp,
@@ -256,6 +256,11 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         keys: Vec<BoundItem>,
         aggs: Vec<BoundItem>,
+        /// GF20. The aggregates the `ORDER BY` above asked for that no
+        /// item carries. They are accumulated with the rest and land in
+        /// the slot each one names, which the sort reads and no column
+        /// does, so they widen the grouping's work and not its answer.
+        order_aggs: Vec<BoundItem>,
     },
     Distinct {
         input: Box<LogicalPlan>,
@@ -508,13 +513,17 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                 distinct,
                 items,
                 order_by,
+                order_aggs,
                 skip,
                 limit,
                 filter,
             } => {
                 let (aggs, keys): (Vec<_>, Vec<_>) =
                     items.iter().cloned().partition(|i| i.aggregate);
-                plan = if aggs.is_empty() {
+                // A sort key holding an aggregate groups the clause on
+                // its own, so the items are the keys and the answer is
+                // one row per group even where no column is a count.
+                plan = if aggs.is_empty() && order_aggs.is_empty() {
                     LogicalPlan::Project {
                         input: plan.boxed(),
                         items: items.clone(),
@@ -524,6 +533,7 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                         input: plan.boxed(),
                         keys,
                         aggs,
+                        order_aggs: order_aggs.clone(),
                     }
                 };
                 for item in items {
@@ -1228,8 +1238,21 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
                 ..plain("Project", rendered.join(", "), under(input))
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
-            let rendered: Vec<String> = aggs.iter().map(|i| item_text(i, query)).collect();
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } => {
+            // The hidden ones are listed with the rest, under the name
+            // the sort key above reads them by, because a listing that
+            // left them out would say a grouping does less work than it
+            // does and leave the sort reading a name from nowhere.
+            let rendered: Vec<String> = aggs
+                .iter()
+                .chain(order_aggs)
+                .map(|i| item_text(i, query))
+                .collect();
             let grouped: Vec<String> = keys.iter().map(|i| item_text(i, query)).collect();
             let detail = match grouped.is_empty() {
                 true => rendered.join(", "),
@@ -1423,6 +1446,32 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             args,
             ..
         } => {
+            // ISO 20.27 writes some of these as bare words and brackets
+            // the rest, and the argument of a bare one is the instant
+            // the binder planted. Printing that instant would print a
+            // thing no query can write and no reader asked for, so the
+            // clock is printed as the word alone and a written string
+            // is printed inside the brackets it was written in.
+            if let Func::Temporal(which) = func {
+                let word = which.word().to_uppercase();
+                return match args.first() {
+                    Some(BoundExpr::Clock) | None => word,
+                    Some(arg) => format!("{word}({})", expr_text(arg, query)),
+                };
+            }
+            // ISO 20.28 puts the qualifier behind the brackets, so a
+            // plan that printed it as an argument would print text no
+            // query can write. It is printed even where the query left
+            // it out, since what a reader wants from a plan is which
+            // of the two the call settled on.
+            if let Func::DurationBetween(kind) = func {
+                let written: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+                let qualifier = match kind {
+                    DurationKind::YearMonth => "YEAR TO MONTH",
+                    DurationKind::DayTime => "DAY TO SECOND",
+                };
+                return format!("DURATION_BETWEEN({}) {qualifier}", written.join(", "));
+            }
             let name = func_name(*func);
             let inner = if *star {
                 "*".to_string()
@@ -1460,6 +1509,10 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             let rendered: Vec<String> = items.iter().map(|i| expr_text(i, query)).collect();
             format!("[{}]", rendered.join(", "))
         }
+        // The instant, which only ever appears as the argument of one
+        // of the five words above and is printed as the word a query
+        // would have written to ask for it whole.
+        BoundExpr::Clock => "CURRENT_TIMESTAMP".into(),
         BoundExpr::Map(entries) => {
             let rendered: Vec<String> = entries
                 .iter()
@@ -1573,6 +1626,40 @@ mod tests {
     fn explained(source: &str) -> String {
         let (plan, query) = planned(source);
         explain(&plan, &query, &schema())
+    }
+
+    /// A block is not an optimization barrier, which is the whole
+    /// performance specification for the procedure family: a call with
+    /// an inline body is bound into the statement around it, so the
+    /// walk inside it sits in the same join ordering search as the walk
+    /// beside it. Three of them nested inside each other plan as the
+    /// flattened text plans, operator for operator, because after the
+    /// binder there is no nest left to plan.
+    #[test]
+    fn a_nest_of_blocks_plans_as_the_flattened_text_plans() {
+        let nested = explained(
+            "MATCH (a:Person) \
+             CALL (a) { \
+               MATCH (a)-[:KNOWS]->(b:Person) \
+               CALL (b) { \
+                 MATCH (b)-[:KNOWS]->(c:Person) \
+                 CALL (c) { \
+                   MATCH (c)-[:IS_LOCATED_IN]->(d:Place) RETURN d AS d \
+                 } \
+                 RETURN d AS d \
+               } \
+               RETURN d AS d \
+             } \
+             RETURN d.name AS name",
+        );
+        let flat = explained(
+            "MATCH (a:Person) \
+             MATCH (a)-[:KNOWS]->(b:Person) \
+             MATCH (b)-[:KNOWS]->(c:Person) \
+             MATCH (c)-[:IS_LOCATED_IN]->(d:Place) \
+             RETURN d.name AS name",
+        );
+        assert_eq!(nested, flat, "nested:\n{nested}\nflat:\n{flat}");
     }
 
     /// A chain of three statements plans as one pipeline: the result

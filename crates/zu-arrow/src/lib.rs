@@ -57,7 +57,9 @@ use arrow::datatypes::{
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions, RecordBatchReader};
 
-use zu_query::column::{ColumnData, ColumnType, Columns, Offsets, Validity};
+use zu_query::column::{
+    ColumnData, ColumnType, Columns, Held, HeldColumn, HeldData, Offsets, Validity,
+};
 use zu_query::exec::QueryResult;
 
 pub mod values;
@@ -181,6 +183,76 @@ impl Table {
         })
     }
 
+    /// The result taken rather than read, which is the export that
+    /// copies nothing.
+    ///
+    /// [`Table::of`] borrows the result, and a borrowed buffer has to be
+    /// copied on the way into Arrow, because the buffer behind the
+    /// borrow stays where it is and the array has to own what it points
+    /// at. So the whole answer is memcpied once, every time, purely
+    /// because the caller might ask again.
+    ///
+    /// This is the other bargain. The result is consumed, its buffers
+    /// are moved into Arrow arrays, and a column of a hundred million
+    /// integers costs a pointer. The engine already filled those buffers
+    /// in the layout Arrow reads, so between the sink and the consumer
+    /// there is now no copy of the data at all.
+    ///
+    /// Two arms still allocate, and neither is data. A year-month
+    /// interval is 64 bits in the engine and 96 in Arrow, so it is
+    /// rebuilt; and a complex column is values rather than a buffer, so
+    /// it is built the way it always was. Those are the columns nobody
+    /// exports a million of.
+    pub fn taken<T: Tables + ?Sized>(result: QueryResult, tables: &T) -> Result<Table, Error> {
+        match result.into_columns() {
+            Ok(held) => Table::from_held(held, tables),
+            // The sink built rows rather than columns, so there are no
+            // buffers to take and the borrowing path is the only path.
+            // It reads the rows down their columns and allocates its
+            // buffers fresh, which is not a copy of anything.
+            Err(result) => Table::of(&result, tables),
+        }
+    }
+
+    /// The same, for a caller that already owns the columns.
+    pub fn from_held<T: Tables + ?Sized>(held: Held, tables: &T) -> Result<Table, Error> {
+        let rows = held.rows;
+        let mut fields = Vec::with_capacity(held.columns.len());
+        let mut arrays = Vec::with_capacity(held.columns.len());
+        for HeldColumn {
+            name,
+            ty,
+            data,
+            validity,
+        } in held.columns
+        {
+            // A complex column has no buffer to move: its values are
+            // read where they lie and the array is built out of them.
+            // Naming the vector out here is what keeps it alive for as
+            // long as the borrowed view of it exists.
+            let values;
+            let data = match data {
+                HeldData::Null => ColumnData::Null,
+                HeldData::Bool { bits } => ColumnData::Bool { bits },
+                HeldData::Int(buffer) => ColumnData::Int(buffer),
+                HeldData::Float(buffer) => ColumnData::Float(buffer),
+                HeldData::Str(strings) => ColumnData::Str(strings),
+                HeldData::Complex(held) => {
+                    values = held;
+                    ColumnData::Complex(values.iter().collect())
+                }
+            };
+            let array = column(&name, &ty, data, validity, rows, tables)?;
+            fields.push(field(&name, array.data_type().clone()));
+            arrays.push(array);
+        }
+        Ok(Table {
+            schema: Arc::new(Schema::new(Fields::from(fields))),
+            arrays,
+            rows,
+        })
+    }
+
     /// The schema, which a result with no rows has as much as any other.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
@@ -201,6 +273,45 @@ impl Table {
             at: 0,
             given: 0,
         }
+    }
+
+    /// This table as a C Data Interface stream.
+    ///
+    /// The arrays go across as they are. Whoever imports the stream
+    /// shares the buffers with it and releases them through the callback
+    /// the struct carries, so nothing here is copied and nothing is
+    /// freed until the other side says so.
+    #[cfg(feature = "ffi")]
+    pub fn into_stream(self, rows: usize) -> arrow::ffi_stream::FFI_ArrowArrayStream {
+        arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(self.batches(rows)))
+    }
+
+    /// This table as the bytes of an Arrow IPC stream.
+    ///
+    /// The bytes are written once, into a buffer sized from what the
+    /// arrays hold, and the schema goes first, so a reader that takes
+    /// them knows the columns before the first batch and an empty result
+    /// is a schema and one empty batch rather than nothing at all.
+    #[cfg(feature = "ipc")]
+    pub fn into_ipc(self, rows: usize) -> Result<Vec<u8>, Error> {
+        let schema = self.schema();
+        // Every batch is a slice of arrays that are already in memory,
+        // so the writer's output is about the size of the buffers plus
+        // the flatbuffer headers. Guessing it once saves the doubling.
+        let guess = self
+            .arrays
+            .iter()
+            .map(|array| array.get_buffer_memory_size())
+            .sum::<usize>()
+            + 1024;
+        let mut bytes = Vec::with_capacity(guess);
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema)?;
+        for batch in self.batches(rows) {
+            writer.write(&batch?)?;
+        }
+        writer.finish()?;
+        drop(writer);
+        Ok(bytes)
     }
 }
 
@@ -250,52 +361,64 @@ impl RecordBatchReader for Batches {
     }
 }
 
+/// The struct the C Data Interface passes a stream in, re-exported so
+/// that a crate handing one over the boundary can name it without
+/// depending on Arrow itself.
+#[cfg(feature = "ffi")]
+pub use arrow::ffi_stream::FFI_ArrowArrayStream;
+
 /// The result as a C Data Interface stream, ready to hand to anything in
 /// the process that speaks Arrow.
+///
+/// This borrows the result, so the buffers are copied on the way out. A
+/// caller that is finished with the result should take it instead, with
+/// [`Table::taken`] and [`Table::into_stream`].
 #[cfg(feature = "ffi")]
 pub fn stream<T: Tables + ?Sized>(
     result: &QueryResult,
     tables: &T,
     rows: usize,
 ) -> Result<arrow::ffi_stream::FFI_ArrowArrayStream, Error> {
-    let table = Table::of(result, tables)?;
-    Ok(arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(
-        table.batches(rows),
-    )))
+    Ok(Table::of(result, tables)?.into_stream(rows))
+}
+
+/// The result taken and handed over as a C Data Interface stream, which
+/// is the export that copies nothing.
+#[cfg(feature = "ffi")]
+pub fn stream_taken<T: Tables + ?Sized>(
+    result: QueryResult,
+    tables: &T,
+    rows: usize,
+) -> Result<arrow::ffi_stream::FFI_ArrowArrayStream, Error> {
+    Ok(Table::taken(result, tables)?.into_stream(rows))
 }
 
 /// The result as the bytes of an Arrow IPC stream.
 ///
 /// For a runtime that cannot dereference a pointer, which is every
-/// JavaScript one. The bytes are written once, into a buffer sized from
-/// what the arrays hold, and the schema goes first, so a reader that
-/// takes them knows the columns before the first batch and an empty
-/// result is a schema and one empty batch rather than nothing at all.
+/// JavaScript one.
 #[cfg(feature = "ipc")]
 pub fn ipc<T: Tables + ?Sized>(
     result: &QueryResult,
     tables: &T,
     rows: usize,
 ) -> Result<Vec<u8>, Error> {
-    let table = Table::of(result, tables)?;
-    let schema = table.schema();
-    // Every batch is a slice of arrays that are already in memory, so
-    // the writer's output is about the size of the buffers plus the
-    // flatbuffer headers. Guessing it once saves the doubling.
-    let guess = table
-        .arrays
-        .iter()
-        .map(|array| array.get_buffer_memory_size())
-        .sum::<usize>()
-        + 1024;
-    let mut bytes = Vec::with_capacity(guess);
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema)?;
-    for batch in table.batches(rows) {
-        writer.write(&batch?)?;
-    }
-    writer.finish()?;
-    drop(writer);
-    Ok(bytes)
+    Table::of(result, tables)?.into_ipc(rows)
+}
+
+/// The same out of a result the caller is finished with.
+///
+/// The bytes are written either way, because that is what a serialised
+/// stream is, but taking the result keeps the arrays from being a second
+/// copy of it while they are written, which halves what a large answer
+/// costs at its peak.
+#[cfg(feature = "ipc")]
+pub fn ipc_taken<T: Tables + ?Sized>(
+    result: QueryResult,
+    tables: &T,
+    rows: usize,
+) -> Result<Vec<u8>, Error> {
+    Table::taken(result, tables)?.into_ipc(rows)
 }
 
 /// Every field is nullable, here and in the nested types, because a null
@@ -868,5 +991,162 @@ mod tests {
             1,
         ));
         assert_eq!(array.data_type(), &DataType::List(item(DataType::Date32)));
+    }
+
+    /// A result the sink filled down its columns, which is the shape the
+    /// taking path is for.
+    fn filled(columns: Vec<HeldColumn>, rows: usize) -> QueryResult {
+        let held = Held { columns, rows };
+        QueryResult {
+            columns: held.names(),
+            rows: zu_query::exec::Rows::held(held),
+            notices: Vec::new(),
+        }
+    }
+
+    fn column_of(name: &str, ty: ColumnType, data: HeldData) -> HeldColumn {
+        HeldColumn {
+            name: name.to_string(),
+            ty,
+            data,
+            validity: None,
+        }
+    }
+
+    #[test]
+    fn taking_a_result_moves_its_buffers_and_borrowing_one_copies_them() {
+        let values: Vec<i64> = (0..4096).collect();
+        let filled_at = values.as_ptr();
+        let result = filled(
+            vec![column_of("n", ColumnType::Int, HeldData::Int(values))],
+            4096,
+        );
+
+        // Borrowed, the buffer behind the borrow stays with the result,
+        // so the array has to have its own.
+        let copied = Table::of(&result, &Catalog).expect("arrays");
+        let ints = copied.arrays[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64");
+        assert_ne!(ints.values().as_ptr(), filled_at);
+        assert_eq!(ints.value(4095), 4095);
+
+        // Taken, the buffer the sink filled is the buffer Arrow reads.
+        // Same address, so nothing between the two ever touched it.
+        let moved = Table::taken(result, &Catalog).expect("arrays");
+        let ints = moved.arrays[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64");
+        assert_eq!(ints.values().as_ptr(), filled_at);
+        assert_eq!(ints.value(4095), 4095);
+    }
+
+    #[test]
+    fn the_bytes_of_a_string_column_move_too() {
+        let bytes = b"alicebob".to_vec();
+        let filled_at = bytes.as_ptr();
+        let result = filled(
+            vec![column_of(
+                "s",
+                ColumnType::Str,
+                HeldData::Str(StrColumn {
+                    bytes,
+                    offsets: Offsets::I32(vec![0, 5, 8]),
+                }),
+            )],
+            2,
+        );
+        let table = Table::taken(result, &Catalog).expect("arrays");
+        let strings = table.arrays[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(strings.value(1), "bob");
+        assert_eq!(strings.value_data().as_ptr(), filled_at);
+    }
+
+    #[test]
+    fn taken_and_borrowed_are_the_same_answer() {
+        let columns = || {
+            vec![
+                column_of("n", ColumnType::Int, HeldData::Int(vec![1, 2])),
+                column_of("f", ColumnType::Float, HeldData::Float(vec![1.5, 2.5])),
+                column_of("b", ColumnType::Bool, HeldData::Bool { bits: vec![0b10] }),
+                column_of("z", ColumnType::Null, HeldData::Null),
+                column_of(
+                    "s",
+                    ColumnType::Str,
+                    HeldData::Str(StrColumn {
+                        bytes: b"ab".to_vec(),
+                        offsets: Offsets::I32(vec![0, 1, 2]),
+                    }),
+                ),
+                column_of(
+                    "p",
+                    ColumnType::Node,
+                    HeldData::Complex(vec![
+                        Value::Node {
+                            table: 0,
+                            offset: 1,
+                        },
+                        Value::Node {
+                            table: 0,
+                            offset: 2,
+                        },
+                    ]),
+                ),
+            ]
+        };
+        let borrowed = Table::of(&filled(columns(), 2), &Catalog).expect("arrays");
+        let taken = Table::taken(filled(columns(), 2), &Catalog).expect("arrays");
+        assert_eq!(borrowed.schema(), taken.schema());
+        assert_eq!(borrowed.rows(), taken.rows());
+        for (one, two) in borrowed.arrays.iter().zip(taken.arrays.iter()) {
+            assert_eq!(one.as_ref(), two.as_ref());
+        }
+    }
+
+    #[test]
+    fn a_result_that_was_built_across_its_rows_is_handed_back_rather_than_half_taken() {
+        let result = QueryResult {
+            columns: vec!["n".to_string()],
+            rows: zu_query::exec::Rows::of(vec![vec![Value::Int(1)], vec![Value::Int(2)]]),
+            notices: Vec::new(),
+        };
+        let table = Table::taken(result, &Catalog).expect("arrays");
+        assert_eq!(table.rows(), 2);
+        let ints = table.arrays[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64");
+        assert_eq!(ints.values().to_vec(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_column_that_arrow_refuses_is_refused_out_of_a_taken_result_too() {
+        let result = filled(
+            vec![column_of(
+                "g",
+                ColumnType::Graph,
+                HeldData::Complex(vec![Value::Graph(GraphHandle {
+                    id: 0,
+                    schema: "/".into(),
+                    name: "g".into(),
+                    epoch: 1,
+                })]),
+            )],
+            1,
+        );
+        match Table::taken(result, &Catalog) {
+            Err(Error::Type(detail)) => {
+                assert!(detail.contains("reference to a graph"), "{detail}")
+            }
+            other => panic!(
+                "expected a type refusal, got {other:?}",
+                other = other.err()
+            ),
+        }
     }
 }

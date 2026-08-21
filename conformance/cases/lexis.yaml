@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: lexis
 doc: How a statement is written rather than what it means. Every case here answers a value another suite already covers, and what is being asked is whether the engine reads the spelling ISO 21.3 gives it: the separator between digits, the two comment introducers, the doubled quote, the escapes, and the delimited name. A engine that refuses one of these refuses a statement that is legal GQL, and a client that generates GQL has to know which spellings travel.
 

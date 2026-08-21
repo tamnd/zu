@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: aggregate
 doc: The set functions, which are where a type changes on the way through: a count is an integer whatever it counted, an average is a float whatever it averaged, and a sum is neither reliably. They are also the one place in the language where a null does not propagate, and the empty input is where each of them chooses separately between zero and null.
 
@@ -330,3 +330,269 @@ cases:
       - values:
           - type: INT64
             value: "3"
+
+  - name: collect-list-is-the-standard-name
+    doc: COLLECT_LIST is what ISO 20.9 calls the function COLLECT is openCypher's name for, and both spellings reach it. A client that implements only the short name fails here and a client that implements only the long one fails every collect case above.
+    query: UNWIND [1, 2, 3] AS n RETURN collect_list(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "3"
+
+  - name: the-set-quantifier-all-is-the-default-written-down
+    doc: ALL is the other set quantifier the standard allows and it means what leaving the quantifier out means, so these two columns are the same number. A client that refuses the word fails a query that is only being explicit.
+    query: UNWIND [1, 1, 2] AS n RETURN count(ALL n) AS a, count(n) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "3"
+
+  - name: standard-deviation-of-a-sample
+    doc: The sample deviation of the eight values every textbook uses, which divides the squared deviations by one less than the count. The digits are given in full because an engine computing this from the sum of squares agrees to about six of them and then does not.
+    query: UNWIND [2, 4, 4, 4, 5, 5, 7, 9] AS n RETURN stddev_samp(n) AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.138089935299395"
+
+  - name: standard-deviation-of-a-population
+    doc: The same eight values divided by the count rather than one less, which is the whole of the difference between the two functions and is the case that catches a client that implements one of them twice.
+    query: UNWIND [2, 4, 4, 4, 5, 5, 7, 9] AS n RETURN stddev_pop(n) AS p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: standard-deviation-of-one-value
+    doc: One value is a population sitting on its own mean, which is a deviation of nought, and is no sample of a spread at all, which is null. The two divisors say so and neither is a special case, but they are the pair a client is most likely to get wrong in the same direction.
+    query: UNWIND [7] AS n RETURN stddev_samp(n) AS s, stddev_pop(n) AS p
+    columns:
+      - s
+      - p
+    rows:
+      - values:
+          - type: NULL
+          - type: FLOAT64
+            value: "0.0"
+
+  - name: standard-deviation-with-no-rows
+    doc: Neither deviation has an answer for no values, so both are null rather than nought, which is the fourth of the empty answers and the only one the two spellings agree on.
+    query: UNWIND [] AS n RETURN stddev_samp(n) AS s, stddev_pop(n) AS p
+    columns:
+      - s
+      - p
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+
+  - name: standard-deviation-skips-nulls
+    doc: A null is left out of the count as well as the total, so this is the deviation of two values and not of three, the same rule the average follows.
+    query: UNWIND [2, null, 4] AS n RETURN stddev_pop(n) AS p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+
+  - name: standard-deviation-distinct
+    doc: DISTINCT under a deviation measures the spread of the values rather than of the rows, which is a different number whenever anything repeats and is here the same number only because two of these three are equal.
+    query: UNWIND [2, 2, 4] AS n RETURN stddev_pop(DISTINCT n) AS p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+
+  - name: standard-deviation-refuses-text
+    doc: A deviation of strings raises rather than measuring their lengths or their order, the same refusal the sum gives and for the same reason.
+    query: UNWIND ['a', 'b'] AS n RETURN stddev_pop(n) AS p
+    raises: "22G03"
+
+  - name: percentile-cont-of-an-even-count
+    doc: The median of four values under the continuous percentile, which falls between the second and the third and is answered by the point on the line between them. The answer is a number that is not in the input, which is the whole difference between this function and the one below.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: percentile-disc-of-an-even-count
+    doc: The same median under the discrete percentile, which answers the first value whose share of the group reaches the fraction. That is a value that was there and it comes back with the type it had, so this column is an integer where the one above is a float.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_disc(n, 0.5) AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: percentile-of-the-ends
+    doc: A fraction of nought is the smallest value and a fraction of one is the largest, under both functions, which is where the two have to agree and is the pair that catches an off by one in either.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN percentile_cont(n, 0.0) AS a, percentile_cont(n, 1.0) AS b, percentile_disc(n, 0.0) AS c, percentile_disc(n, 1.0) AS d
+    columns:
+      - a
+      - b
+      - c
+      - d
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+          - type: FLOAT64
+            value: "4.0"
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "4"
+
+  - name: percentile-that-lands-on-a-value
+    doc: A quarter of the way through five values lands on the second one exactly, so nothing is interpolated and both functions answer it, one as a float and one as the integer it was.
+    query: UNWIND [1, 2, 3, 4, 5] AS n RETURN percentile_cont(n, 0.25) AS c, percentile_disc(n, 0.25) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+          - type: INT64
+            value: "2"
+
+  - name: percentile-ignores-the-order-of-the-rows
+    doc: A percentile is about the values and not about the order they arrived in, so shuffling the input does not move it. A client that reads the rows positionally rather than sorting them fails this and passes every case above.
+    query: UNWIND [4, 1, 3, 2] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: percentile-skips-nulls
+    doc: A null is not a value at the bottom of the order, it is not a value at all, so this is the median of two numbers and not of three things.
+    query: UNWIND [1, null, 3] AS n RETURN percentile_cont(n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: percentile-with-no-rows
+    doc: No values is no percentile, so both answer null rather than nought, which is the same choice the deviations make and the opposite of the one the count makes.
+    query: UNWIND [] AS n RETURN percentile_cont(n, 0.5) AS c, percentile_disc(n, 0.5) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+
+  - name: percentile-of-a-null-fraction
+    doc: A fraction of null is a question with nothing asked in it, which is null and not an error, the same reading every other null argument gets.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_cont(n, null) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: NULL
+
+  - name: percentile-refuses-a-fraction-past-one
+    doc: The fraction is a fraction, so a number outside nought to one is out of range rather than clamped to the nearest end. A client that clamps answers the largest value here and is wrong quietly.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_cont(n, 1.5) AS c
+    raises: "22003"
+
+  - name: percentile-refuses-a-negative-fraction
+    doc: The other end of the same rule, written down because clamping to nought is the more tempting of the two mistakes.
+    query: UNWIND [1, 2, 3] AS n RETURN percentile_disc(n, -0.5) AS d
+    raises: "22003"
+
+  - name: percentile-refuses-text
+    doc: Both arguments are numbers, so a column of strings has no percentile, the same refusal the sum and the deviations give.
+    query: UNWIND ['a', 'b'] AS n RETURN percentile_cont(n, 0.5) AS c
+    raises: "22G03"
+
+  - name: percentile-distinct
+    doc: DISTINCT under a percentile measures the values rather than the rows, so the repeated ones count once and the median moves. Without the quantifier this is the median of five and with it the median of three.
+    query: UNWIND [1, 1, 2, 2, 3] AS n RETURN percentile_cont(DISTINCT n, 0.5) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: sorted-by-a-count-no-column-carries
+    doc: A sort key of ISO 14.9 is an expression, so a set function may stand in one, and it means there what it means in a returned item: the rows group by everything else the statement answers and the key is read once per group. Nothing here carries the count, so a client that only accepts a set function where a column will hold it answers three rows in the order they arrived.
+    query: UNWIND ['a', 'a', 'a', 'b', 'c', 'c'] AS t RETURN t ORDER BY count(*) DESC
+    columns:
+      - t
+    rows:
+      - values:
+          - type: STRING
+            value: a
+      - values:
+          - type: STRING
+            value: c
+      - values:
+          - type: STRING
+            value: b
+
+  - name: sorted-by-an-expression-over-a-count
+    doc: The key is the whole expression and not a call standing on its own, so the arithmetic runs on what the group answered. A client that matches sort keys against the returned items by their text finds nothing to match here and has to work the count out for itself.
+    query: UNWIND ['a', 'a', 'a', 'b', 'c', 'c'] AS t RETURN t, count(*) AS c ORDER BY count(*) * -1 ASC
+    columns:
+      - t
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: a
+          - type: INT64
+            value: "3"
+      - values:
+          - type: STRING
+            value: c
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: b
+          - type: INT64
+            value: "1"
+
+  - name: sorted-by-a-sum-of-a-column
+    doc: The star is the easy form because it needs no argument, so the same question is asked of a set function that reads one: the argument is a row's and the sum is a group's, which is the one place behind a grouping where a name is still read once per row.
+    query: UNWIND [1, 2, 2] AS n RETURN n % 2 AS parity ORDER BY sum(n) DESC
+    columns:
+      - parity
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"

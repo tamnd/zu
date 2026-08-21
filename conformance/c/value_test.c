@@ -327,10 +327,65 @@ static void a_list_holds_encoded_values_and_not_bare_ones(void) {
 
 static void a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo(void) {
     refused("type: DECIMAL\nvalue: \"1.00\"\n", "reserves");
-    refused("type: NODE\nvalue: \"1\"\n", "reserves");
+    refused("type: BYTES\nvalue: \"00\"\n", "reserves");
     refused("type: INT65\nvalue: \"1\"\n", "not a type this encoding knows");
     check(cv_is_type("INT64") && cv_is_type("LIST"), "the names a load column may write");
     check(!cv_is_type("DECIMAL") && !cv_is_type("int64"), "and the ones it may not");
+}
+
+/* A node and an edge carry a name and the rows they are, which is what
+ * a case can assert about them: the id in the value is a number the
+ * file decided and every client builds its own file. */
+static void a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are(void) {
+    static const char *const wrong[] = {"type: NODE\nvalue: \"person\"\n",
+                                        "type: NODE\nvalue: \"#1\"\n",
+                                        "type: NODE\nvalue: \"person#-1\"\n",
+                                        "type: EDGE\nvalue: \"knows#0\"\n",
+                                        "type: EDGE\nvalue: \"knows#0->\"\n"};
+    size_t i;
+    cv v = ok("type: NODE\nvalue: \"person#1\"\n");
+    check(v.kind == CV_NODE && zy_eq(v.as.node.table, "person") && v.as.node.offset == 1,
+          "a node is its table and its row");
+    v = ok("type: EDGE\nvalue: \"knows#0->1\"\n");
+    check(v.kind == CV_EDGE && zy_eq(v.as.edge.table, "knows") && v.as.edge.src == 0 &&
+              v.as.edge.dst == 1,
+          "an edge is its table and the rows it runs between");
+    for (i = 0; i < sizeof wrong / sizeof wrong[0]; i++) {
+        refused(wrong[i], "is not a");
+    }
+    /* Bare rather than quoted, which is the rule the whole encoding
+     * exists for, told with the reason that applies to these two. */
+    refused("type: NODE\nvalue: person#1\n", "no reader has a scalar for that");
+}
+
+static void a_path_is_a_walk_and_a_sequence_that_is_not_one_is_refused(void) {
+    static const char hop[] = "type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n"
+                              "  - type: EDGE\n    value: \"knows#0->1\"\n"
+                              "  - type: NODE\n    value: \"person#1\"\n";
+    cv v = ok(hop);
+    check(v.kind == CV_PATH && v.as.list.count == 3, "a node, an edge and a node");
+    check_show(&v, "PATH [NODE \"person#0\", EDGE \"knows#0->1\", NODE \"person#1\"]",
+               "what a path prints as");
+    /* A path of one node is the shortest there is, and it is a path: a
+     * walk starts somewhere. */
+    v = ok("type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n");
+    check(v.kind == CV_PATH && v.as.list.count == 1, "the shortest walk");
+    refused("type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n"
+            "  - type: EDGE\n    value: \"knows#0->1\"\n",
+            "odd number of values");
+    refused("type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n"
+            "  - type: NODE\n    value: \"person#1\"\n  - type: NODE\n    value: \"person#2\"\n",
+            "value 2 is a NODE");
+    /* A path and the list of its parts print differently and are
+     * different values, which is what keeps a case from passing because
+     * the shapes happened to line up. */
+    {
+        cv path = ok(hop);
+        cv list;
+        list.kind = CV_LIST;
+        list.as.list = path.as.list;
+        check(!cv_same(&path, &list), "a path is not the list of its parts");
+    }
 }
 
 static void a_mapping_that_is_not_a_value_is_refused_with_its_line(void) {
@@ -468,7 +523,7 @@ static void an_arena_reset_hands_the_memory_back_without_handing_a_value_over(vo
  * four values and every one of them was decoded. */
 static size_t counted(const cv *v) {
     size_t n = 1, i;
-    if (v->kind == CV_LIST) {
+    if (v->kind == CV_LIST || v->kind == CV_PATH) {
         for (i = 0; i < v->as.list.count; i++) {
             n += counted(&v->as.list.items[i]);
         }
@@ -598,6 +653,8 @@ int main(int argc, char **argv) {
     a_datetime_wider_than_a_nanosecond_count_is_refused();
     a_list_holds_encoded_values_and_not_bare_ones();
     a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo();
+    a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are();
+    a_path_is_a_walk_and_a_sequence_that_is_not_one_is_refused();
     a_mapping_that_is_not_a_value_is_refused_with_its_line();
     what_a_report_prints_is_what_a_case_would_be_written_as();
     a_report_that_does_not_fit_says_how_much_it_needed();

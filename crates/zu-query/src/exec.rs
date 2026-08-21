@@ -68,13 +68,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
+use zu_common::{Clock, DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
     UnaryOp,
 };
-use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
+use crate::binder::{
+    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Percentile, Schema, TableFunc,
+};
 use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
 use crate::refs::{BindingTable, GraphHandle};
@@ -415,6 +417,20 @@ impl Rows {
     /// The rows, taken by a caller who wants them and nothing else.
     pub fn into_vec(mut self) -> Vec<Vec<Value>> {
         std::mem::take(&mut *self)
+    }
+
+    /// The columns themselves, out of a result nobody will read again.
+    ///
+    /// [`Rows::columns`] lends them, which is what lets a result be read
+    /// twice and is also what makes an export copy: a buffer that leaves
+    /// through a borrow has to be copied, because the one behind it stays
+    /// where it is. This is the other half of that bargain, and it is
+    /// crate-private on purpose. Taking the columns leaves a `Rows` that
+    /// says it has none, so the only safe place to call it from is
+    /// [`QueryResult::into_columns`], which owns the whole result and
+    /// gives nobody the chance to look at what is left.
+    pub(crate) fn take_columns(&mut self) -> Option<Held> {
+        self.held.take()
     }
 
     /// The rows, built out of the columns the first time this is asked.
@@ -856,6 +872,18 @@ pub struct Options {
     /// statements. The default is the handle nobody armed, so a caller
     /// who wants none pays a branch per chunk.
     pub interrupt: Interrupt,
+    /// The instant the datetime value functions of ISO 20.27 answer,
+    /// `None` for a run that has not read a clock yet.
+    ///
+    /// It is here for the reason the interrupt is: it is state one
+    /// statement has and every path through the executor already
+    /// carries the switches. [`run_stages`] fills it in on the way in
+    /// and hands the filled copy down, so a query written inside an
+    /// expression answers the same instant as the query around it
+    /// rather than reading a clock of its own halfway through the scan.
+    /// A caller may set it before running, which is how a test pins the
+    /// time.
+    pub clock: Option<Clock>,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -1731,6 +1759,13 @@ struct AggSpec {
     /// The one unflat chunk the argument reads, if any; the optimizer
     /// flattens the rest.
     arg_chunk: Option<usize>,
+    /// The second argument of a binary set function, which is the
+    /// percentiles and nothing else: the standard's independent value
+    /// expression, the fraction of the way through the group to
+    /// answer. It reads no slot, which the compiler checks, so it is
+    /// the same value for every row and is evaluated once, when the
+    /// group is finalized.
+    fraction: Option<BoundExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -1739,7 +1774,14 @@ struct SinkDef {
     /// interleaves keys and aggregates exactly as written.
     items: Vec<BoundItem>,
     aggregate: bool,
+    /// One per aggregate item in clause order, then one per hidden sort
+    /// aggregate. The two live in one list because a group accumulates
+    /// them together; what tells them apart is that the second lot has
+    /// no column, which is why the slots below say where they go.
     aggs: Vec<AggSpec>,
+    /// GF20. The slot each hidden sort aggregate finalizes into, in the
+    /// order those specs sit at the end of `aggs`.
+    order_slots: Vec<usize>,
     post: Vec<PostOp>,
     /// Slots snapshotted per row for post-projection filters.
     extra_slots: Vec<usize>,
@@ -2769,11 +2811,13 @@ fn build_stages(
     let leaf = cur;
     linear.reverse();
 
-    let projections: Vec<&Vec<BoundItem>> = query
+    let projections: Vec<(&Vec<BoundItem>, &Vec<BoundItem>)> = query
         .clauses
         .iter()
         .filter_map(|c| match c {
-            crate::binder::BoundClause::Project { items, .. } => Some(items),
+            crate::binder::BoundClause::Project {
+                items, order_aggs, ..
+            } => Some((items, order_aggs)),
             _ => None,
         })
         .collect();
@@ -2890,14 +2934,16 @@ fn build_stages(
                 b.produced(chunk);
             }
             LogicalPlan::Project { .. } | LogicalPlan::Aggregate { .. } => {
-                let items = projections
+                let (items, order_aggs) = projections
                     .get(proj_ix)
-                    .ok_or_else(|| invalid("more sinks than projection clauses".into()))?
-                    .to_vec();
+                    .ok_or_else(|| invalid("more sinks than projection clauses".into()))?;
+                let items = items.to_vec();
+                let order_aggs = order_aggs.to_vec();
                 proj_ix += 1;
                 let aggregate = matches!(linear[i], LogicalPlan::Aggregate { .. });
 
                 let mut aggs = Vec::new();
+                let mut order_slots = Vec::new();
                 if aggregate {
                     // Grouping keys must be flat; each aggregate
                     // argument may keep exactly one unflat vector.
@@ -2906,7 +2952,15 @@ fn build_stages(
                             b.ensure_flat(c);
                         }
                     }
-                    for item in items.iter().filter(|it| it.aggregate) {
+                    // The aggregates with a column first, in clause
+                    // order, then the ones a sort key asked for. The
+                    // second lot accumulates exactly like the first,
+                    // which is why one loop reads both.
+                    for item in items
+                        .iter()
+                        .filter(|it| it.aggregate)
+                        .chain(order_aggs.iter())
+                    {
                         let BoundExpr::Call {
                             func,
                             distinct,
@@ -2944,13 +2998,40 @@ fn build_stages(
                                 unflat.first().copied()
                             }
                         };
+                        // The percentiles' second argument. The
+                        // standard says it is one value for the whole
+                        // group and says nothing about what happens if
+                        // a query writes something that is not, which
+                        // is a question worth refusing rather than
+                        // answering with whichever row arrived first.
+                        // Reading no slot is the strict form of that
+                        // and it is a compile time check, so a literal
+                        // and a parameter both pass and a column does
+                        // not.
+                        let fraction = args.get(1).cloned();
+                        if let Some(expr) = &fraction {
+                            let mut slots = BTreeSet::new();
+                            crate::binder::expr_slots(expr, &mut slots);
+                            if !slots.is_empty() {
+                                return Err(invalid(format!(
+                                    "the second argument of {}() is the fraction to answer and has to be the same for the whole group, so it cannot read a column",
+                                    crate::functions::name_of(*func)
+                                )));
+                            }
+                        }
                         aggs.push(AggSpec {
                             func: *func,
                             distinct: *distinct,
                             star: *star,
                             arg,
                             arg_chunk,
+                            fraction,
                         });
+                    }
+                    for item in &order_aggs {
+                        order_slots.push(item.slot.ok_or_else(|| {
+                            invalid("a sort key's aggregate lost its slot, this is a bug".into())
+                        })?);
                     }
                 }
 
@@ -2971,8 +3052,15 @@ fn build_stages(
                     i += 1;
                 }
 
-                rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra, aggregate);
-                rewrite_reach_varlen(&mut b, &items, &aggs, &post, &extra, aggregate);
+                // A hidden sort aggregate reads its argument the way a
+                // projected one does, and the two rewrites below decide
+                // what a column may drop by what is read, so they are
+                // handed the items and the hidden ones together. Left
+                // out, the argument of `ORDER BY count(r.weight)` would
+                // look like a slot nobody wants.
+                let read: Vec<BoundItem> = items.iter().chain(&order_aggs).cloned().collect();
+                rewrite_count_expand(&mut b, &read, &mut aggs, &post, &extra, aggregate);
+                rewrite_reach_varlen(&mut b, &read, &aggs, &post, &extra, aggregate);
 
                 let unflat = (0..b.chunk_flat.len())
                     .filter(|&c| !b.chunk_flat[c])
@@ -2981,6 +3069,7 @@ fn build_stages(
                     items,
                     aggregate,
                     aggs,
+                    order_slots,
                     post,
                     extra_slots: extra.into_iter().collect(),
                 };
@@ -6049,25 +6138,15 @@ fn temporal_arith(op: BinaryOp, a: &Value, b: &Value) -> Result<Value> {
             })?;
             shift(other, *kind, count)
         }
-        // Two instants of one kind subtract to the length between
+        // Two instants of one shape subtract to the length between
         // them, which is a day-time duration because the calendar is
-        // not involved in counting it.
-        (Sub, Temporal::Date(p), Temporal::Date(q)) => Ok(Value::Temporal(Temporal::Duration(
-            DurationKind::DayTime,
-            (i64::from(*p) - i64::from(*q)) * temporal::NANOS_PER_DAY,
-        ))),
-        (Sub, Temporal::LocalDatetime(p), Temporal::LocalDatetime(q))
-        | (Sub, Temporal::LocalTime(p), Temporal::LocalTime(q)) => Ok(Value::Temporal(
-            Temporal::Duration(DurationKind::DayTime, p - q),
-        )),
-        (
-            Sub,
-            Temporal::ZonedDatetime { nanos: p, .. },
-            Temporal::ZonedDatetime { nanos: q, .. },
-        ) => Ok(Value::Temporal(Temporal::Duration(
-            DurationKind::DayTime,
-            p - q,
-        ))),
+        // not involved in counting it. It is `DURATION_BETWEEN` with
+        // the arguments the other way round, and it is the same code,
+        // so the operator and the function cannot answer differently.
+        (Sub, left, right) => match Temporal::between(*right, *left, DurationKind::DayTime) {
+            Some(length) => Ok(Value::Temporal(length)),
+            None => refuse(),
+        },
         _ => refuse(),
     }
 }
@@ -6340,6 +6419,14 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
+        // ISO 20.27, the instant behind the five datetime value
+        // functions. It was read once before the first stage and is
+        // handed out here as many times as the rows ask for it, so a
+        // scan of ten million rows makes no system call at all and
+        // every row of it agrees about what time the statement ran.
+        BoundExpr::Clock => Ok(Value::Temporal(
+            ctx.scalars.options.clock.unwrap_or_default().instant(),
+        )),
         // GE01. The binder already asked the catalog which graph this
         // is, so the row's work is a clone of the handle and nothing
         // else.
@@ -6665,11 +6752,14 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 star: false,
                 arg: None,
                 arg_chunk: None,
+                fraction: None,
             });
             for arg in args {
                 state.add(eval(ctx, arg)?, 1)?;
             }
-            state.finalize()
+            // The binder sends only the one argument set functions
+            // down this path, so there is no fraction to hand over.
+            state.finalize(None)
         }
         BoundExpr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -6762,10 +6852,142 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
 enum Acc {
     Count(i64),
     Sum(Option<Value>),
-    Avg { sum: f64, n: i64 },
+    Avg {
+        sum: f64,
+        n: i64,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// GF10's two standard deviations, kept as a running count, mean
+    /// and sum of squared deviations from that mean.
+    ///
+    /// This is Welford's, and it is here rather than the sum of squares
+    /// because the sum of squares is what a one pass deviation is
+    /// usually written as and it is wrong: over values that are large
+    /// and close together the sum of squares and the square of the sum
+    /// are two big numbers whose difference is small, and subtracting
+    /// them loses the answer's leading digits. Welford's subtracts
+    /// nothing large from anything large, and it costs one more
+    /// multiply per row.
+    ///
+    /// The fields are the ones the merge needs too, so a morsel partial
+    /// is this and a group is these folded together.
+    Spread {
+        /// Which of the two divisors the answer takes, which is the
+        /// whole of what the two functions differ by.
+        which: Deviation,
+        /// How many values arrived, counting multiplicities.
+        n: f64,
+        /// The mean of them so far.
+        mean: f64,
+        /// The sum of squared deviations from that mean.
+        m2: f64,
+    },
+    /// GF11's two percentiles, kept as the values that arrived and how
+    /// many rows each of them stood for.
+    ///
+    /// A percentile is holistic: no fixed amount of state answers it,
+    /// because the answer can be any of the values and which one it is
+    /// is not known until the last row has arrived. So the values are
+    /// kept, which is what `COLLECT_LIST` does and costs what it costs.
+    /// They are kept against their multiplicities rather than expanded,
+    /// so an unflat chunk standing for a thousand rows is one entry
+    /// weighing a thousand, and they are kept unsorted, the sort being
+    /// one pass at the end rather than an insertion per row.
+    Quantile {
+        /// Whether a fraction that lands between two values is
+        /// interpolated or answered with the value above it.
+        which: Percentile,
+        /// The values and their weights, in arrival order.
+        values: Vec<(Value, i64)>,
+    },
+}
+
+/// The percentile of a group: what arrived, weighted, and the fraction
+/// of the way through it to answer.
+///
+/// The two functions read the same values and part on one question,
+/// what to say when the fraction falls between two of them. The
+/// discrete one answers the first value whose running share of the
+/// group reaches the fraction, so its answer is a value that was there.
+/// The continuous one draws a line through the values and answers the
+/// point on it, so its answer usually was not.
+fn percentile(which: Percentile, mut values: Vec<(Value, i64)>, fraction: &Value) -> Result<Value> {
+    let name = match which {
+        Percentile::Continuous => "percentile_cont",
+        Percentile::Discrete => "percentile_disc",
+    };
+    let p = match fraction {
+        // A null fraction is a question with nothing asked, which is
+        // null, the same answer a null argument gets everywhere else.
+        Value::Null => return Ok(Value::Null),
+        other => as_f64(other).ok_or_else(|| {
+            gql(
+                codes::C22G03,
+                format!("{name}() needs a number for its fraction, got {other:?}"),
+            )
+        })?,
+    };
+    if !(0.0..=1.0).contains(&p) {
+        return Err(gql(
+            codes::C22003,
+            format!("{name}() needs a fraction from 0 to 1, got {p}"),
+        ));
+    }
+    let n: i64 = values.iter().map(|(_, weight)| *weight).sum();
+    if n <= 0 {
+        return Ok(Value::Null);
+    }
+    // Every value that got in here is a number, which `apply` checked,
+    // so the order is the numeric one and a value that is somehow not a
+    // number sorts to the end rather than making the comparison
+    // inconsistent and the sort panic.
+    let key = |value: &Value| as_f64(value).unwrap_or(f64::NAN);
+    values.sort_by(|left, right| key(&left.0).total_cmp(&key(&right.0)));
+    if let Percentile::Discrete = which {
+        let mut seen = 0_i64;
+        for (value, weight) in &values {
+            seen += weight;
+            if seen as f64 / n as f64 >= p {
+                return Ok(value.clone());
+            }
+        }
+        // Unreachable while the fraction is at most one, since the last
+        // share is exactly one, but the answer if the rounding ever
+        // says otherwise is the last value and not a null.
+        return Ok(values
+            .last()
+            .map_or(Value::Null, |(value, _)| value.clone()));
+    }
+    // The value at a place in the group counted as though the weights
+    // had been expanded, which is what the standard's rule is written
+    // over. Two walks rather than one because the two places are
+    // adjacent and the second is usually in the same entry.
+    let at = |place: i64| -> f64 {
+        let mut seen = 0_i64;
+        for (value, weight) in &values {
+            seen += weight;
+            if place < seen {
+                return key(value);
+            }
+        }
+        values.last().map_or(f64::NAN, |(value, _)| key(value))
+    };
+    let exact = p * (n - 1) as f64;
+    let below = exact.floor();
+    let above = exact.ceil();
+    let low = at(below as i64);
+    if below == above {
+        return Ok(Value::Float(low));
+    }
+    // The standard writes this as the two ends weighted by their
+    // distances and summed. It is written here as the low end plus the
+    // step, which is the same number and does not subtract two nearly
+    // equal products when the two ends are nearly equal.
+    Ok(Value::Float(
+        low + (at(above as i64) - low) * (exact - below),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -6791,6 +7013,16 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
+            Func::Stddev(which) => Acc::Spread {
+                which,
+                n: 0.0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            Func::Percentile(which) => Acc::Quantile {
+                which,
+                values: Vec::new(),
+            },
             Func::Id
             | Func::ElementId
             | Func::Size
@@ -6803,7 +7035,10 @@ impl AggState {
             | Func::OctetLength
             | Func::Upper
             | Func::Lower
-            | Func::Trim
+            | Func::Trim(_)
+            | Func::Cut(_)
+            | Func::Temporal(_)
+            | Func::DurationBetween(_)
             | Func::Normalize(_)
             | Func::IsNormalized(_)
             | Func::Math(_) => {
@@ -6887,11 +7122,42 @@ impl AggState {
                     items.push(v.clone());
                 }
             }
+            // A multiplicity is `mult` copies of one value, so this is
+            // the merge below with a second set of `mult` values whose
+            // mean is the value and whose spread is nought. Written out
+            // rather than looped, since a chunk may stand for a great
+            // many rows and they all fold in the same step.
+            Acc::Spread { n, mean, m2, .. } => {
+                let x = as_f64(&v).ok_or_else(|| {
+                    gql(codes::C22G03, format!("stddev() needs numbers, got {v:?}"))
+                })?;
+                let w = mult as f64;
+                let total = *n + w;
+                let delta = x - *mean;
+                *mean += delta * w / total;
+                *m2 += delta * delta * w * *n / total;
+                *n = total;
+            }
+            // The type is checked here rather than at the end so that a
+            // string in the column is refused where it is, and so that
+            // the sort below can order what it holds by number.
+            Acc::Quantile { values, .. } => {
+                if as_f64(&v).is_none() {
+                    return Err(gql(
+                        codes::C22G03,
+                        format!("percentile() needs numbers, got {v:?}"),
+                    ));
+                }
+                values.push((v, mult));
+            }
         }
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<Value> {
+    /// The group's answer. `fraction` is the second argument of a
+    /// binary set function, already evaluated, and is `None` for every
+    /// other set function because they have no second argument.
+    fn finalize(mut self, fraction: Option<Value>) -> Result<Value> {
         if let Some(set) = self.distinct.take() {
             for v in set {
                 self.apply(v.0, 1)?;
@@ -6904,6 +7170,25 @@ impl AggState {
             Acc::Avg { sum, n } => Value::Float(sum / n as f64),
             Acc::Min(cur) | Acc::Max(cur) => cur.unwrap_or(Value::Null),
             Acc::Collect(items) => Value::List(items),
+            // No values is no deviation, and one value is no sample of
+            // one, so both answer null rather than nought. A population
+            // of one has a deviation and it is nought, the one value
+            // being the whole of the population and sitting on its own
+            // mean.
+            Acc::Spread { which, n, m2, .. } => match which {
+                _ if n < 1.0 => Value::Null,
+                Deviation::Sample if n < 2.0 => Value::Null,
+                Deviation::Sample => Value::Float((m2 / (n - 1.0)).sqrt()),
+                Deviation::Population => Value::Float((m2 / n).sqrt()),
+            },
+            Acc::Quantile { which, values } => {
+                let Some(fraction) = fraction else {
+                    return Err(invalid(
+                        "a percentile needs the fraction to answer as its second argument".into(),
+                    ));
+                };
+                percentile(which, values, &fraction)?
+            }
         })
     }
 
@@ -6947,6 +7232,31 @@ impl AggState {
             }
             (Acc::Min(_), Acc::Min(None)) | (Acc::Max(_), Acc::Max(None)) => {}
             (Acc::Collect(items), Acc::Collect(more)) => items.extend(more),
+            // Chan's merge, which is what makes the deviation one pass
+            // and parallel at once: two partials fold into one without
+            // either of them keeping the values it saw.
+            (
+                Acc::Spread { n, mean, m2, .. },
+                Acc::Spread {
+                    n: n2,
+                    mean: mean2,
+                    m2: m22,
+                    ..
+                },
+            ) => {
+                let total = *n + n2;
+                if total > 0.0 {
+                    let delta = mean2 - *mean;
+                    *mean += delta * n2 / total;
+                    *m2 += m22 + delta * delta * *n * n2 / total;
+                    *n = total;
+                }
+            }
+            // Nothing to fold: the values are sorted once, at the end,
+            // over whatever the morsels between them gathered.
+            (Acc::Quantile { values, .. }, Acc::Quantile { values: more, .. }) => {
+                values.extend(more);
+            }
             _ => unreachable!("morsel partials built from the same aggregate spec"),
         }
         Ok(())
@@ -7114,10 +7424,12 @@ fn finalize_group(
 ) -> Result<Row> {
     let mut kit = keyvals.into_iter();
     let mut sit = states.into_iter();
+    let mut specs = sink.aggs.iter();
     let mut values = Vec::with_capacity(sink.items.len());
     for item in &sink.items {
         let v = if item.aggregate {
             let state = sit.next().expect("one state per aggregate item");
+            let spec = specs.next().expect("one spec per aggregate item");
             // Read the flag before finalize consumes the state. The
             // warning is per statement, not per group: notice() dedupes
             // by status, so a thousand groups that each dropped a null
@@ -7128,7 +7440,14 @@ fn finalize_group(
                     "a set function ignored one or more null arguments",
                 ));
             }
-            state.finalize()?
+            // The fraction of a percentile, which the compiler made
+            // sure reads no slot, so it is the same value wherever it
+            // is asked for and here is the one place it is needed.
+            let fraction = match &spec.fraction {
+                Some(expr) => Some(eval(ctx, expr)?),
+                None => None,
+            };
+            state.finalize(fraction)?
         } else {
             kit.next().expect("one key value per key item").0
         };
@@ -7139,6 +7458,27 @@ fn finalize_group(
         if let Some(slot) = item_slot(item, query) {
             ctx.overlay.insert(slot, v.clone());
         }
+    }
+    // GF20. What is left in the two iterators is the aggregates a sort
+    // key asked for and no column carries. They finalize like the rest
+    // and go into the slot each one was given, which is what the key
+    // reads a line below, so a sort by a count costs the sort an
+    // accumulator and the answer nothing.
+    for slot in &sink.order_slots {
+        let state = sit.next().expect("one state per hidden sort aggregate");
+        let spec = specs.next().expect("one spec per hidden sort aggregate");
+        if state.nulls_eliminated {
+            ctx.notices.push(DiagnosticRecord::new(
+                codes::C01G11,
+                "a set function ignored one or more null arguments",
+            ));
+        }
+        let fraction = match &spec.fraction {
+            Some(expr) => Some(eval(ctx, expr)?),
+            None => None,
+        };
+        let v = state.finalize(fraction)?;
+        ctx.overlay.insert(*slot, v);
     }
     let mut keys = Vec::new();
     for SortKey { expr, .. } in sort_exprs(sink) {
@@ -8015,6 +8355,22 @@ fn run_stages(
         mut profile,
         mut stream,
     } = extras;
+    // The instant this statement answers the datetime value functions
+    // with, read here and nowhere else. A run that arrives with one
+    // already keeps it, which is what makes a query written inside an
+    // expression agree with the query around it, and what lets a test
+    // say what time it is.
+    let read;
+    let options = match options.clock {
+        Some(_) => options,
+        None => {
+            read = Options {
+                clock: Some(Clock::read()),
+                ..options.clone()
+            };
+            &read
+        }
+    };
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }
@@ -9176,7 +9532,13 @@ mod tests {
         // then rewire the match into the shared-vector order by hand
         // so the shape cannot drift with the optimizer.
         let built = crate::plan::build(&query).expect("plan");
-        let LogicalPlan::Aggregate { input, keys, aggs } = built else {
+        let LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            order_aggs,
+        } = built
+        else {
             panic!("count(*) builds an aggregate");
         };
         let LogicalPlan::Expand {
@@ -9225,6 +9587,7 @@ mod tests {
             input: Box::new(close_a_b),
             keys,
             aggs,
+            order_aggs,
         };
         // Everyone points at 0, plus 1 knows 3 and 2 knows 4: the
         // triangles are (1, 3, 0) and (2, 4, 0).

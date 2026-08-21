@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: cast
 doc: Conversion between types, which is where a client is most tempted to use its host language's own and where the host language's own is most often wrong. Truncation towards zero rather than rounding, a range check rather than a wrap, and a refusal rather than a zero are the three rules, and each of them contradicts at least one popular language.
 

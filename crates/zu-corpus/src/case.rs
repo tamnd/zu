@@ -15,9 +15,17 @@
 //! encoding, hands it to the client's own binding call, and asserts
 //! what came back. A client that decodes a date correctly and encodes
 //! it a day early passes every case that has no parameters in it.
+//!
+//! A case may also say which connection a statement runs on. That is
+//! how a case about a transaction is written, since a transaction is
+//! only observable from somewhere else: one connection writes and
+//! another asks what it can see. A case that says nothing runs
+//! everything on one connection called `main`, which is every case but
+//! a handful.
 
+use crate::arrow::{self, Export};
 use crate::load::Load;
-use crate::value;
+use crate::value::{self, Cell};
 use crate::yaml::{self, Node};
 
 use zu::query::Value;
@@ -25,7 +33,22 @@ use zu::query::Value;
 /// The schema version a file declares. It exists so that a corpus
 /// unpacked from an old release tells a new runner what it is instead
 /// of failing in the middle.
-pub const SCHEMA: i64 = 3;
+pub const SCHEMA: i64 = 4;
+
+/// The connection a statement runs on when the case does not name one.
+///
+/// A case that says nothing about connections still has one, and
+/// giving it a name rather than a special case means the runners hold
+/// a set of connections and never two kinds of thing.
+pub const MAIN: &str = "main";
+
+/// A statement run before the one under test, and the connection it
+/// runs on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub on: String,
+    pub query: String,
+}
 
 /// What running a case's statement has to produce.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +58,7 @@ pub enum Expect {
     /// an ORDER BY.
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Vec<Cell>>,
     },
     /// The five character GQLSTATUS code the statement has to raise.
     Raises(String),
@@ -50,7 +73,10 @@ pub struct Case {
     pub doc: String,
     /// Statements run before the one under test, against a database
     /// that is this case's alone.
-    pub setup: Vec<String>,
+    pub setup: Vec<Step>,
+    /// The connection the statement under test runs on, which is
+    /// [`MAIN`] unless the case says otherwise.
+    pub on: String,
     /// The parameters the statement under test is run with, in the
     /// order they were written. The setup statements take none: a
     /// parameter belongs to the case's one assertion, and a fixture
@@ -59,6 +85,12 @@ pub struct Case {
     pub params: Vec<(String, Value)>,
     pub query: String,
     pub expect: Expect,
+    /// What the same result looks like on the way out through Arrow,
+    /// for a case that says. Most do not: the export gives one answer
+    /// per column type and a handful of cases pin every one of them,
+    /// so the rest would be repeating a type the corpus already
+    /// covers.
+    pub arrow: Option<Export>,
     pub line: usize,
 }
 
@@ -153,7 +185,7 @@ fn case(node: &Node) -> Result<Case, String> {
     }
     if let Some(key) = node
         .unknown(&[
-            "name", "doc", "setup", "params", "query", "columns", "rows", "raises",
+            "name", "doc", "setup", "on", "params", "query", "columns", "rows", "raises", "arrow",
         ])
         .first()
     {
@@ -177,12 +209,12 @@ fn case(node: &Node) -> Result<Case, String> {
             .seq()
             .ok_or(at("`setup:` is a sequence of statements".to_string()))?
             .iter()
-            .map(|s| {
-                s.str()
-                    .map(str::to_string)
-                    .ok_or(format!("line {}: a setup statement is one line", s.line()))
-            })
+            .map(step)
             .collect::<Result<_, _>>()?,
+    };
+    let on = match node.get("on") {
+        None => MAIN.to_string(),
+        Some(on) => connection(on)?,
     };
 
     let params = params(node)?;
@@ -242,15 +274,96 @@ fn case(node: &Node) -> Result<Case, String> {
         )));
     }
 
+    let export = node.get("arrow").map(arrow::parse).transpose()?;
+    match (&expect, &export) {
+        // A statement that raises produces no result, so there is
+        // nothing for an export to be about.
+        (Expect::Raises(_), Some(_)) => {
+            return Err(at(
+                "a case that raises has no result, and an export is what a result gives"
+                    .to_string(),
+            ));
+        }
+        (Expect::Rows { columns, .. }, Some(Export::Columns(fields)))
+            if fields.len() != columns.len() =>
+        {
+            return Err(at(format!(
+                "an export of {} columns against {} the statement projects",
+                fields.len(),
+                columns.len()
+            )));
+        }
+        _ => {}
+    }
+
     Ok(Case {
         name,
         doc,
         setup,
+        on,
         params,
         query,
         expect,
+        arrow: export,
         line,
     })
+}
+
+/// One setup statement, which is a line of text, or the connection it
+/// runs on and the statement.
+///
+/// The short form is the one nearly every case is written in and it
+/// means [`MAIN`]. The long form exists for the cases that need two
+/// connections, and it names the connection out loud rather than
+/// leaving the reader to count which statement went where.
+fn step(node: &Node) -> Result<Step, String> {
+    let line = node.line();
+    if let Some(query) = node.str() {
+        return Ok(Step {
+            on: MAIN.to_string(),
+            query: query.to_string(),
+        });
+    }
+    if node.map().is_none() {
+        return Err(format!(
+            "line {line}: a setup statement is one line, or `on:` and `query:`, and this is {}",
+            node.kind()
+        ));
+    }
+    if let Some(key) = node.unknown(&["on", "query"]).first() {
+        return Err(format!("line {line}: a setup statement has no key {key:?}"));
+    }
+    let on = node.get("on").ok_or(format!(
+        "line {line}: a setup statement written as a mapping names the connection it runs on"
+    ))?;
+    Ok(Step {
+        on: connection(on)?,
+        query: field(node, "query")?,
+    })
+}
+
+/// The name of a connection, checked where it is written.
+///
+/// The rule is the one case names follow, because a connection name is
+/// read the same way: it goes into a report, and a name that differed
+/// only by case or by a space would be two names to everyone but the
+/// person who wrote it.
+fn connection(node: &Node) -> Result<String, String> {
+    let name = node.str().ok_or(format!(
+        "line {}: `on:` is the name of a connection",
+        node.line()
+    ))?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "line {}: {name:?} is a connection name, which is lower case words joined by dashes",
+            node.line()
+        ));
+    }
+    Ok(name.to_string())
 }
 
 /// The parameters a case binds, which is the value encoding with a name
@@ -290,12 +403,23 @@ fn params(node: &Node) -> Result<Vec<(String, Value)>, String> {
         if out.iter().any(|(n, _)| *n == name) {
             return Err(format!("line {line}: two parameters are called {name:?}"));
         }
-        out.push((name, value::typed(item)?));
+        let cell = value::typed(item)?;
+        // A node is a row that exists, so a parameter naming one would
+        // be naming a row the case has not written yet. The engine has
+        // no parameter for one either, which is the same fact from the
+        // other side.
+        let bound = cell.plain().ok_or_else(|| {
+            format!(
+                "line {line}: a parameter cannot be a graph value, and this is {}",
+                value::show(&cell)
+            )
+        })?;
+        out.push((name, bound));
     }
     Ok(out)
 }
 
-fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
+fn rows(node: &Node) -> Result<Vec<Vec<Cell>>, String> {
     let Some(rows) = node.get("rows") else {
         // A statement that returns no rows is a case worth having, and
         // writing it as an absent `rows:` would make it the same shape
@@ -328,7 +452,7 @@ fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
 mod tests {
     use super::*;
 
-    const HEAD: &str = "schema: 3\nsuite: int\ndoc: the integer tower\n";
+    const HEAD: &str = "schema: 4\nsuite: int\ndoc: the integer tower\n";
 
     fn suite(cases: &str) -> Result<Suite, String> {
         Suite::parse(&format!("{HEAD}\ncases:\n{cases}"))
@@ -352,7 +476,7 @@ mod tests {
             case.expect,
             Expect::Rows {
                 columns: vec!["n".to_string()],
-                rows: vec![vec![Value::Int(i64::MAX)]],
+                rows: vec![vec![Cell::Plain(Value::Int(i64::MAX))]],
             }
         );
     }
@@ -363,7 +487,61 @@ mod tests {
             "  - name: with-setup\n    doc: a case that needs a graph\n    setup:\n      - CREATE NODE TABLE Person(name STRING)\n      - INSERT (:Person {name: 'a'})\n    query: MATCH (p:Person) RETURN p.name AS name\n    columns:\n      - name\n    rows:\n      - values:\n          - type: STRING\n            value: a\n",
         );
         assert_eq!(case.setup.len(), 2);
-        assert!(case.setup[0].starts_with("CREATE NODE TABLE"));
+        assert_eq!(case.setup[0].on, MAIN);
+        assert!(case.setup[0].query.starts_with("CREATE NODE TABLE"));
+    }
+
+    #[test]
+    fn a_case_may_say_which_connection_each_statement_runs_on() {
+        let case = one(
+            "  - name: two-connections\n    doc: one connection writes and another reads\n    setup:\n      - on: writer\n        query: \"INSERT (:thing {n: 1})\"\n    on: reader\n    query: MATCH (t:thing) RETURN count(t) AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"1\"\n",
+        );
+        assert_eq!(
+            case.setup,
+            vec![Step {
+                on: "writer".to_string(),
+                query: "INSERT (:thing {n: 1})".to_string(),
+            }]
+        );
+        assert_eq!(case.on, "reader");
+    }
+
+    #[test]
+    fn a_case_that_says_nothing_about_connections_runs_on_one_called_main() {
+        let case = one(
+            "  - name: alone\n    doc: the case every other case is\n    setup:\n      - \"INSERT (:thing {n: 1})\"\n    query: MATCH (t:thing) RETURN count(t) AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"1\"\n",
+        );
+        assert_eq!(case.on, MAIN);
+        assert_eq!(case.setup[0].on, MAIN);
+    }
+
+    #[test]
+    fn a_connection_nobody_could_name_is_refused_where_it_is_written() {
+        for (text, want) in [
+            (
+                "  - name: a\n    doc: d\n    on: Reader\n    query: RETURN 1\n    raises: 22012\n",
+                "is a connection name",
+            ),
+            (
+                "  - name: a\n    doc: d\n    on:\n    query: RETURN 1\n    raises: 22012\n",
+                "`on:` is the name of a connection",
+            ),
+            (
+                "  - name: a\n    doc: d\n    setup:\n      - quyer: RETURN 1\n    query: RETURN 1\n    raises: 22012\n",
+                "a setup statement has no key \"quyer\"",
+            ),
+            (
+                "  - name: a\n    doc: d\n    setup:\n      - query: RETURN 1\n    query: RETURN 1\n    raises: 22012\n",
+                "names the connection it runs on",
+            ),
+            (
+                "  - name: a\n    doc: d\n    setup:\n      - on: writer\n    query: RETURN 1\n    raises: 22012\n",
+                "no `query:`",
+            ),
+        ] {
+            let err = suite(text).expect_err(&format!("{text:?} is refused"));
+            assert!(err.contains(want), "{text:?} gave {err:?}");
+        }
     }
 
     #[test]
@@ -444,7 +622,7 @@ mod tests {
     #[test]
     fn a_suite_may_load_a_table_every_case_in_it_reads_back() {
         let suite = Suite::parse(
-            "schema: 3\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n  columns:\n    - name: age\n      type: INT64\n      values:\n        - \"30\"\ncases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"30\"\n",
+            "schema: 4\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n  columns:\n    - name: age\n      type: INT64\n      values:\n        - \"30\"\ncases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"30\"\n",
         )
         .expect("parses");
         let load = suite.load.expect("a load");
@@ -538,7 +716,7 @@ mod tests {
         let err = Suite::parse("schema: 1\nsuite: int\ndoc: d\ncases:\n  - name: a\n")
             .expect_err("refused");
         assert!(
-            err.contains("schema 1 and the runner reads schema 3"),
+            err.contains("schema 1 and the runner reads schema 4"),
             "{err}"
         );
     }

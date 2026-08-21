@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: stored
 doc: Values put in through a client's bulk load path and read back out through a query. Every other suite asks what a value means on the way out, which is half the question, because a client that decodes a date correctly and encodes it a day early is still wrong and no expression can catch that. Here the value crosses the boundary twice and by two different mechanisms, so a client passes only if its loader and its reader agree with each other and with this file.
 
@@ -636,3 +636,754 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: a-divisor-a-row-makes-nought-raises
+    doc: ISO 20.21. A divisor of nought is a condition rather than a null or an infinity, and a stored column is where an engine that vectorizes its arithmetic answers it. A kernel that cleared the row's validity instead would read as a row that failed the predicate, so the statement would answer no rows where it has no answer at all.
+    query: MATCH (n:person) WHERE n.age / (n.age - n.age) > 0 RETURN count(*) AS c
+    raises: "22012"
+
+  - name: a-division-behind-a-guard-never-runs
+    doc: The conjuncts of a WHERE are read in the order they were written and a conjunct that decided the row stops the rest, so the guard people write in front of a division is a guard. Nobody here is over a hundred, so the division is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND 100 / (n.age - 40) > 1 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: the-distance-from-nought-of-a-stored-column
+    doc: ISO 20.22. An integer argument keeps its type through the numeric functions, so the distance from nought of a whole number is a whole number and not a float that would lose a digit above two to the fifty third. A stored column is where a vectorized engine answers this a chunk at a time rather than a row at a time.
+    query: MATCH (n:person) RETURN abs(n.age - 40) AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "10"
+      - values:
+          - type: INT64
+            value: "10"
+
+  - name: the-bottom-integer-has-no-distance-from-nought
+    doc: The one whole number whose distance from nought is not a whole number, because it is one past the top of the type holding it. The standard's 22003 is the answer rather than the number wrapped back to itself, which is what an engine computing it without a check hands back.
+    query: MATCH (n:person) RETURN abs(n.big) AS a ORDER BY a
+    raises: "22003"
+
+  - name: the-sign-of-a-stored-column
+    doc: Minus one, nought or one, which is exact whatever arrived and is the one numeric function whose answer is not the type of its argument.
+    query: MATCH (n:person) RETURN sign(n.big) AS s ORDER BY s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+      - values:
+          - type: INT64
+            value: "-1"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-numeric-function-in-a-filter
+    doc: A call in a predicate, which is the shape that decides whether a whole scan is answered a chunk at a time or a row at a time. The answer has to be the same either way.
+    query: MATCH (n:person) WHERE abs(n.age - 40) < 5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: rounding-a-stored-integer-left-of-the-point
+    doc: A negative digit count rounds tens and hundreds, and over the integers it never goes through a float, so a number wider than a double holds is rounded exactly. Halves go away from nought, which is the rule SQL rounds by.
+    query: MATCH (n:person) RETURN round(n.age, -2) AS r ORDER BY r
+    columns:
+      - r
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "100"
+
+  - name: a-numeric-function-behind-a-guard-never-runs
+    doc: The same rule the division behind a guard follows. Nobody here is over a hundred, so the distance from nought of the bottom integer is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND abs(n.big) > 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-root-of-a-stored-column
+    doc: The half of the numeric library whose answer is a float whatever arrived. A whole number in and a float out is the one shape where the answer is wider than the argument, and a square of a whole number is where that answer is exact enough to write down.
+    query: MATCH (n:person) RETURN sqrt(n.age * n.age) AS r ORDER BY r
+    columns:
+      - r
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "30.0"
+      - values:
+          - type: FLOAT64
+            value: "40.0"
+      - values:
+          - type: FLOAT64
+            value: "40.0"
+      - values:
+          - type: FLOAT64
+            value: "50.0"
+
+  - name: a-root-below-nought-has-no-answer
+    doc: ISO 20.22 defines the square root as the power of one half, so a negative argument is the power function's condition rather than one of its own. A NaN would travel through every comparison below it as false and tell the statement nothing about what went wrong.
+    query: MATCH (n:person) RETURN sqrt(n.age - 40) AS r ORDER BY r
+    raises: "2201F"
+
+  - name: a-logarithm-of-nought-has-no-answer
+    doc: A logarithm is defined for a number above nought and for no other, and the standard names the condition rather than leaving the answer to IEEE arithmetic.
+    query: MATCH (n:person) RETURN ln(n.age - 30) AS l ORDER BY l
+    raises: "2201E"
+
+  - name: an-inverse-sine-outside-minus-one-to-one-has-no-answer
+    doc: The sine of an angle is between minus one and one, so a number outside that is not the sine of anything and the standard says the value is out of range.
+    query: MATCH (n:person) RETURN asin(n.score) AS a ORDER BY a
+    raises: "22003"
+
+  - name: a-cotangent-where-the-sine-is-nought-has-no-answer
+    doc: The cotangent is the cosine over the sine, so where the sine is nought it is a division by nought and is raised as one.
+    query: MATCH (n:person) RETURN cot(n.age - 30) AS c ORDER BY c
+    raises: "22012"
+
+  - name: an-answer-past-the-top-of-a-float-has-no-answer
+    doc: An exponential of a number near the top of the range leaves the range, and an engine that quietly answers infinity has given a wrong answer rather than raised a condition.
+    query: MATCH (n:person) RETURN exp(n.score) AS e ORDER BY e
+    raises: "22003"
+
+  - name: a-root-in-a-filter
+    doc: A call in a predicate over a stored column, which is the shape that decides whether a scan is answered a chunk at a time or a row at a time.
+    query: MATCH (n:person) WHERE sqrt(n.age) > 6.5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: an-angle-read-in-both-directions
+    doc: Degrees into radians and back, which is a pair of multiplications and lands within a digit or two of where it started. The test is written as a comparison rather than an equality because the last digit of the trip is the implementation's to lose.
+    query: MATCH (n:person) WHERE degrees(radians(n.age)) > 39 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-remainder-of-two-stored-integers
+    doc: ISO 20.22. MOD is the modulus operator under a name, so a remainder of two whole numbers is a whole number and carries the sign of the dividend. It is the one of the three two argument functions whose answer is exact, which is why this case can be written as values rather than as a comparison.
+    query: MATCH (n:person) RETURN mod(n.age, 7) AS m ORDER BY m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "5"
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: a-remainder-in-a-filter
+    doc: A remainder in a predicate over a stored column, which is the shape a query picking every nth row is written in and the shape that decides whether a scan is answered a chunk at a time or a row at a time.
+    query: MATCH (n:person) WHERE mod(n.age, 20) = 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-remainder-by-nought-has-no-answer
+    doc: A modulus of a nought divisor is undefined for the reason a division by nought is, and the standard gives it the same condition rather than the infinity or the NaN the hardware would answer.
+    query: MATCH (n:person) RETURN mod(n.age, n.age - 40) AS m ORDER BY m
+    raises: "22012"
+
+  - name: the-bottom-integer-has-no-remainder-by-minus-one
+    doc: The one pair of whole numbers whose remainder is not a whole number, for the reason the distance of the bottom integer from nought is not one. An engine that answers nought here has answered from the hardware rather than from the type.
+    query: MATCH (n:person) RETURN mod(n.big, -1) AS m ORDER BY m
+    raises: "22003"
+
+  - name: a-remainder-behind-a-guard-never-runs
+    doc: The same rule the division behind a guard follows. Nobody here is over a hundred, so the remainder by nought is never worked out and the statement answers no rows rather than raising.
+    query: MATCH (n:person) WHERE n.age > 100 AND mod(n.age, n.age - 40) > 0 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-power-of-a-stored-column
+    doc: A power answers a float whatever arrived, so a whole column comes back wider than it went in. The answer is rounded here because a square worked out through an exponential and a logarithm can land a digit either side of the whole number, and which of those an implementation does is not what this case is about.
+    query: MATCH (n:person) RETURN round(power(n.age, 2)) AS p ORDER BY p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "900.0"
+      - values:
+          - type: FLOAT64
+            value: "1600.0"
+      - values:
+          - type: FLOAT64
+            value: "1600.0"
+      - values:
+          - type: FLOAT64
+            value: "2500.0"
+
+  - name: nought-to-a-negative-power-has-no-answer
+    doc: ISO 20.22 names two pairs a power has no answer for, and this is the first: nought raised to a negative power is a division by nought written another way.
+    query: MATCH (n:person) RETURN power(n.age - 40, -1) AS p ORDER BY p
+    raises: "2201F"
+
+  - name: a-negative-number-to-a-fraction-has-no-answer
+    doc: The second pair a power has no answer for. A negative number raised to a power that is not whole is not a real number at all, and an engine that answers NaN has let a value travel that every comparison below it reads as false.
+    query: MATCH (n:person) RETURN power(n.age - 40, 0.5) AS p ORDER BY p
+    raises: "2201F"
+
+  - name: a-power-past-the-top-of-a-float-has-no-answer
+    doc: A square of a number near the top of the range leaves the range, and an engine that quietly answers infinity has given a wrong answer rather than raised a condition.
+    query: MATCH (n:person) RETURN power(n.score, 2) AS p ORDER BY p
+    raises: "22003"
+
+  - name: a-logarithm-in-a-written-base
+    doc: LOG takes the base first and the number second, which is the order ISO 20.22 writes it in. The case is a comparison rather than an equality because a logarithm in a base other than the two the library names is worked out as a ratio, and the last digit of that ratio is the implementation's to lose.
+    query: MATCH (n:person) WHERE log(2, n.age) > 5 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-logarithm-in-base-one-has-no-answer
+    doc: A base of one has every power equal to one, so no number but one has a logarithm in it and one has every logarithm at once. The standard names the condition rather than leaving the answer to a division by nought inside the ratio.
+    query: MATCH (n:person) RETURN log(1, n.age) AS l ORDER BY l
+    raises: "2201E"
+
+  - name: a-logarithm-in-a-base-of-nought-has-no-answer
+    doc: A base has to be above nought as well as not be one, which is the same condition the logarithm of a number that is not above nought raises.
+    query: MATCH (n:person) RETURN log(n.age - 30, 8) AS l ORDER BY l
+    raises: "2201E"
+
+  - name: the-character-length-of-a-stored-column
+    doc: ISO 20.9. CHAR_LENGTH counts characters and OCTET_LENGTH counts bytes, and the two agree on ASCII and nowhere else. The tag column here holds an empty string, a word with an accent in it, a word with a tab in it and one emoji, so a client that measured the encoding where the standard asked for characters answers differently on three of the four rows.
+    query: MATCH (n:person) RETURN char_length(n.tag) AS c ORDER BY c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: the-octet-length-of-a-stored-column
+    doc: The same four strings counted in bytes, which is what they take in the store rather than what a reader sees.
+    query: MATCH (n:person) RETURN octet_length(n.tag) AS o ORDER BY o
+    columns:
+      - o
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "4"
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: the-two-lengths-part-company-outside-ascii
+    doc: The two counts compared against each other on the same row, which is the case an engine measuring both the same way cannot pass whichever of the two it picked. A character takes more than one byte on the accented word and on the emoji, and exactly one on the empty string and on the word with a tab in it.
+    query: MATCH (n:person) WHERE char_length(n.tag) < octet_length(n.tag) RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-length-in-a-filter
+    doc: A count in a predicate over a stored column, which is the shape that decides whether a scan is answered a chunk at a time or a row at a time. Three of these four names are two characters long.
+    query: MATCH (n:person) WHERE char_length(n.name) = 2 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-length-as-a-grouping-key
+    doc: A count standing in a key, which is the shape a report grouping by how long a value is takes. The names are one of three characters and three of two.
+    query: MATCH (n:person) RETURN char_length(n.name) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "1"
+  - name: the-upper-fold-of-a-stored-column
+    doc: ISO 20.9. UPPER over a column of names, which is the plainest shape the fold has and the one every report that headlines a value takes. The four names are stored in lower case, so every row changes and none of them changes length.
+    query: MATCH (n:person) RETURN upper(n.name) AS u ORDER BY u
+    columns:
+      - u
+    rows:
+      - values:
+          - type: STRING
+            value: "ANN"
+      - values:
+          - type: STRING
+            value: "BO"
+      - values:
+          - type: STRING
+            value: "CY"
+      - values:
+          - type: STRING
+            value: "DI"
+
+  - name: the-lower-fold-undoes-the-upper-one
+    doc: The two folds nested, which is the case that says the answer of one is a string the other can be handed rather than something that only looks like one. Folding up and back down over an ASCII name is the name again.
+    query: MATCH (n:person) RETURN lower(upper(n.name)) AS l ORDER BY l
+    columns:
+      - l
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+      - values:
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+
+  - name: a-fold-leaves-what-has-no-case-alone
+    doc: A fold over the tag column, counting the rows it left exactly as they were. The empty string and the emoji have no case to change, and the other two hold a letter that does, so this is two whichever rule an engine folds by.
+    query: MATCH (n:person) WHERE upper(n.tag) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-fold-in-a-filter
+    doc: A fold in a predicate, which is how a query asks about a name without caring how it was typed in. The comparison is against a written string already in upper case, so the row that matches is the one whose stored name folds onto it.
+    query: MATCH (n:person) WHERE upper(n.name) = 'ANN' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-fold-as-a-grouping-key
+    doc: A folded string standing in a key, which is the shape a report that groups case insensitively takes. The four names differ from each other before the fold and after it, so each one is its own group.
+    query: MATCH (n:person) RETURN upper(n.name) AS u, count(*) AS c ORDER BY u
+    columns:
+      - u
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: "ANN"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "BO"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "CY"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: "DI"
+          - type: INT64
+            value: "1"
+
+  - name: a-fold-feeding-a-length
+    doc: A count of a folded string, which asks whether the answer of one string function is a proper argument to the next. An ASCII fold changes no character's width, so the counts are the counts of the names themselves.
+    query: MATCH (n:person) RETURN char_length(upper(n.name)) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "1"
+
+  - name: two-stored-string-columns-compared-row-by-row
+    doc: One string column against another on the same row, which is the comparison with no constant in it and therefore no dictionary to translate against. None of the four names is the tag stored beside it, so every row differs and none matches.
+    query: MATCH (n:person) WHERE n.name <> n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-three-ends-a-trim-can-take
+    doc: ISO 20.24. TRIM, TRIM LEADING and TRIM TRAILING over a stored column, which is one loop and three answers: the ends a trim takes characters off are the whole of what separates the spellings. The name here begins with one letter and ends with another, so each end shows on its own.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN TRIM('n' FROM n.name) AS b, TRIM(LEADING 'a' FROM n.name) AS l, TRIM(TRAILING 'n' FROM n.name) AS r
+    columns:
+      - b
+      - l
+      - r
+    rows:
+      - values:
+          - type: STRING
+            value: "a"
+          - type: STRING
+            value: "nn"
+          - type: STRING
+            value: "a"
+
+  - name: a-trim-of-a-set-takes-any-of-its-members
+    doc: GF05. BTRIM over a column, where the set holds every letter of two of the four names and neither of the letters the other two begin with. A name made only of members trims away to the empty string, which is a value and not a missing one.
+    query: MATCH (n:person) RETURN btrim(n.name, 'adin') AS t ORDER BY t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+
+  - name: the-three-set-trims-differ-only-in-which-end
+    doc: LTRIM, RTRIM and BTRIM over one stored value, each handed the set that suits it. The name is two letters and each function is asked for a different one of them, so the three answers say which end each function read.
+    query: MATCH (n:person) WHERE n.name = 'di' RETURN ltrim(n.name, 'd') AS l, rtrim(n.name, 'i') AS r, btrim(n.name, 'di') AS b
+    columns:
+      - l
+      - r
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "i"
+          - type: STRING
+            value: "d"
+          - type: STRING
+            value: ""
+
+  - name: a-trim-takes-whole-characters-outside-ascii
+    doc: A trim over a stored string holding an accented letter, first taking the plain letter in front of it and then the accented letter itself. An engine that trimmed bytes rather than characters would cut the accented letter in half and answer something that is not text at all.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN ltrim(n.tag, 'h') AS a, btrim(ltrim(n.tag, 'h'), 'é') AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "éllo"
+          - type: STRING
+            value: "llo"
+
+  - name: a-trim-in-a-filter
+    doc: A trim in a predicate, which is how a query matches a value whose padding it does not want to write out. The comparison is against a written string, so the row that matches is the one whose stored name trims onto it.
+    query: MATCH (n:person) WHERE ltrim(n.name, 'a') = 'nn' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-trim-with-nothing-to-take-answers-what-it-was-given
+    doc: A trim of spaces over a column that holds none, counting the rows it left exactly as they were. All four tags come back unchanged, the empty string and the emoji among them, so this says a trim that finds no member at either end stops rather than taking a character anyway.
+    query: MATCH (n:person) WHERE btrim(n.tag, ' ') = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-trim-feeding-a-length
+    doc: A count of a trimmed string, which asks whether the answer of one string function is a proper argument to the next and whether an answer that trimmed away to nothing counts as nought rather than as a missing value.
+    query: MATCH (n:person) RETURN char_length(btrim(n.name, 'adin')) AS w, count(*) AS c ORDER BY w
+    columns:
+      - w
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "2"
+
+  - name: a-trim-of-more-than-one-character-over-a-column-raises
+    doc: TRIM takes one character whatever it is trimming, so a column argument does not make a longer trim string acceptable. The condition belongs to what was written rather than to any row, so it is raised whether a row is read or not.
+    query: MATCH (n:person) RETURN TRIM('ab' FROM n.name) AS t
+    raises: "22027"
+
+  - name: the-two-canonical-forms-over-a-stored-string
+    doc: GF08 over a column. The stored tag holds an accented letter written as one character, so NFC answers it unchanged and NFD answers the plain letter followed by a combining accent. A client whose normalization is a no-op passes the first of these and fails the second.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN NORMALIZE(n.tag, NFC) AS c, NORMALIZE(n.tag, NFD) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo"
+          - type: STRING
+            value: "héllo"
+
+  - name: a-normal-form-answers-a-plain-string-unchanged
+    doc: Every character below 128 is in all four normal forms already, so a normalization of a stored name is the name. This is the case a client is most likely to get right by accident and the one an engine can answer without reading a table, so it says nothing about the tables and everything about the column not being touched.
+    query: MATCH (n:person) WHERE NORMALIZE(n.name, NFD) = n.name RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-normalization-can-make-a-string-longer
+    doc: A count of characters before and after a decomposition of the same stored value. The accented letter becomes two characters, so the two counts differ, which is what separates this function from every other string function in the suite: the answer is not a part of the argument and is not the length of it either.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN char_length(n.tag) AS w, char_length(NORMALIZE(n.tag, NFD)) AS d
+    columns:
+      - w
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+          - type: INT64
+            value: "6"
+
+  - name: the-compatibility-forms-agree-here
+    doc: None of the four stored tags has a compatibility decomposition that differs from its canonical one, an emoji and a tab included, so NFKC answers what NFC answers for every row. A client that treated the K forms as a licence to fold anything it liked would fail this.
+    query: MATCH (n:person) WHERE NORMALIZE(n.tag, NFKC) = NORMALIZE(n.tag, NFC) RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-stored-string-is-asked-which-form-it-is-in
+    doc: The predicate of ISO 19.7 over a column. Three of the four tags hold nothing that composes, so they are in the decomposed form as they stand; the fourth holds the composed accent and is not. The rows are named rather than counted so a client that answers the predicate backwards cannot pass on the count.
+    query: MATCH (n:person) WHERE n.tag IS NORMALIZED NFD RETURN n.name AS m ORDER BY m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+      - values:
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+
+  - name: the-negated-predicate-names-the-other-row
+    doc: The same question spelled with NOT in it, which has to answer the row the plain spelling left out and no other. A null would be in neither answer, there being no third bit in a predicate, and there is no null here so the two answers cover the table between them.
+    query: MATCH (n:person) WHERE n.tag IS NOT NORMALIZED NFD RETURN n.name AS m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "bo"
+
+  - name: the-predicate-defaults-to-the-composed-form
+    doc: The form is optional in the predicate the way it is optional in the function, and ISO 19.7 defaults it to NFC. All four stored tags are in that form, so a client that defaults to no form at all and answers true passes this by luck, and one that defaults to NFD answers three.
+    query: MATCH (n:person) WHERE n.tag IS NORMALIZED RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-normalization-in-a-filter
+    doc: A normalization on one side of a comparison and the column it read on the other, which counts the rows that were in the form already. It is the same three rows the predicate names, so an engine whose function and whose predicate disagree fails one of the two.
+    query: MATCH (n:person) WHERE NORMALIZE(n.tag, NFD) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-stored-string-is-cut-by-characters
+    doc: The substring function counts characters and not bytes, so the first character of a tag holding one emoji is the whole emoji and the four bytes it is written as. An engine that cut the string by bytes would answer the first byte of it, which is not a string at all.
+    query: MATCH (n:person) WHERE n.name = 'di' RETURN LEFT(n.tag, 1) AS s, octet_length(LEFT(n.tag, 1)) AS o
+    columns:
+      - s
+      - o
+    rows:
+      - values:
+          - type: STRING
+            value: "🙂"
+          - type: INT64
+            value: "4"
+
+  - name: the-two-ends-of-a-stored-string
+    doc: LEFT and RIGHT over one column, which is how a client tells them apart. The stored tag holds a tab in the middle, so the two answers overlap in it and differ everywhere else, and an engine that answered the same end twice fails one of the two.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN LEFT(n.tag, 2) AS l, RIGHT(n.tag, 2) AS r
+    columns:
+      - l
+      - r
+    rows:
+      - values:
+          - type: STRING
+            value: "a\t"
+          - type: STRING
+            value: "\tb"
+
+  - name: a-cut-longer-than-the-column-answers-the-column
+    doc: Asking for more characters than a string has is an answer rather than a condition, and the answer is the whole string. It holds for the empty tag as well, which is the row where every count answers the same thing.
+    query: MATCH (n:person) WHERE LEFT(n.tag, 99) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-cut-of-no-characters-is-the-empty-string
+    doc: The other end of the range. Nought characters is a count a statement may write, and what comes back is the empty string for every row, which is a value and not a null.
+    query: MATCH (n:person) WHERE RIGHT(n.tag, 0) = '' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-middle-of-a-stored-string
+    doc: GQL has no SUBSTRING, the word being reserved and left without a meaning, so a query that wants the middle of a string writes one substring function inside the other. This takes the last two characters of a name and then the first of those.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN LEFT(RIGHT(n.name, 2), 1) AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "n"
+
+  - name: a-cut-whose-count-is-a-column
+    doc: The count is an ordinary argument rather than a word the statement wrote, so it may be a different number on every row. Here it is the character count of one column applied to another, which answers the empty string where the count is nought and the whole name where the count reaches it.
+    query: MATCH (n:person) RETURN n.name AS m, LEFT(n.name, char_length(n.tag)) AS s ORDER BY m
+    columns:
+      - m
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: "bo"
+          - type: STRING
+            value: "bo"
+      - values:
+          - type: STRING
+            value: "cy"
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+          - type: STRING
+            value: "d"
+
+  - name: a-negative-count-over-a-column-raises
+    doc: A string has no negative number of characters, and the condition the standard gives that is 22011. The count is written out here, so the condition belongs to the statement rather than to any row, and an engine that answered the empty string instead would be inventing a value nobody asked for.
+    query: MATCH (n:person) RETURN LEFT(n.name, -1) AS s
+    raises: "22011"
+
+  - name: a-cut-in-a-filter
+    doc: The same function on the reading side of a comparison, which is where a query most often writes it. One name ends in the character named and the other three do not.
+    query: MATCH (n:person) WHERE RIGHT(n.name, 1) = 'i' RETURN n.name AS m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "di"

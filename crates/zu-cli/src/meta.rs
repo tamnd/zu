@@ -286,6 +286,18 @@ pub(crate) fn describe(catalog: &Catalog, name: &str, columns: &[Column]) -> Str
 /// chunk that is only a comment or only space is dropped rather than
 /// run.
 pub(crate) fn statements(text: &str) -> Vec<&str> {
+    spans(text).into_iter().map(|(_, stmt)| stmt).collect()
+}
+
+/// The same statements, each with where it starts in `text`.
+///
+/// The offset is what an editor needs and a file runner does not: a
+/// parse error carries a position into the statement it was raised on,
+/// and a squiggle goes under the third statement of a document rather
+/// than under the third character of it. The offset is of the trimmed
+/// text, so adding a position to it lands on the same byte the parser
+/// was looking at.
+pub(crate) fn spans(text: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut quote: Option<char> = None;
@@ -325,7 +337,7 @@ pub(crate) fn statements(text: &str) -> Vec<&str> {
                 }
             }
             ';' => {
-                push(&mut out, &text[start..at]);
+                push(&mut out, text, start, at);
                 start = at + 1;
             }
             _ => {}
@@ -333,7 +345,7 @@ pub(crate) fn statements(text: &str) -> Vec<&str> {
     }
     // A file whose last statement has no semicolon is a file one line
     // short of a convention, not a file with a statement missing.
-    push(&mut out, &text[start..]);
+    push(&mut out, text, start, text.len());
     out
 }
 
@@ -342,9 +354,10 @@ pub(crate) fn statements(text: &str) -> Vec<&str> {
 /// What is left after the comments and the space is what decides, so a
 /// file ending in a comment does not run an empty statement and get a
 /// syntax error for its trouble.
-fn push<'a>(out: &mut Vec<&'a str>, chunk: &'a str) {
+fn push<'a>(out: &mut Vec<(usize, &'a str)>, text: &'a str, start: usize, end: usize) {
+    let chunk = &text[start..end];
     if !bare(chunk).is_empty() {
-        out.push(chunk.trim());
+        out.push((start + chunk.len() - chunk.trim_start().len(), chunk.trim()));
     }
 }
 

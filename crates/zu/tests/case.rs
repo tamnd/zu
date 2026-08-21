@@ -1,4 +1,4 @@
-//! The case expression and its two abbreviations: ISO 19.4, mandatory
+//! The case expression and its two abbreviations: ISO 20.7, mandatory
 //! feature GE01.
 //!
 //! `CASE` is written in two forms, one that asks a condition per branch

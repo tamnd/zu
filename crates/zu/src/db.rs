@@ -522,6 +522,29 @@ impl Connection {
         self.read_only
     }
 
+    /// What a table id is called, or nothing when no table has that id.
+    ///
+    /// A node value is a table and a row offset and an edge value is a
+    /// table and two of them, because neither part identifies anything
+    /// on its own: two tables both number their rows from zero. The
+    /// number is what the engine passes around and the name is what a
+    /// user asked about, so a binding that hands a node value out has
+    /// to be able to turn one into the other, and until now the only
+    /// way was to reach past this type into the session and read the
+    /// catalog. Node and rel tables share one id space, so this is one
+    /// call and not two.
+    ///
+    /// The name is borrowed from the catalog, which the next statement
+    /// that creates or drops a table replaces, so a caller keeping one
+    /// past the next statement copies it.
+    pub fn table_name(&self, table: u32) -> Option<&str> {
+        let catalog = self.session.catalog();
+        catalog
+            .node_by_id(table)
+            .map(|t| t.name.as_str())
+            .or_else(|| catalog.rel_by_id(table).map(|t| t.name.as_str()))
+    }
+
     /// Another connection to the same database, made from this one
     /// rather than from the path.
     ///
@@ -794,6 +817,29 @@ mod tests {
                 .len(),
             8
         );
+    }
+
+    /// Both kinds out of one call, since they share one id space, and
+    /// nothing for an id no table has rather than a name that would be
+    /// a guess.
+    #[test]
+    fn a_table_id_from_a_value_is_named_and_an_id_no_table_has_is_not() {
+        let (_dir, path) = scratch("names.zu1");
+        let db = Database::open(&path).expect("open");
+        let mut conn = db.connect().expect("connect");
+        let rows = conn
+            .query("MATCH (a:person)-[e:follows]->(b:person) RETURN a, e LIMIT 1")
+            .expect("query")
+            .rows;
+        let (Value::Node { table: nodes, .. }, Value::Rel { table: rels, .. }) =
+            (&rows[0][0], &rows[0][1])
+        else {
+            panic!("expected a node and an edge, got {:?}", rows[0]);
+        };
+        assert_ne!(nodes, rels, "a node table and a rel table are never one");
+        assert_eq!(conn.table_name(*nodes), Some("person"));
+        assert_eq!(conn.table_name(*rels), Some("follows"));
+        assert_eq!(conn.table_name(u32::MAX), None);
     }
 
     #[test]

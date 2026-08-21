@@ -13,6 +13,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
+use zu_common::unicode::NormalForm;
 use zu_vector::{
     Bitmap, CmpOp, Dictionary, MorselArena, PhysType, SelVector, ValueVector, kernels,
 };
@@ -204,6 +205,149 @@ fn main() {
         failed = true;
     }
 
+    // Arithmetic kernel, i64 flat plus flat, with the conditions the
+    // row engine raises. The kernel folds both operands into one
+    // magnitude to answer whether any row could have gone over the top
+    // of an integer, and the fold is the whole price of raising where
+    // the row engine raises: a chunk of ordinary numbers never reaches
+    // the checked walk behind it. Both numbers are printed so the price
+    // is on the record rather than assumed.
+    let addends: Vec<i64> = (0..VECTOR as i64)
+        .map(|i| (i * 7_919) % 1_000_000)
+        .collect();
+    let w = ValueVector::flat_from(&mut arena, PhysType::Int64, &addends);
+    let mut arith_scratch = MorselArena::new();
+    let per_sec = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::binary(
+                &mut arith_scratch,
+                kernels::BinOp::Add,
+                black_box(&v),
+                black_box(&w),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let arith_grows = per_sec * VECTOR as f64 / 1e9;
+    println!("arith_i64_add: {arith_grows:.2} G rows/s (target 4)");
+    if let Some(floor) = budgets.get("vec_arith_grows_s")
+        && arith_grows < floor
+    {
+        println!("GATE FAIL vec_arith_grows_s: {arith_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
+    // The same addition over numbers wide enough that the fold cannot
+    // rule out an answer that does not fit, which is what the checked
+    // walk costs when it runs and finds nothing.
+    let wide: Vec<i64> = (0..VECTOR as i64).map(|i| -(i64::MAX - i)).collect();
+    let wv = ValueVector::flat_from(&mut arena, PhysType::Int64, &wide);
+    let per_sec_wide = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::binary(
+                &mut arith_scratch,
+                kernels::BinOp::Add,
+                black_box(&wv),
+                black_box(&w),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let arith_checked = per_sec_wide * VECTOR as f64 / 1e9;
+    println!("arith_i64_add_checked: {arith_checked:.2} G rows/s (no target, the slow path)");
+
+    // The numeric library, GF01, over the same width. The distance from
+    // nought is the one of the five with a condition behind it on every
+    // argument, so it is the one worth measuring: the fold that clears
+    // a chunk is a single pass and the loop behind it is one
+    // instruction per row.
+    let per_sec_math = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::unary(
+                &mut arith_scratch,
+                kernels::MathOp::Abs,
+                black_box(&v),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let math_grows = per_sec_math * VECTOR as f64 / 1e9;
+    println!("math_i64_abs: {math_grows:.2} G rows/s (target 4)");
+    if let Some(floor) = budgets.get("vec_math_grows_s")
+        && math_grows < floor
+    {
+        println!("GATE FAIL vec_math_grows_s: {math_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
+    // The approximate half of the same library, whose answer is a float
+    // whatever arrived. A root costs what the hardware charges for one
+    // and the fold that clears the column of negative numbers is the
+    // same single pass, so the distance between this and the line above
+    // is the function itself and nothing the kernel added.
+    let roots: Vec<f64> = (0..VECTOR as i64).map(|i| (i % 10_000) as f64).collect();
+    let rv = ValueVector::flat_from(&mut arena, PhysType::Float64, &roots);
+    let per_sec_sqrt = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::unary(
+                &mut arith_scratch,
+                kernels::MathOp::Sqrt,
+                black_box(&rv),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let sqrt_grows = per_sec_sqrt * VECTOR as f64 / 1e9;
+    println!("math_f64_sqrt: {sqrt_grows:.2} G rows/s (target 1)");
+    if let Some(floor) = budgets.get("vec_math_real_grows_s")
+        && sqrt_grows < floor
+    {
+        println!("GATE FAIL vec_math_real_grows_s: {sqrt_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
+    // The two argument half of the same library. A remainder of two
+    // whole numbers is the cheap one of the three and is the one that
+    // says what the kernel costs rather than what the hardware charges
+    // for a power: the divisors here are all above nought, so the fold
+    // clears the chunk and the loop is one instruction per row.
+    let divisors: Vec<i64> = (0..VECTOR as i64).map(|i| i % 97 + 1).collect();
+    let dvs = ValueVector::flat_from(&mut arena, PhysType::Int64, &divisors);
+    let per_sec_mod = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::pair(
+                &mut arith_scratch,
+                kernels::MathPair::Mod,
+                black_box(&v),
+                black_box(&dvs),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let mod_grows = per_sec_mod * VECTOR as f64 / 1e9;
+    println!("math_i64_mod: {mod_grows:.2} G rows/s (target 1)");
+    if let Some(floor) = budgets.get("vec_math_pair_grows_s")
+        && mod_grows < floor
+    {
+        println!("GATE FAIL vec_math_pair_grows_s: {mod_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
     // Dict-code equality vs the path it replaces: owned Strings compared
     // per row, which is what a Vec<Value::Str> column does today. The
     // gate is the ratio, both sides run the same logical rows.
@@ -251,6 +395,288 @@ fn main() {
         && speedup < floor
     {
         println!("GATE FAIL vec_dict_eq_speedup: {speedup:.1} < floor {floor}");
+        failed = true;
+    }
+
+    // The string library's first kernel, over the same two encodings
+    // the comparison above uses. A count of characters is a fold over
+    // the bytes of each row when the column is flat, and a fold over
+    // the table plus a gather when it is coded, so the distance
+    // between these two lines is the reason the kernel reads codes
+    // rather than asking the caller to materialize them.
+    let flat = zu_vector::str_vector(&mut arena, &strings);
+    let per_sec_len = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::length(&mut arith_scratch, kernels::StrLen::Chars, black_box(&flat))
+                .unwrap()
+                .len,
+        );
+    });
+    let len_grows = per_sec_len * VECTOR as f64 / 1e9;
+    println!(
+        "str_char_length: {len_grows:.2} G rows/s over fourteen byte strings (no spec target)"
+    );
+    if let Some(floor) = budgets.get("vec_str_length_grows_s")
+        && len_grows < floor
+    {
+        println!("GATE FAIL vec_str_length_grows_s: {len_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_len_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::length(&mut arith_scratch, kernels::StrLen::Chars, black_box(&dv))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_char_length_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_len_dict * VECTOR as f64 / 1e9,
+        per_sec_len_dict / per_sec_len
+    );
+
+    // The fold, which is the first kernel whose answer is a string.
+    // The two lines are the same two encodings again, and the reason
+    // the coded one is ahead is stronger here than for a count: an
+    // entry is folded once and its bytes are written once however many
+    // rows point at them, so the rows themselves cost a gather of
+    // views rather than a copy of a string.
+    let per_sec_fold = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::fold(
+                &mut arith_scratch,
+                kernels::StrFold::Upper,
+                black_box(&flat),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let fold_grows = per_sec_fold * VECTOR as f64 / 1e9;
+    println!("str_upper: {fold_grows:.2} G rows/s over fourteen byte strings (no spec target)");
+    if let Some(floor) = budgets.get("vec_str_fold_grows_s")
+        && fold_grows < floor
+    {
+        println!("GATE FAIL vec_str_fold_grows_s: {fold_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_fold_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::fold(&mut arith_scratch, kernels::StrFold::Upper, black_box(&dv))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_upper_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_fold_dict * VECTOR as f64 / 1e9,
+        per_sec_fold_dict / per_sec_fold
+    );
+
+    // The trim, which is the string kernel that fills no buffer: the
+    // set is the digits, so every entry here loses its number and what
+    // is left is a part of the entry that the answer points back at.
+    // The ratio against the fold is printed because the two walk the
+    // same column, and it is worth reading for what it does not say.
+    // The trim comes out about level with the fold rather than well
+    // ahead of it, because taking six characters off a string is six
+    // tests of the set, which costs about what copying fifteen bytes
+    // costs. What the trim saves is the buffer, not the walk.
+    let digits = kernels::TrimSet::new("0123456789");
+    let per_sec_trim = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::trim(
+                &mut arith_scratch,
+                kernels::StrTrim::Both,
+                black_box(&digits),
+                black_box(&flat),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let trim_grows = per_sec_trim * VECTOR as f64 / 1e9;
+    println!(
+        "str_trim: {trim_grows:.2} G rows/s over fifteen byte strings ({:.1}x the fold of the same column, no spec target)",
+        per_sec_trim / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_trim_grows_s")
+        && trim_grows < floor
+    {
+        println!("GATE FAIL vec_str_trim_grows_s: {trim_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_trim_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::trim(
+                &mut arith_scratch,
+                kernels::StrTrim::Both,
+                black_box(&digits),
+                black_box(&dv),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    println!(
+        "str_trim_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_trim_dict * VECTOR as f64 / 1e9,
+        per_sec_trim_dict / per_sec_trim
+    );
+
+    // The normalization, which is the kernel that has to write its
+    // answers out and cannot say beforehand how many bytes that comes
+    // to. The two lines here are not two encodings, which is what the
+    // three kernels above compare, but two columns, because what
+    // decides the cost of this one is what the strings hold rather
+    // than how they are stored.
+    //
+    // The plain column is the one nearly every query holds. Nothing
+    // below 128 decomposes, so every row is in all four forms already
+    // and the answers are the argument's own strings: a scan of the
+    // bytes to find that out, a copy of the views, and no buffer at
+    // all. The accented column is the same rows with one letter
+    // changed, and it is the other end of the range, every row of it
+    // decoded a character at a time, looked up, sorted and written
+    // back out. The distance between the two lines is what the ASCII
+    // question is worth asking for.
+    let per_sec_norm = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::normalize(&mut arith_scratch, NormalForm::Nfd, black_box(&flat))
+                .unwrap()
+                .len,
+        );
+    });
+    let norm_grows = per_sec_norm * VECTOR as f64 / 1e9;
+    println!(
+        "str_normalize: {norm_grows:.2} G rows/s over plain fourteen byte strings ({:.1}x the fold of the same column, no spec target)",
+        per_sec_norm / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_normalize_grows_s")
+        && norm_grows < floor
+    {
+        println!("GATE FAIL vec_str_normalize_grows_s: {norm_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let accented: Vec<String> = strings
+        .iter()
+        .map(|s| s.replace("category", "cat\u{e9}gory"))
+        .collect();
+    let wide = zu_vector::str_vector(&mut arena, &accented);
+    let per_sec_norm_wide = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::normalize(&mut arith_scratch, NormalForm::Nfd, black_box(&wide))
+                .unwrap()
+                .len,
+        );
+    });
+    println!(
+        "str_normalize_accented: {:.3} G rows/s ({:.3}x the plain column, no target)",
+        per_sec_norm_wide * VECTOR as f64 / 1e9,
+        per_sec_norm_wide / per_sec_norm
+    );
+    let mut norm_bits = Bitmap::new_in(&mut dict_scratch, VECTOR, false);
+    let per_sec_is_norm = measure(|| {
+        kernels::normalized(NormalForm::Nfc, false, black_box(&wide), &mut norm_bits).unwrap();
+        black_box(norm_bits.words());
+    });
+    println!(
+        "str_is_normalized_accented: {:.3} G rows/s over the same column (no target)",
+        per_sec_is_norm * VECTOR as f64 / 1e9
+    );
+
+    // The substring function, which is the trim's trick with the walk
+    // bounded by the count rather than by the set. Four characters off
+    // the front is four steps whatever the column holds, so this is the
+    // cheapest of the string kernels and the ratio against the trim of
+    // the same column says how much of the trim was the set test.
+    //
+    // The second line is the same call with the count coming from a
+    // column instead of from the statement. It reads a number a row and
+    // is otherwise the same work, so the gap between the two is what
+    // asking a column costs and nothing else.
+    let four = ValueVector::constant(&mut arena, PhysType::Int64, 4i64, VECTOR);
+    let varying: Vec<i64> = (0..VECTOR).map(|i| (i % 9) as i64).collect();
+    let counted = ValueVector::flat_from(&mut arena, PhysType::Int64, &varying);
+    let per_sec_cut = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::cut(
+                &mut arith_scratch,
+                kernels::StrCut::Left,
+                black_box(&flat),
+                black_box(&four),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let cut_grows = per_sec_cut * VECTOR as f64 / 1e9;
+    println!(
+        "str_cut: {cut_grows:.2} G rows/s over fifteen byte strings ({:.1}x the trim of the same column, no spec target)",
+        per_sec_cut / per_sec_trim
+    );
+    if let Some(floor) = budgets.get("vec_str_cut_grows_s")
+        && cut_grows < floor
+    {
+        println!("GATE FAIL vec_str_cut_grows_s: {cut_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_cut_counted = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::cut(
+                &mut arith_scratch,
+                kernels::StrCut::Right,
+                black_box(&flat),
+                black_box(&counted),
+                None,
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    println!(
+        "str_cut_counted: {:.2} G rows/s ({:.1}x the written count, no target)",
+        per_sec_cut_counted * VECTOR as f64 / 1e9,
+        per_sec_cut_counted / per_sec_cut
+    );
+
+    // The identifier of a node, which is the string kernel with no
+    // string on its input side: a level's rows go in and `n:0:<row>`
+    // comes out. Every answer is written rather than read out of an
+    // argument, so this is the fold's cost without the fold's copy, and
+    // the rows here are the rows a graph really has, counted from
+    // nought, so nearly every answer fits in the twelve bytes a view
+    // holds and the buffer stays empty.
+    let ids: Vec<i64> = (0..VECTOR).map(|i| i as i64).collect();
+    let id_rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &ids);
+    let per_sec_ids = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::element_ids(&mut arith_scratch, 0, black_box(&id_rows))
+                .unwrap()
+                .len,
+        );
+    });
+    let ids_grows = per_sec_ids * VECTOR as f64 / 1e9;
+    println!(
+        "str_element_id: {ids_grows:.2} G rows/s over a level's rows ({:.1}x the fold of a string column, no spec target)",
+        per_sec_ids / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_element_id_grows_s")
+        && ids_grows < floor
+    {
+        println!("GATE FAIL vec_str_element_id_grows_s: {ids_grows:.2} < floor {floor}");
         failed = true;
     }
 

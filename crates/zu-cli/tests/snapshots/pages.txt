@@ -21,6 +21,17 @@ examples:
 
 see also: shell, explain, stat
 
+$ zu lsp --help
+zu lsp: speak the language server protocol, for an editor
+
+usage: zu lsp --stdio [--db <file.zu1>]
+
+examples:
+  zu lsp --stdio
+  zu lsp --stdio --db graph.zu1
+
+see also: shell, query
+
 $ zu copy --help
 zu copy: bulk load an edge list, or a whole dataset, into a new file
 

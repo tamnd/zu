@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: pattern
 doc: What a pattern selects, which is the half of a statement that reads the graph rather than the values in it. The fixture is four people and three edges, one of which runs from a node to itself, and every case here is a question about which of those a pattern reaches: whether a label selects, whether an arrow has a direction, whether a name written twice means one element or two, and how many rows a walk of two edges is. The counts are small enough to check by reading the pairs at the top of this file, which is the point of them.
 
@@ -1063,6 +1063,35 @@ cases:
           - type: INT64
             value: "4"
 
+  - name: id-numbers-a-node
+    doc: ID is zu's own function and older than the standard's ELEMENT_ID. What it answers is where in its table the node sits, counted from nought, which is the number the storage already keeps and not one made up for the answer. The people load in the order they are written above, so cy is the third of them.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN id(n) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: id-of-an-edge-is-nothing
+    doc: An edge has a place of its own but not a place in a table of nodes, and a number that named one would be a number a node also answers to. So ID takes nodes and says so by answering null for anything else, which is what ELEMENT_ID is for.
+    query: MATCH (a:person)-[r:knows]->(b:person) WHERE a.name = 'ann' RETURN id(r) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: id-tells-the-ends-of-an-edge-apart
+    doc: Two nodes of one table are the same node exactly when their numbers agree, so this is the same question SAME asks and the fixture's edge from a node to itself is the row that answers yes.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE id(a) = id(b) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
   - name: element-id-names-a-node
     doc: ELEMENT_ID of ISO 20.10 answers an identifier for an element, and what the identifier is the standard leaves to the engine. zu answers a string that says which kind of element it names, then which table, then where in it, so the spelling is here rather than only in the declaration; a client that stores one of these is relying on it.
     query: MATCH (n:person) WHERE n.name = 'ann' RETURN element_id(n) AS a
@@ -1072,6 +1101,25 @@ cases:
       - values:
           - type: STRING
             value: "n:0:0"
+
+  - name: element-id-names-every-node-of-a-chunk
+    doc: The identifier is written for a whole chunk of rows at once rather than for the one row a WHERE picked out, and what varies across a chunk is the number at the end of it. The people load in the order they are written above, so their identifiers count from nought with them.
+    query: MATCH (n:person) RETURN element_id(n) AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "n:0:0"
+      - values:
+          - type: STRING
+            value: "n:0:1"
+      - values:
+          - type: STRING
+            value: "n:0:2"
+      - values:
+          - type: STRING
+            value: "n:0:3"
 
   - name: element-id-names-an-edge-as-well-as-a-node
     doc: The argument is an element and not a node, so an edge has one too, and an edge's is its table, the pair it runs between and which copy of that pair it is. Nothing an edge answers can collide with what a node answers, because the two spellings start differently.
@@ -1270,3 +1318,105 @@ cases:
     doc: An edge is stored under exactly one type in this engine, so a negated label on a step describes something no edge of it can be asked about. It is refused by name where it is written rather than answered as though the negation had been dropped.
     query: MATCH (a:person)-/ !knows /->(b:person) RETURN count(*) AS a
     raises: "42001"
+
+  - name: path-length-counts-the-edges-of-a-walk
+    doc: Feature GF04, ISO 20.22. The length of a path is its edges and not its elements, and the two are different numbers that are both integers, so an engine answering with the element count would be believed. The walk asked about here is ann to bo to cy.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN path_length(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: path-length-of-a-path-of-one-node
+    doc: A path of one node has no edges and is the shortest path there is. There is no empty path, a path being a walk and a walk starting somewhere, so nought is the bottom of this number.
+    query: MATCH (a:person) WHERE a.name = 'ann' RETURN path_length(PATH [a]) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: path-length-of-null-is-null
+    doc: The path functions answer null for a null path rather than nought, which is what an optional match that found nothing hands them.
+    query: RETURN path_length(null) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: path-length-refuses-a-list
+    doc: A list of the elements of a walk is not the walk, so it has no path length. Answering the element count anyway would let a query that lost its path on the way in look like it still had one.
+    query: RETURN path_length([1, 2, 3]) AS a
+    raises: "22G03"
+
+  - name: elements-answers-the-whole-walk
+    doc: ISO 20.16. A path is a value of its own and nothing indexes into one, so ELEMENTS is how a query reads what a path holds. A walk of two edges is five elements, a node at each end and an edge between each pair.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN size(elements(p)) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: elements-answers-the-walk-in-the-order-it-was-taken
+    doc: The list is the elements the path holds and in the same places, so it equals the list the query can write out of the names the pattern bound. An engine answering the same elements in another order passes a count and fails this.
+    query: MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.name = 'ann' RETURN (elements(p) = [a, e, b]) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-cardinality-of-a-path-is-what-it-holds-and-its-length-is-not
+    doc: A path is one of the four things ISO 20.10 gives CARDINALITY, and the two questions about a walk have separate answers. A walk of two edges holds five elements and has a length of two, and an engine that answers the hop count to both has made PATH_LENGTH the only one of them it implements.
+    query: MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name = 'ann' RETURN cardinality(p) AS a, path_length(p) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+          - type: INT64
+            value: "2"
+
+  - name: the-cardinality-of-a-path-of-one-node
+    doc: A path with no edges is the shortest there is and it still holds the node it started at, so its cardinality is one. There is no path of zero elements to compare it against, which is why this is the floor.
+    query: MATCH p = (a:person) WHERE a.name = 'ann' RETURN cardinality(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: the-size-of-a-property-that-is-a-number
+    doc: The same condition as asking a literal number for its size, raised on the row rather than at binding time, because a property read has no type until a row arrives. A client sorting failures by code should not have to know which side of that line caught it.
+    query: MATCH (a:person) WHERE a.name = 'ann' RETURN size(a.age) AS a
+    raises: "22G03"
+
+  - name: elements-refuses-a-list
+    doc: A list is already the list of its elements, so asking a list for them is a query that has lost the path it meant to ask about.
+    query: RETURN elements([1, 2, 3]) AS a
+    raises: "22G03"
+
+  - name: a-path-built-from-elements-equals-the-path-that-was-matched
+    doc: Features GE06 and GA09 together. The constructor of ISO 20.14 builds a path out of the elements a pattern bound, and the only thing that says it built the same walk the pattern matched is that the two are equal.
+    query: MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.name = 'ann' RETURN (PATH [a, e, b] = p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-built-path-has-to-be-a-walk-somebody-could-take
+    doc: The elements have to join. An edge between two nodes it does not touch is the interesting case, because the sequence is the right shape and the right kinds, so nothing but the graph can tell it is wrong. Here the edge runs from di to di and neither end of it is ann.
+    query: MATCH (a:person), (d:person)-[e:knows]->(d) WHERE a.name = 'ann' AND d.name = 'di' RETURN PATH [a, e, d] AS a
+    raises: "22G0Z"

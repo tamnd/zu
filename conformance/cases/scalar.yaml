@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: scalar
 doc: The values that cross a language boundary badly. Every case here is one a client has got wrong somewhere, which is why the corpus starts with them rather than with the ones that work everywhere.
 
@@ -198,7 +198,7 @@ cases:
     rows:
 
   - name: a-record-named-by-its-type
-    doc: The record constructor of ISO 20.19 may name what it is building the way the list constructor does, and the name changes nothing about the record. The field is read back here rather than the record itself, because the wire encoding of this corpus has no record value and a client is not asked to invent one.
+    doc: The record constructor of ISO 20.18 may name what it is building the way the list constructor does, and the name changes nothing about the record. The field is read back here rather than the record itself, because the wire encoding of this corpus has no record value and a client is not asked to invent one.
     query: RETURN (RECORD {a: 1, b: 2}).b AS n
     columns:
       - n
@@ -216,6 +216,31 @@ cases:
       - values:
           - type: BOOL
             value: true
+
+  - name: the-cardinality-of-a-record-is-its-field-count
+    doc: A record is one of the four things ISO 20.10 gives CARDINALITY, and what it counts is the fields. Reading the count rather than the record is what lets this case be written at all, since the wire encoding of this corpus has no record value.
+    query: RETURN cardinality(RECORD {a: 1, b: 2}) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: the-cardinality-of-a-record-with-no-fields
+    doc: A record may hold nothing, and it has a cardinality of zero rather than no cardinality. A client that treats an empty record as a null loses this row.
+    query: RETURN cardinality({}) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: size-refuses-a-record
+    doc: SIZE is the list function of ISO 20.10 and CARDINALITY is the general one, so the count of a record is written with the second name only and asking for it with the first raises.
+    query: RETURN size(RECORD {a: 1}) AS n
+    raises: "22G03"
 
   - name: record-is-still-a-name
     doc: The word is a constructor only when a brace follows it, so a query may still bind a variable called record and read it back.
@@ -268,7 +293,7 @@ cases:
             value: kept
 
   - name: a-name-that-lives-for-one-expression
-    doc: ISO 20.7 lets an expression name a value for its own length, which is the LET clause said in a smaller place. The name is worked out once however often the body reads it, and the answer says nothing about that, so what is asked here is the plain reading.
+    doc: ISO 20.5 lets an expression name a value for its own length, which is the LET clause said in a smaller place. The name is worked out once however often the body reads it, and the answer says nothing about that, so what is asked here is the plain reading.
     query: RETURN LET n = 2 + 3 IN n * n END AS n
     columns:
       - n

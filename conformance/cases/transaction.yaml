@@ -1,0 +1,162 @@
+schema: 4
+suite: transaction
+doc: What a transaction is and what two connections see of each other. A transaction here is three statements and not an API, so a client that can run a statement can run one, and the cases below are written the way a user writes them. The half of this suite that needs two connections needs them because a transaction is only observable from outside it, and the connections come from one database and share its write side, which is what a pool hands out. Nothing here starts a thread. The statements run one at a time in the order they are written, so every case says what it means on every client, and a client whose connections were secretly one connection fails the cases that ask what the other one sees.
+
+cases:
+  - name: a-write-is-visible-to-a-connection-that-was-already-open
+    doc: The reader connects before the write happens and reads after it, which is the case that says a connection is a view of the database and not a copy of it taken when it opened. The first setup statement is there to make the connection and touches nothing, since a connection is made when a case first names one.
+    setup:
+      - on: reader
+        query: RETURN 1 AS n
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+    on: reader
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-table-one-connection-made-is-named-the-same-by-another
+    doc: The row comes back as a node, so the reader has to turn a table id into a name it never saw created. A client holding a map of its own rather than asking the connection would answer this with a number or with nothing.
+    setup:
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+    on: reader
+    query: MATCH (t:thing) RETURN t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: NODE
+            value: "thing#0"
+
+  - name: a-committed-transaction-is-visible-to-another-connection
+    doc: The write is inside a transaction the writer commits, and the reader asks afterwards. This is the case a client's own transaction API is checked against: whatever it wraps, what it has to mean is that the row is there once COMMIT has returned.
+    setup:
+      - on: writer
+        query: START TRANSACTION
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+      - on: writer
+        query: COMMIT
+    on: reader
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-rolled-back-transaction-is-visible-to-nobody
+    doc: One row is written and committed, a second is written inside a transaction that rolls back, and another connection counts one. The first row is what makes this a real assertion: a reader that saw nothing at all would pass a case that only counted the second.
+    setup:
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+      - on: writer
+        query: START TRANSACTION
+      - on: writer
+        query: "INSERT (:thing {n: 2})"
+      - on: writer
+        query: ROLLBACK
+    on: reader
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-transaction-belongs-to-the-connection-that-started-it
+    doc: One connection opens a transaction and another commits, which there is nothing to commit on. A client that kept the transaction on the database rather than on the connection would end the writer's transaction here and answer no rows instead of a condition.
+    setup:
+      - on: writer
+        query: START TRANSACTION
+    on: reader
+    query: COMMIT
+    raises: 2D000
+
+  - name: a-connection-sees-what-it-has-written-and-not-committed
+    doc: The statement under test runs inside the open transaction that wrote the row. A client that read through a snapshot taken when the transaction began would answer zero, and a statement that could not see its own writes would make a transaction useless to write in.
+    setup:
+      - START TRANSACTION
+      - "INSERT (:thing {n: 1})"
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-rollback-undoes-the-write-on-the-connection-that-made-it
+    doc: The same connection that wrote the row asks for it after rolling back. Rolling back is not only about what other connections were shown: the connection that did the writing has to stop seeing it too.
+    setup:
+      - START TRANSACTION
+      - "INSERT (:thing {n: 1})"
+      - ROLLBACK
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-transaction-does-not-start-inside-another
+    doc: Two starts on one connection, which is 25G01. There is no nesting and no counter, so a client that made START TRANSACTION idempotent to be helpful would swallow a bug in the program using it.
+    setup:
+      - START TRANSACTION
+    query: START TRANSACTION
+    raises: 25G01
+
+  - name: a-commit-with-nothing-running-is-refused
+    doc: 2D000 on a connection that never started one. A commit that quietly did nothing would let a program that lost track of its transaction believe its writes are durable.
+    query: COMMIT
+    raises: 2D000
+
+  - name: a-rollback-with-nothing-running-is-refused
+    doc: The same for the other end of it, since the two are one pair and a client that mapped only one of them onto the condition would be found by this case and not by the one above.
+    query: ROLLBACK
+    raises: 2D000
+
+  - name: a-commit-ends-the-transaction-it-committed
+    doc: A start after a commit, which is allowed because the commit ended the first one. This is the case that keeps the condition above from being read as "one transaction per connection ever".
+    setup:
+      - START TRANSACTION
+      - COMMIT
+    query: START TRANSACTION
+    columns:
+    rows:
+
+  - name: a-rollback-ends-the-transaction-it-rolled-back
+    doc: The commit here has nothing to commit because the rollback before it ended the transaction, which is the same fact as the case above told through the condition rather than through a statement that succeeds.
+    setup:
+      - START TRANSACTION
+      - ROLLBACK
+    query: COMMIT
+    raises: 2D000
+
+  - name: a-write-inside-a-read-only-transaction-is-refused
+    doc: 25G03, which is the point of READ ONLY. The transaction is started by the case and the write is the statement under test, so what is being asserted is the refusal and not the state afterwards.
+    setup:
+      - START TRANSACTION READ ONLY
+    query: "INSERT (:thing {n: 1})"
+    raises: 25G03
+
+  - name: a-read-only-transaction-still-reads
+    doc: The other half of the case above, which a client that turned READ ONLY into a connection that refuses everything would fail. The row is written before the transaction starts, since inside it nothing can be.
+    setup:
+      - "INSERT (:thing {n: 1})"
+      - START TRANSACTION READ ONLY
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"

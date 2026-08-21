@@ -313,7 +313,7 @@ fn the_word_in_front_of_a_reference_parameter_says_nothing_the_value_does_not() 
 }
 
 /// GE08. The standard writes a reference parameter with two dollar
-/// signs, `<substituted parameter reference>` in ISO 21.10, and a
+/// signs, `<substituted parameter reference>` in ISO 21.3, and a
 /// value parameter with one. Both name the same parameter here,
 /// because what a parameter holds is settled by the value that
 /// arrives, which is the rule the word in front of it is read under
@@ -444,4 +444,50 @@ fn a_for_statement_over_a_number_is_refused() {
         .expect_err("a number is not a sequence");
     let message = err.to_string();
     assert!(message.contains("list"), "{message}");
+}
+
+/// GF12. The fourth argument form of ISO 20.10's cardinality
+/// expression, and the one that cannot be written in a statement: a
+/// binding table arrives as a parameter, so this is the only place the
+/// question can be asked at all.
+///
+/// What it counts is the rows. A table is a sequence of rows the way a
+/// list is a sequence of elements, and the columns are the shape of a
+/// row rather than a second thing to count, so a two column table of
+/// two rows answers two and not four. The count is checked against
+/// what `FOR` sees over the same table, because a table whose
+/// cardinality and whose row count disagree is one a query cannot
+/// reason about.
+#[test]
+fn the_cardinality_of_a_binding_table_is_its_row_count() {
+    let (_dir, mut session) = opened("table-cardinality.zu1");
+    let rows = session_run(
+        &mut session,
+        "MATCH (p:person) RETURN p.id AS id, p.name AS name",
+    );
+    assert_eq!(rows.columns.len(), 2);
+    let table = session.binding_table(rows);
+
+    let out = session
+        .run("RETURN cardinality($t) AS n", &[("t", table.clone())])
+        .expect("a count of rows");
+    assert_eq!(out.rows[0], vec![Value::Int(2)]);
+
+    let out = session
+        .run(
+            "FOR row IN $t RETURN count(*) AS n",
+            &[("t", table.clone())],
+        )
+        .expect("a row for each row of the table");
+    assert_eq!(out.rows[0], vec![Value::Int(2)]);
+
+    let empty = session_run(
+        &mut session,
+        "MATCH (p:person) WHERE p.id < 0 RETURN p.id AS id",
+    );
+    let empty = session.binding_table(empty);
+    let out = session
+        .run("RETURN cardinality($t) AS n", &[("t", empty)])
+        .expect("a table of no rows still has a cardinality");
+    assert_eq!(out.rows[0], vec![Value::Int(0)]);
 }

@@ -50,6 +50,24 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
         .map(|i| format!("p{}", i % 50).into_bytes())
         .collect();
     let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
+    // A second string column, and the one that is not plain. Names are
+    // ASCII, which every normal form leaves alone, so a column that
+    // asks the normalization to do something has to be here for the
+    // parity queries to be worth running: the same letter written
+    // composed and decomposed, a ligature that only the compatibility
+    // forms take apart, and plain rows in among them.
+    let tags: Vec<Vec<u8>> = (0..N)
+        .map(|i| {
+            match i % 4 {
+                0 => "he\u{301}llo".to_string(),
+                1 => "h\u{e9}llo".to_string(),
+                2 => "o\u{fb01}ce".to_string(),
+                _ => format!("t{}", i % 50),
+            }
+            .into_bytes()
+        })
+        .collect();
+    let tag_refs: Vec<&[u8]> = tags.iter().map(|v| v.as_slice()).collect();
     store_props(
         &mut db,
         "person",
@@ -57,6 +75,7 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
             ("age", PropValues::Int(&age)),
             ("score", PropValues::Int(&score)),
             ("name", PropValues::Str(&name_refs)),
+            ("tag", PropValues::Str(&tag_refs)),
         ],
     )
     .unwrap();
@@ -443,6 +462,182 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) RETURN DISTINCT p.age + p.age AS b ORDER BY b",
         "MATCH (a:person {id: 1})-[:knows]->(b) RETURN b.age + 1 AS b ORDER BY b",
         "MATCH (a:person)-[:knows]->(b) RETURN sum(b.score + 1) AS s",
+        // A division whose divisor is written as a number that is not
+        // nought, which is the one division shape that cannot raise, so
+        // it is a computed column like any other.
+        "MATCH (p:person) RETURN p.score / 3 AS b",
+        "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
+        // The numeric functions over a whole number, which are kernels
+        // rather than a call per row. Once bare, once in a filter, once
+        // grouped on, and once behind a guard the row engine reads in
+        // the order it was written.
+        "MATCH (p:person) RETURN floor(p.score / 2) AS b, p.id AS id ORDER BY b, id LIMIT 20",
+        "MATCH (p:person) WHERE abs(p.age - 40) < 5 RETURN p.id AS id ORDER BY id",
+        "MATCH (p:person) RETURN sign(p.age - 40) AS s, count(*) AS n ORDER BY s",
+        "MATCH (p:person) WHERE p.age > 40 AND floor(p.score) > 2 RETURN count(*) AS n",
+        // And the half that answers a float whatever arrived, where a
+        // whole column comes back wider than it went in. A root in a
+        // filter is claimed because the rows it is asked about are the
+        // rows the old engine asked it about, and an angle stands in a
+        // projection because it has an answer for every number there is.
+        "MATCH (p:person) WHERE sqrt(p.score) > 10 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN sin(p.age) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN radians(p.age) * 2 AS b, p.id AS id ORDER BY id LIMIT 20",
+        // The three that take two numbers. A remainder by a written
+        // number that is not nought is a computed column like any
+        // other, and a power and a logarithm stand in a filter, where
+        // the rows they are asked about are the rows the old engine
+        // asked them about.
+        "MATCH (p:person) RETURN mod(p.age, 7) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // The two questions about a string whose answer is a number.
+        // Every string has a length, so a count is a computed column
+        // like a floor, and it stands in a filter and in a group key
+        // as well.
+        "MATCH (p:person) RETURN char_length(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN octet_length(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE char_length(p.name) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN char_length(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE p.age > 40 OR octet_length(p.name) > 3 RETURN count(*) AS n",
+        // The two folds, which are the first calls whose answer is a
+        // string. One in a projection, where the vector the kernel
+        // wrote has to be read back the way a stored column is, one in
+        // a filter, one as a group key, and one either side of a
+        // comparison so the folded bytes are what is compared.
+        "MATCH (p:person) RETURN upper(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN lower(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE upper(p.name) = 'ANN' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN upper(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE char_length(upper(p.name)) > 3 RETURN count(*) AS n",
+        // A folded string against the column it was folded from, which
+        // is two string vectors compared row by row with no constant
+        // either side to translate against.
+        "MATCH (p:person) WHERE upper(p.name) = p.name RETURN count(*) AS n",
+        "MATCH (p:person) WHERE lower(p.name) = p.name RETURN count(*) AS n",
+        // The trim family, which is six spellings of one loop and the
+        // kernel that answers without writing a byte. One of each end,
+        // one set of several characters, and the explicit form the
+        // standard writes with LEADING in it.
+        "MATCH (p:person) RETURN TRIM('p' FROM p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN ltrim(p.name, 'p') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN rtrim(p.name, '0123456789') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN btrim(p.name, 'p0123456789') AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN TRIM(LEADING 'p' FROM p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it was trimmed from, which is the same four
+        // places the folds are tried in.
+        "MATCH (p:person) WHERE ltrim(p.name, 'p') = '7' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN rtrim(p.name, '0123456789') AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE char_length(ltrim(p.name, 'p')) > 1 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE TRIM('p' FROM p.name) = p.name RETURN count(*) AS n",
+        // The four normal forms over the column that is not plain, and
+        // the same forms over the column that is, which the kernel
+        // answers without copying a byte. The default form is written
+        // in one of them and left out of another, since the standard
+        // supplies NFC where a statement writes nothing.
+        "MATCH (p:person) RETURN NORMALIZE(p.tag) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFC) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKC) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN NORMALIZE(p.name, NFD) AS t, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it normalized, which is the four places every
+        // string function is tried in.
+        "MATCH (p:person) WHERE NORMALIZE(p.tag, NFD) = 'he\u{301}llo' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN NORMALIZE(p.tag, NFKC) AS t, count(*) AS n ORDER BY t",
+        "MATCH (p:person) WHERE char_length(NORMALIZE(p.tag, NFD)) > 5 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE NORMALIZE(p.tag, NFC) = p.tag RETURN count(*) AS n",
+        // The predicate, which is the one string function whose answer
+        // is a truth value. Both spellings of the negation, a form
+        // written and a form left out, the column that is plain and so
+        // is in every form, and the predicate behind an AND and an OR.
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFD RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.name IS NORMALIZED NFKD RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 AND p.tag IS NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 OR p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        // The substring function, which in GQL is these two. A count
+        // the statement wrote cannot be negative, so these are the
+        // string calls that stand in a projection, and one written
+        // inside the other is how a query asks for the middle.
+        "MATCH (p:person) RETURN LEFT(p.name, 2) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.name, 1) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(p.tag, 3) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.tag, 2) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(p.name, 0) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN RIGHT(p.name, 40) AS s, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN LEFT(RIGHT(p.name, 2), 1) AS s, p.id AS id ORDER BY id LIMIT 20",
+        // In a filter, as a group key, feeding a length, and against
+        // the column it was cut from.
+        "MATCH (p:person) WHERE LEFT(p.name, 1) = 'p' RETURN count(*) AS n",
+        "MATCH (p:person) RETURN RIGHT(p.name, 1) AS d, count(*) AS n ORDER BY d",
+        "MATCH (p:person) WHERE char_length(LEFT(p.tag, 3)) > 2 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE RIGHT(p.name, 40) = p.name RETURN count(*) AS n",
+        // A count that is a column, which the fixture's ages supply and
+        // none of them is negative. A filter is where a count nobody
+        // wrote is allowed to stand, since both engines evaluate it for
+        // every row the filter sees.
+        "MATCH (p:person) WHERE LEFT(p.name, p.age) = p.name RETURN count(*) AS n",
+        "MATCH (p:person) WHERE char_length(RIGHT(p.tag, p.age)) > 4 RETURN count(*) AS n",
+        // The element family. ID of a node is the row the level
+        // already carries, so it reads where a stored column reads and
+        // the places a number can stand are the places it stands: a
+        // projection, a filter, an order, a group key and the argument
+        // of an aggregate.
+        "MATCH (p:person) RETURN ID(p) AS i ORDER BY i LIMIT 20",
+        "MATCH (p:person) WHERE ID(p) < 100 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE ID(p) = 7 RETURN p.name AS s",
+        "MATCH (p:person) WHERE ID(p) > 2900 RETURN ID(p) AS i, p.age AS a ORDER BY i",
+        "MATCH (p:person) RETURN max(ID(p)) AS m",
+        "MATCH (p:person) RETURN min(ID(p)) AS m",
+        "MATCH (p:person) WHERE p.age > 50 RETURN count(DISTINCT ID(p)) AS n",
+        "MATCH (p:person) WHERE ID(p) < 40 RETURN ID(p) AS i, count(*) AS n ORDER BY i",
+        // Two levels, where the number is what tells the ends of a hop
+        // apart. A ring in the fixture makes both directions non-empty.
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ID(a) < ID(b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ID(a) = ID(b) RETURN count(*) AS n",
+        // SAME and ALL_DIFFERENT, which ask the same question the
+        // comparison above asks and say so in one word. Two names for
+        // one level and a hop's two ends are the two shapes, and the
+        // three argument spelling walks the pairs.
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ALL_DIFFERENT(a, b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE SAME(a, b) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE SAME(a, a) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) WHERE ALL_DIFFERENT(a, a) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+         WHERE ALL_DIFFERENT(a, b, c) AND ID(a) < 20 RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+         WHERE SAME(a, c) AND ID(a) < 20 RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b:person) \
+         WHERE ALL_DIFFERENT(a, b) AND a.age > 50 RETURN count(*) AS n",
+        // ELEMENT_ID, which is the same two numbers written as the
+        // string the standard asks for. It stands where a string column
+        // stands, so the shapes are the fold's shapes: a projection, a
+        // comparison against something the statement wrote, an order, a
+        // group key, and a string function reading it.
+        "MATCH (p:person) RETURN ELEMENT_ID(p) AS e, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE ELEMENT_ID(p) = 'n:0:7' RETURN p.name AS s",
+        "MATCH (p:person) WHERE ID(p) < 30 RETURN ELEMENT_ID(p) AS e ORDER BY e",
+        "MATCH (p:person) WHERE ID(p) < 12 RETURN ELEMENT_ID(p) AS e, count(*) AS n ORDER BY e",
+        "MATCH (p:person) RETURN count(DISTINCT ELEMENT_ID(p)) AS n",
+        "MATCH (p:person) WHERE char_length(ELEMENT_ID(p)) > 6 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE ID(p) < 5 RETURN upper(ELEMENT_ID(p)) AS e ORDER BY e",
+        "MATCH (a:person)-[:knows]->(b:person) \
+         WHERE ID(a) < 20 RETURN ELEMENT_ID(a) AS x, ELEMENT_ID(b) AS y ORDER BY x, y",
+        // SIZE over a string, which counts what CHAR_LENGTH counts and
+        // runs the same kernel. A column, an order, a group key, a
+        // condition, and one over a string the statement itself made,
+        // so the kernel is reached through a register as well as
+        // straight off a stored column.
+        "MATCH (p:person) RETURN size(p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE size(p.name) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) RETURN size(p.name) AS w, count(*) AS n ORDER BY w",
+        "MATCH (p:person) WHERE size(upper(p.name)) > 3 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE size(ELEMENT_ID(p)) > 6 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and
         // answers with how many groups came out. Once on a column,
         // once on a node, once on a computed value, once on a string,
@@ -897,11 +1092,27 @@ fn fallback_queries() -> &'static [&'static str] {
         // A sort inside a WITH orders rows the pipeline is not the
         // last reader of, so the whole chain goes back.
         "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
-        // Division and modulo in a projection: the old engine raises
-        // on a zero divisor and the kernel returns null instead, so
-        // the shape stays where the error is, divisor constant or not.
-        "MATCH (p:person) RETURN p.score / 3 AS b",
-        "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
+        // A division by a column in a projection. A computed column is
+        // filled before the filter that would have dropped the row
+        // whose divisor is nought, so a condition raised here is one
+        // the old engine never reached, and the shape stays where the
+        // question of raising it belongs.
+        "MATCH (p:person) RETURN p.score / (p.id + 1) AS b",
+        "MATCH (p:person) RETURN p.age % (p.id + 1) AS b, p.id AS id",
+        // The same rule over a numeric function that has a condition
+        // behind it: the distance of the bottom integer from nought is
+        // one past the top of one, so a projection holding a distance
+        // declines where a floor would not.
+        "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
+        "MATCH (p:person) RETURN sqrt(p.score) AS b, p.id AS id",
+        "MATCH (p:person) RETURN power(p.age, 2) AS b, p.id AS id",
+        "MATCH (p:person) RETURN mod(p.age, p.id + 1) AS b, p.id AS id",
+        // And behind an OR, where the old engine reads the halves in
+        // the order they were written and never asks the second one
+        // about a row the first said yes to. An AND is not the same
+        // shape, the planner having split it into a filter apiece, and
+        // the second filter sees the rows the first one kept.
+        "MATCH (p:person) WHERE p.age > 40 OR abs(p.age - 40) > 1 RETURN count(*) AS n",
         // A correlated string end would have to carry its buffers into
         // the broadcast.
         "MATCH (a:person)-[:knows]->(b) WHERE a.name < b.name RETURN count(*) AS n",
@@ -1039,6 +1250,21 @@ fn fallback_queries() -> &'static [&'static str] {
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
+        // A trim set that is a column is a different set a row, and
+        // the kernel prepares one set for the chunk.
+        "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
+        // Whether a string is in a normal form is a truth value, and a
+        // truth value is not a column this executor carries: the
+        // predicate has a register of its own and a projection wants a
+        // vector. In a filter the same expression is claimed, which is
+        // where a query writes it.
+        "MATCH (p:person) RETURN p.tag IS NORMALIZED NFC AS b, p.id AS id ORDER BY id LIMIT 20",
+        // A count that is a column, in a projection. A string has no
+        // negative number of characters, and a computed column is
+        // filled before the filter that would have dropped the row
+        // asking for one, so this is the substring function's version
+        // of the division whose divisor is a column.
+        "MATCH (p:person) RETURN LEFT(p.name, p.age) AS s, p.id AS id ORDER BY id LIMIT 20",
     ]
 }
 
@@ -1188,6 +1414,35 @@ fn a_chunk_is_thinned_only_when_the_bound_takes_most_of_it() {
         ) > 0,
         "a bound one row in ten passes is"
     );
+}
+
+/// TRIM takes one character and raises `22027` when it is handed
+/// more. The compiler reads the written set and knows that condition
+/// is coming, so the shape goes back to the old engine and the message
+/// the statement gets is the one that engine writes, said once and in
+/// one place.
+#[test]
+fn a_trim_of_more_than_one_character_still_raises() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, _, _) = setup(&dir.path().join("trim.zu1"));
+    let err = query::run(
+        "MATCH (p:person) RETURN TRIM('p0' FROM p.name) AS b",
+        &mut db,
+        &[],
+    )
+    .expect_err("a trim of two characters has no answer");
+    let text = err.to_string();
+    assert!(text.contains("22027"), "{text}");
+    assert!(text.contains("btrim, ltrim and rtrim"), "{text}");
+    // The set a query wrote out is trimmed on the pipeline, and the
+    // same trim of a set nobody wrote is the default space.
+    let r = query::run(
+        "MATCH (p:person) WHERE p.id = 7 RETURN ltrim(p.name, 'p') AS b",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Str("7".to_string())]]);
 }
 
 #[test]

@@ -38,6 +38,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Every gate above now builds with the compiler rust-toolchain.toml
+  # names, which is what makes a red job reproduce on a developer's
+  # machine. That leaves nobody in the tree looking at the next one, and
+  # the pin has to move eventually: the day it does, whichever pull
+  # request bumps it inherits every lint and every rustfmt change that
+  # accumulated in the meantime, which is the same red main as #489 with
+  # a longer fuse. So this looks, on the newest stable, and is allowed to
+  # fail. One runner buys a yellow mark on the day a lint ships rather
+  # than a surprise inside an unrelated change months later.
+  next:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   api-model:
     runs-on: ubuntu-latest
     steps:
@@ -216,6 +238,15 @@ jobs:
             exit 0
           fi
           cargo semver-checks check-release -p zu -p zu-corpus --baseline-rev "$base" --release-type patch
+      # The tool builds the baseline in a checkout of its own under
+      # target, and takes it away again while it works. The cache action
+      # walks target when the job ends, and a directory that went while
+      # it was being read is an ENOENT that fails a job whose gates all
+      # passed. Nothing wants that tree cached anyway: it is a second
+      # copy of this repository at a commit already in git.
+      - name: Take the baseline checkout away before the cache reads it
+        if: always()
+        run: rm -rf target/semver-checks
 
   deny:
     runs-on: ubuntu-latest
@@ -254,6 +285,14 @@ jobs:
           cargo test -p zu-capi --all-features
       - if: matrix.os != 'windows-latest'
         run: cargo test --workspace --all-features
+      # The one build shape the two lines above cannot reach. libzu
+      # exports zu_result_arrow whether or not it was built with Arrow
+      # in it, answering ZU_UNSUPPORTED when it was not, and the test
+      # that says so only compiles on that side of the feature. A
+      # binding that loads this library by name is the caller that
+      # would find out the hard way.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p zu-capi --no-default-features
       # The point read path, where a walk reads one neighbor list rather
       # than decoding the group around it, only comes up on groups far
       # bigger than a test builds. This env asks for it on every list, so
@@ -284,6 +323,17 @@ jobs:
 
   miri:
     runs-on: ubuntu-latest
+    # Miri puts a random error of its own into the operations the
+    # platform does not give a guaranteed precision for, which is how a
+    # program that leans on one machine's libm gets caught. The kernels
+    # here do not lean on it, and the math tests assert the answers a
+    # power and a logarithm have on every machine: two to the third is
+    # three whatever the library did to get there. Under the random
+    # error those reads come back a bit out and the job goes red over
+    # arithmetic nobody wrote. This job is here for the unsafe, so the
+    # floats are told to behave and the aliasing is what is watched.
+    env:
+      MIRIFLAGS: -Zmiri-deterministic-floats
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -467,6 +517,19 @@ jobs:
       # sides: a chunked read that converts more than its chunk.
       - run: ZU_GATE=1 cargo bench -p zu-capi --bench result
 
+  arrow-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # What an export costs when the result is taken instead of
+      # borrowed. Both halves run over the same statement in one
+      # process, so it is a ratio and a shared runner does not move it,
+      # and it fails on exactly one defect: a copy coming back to the
+      # path whose whole point is that there is not one.
+      - run: ZU_GATE=1 cargo bench -p zu-arrow --bench export
+
   cli:
     runs-on: ubuntu-latest
     steps:
@@ -515,14 +578,14 @@ jobs:
       - run: cargo bench -p xtask --bench corpus
       # The second reader of the same files, in the language the C
       # runner is written in. It runs over every case rather than over
-      # a handful of literals, because 18 files of hand written YAML are
+      # a handful of literals, because 22 files of hand written YAML are
       # a better adversary than anything a test would think to write,
       # and it runs under both sanitizers, because a reader in C over
       # files nobody validated first is exactly where a bad index lives.
       # `-fno-sanitize-recover` because UBSan prints and carries on by
       # default, and a report nothing acts on is a report nobody reads.
       # The decoder above it gets the same treatment over the same
-      # files, which is 1475 values through the temporal parser and the
+      # files, which is 1813 values through the temporal parser and the
       # float printer on every pull request.
       - name: The C reader and decoder over every case
         run: |
@@ -615,7 +678,7 @@ jobs:
       # roughly doubles the cost, so the two readers get it, where it
       # turns "uninitialised" into the line that left it that way, and
       # the runner does not, because the runner also runs the engine
-      # over all 945 cases and that is where the minutes are.
+      # over all 1268 cases and that is where the minutes are.
       - name: The C programs under Valgrind
         run: |
           sudo apt-get update
@@ -707,6 +770,22 @@ jobs:
       # this repository's reader against its own tree.
       - run: npm test
         working-directory: grammar
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # No install step, and that is the point. What the extension
+      # decides before it talks to the editor is a command line, and
+      # nothing about deciding it needs a package: the tests run on the
+      # node that is already here, in a second, so the manifest against
+      # the code and the grammar against its generator are checked on
+      # every commit rather than at package time.
+      - run: npm test
+        working-directory: editors/vscode
 
   fuzz:
     runs-on: ubuntu-latest

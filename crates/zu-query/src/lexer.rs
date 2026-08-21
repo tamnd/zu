@@ -283,7 +283,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 continue;
             }
             b'$' => {
-                // ISO 21.10 writes a parameter two ways. One dollar
+                // ISO 21.3 writes a parameter two ways. One dollar
                 // sign is a general parameter, which holds a value,
                 // and two is a substituted parameter, which holds a
                 // reference: a graph, a binding table, a graph type or
@@ -848,7 +848,7 @@ mod tests {
         );
     }
 
-    /// ISO 21.10's two parameter spellings, the general one and the
+    /// ISO 21.3's two parameter spellings, the general one and the
     /// substituted one a reference is written with. They name the same
     /// parameter, so the name is what comes out either way, and a
     /// dollar sign with nothing behind it is still an error.

@@ -51,6 +51,56 @@ pub const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 pub const MIN_DAY: i32 = -719_162;
 pub const MAX_DAY: i32 = 2_932_896;
 
+/// What a statement answers the datetime value functions with: the
+/// instant it is running at and the displacement its session keeps.
+///
+/// It is one reading and not a call to the operating system per row,
+/// because ISO 20.27 asks that every datetime value function in one
+/// statement answer the same instant. A statement that read the clock
+/// twice could have `CURRENT_DATE` and `CURRENT_TIMESTAMP` land on two
+/// days, and a scan of ten million rows would spend ten million system
+/// calls finding that out.
+///
+/// The displacement is minutes east of UTC and never a zone name, for
+/// the reason the zoned types carry an offset: a name is a rule that
+/// changes when the zone database is updated, and a value that means
+/// something different tomorrow is not a value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Clock {
+    /// Nanoseconds since 1970-01-01T00:00:00Z.
+    pub nanos: i64,
+    /// Minutes east of UTC.
+    pub offset: i16,
+}
+
+impl Clock {
+    /// The clock read now, in UTC, which is what a statement does once
+    /// before its first row.
+    ///
+    /// The displacement is nought because zu's session time zone is
+    /// UTC, which is one of the implementation-defined choices the
+    /// standard leaves open and is written down as such. A clock before
+    /// the epoch on a machine whose time is set wrong reads as the
+    /// epoch rather than refusing, since a statement asking what time
+    /// it is has no better answer to give and no condition to raise.
+    pub fn read() -> Clock {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| i64::try_from(since.as_nanos()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        Clock { nanos, offset: 0 }
+    }
+
+    /// The instant as a zoned datetime, which is the one value the five
+    /// datetime value functions are cut out of.
+    pub fn instant(self) -> Temporal {
+        Temporal::ZonedDatetime {
+            nanos: self.nanos,
+            offset: self.offset,
+        }
+    }
+}
+
 /// One temporal value.
 ///
 /// The variants carry counts and not fields. A zoned value carries the
@@ -262,6 +312,101 @@ impl Temporal {
             DurationKind::YearMonth => Temporal::Duration(DurationKind::YearMonth, sign * months),
             DurationKind::DayTime => Temporal::Duration(DurationKind::DayTime, sign * nanos),
         })
+    }
+
+    /// The duration from `from` to `to`, of the kind asked for, or
+    /// `None` when the two are not two instants of one shape or the
+    /// answer leaves the calendar.
+    ///
+    /// This is what `DURATION_BETWEEN` answers and what a minus
+    /// between two instants answers, so the operator and the function
+    /// cannot drift apart.
+    ///
+    /// The two operands have to be the same shape. A date and a time
+    /// have no length between them, and a local datetime and a zoned
+    /// one have none either, because a local value names a wall clock
+    /// and not an instant, so the length would depend on a zone nobody
+    /// wrote.
+    ///
+    /// A day-time answer is a count of nanoseconds and needs no
+    /// calendar. A year-month answer is the largest count of whole
+    /// months that does not carry `from` past `to`, which is stated
+    /// against zu's own month addition rather than against a
+    /// comparison of day numbers. The two readings differ: 31 March to
+    /// 30 April is one month here, because 31 March plus one month is
+    /// 30 April and lands exactly on it, and is nought under a rule
+    /// that compares the days of the month first. Stating it against
+    /// the addition is what makes `from + DURATION_BETWEEN(from, to)`
+    /// land at or before `to` and one month more overshoot, and a law
+    /// that holds is worth more than agreement with a rule that does
+    /// not.
+    ///
+    /// A backwards answer truncates toward nought the same way, so the
+    /// two directions are not mirror images when a month is clipped.
+    pub fn between(from: Temporal, to: Temporal, kind: DurationKind) -> Option<Temporal> {
+        if std::mem::discriminant(&from) != std::mem::discriminant(&to) {
+            return None;
+        }
+        let count = match kind {
+            DurationKind::DayTime => to.elapsed()?.checked_sub(from.elapsed()?)?,
+            DurationKind::YearMonth => {
+                let ((day_a, time_a), (day_b, time_b)) = (from.civil()?, to.civil()?);
+                let (year_a, month_a, _) = civil_from_days(day_a);
+                let (year_b, month_b, _) = civil_from_days(day_b);
+                let mut months = (i64::from(year_b) * 12 + i64::from(month_b))
+                    - (i64::from(year_a) * 12 + i64::from(month_a));
+                // The count read off the year and the month alone is
+                // out by at most one, in whichever direction the day
+                // and the time of day fall, so one step settles it.
+                if months != 0 {
+                    let landed = (add_months(day_a, months)?, time_a);
+                    let past = if months > 0 {
+                        landed > (day_b, time_b)
+                    } else {
+                        landed < (day_b, time_b)
+                    };
+                    if past {
+                        months -= months.signum();
+                    }
+                }
+                months
+            }
+        };
+        Some(Temporal::Duration(kind, count))
+    }
+
+    /// The instant this value names, as one number in a frame the same
+    /// shape shares: nanoseconds since the epoch for a datetime, since
+    /// midnight for a time, and since the epoch for a date. `None` for
+    /// a duration, which names no instant.
+    fn elapsed(self) -> Option<i64> {
+        Some(match self {
+            Temporal::Date(days) => i64::from(days).checked_mul(NANOS_PER_DAY)?,
+            Temporal::LocalTime(nanos) | Temporal::LocalDatetime(nanos) => nanos,
+            Temporal::ZonedTime { nanos, offset } => {
+                nanos.checked_sub(i64::from(offset) * NANOS_PER_MINUTE)?
+            }
+            Temporal::ZonedDatetime { nanos, .. } => nanos,
+            Temporal::Duration(_, _) => return None,
+        })
+    }
+
+    /// The calendar day this value falls on and the nanoseconds into
+    /// that day, read on the value's own wall clock. `None` for the
+    /// values that have no calendar: the two times and a duration.
+    fn civil(self) -> Option<(i32, i64)> {
+        let local = match self {
+            Temporal::Date(days) => return Some((days, 0)),
+            Temporal::LocalDatetime(nanos) => nanos,
+            Temporal::ZonedDatetime { nanos, offset } => {
+                nanos.checked_add(i64::from(offset) * NANOS_PER_MINUTE)?
+            }
+            Temporal::LocalTime(_) | Temporal::ZonedTime { .. } | Temporal::Duration(_, _) => {
+                return None;
+            }
+        };
+        let days = i32::try_from(local.div_euclid(NANOS_PER_DAY)).ok()?;
+        Some((days, local.rem_euclid(NANOS_PER_DAY)))
     }
 }
 

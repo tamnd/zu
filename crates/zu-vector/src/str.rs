@@ -104,6 +104,30 @@ impl StrView {
         }
     }
 
+    /// A view over `len` bytes of this string starting at `start`,
+    /// where `bytes` is what [`Self::bytes`] answered for it.
+    ///
+    /// A part of a string is bytes that are already somewhere, so this
+    /// makes no bytes and copies none: a part short enough goes inline
+    /// and a longer one names the buffer and offset this view names,
+    /// moved along by where the part begins. That is what a trim wants,
+    /// since what a trim answers is always a part of what it was
+    /// handed, and it is why a chunk of trimmed strings can cost no
+    /// bytes at all beyond the views themselves.
+    ///
+    /// A part longer than the inline limit can only have come from a
+    /// view that was already long, so the buffer it names is there to
+    /// name.
+    pub fn sub(&self, bytes: &[u8], start: usize, len: usize) -> Self {
+        debug_assert!(start + len <= self.len());
+        let part = &bytes[start..start + len];
+        if len <= INLINE_LEN {
+            Self::inline(part)
+        } else {
+            Self::long(part, self.buffer_id(), self.offset() + start as u32)
+        }
+    }
+
     /// Equality without materializing either side. The length and prefix
     /// word reject most non-equal pairs before any buffer is touched.
     pub fn eq_with(&self, a_bufs: &StrBuffers, other: &StrView, b_bufs: &StrBuffers) -> bool {
@@ -159,9 +183,19 @@ pub struct StrBuffers {
     bufs: Vec<Buf>,
 }
 
+/// A vector whose views are all short carries no buffers at all, and a
+/// kernel resolving one still has to hand something to `bytes`. This is
+/// that something, and being a constant it costs nothing to have.
+pub static NO_BUFFERS: StrBuffers = StrBuffers::empty();
+
 impl StrBuffers {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// No buffers at all, in a form a static can hold.
+    pub const fn empty() -> Self {
+        Self { bufs: Vec::new() }
     }
 
     /// Register an allocation of the engine's own and get its id.
@@ -227,6 +261,74 @@ impl StrBuffers {
         // Safe by `Buf`'s own contract: the bytes are alive while the
         // owner is, the owner is held here, and the range is checked.
         unsafe { std::slice::from_raw_parts(buf.ptr.add(start), len) }
+    }
+}
+
+/// Where a kernel puts the bytes of the strings it makes.
+///
+/// A kernel that answers a number writes into a register the arena
+/// already sized for it. A kernel that answers a string has no such
+/// room, because how many bytes a chunk of answers comes to is not
+/// known until the answers are made, so the bytes go here instead and
+/// the vector's views point back into them. Short answers never reach
+/// the buffer at all, a view of twelve bytes or fewer carrying its own
+/// payload, so a column of words costs one vector and nothing else.
+///
+/// The whole chunk shares one buffer, which is one allocation for a
+/// call rather than one per row, and the views hold offsets rather
+/// than pointers so the buffer may grow underneath them.
+#[derive(Default)]
+pub struct StrBuilder {
+    long: Vec<u8>,
+}
+
+impl StrBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Room for the long answers of a chunk, when the caller can say
+    /// what that comes to. An answer no longer than what it was made
+    /// from is the common case, so the input's byte count is the usual
+    /// argument and the usual outcome is that the buffer never grows.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            long: Vec::with_capacity(bytes),
+        }
+    }
+
+    /// Room for a string of `len` bytes, filled by `fill`, answered as
+    /// the view that reads it back.
+    ///
+    /// The caller writes into the answer rather than handing one over,
+    /// so a fold or a trim costs no working string of its own.
+    pub fn push_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> StrView {
+        if len <= INLINE_LEN {
+            let mut inline = [0u8; INLINE_LEN];
+            fill(&mut inline[..len]);
+            StrView::inline(&inline[..len])
+        } else {
+            let start = self.long.len();
+            self.long.resize(start + len, 0);
+            fill(&mut self.long[start..]);
+            // Buffer nought, which is the only buffer `finish` makes.
+            StrView::long(&self.long[start..], 0, start as u32)
+        }
+    }
+
+    /// A string already in hand, copied in.
+    pub fn push(&mut self, bytes: &[u8]) -> StrView {
+        self.push_with(bytes.len(), |dst| dst.copy_from_slice(bytes))
+    }
+
+    /// The buffers the views this handed out read through. A chunk
+    /// whose answers were all short leaves no buffer behind.
+    pub fn finish(self) -> StrBuffers {
+        let mut bufs = StrBuffers::new();
+        if !self.long.is_empty() {
+            bufs.push(Arc::from(self.long.into_boxed_slice()));
+        }
+        bufs
     }
 }
 
@@ -325,6 +427,24 @@ mod tests {
         assert!(a.eq_with(&bufs, &b, &bufs));
         let short = StrView::inline(b"hello");
         assert!(!a.eq_with(&bufs, &short, &bufs));
+    }
+
+    /// A part of a long string keeps pointing at the bytes it was
+    /// always pointing at, and a part short enough to sit in a view
+    /// stops needing the buffer at all.
+    #[test]
+    fn a_part_of_a_string_points_back_at_it() {
+        let mut bufs = StrBuffers::new();
+        let payload: Arc<[u8]> = Arc::from(&b"  a string long enough to need a buffer  "[..]);
+        let id = bufs.push(Arc::clone(&payload));
+        let whole = StrView::long(&payload, id, 0);
+        let bytes = whole.bytes(&bufs);
+        let inner = whole.sub(bytes, 2, payload.len() - 4);
+        assert!(!inner.is_inline());
+        assert_eq!(inner.bytes(&bufs), b"a string long enough to need a buffer");
+        let head = whole.sub(bytes, 2, 8);
+        assert!(head.is_inline(), "a short part carries its own bytes");
+        assert_eq!(head.bytes(&StrBuffers::new()), b"a string");
     }
 
     #[test]

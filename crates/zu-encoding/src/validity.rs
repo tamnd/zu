@@ -105,8 +105,10 @@ impl Validity {
             .get(8..8 + n_words * 8)
             .ok_or_else(|| corrupt("truncated body"))?;
         let words: Vec<u64> = body
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         let v = Self { len, words };
         if v.count_valid() != set_count {

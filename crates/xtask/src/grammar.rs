@@ -65,6 +65,14 @@ pub const CHECKOUT: &str = "ZU_TREE_SITTER";
 /// The TextMate grammar Shiki reads, written from the list.
 pub const TEXTMATE: &str = "grammar/shiki/gql.tmLanguage.json";
 
+/// The same grammar again, inside the VS Code extension.
+///
+/// A second copy rather than a reference, because a `.vsix` is a zip of
+/// one directory and a package cannot reach outside itself. It is
+/// written by the same generator and checked by the same `--check`, so
+/// the copy cannot drift, which is the only property that matters.
+pub const EXTENSION: &str = "editors/vscode/syntaxes/gql.tmLanguage.json";
+
 /// A checkout of the tree-sitter grammar, and its `grammar.js`.
 ///
 /// The grammar is a repository of its own, because most of what it
@@ -310,9 +318,14 @@ impl Vocabulary {
                 text: self.highlights(&ts.js),
             });
         }
+        let textmate = self.textmate();
+        out.push(Generated {
+            path: root.join(EXTENSION),
+            text: textmate.clone(),
+        });
         out.push(Generated {
             path: root.join(TEXTMATE),
-            text: self.textmate(),
+            text: textmate,
         });
         out
     }
@@ -784,7 +797,7 @@ pub fn queries(cases: &Path, out: &Path) -> Result<(usize, usize), String> {
             // it is as much a case for the grammar as the one under
             // test, and the suites that write a graph write it there.
             for (n, setup) in case.setup.iter().enumerate() {
-                write_query(&out.join(format!("{stem}--setup-{n}.gql")), setup)?;
+                write_query(&out.join(format!("{stem}--setup-{n}.gql")), &setup.query)?;
                 taken += 1;
             }
         }

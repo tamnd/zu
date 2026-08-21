@@ -15,6 +15,10 @@ Cargo.lock
 # The node modules of the grammar checks, which npm puts here and
 # nothing else reads.
 /grammar/node_modules
+# The same for the VS Code extension, whose own tests need none of them
+# and whose package step is the only thing that installs any.
+/editors/vscode/node_modules
+/editors/vscode/*.vsix
 # CI clones the editor's grammar here so that `cargo xtask grammar`
 # audits all three highlighters, and a person may do the same rather
 # than keeping it beside this one.

@@ -15,7 +15,7 @@ use zu_common::{Result, ZuError};
 
 use crate::bitmap::Bitmap;
 use crate::sel::SelVector;
-use crate::str::StrView;
+use crate::str::{NO_BUFFERS, StrView};
 use crate::vector::{PhysType, ValueVector, VecEncoding};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,13 +73,15 @@ fn pack_stage(stage: &[u8], out: &mut Bitmap) {
     let words = out.words_mut();
     for (wi, group) in stage.chunks(64).enumerate() {
         let mut w = 0u64;
-        let mut octets = group.chunks_exact(8);
-        for (k, bytes) in octets.by_ref().enumerate() {
-            let v = u64::from_le_bytes(bytes.try_into().expect("octet"));
-            w |= pack8(v) << (8 * k);
+        // Eights as arrays rather than as slices, so the octet is the
+        // type `from_le_bytes` wants and the fallible conversion that
+        // could never fail goes away with it.
+        let (octets, tail) = group.as_chunks::<8>();
+        for (k, bytes) in octets.iter().enumerate() {
+            w |= pack8(u64::from_le_bytes(*bytes)) << (8 * k);
         }
         let base = group.len() / 8 * 8;
-        for (b, &s) in octets.remainder().iter().enumerate() {
+        for (b, &s) in tail.iter().enumerate() {
             w |= u64::from(s) << (base + b);
         }
         words[wi] = w;
@@ -339,6 +341,44 @@ fn cmp_str(
             Ok(())
         }
         (VecEncoding::Constant, VecEncoding::Flat) => cmp_str(op.flip(), r, l, sel, out),
+        // Two columns of strings, row against row. Neither side is one
+        // value the other can be translated against, so this is the arm
+        // with no trick in it: the views are compared where they lie.
+        // Equality still avoids most of the payloads, `eq_with`
+        // rejecting a pair on its length and its four byte prefix
+        // before either side is resolved, and an ordering has to look
+        // at the bytes.
+        (VecEncoding::Flat, VecEncoding::Flat) => {
+            let (lb, rb) = (
+                l.str_buffers().unwrap_or(&NO_BUFFERS),
+                r.str_buffers().unwrap_or(&NO_BUFFERS),
+            );
+            let (lv, rv) = (l.values::<StrView>(), r.values::<StrView>());
+            let eval = |i: usize| -> bool {
+                match op {
+                    CmpOp::Eq => lv[i].eq_with(lb, &rv[i], rb),
+                    CmpOp::Ne => !lv[i].eq_with(lb, &rv[i], rb),
+                    _ => op.holds(lv[i].bytes(lb), rv[i].bytes(rb)),
+                }
+            };
+            match sel {
+                None => {
+                    for i in 0..lv.len().min(rv.len()) {
+                        if eval(i) {
+                            out.set(i);
+                        }
+                    }
+                }
+                Some(s) => {
+                    for &row in s.as_slice() {
+                        if eval(row as usize) {
+                            out.set(row as usize);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => unsupported(l, r),
     }
 }

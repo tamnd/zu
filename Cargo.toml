@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "Apache-2.0"
 repository = "https://github.com/tamnd/zu"
 authors = ["Tam Nguyen <tamnd87@gmail.com>"]
@@ -29,9 +29,9 @@ zu-corpus = { path = "crates/zu-corpus" }
 thiserror = "2"
 crc32c = "0.6"
 zstd = "0.13"
-ruzstd = "0.8"
+ruzstd = "0.9"
 object_store = { version = "0.14", default-features = false }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 arrow-array = "59"
 arrow-schema = "59"
@@ -51,8 +51,18 @@ all = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
 
+# One codegen unit per crate rather than the sixteen cargo splits a
+# release into. The units are compiled apart and each one carries its
+# own copy of whatever it inlined, so the same generic instantiated in
+# two of them is in the binary twice, and a tree that is mostly generic
+# kernels pays that everywhere. Measured on aarch64-apple-darwin the CLI
+# went from 13.01 MiB to 11.36, which is an eighth of it, and the build
+# it costs is under two minutes more. The ceiling in platforms.toml is
+# 15 MiB and the vector kernels had walked it to 15.48 on the ELF rows,
+# so this is the room the rest of them land in.
 [profile.release]
 lto = "thin"
+codegen-units = 1
 strip = true
 
 # Benches keep symbols so check_asm.sh and profilers can find the

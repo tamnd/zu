@@ -224,6 +224,50 @@ fn flat_str_compare_matches_reference() {
     }
 }
 
+/// Two string columns compared row against row, which is the arm with
+/// no constant to translate against and the one an engine reaches when
+/// a query compares two properties or a property with what a function
+/// made of it. The strings run either side of the twelve bytes a view
+/// holds, so equality is settled on the prefix for some pairs and in a
+/// buffer for others, and the answer has to be the same either way.
+#[test]
+fn flat_str_pair_compare_matches_reference() {
+    let mut rng = Rng(0xB5026F5AA96619E9);
+    let word = |rng: &mut Rng| -> String {
+        let n = rng.below(30) as usize;
+        (0..n)
+            .map(|_| (b'a' + rng.below(4) as u8) as char)
+            .collect()
+    };
+    for round in 0..20 {
+        let len = 1 + rng.below(512) as usize;
+        let left: Vec<String> = (0..len).map(|_| word(&mut rng)).collect();
+        // Half the rows repeat the left side, so equality is not a
+        // question the generator answers no to every time.
+        let right: Vec<String> = left
+            .iter()
+            .map(|l| {
+                if rng.below(2) == 0 {
+                    l.clone()
+                } else {
+                    word(&mut rng)
+                }
+            })
+            .collect();
+        let mut arena = MorselArena::new();
+        let lv = str_vector(&mut arena, &left);
+        let rv = str_vector(&mut arena, &right);
+        for op in OPS {
+            let mut bits = Bitmap::new_in(&mut arena, len, false);
+            kernels::compare(op, &lv, &rv, None, &mut bits).unwrap();
+            for i in 0..len {
+                let want = holds(op, left[i].as_bytes(), right[i].as_bytes());
+                assert_eq!(bits.get(i), want, "round {round} op {op:?} row {i}");
+            }
+        }
+    }
+}
+
 #[test]
 fn selection_algebra_composes() {
     let mut rng = Rng(0x243F6A8885A308D3);

@@ -1,6 +1,6 @@
 schema = 1
 doc = "The words of zuQL, grouped by what they are, for the three things that colour them."
-audited = "2026-08-20"
+audited = "2026-08-21"
 
 # One list of words, three consumers. The shell scans a statement as it
 # is typed and colours the words it recognises, the tree-sitter grammar
@@ -89,17 +89,17 @@ words = ["INSERT", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "CALL"]
 
 [[group]]
 kind = "keyword"
-doc = "The transaction statements, which the parser reads and the session runs, since a transaction outlives the statement that opened it."
-words = ["START", "COMMIT", "ROLLBACK"]
+doc = "The transaction statements, which the parser reads and the session runs, since a transaction outlives the statement that opened it. TRANSACTION is the noun START takes and takes alone, and the access mode behind it is READ ONLY or READ WRITE, ISO 13.3. The three mode words are contextual the way the interval fields are: nothing but a START puts them where they mean anything, so READ is an ordinary variable name everywhere else and RETURN read is a variable read."
+words = ["START", "TRANSACTION", "COMMIT", "ROLLBACK", "READ", "ONLY", "WRITE"]
 
 [[group]]
 kind = "keyword"
-doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word."
-words = ["MERGE", "SESSION"]
+doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word. ON is here because a MERGE is the only place it stands, in the ON CREATE SET and ON MATCH SET that say which of the two the MERGE did, and a word only a refused statement can hold is refused along with it."
+words = ["MERGE", "SESSION", "ON"]
 
 [[group]]
 kind = "keyword"
-doc = "The fields an interval qualifier is written with, and the TO that names a range of them. ISO 21.5 gives a duration a second spelling, a string with a qualifier behind it, and the qualifier is the whole of what says how to read the string: '1-2' is a year and two months under YEAR TO MONTH and is no duration at all under DAY. A field word can only stand behind an interval string, so each of these is an ordinary variable name everywhere else, and DAY is the same kind of word DATE is."
+doc = "The fields an interval qualifier is written with, and the TO that names a range of them. ISO 21.2 gives a duration a second spelling, a string with a qualifier behind it, and the qualifier is the whole of what says how to read the string: '1-2' is a year and two months under YEAR TO MONTH and is no duration at all under DAY. A field word can only stand behind an interval string, so each of these is an ordinary variable name everywhere else, and DAY is the same kind of word DATE is."
 words = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "TO"]
 
 [[group]]
@@ -109,13 +109,43 @@ words = ["NULL", "TRUE", "FALSE"]
 
 [[group]]
 kind = "function"
-doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, ELEMENT_ID, PATH_LENGTH and ELEMENTS are the four that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. ELEMENT_ID is ISO 20.10 and ID is zu's own, older function: one answers a string that names any element, the other a node's offset as a number, and both keep the name they are asked for. The last seven are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII. NORMALIZE is written like a call and is not one, because its second argument is a normal form and not a value, which is the arrangement CAST has."
-words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "ELEMENT_ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM", "NORMALIZE"]
+doc = "The built-ins the binder resolves by name. The first eleven are the set functions and the rest are scalar; COLLECT_LIST is ISO 20.9's name for the one COLLECT is openCypher's name for, and both spellings reach the one function; PERCENTILE_CONT and PERCENTILE_DISC are the two that take a second argument, the fraction of the way through the group to answer, and it is the one place a set function takes an argument that is not about the rows; ID, ELEMENT_ID, PATH_LENGTH and ELEMENTS are the four that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. ELEMENT_ID is ISO 20.10 and ID is zu's own, older function: one answers a string that names any element, the other a node's offset as a number, and both keep the name they are asked for. The last seven are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII. NORMALIZE is written like a call and is not one, because its second argument is a normal form and not a value, which is the arrangement CAST has."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT_LIST", "COLLECT", "STDDEV_SAMP", "STDDEV_POP", "PERCENTILE_CONT", "PERCENTILE_DISC", "ID", "ELEMENT_ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM", "NORMALIZE"]
 
 [[group]]
 kind = "function"
-doc = "The numeric library of ISO 20.16, 20.17 and 20.18. The first six are the exact ones, which answer the type they were given, and CEILING is the long spelling of CEIL; ROUND is the one of the six that takes a second argument, the number of digits to keep, and a negative count of digits rounds to tens and hundreds. MOD and POWER take two arguments and the rest take one. The other fifteen are approximate and answer a float whatever they were handed, because a square root, a logarithm and a sine are not exact numbers and a function that answered an integer for SQRT(4) and a float for SQRT(2) would be two functions wearing one name. LOG takes the base first and the value second, which is the order ISO 20.18 gives it and the opposite of the order a school book writes."
+doc = "The numeric library of ISO 20.22. The first six are the exact ones, which answer the type they were given, and CEILING is the long spelling of CEIL; ROUND is the one of the six that takes a second argument, the number of digits to keep, and a negative count of digits rounds to tens and hundreds. MOD and POWER take two arguments and the rest take one. The other fifteen are approximate and answer a float whatever they were handed, because a square root, a logarithm and a sine are not exact numbers and a function that answered an integer for SQRT(4) and a float for SQRT(2) would be two functions wearing one name. LOG takes the base first and the value second, which is the order ISO 20.22 gives it and the opposite of the order a school book writes."
 words = ["ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "SIGN", "MOD", "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "DEGREES", "RADIANS"]
+
+[[group]]
+kind = "function"
+doc = "The multi-character trim functions of ISO 20.24, which take a set of characters rather than one. TRIM itself is in the list above, being older here than these three are, and it trims one character and raises a trim error when it is handed more, which is the whole reason these three exist."
+words = ["BTRIM", "LTRIM", "RTRIM"]
+
+[[group]]
+kind = "function"
+doc = "The substring function of ISO 20.24, which in GQL is these two and nothing else. LEFT takes the first characters of a string and RIGHT the last, both counting characters rather than bytes, and a query that wants the middle of a string writes one inside the other. SUBSTRING is not here and is not a function: the standard lists the word among the ones it has reserved for a later edition to give a meaning to, and giving it one here would be inventing a spelling that a later edition could take back."
+words = ["LEFT", "RIGHT"]
+
+[[group]]
+kind = "keyword"
+doc = "The datetime value functions of ISO 20.27 that ask what time the statement is running at. They are keywords here rather than functions because that is how four of the five are written: the grammar gives them no parentheses, so CURRENT_DATE stands alone and CURRENT_DATE() is a call to a function nobody defined. LOCAL_TIME is the one the standard writes both ways, bare or bracketed, and it is a keyword here because that is the spelling a shell colouring a half typed statement will see. The three CURRENT words answer in the session's time zone and the two LOCAL ones answer without a zone at all. Every one of them in a statement answers the same instant, so a query returning CURRENT_DATE beside CURRENT_TIMESTAMP cannot have them land on two different days."
+words = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCAL_TIME", "LOCAL_TIMESTAMP"]
+
+[[group]]
+kind = "function"
+doc = "The constructors of ISO 20.27 and the DURATION of ISO 20.29, which read a temporal value out of a string instead of out of the clock. Three of the six words are here and three are not, because a word is written once and DATE and DURATION are already type names and LOCAL_TIME is already one of the bare words above. Each takes one string, or nothing at all, and empty brackets read the clock and answer what the bare word beside them answers, so DATE() is CURRENT_DATE and ZONED_DATETIME() is CURRENT_TIMESTAMP. DURATION is the one with no empty form, there being a date now and a time now and no length of time now, and the other duration function of 20.29 is ABS, which answers the length of a duration without its sign."
+words = ["ZONED_TIME", "ZONED_DATETIME", "LOCAL_DATETIME"]
+
+[[group]]
+kind = "function"
+doc = "The datetime subtraction of ISO 20.28, which answers the length of time from the first datetime to the second. A qualifier may stand behind the closing bracket, YEAR TO MONTH or DAY TO SECOND and neither of the other four runs of fields, and it says which of the two duration kinds the answer is. Leaving it out reads as DAY TO SECOND, which is the same answer a minus between the two datetimes gives. The two arguments have to be the same shape, since a date and a time have no length between them and neither has a local datetime and a zoned one."
+words = ["DURATION_BETWEEN"]
+
+[[group]]
+kind = "keyword"
+doc = "The trim specification, which names the end of the string TRIM takes characters off, and the FROM that separates what is trimmed from what it is trimmed out of. They are words rather than arguments because an end of a string is not a value a row can hold, which is the arrangement a normal form has. FROM is here and nowhere else: a GQL query reads its rows from a pattern rather than from a table, so this is the one place the word stands."
+words = ["LEADING", "TRAILING", "BOTH", "FROM"]
 
 [[group]]
 kind = "keyword"

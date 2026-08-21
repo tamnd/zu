@@ -48,11 +48,21 @@
 //! is a no-op on `NULL` (R8). Where the contract can be checked it is,
 //! rather than left as undefined behaviour: see [`ConnState`].
 //!
-//! Results read out column-at-a-time: `zu_result_col_i64` materializes
-//! a whole column into a contiguous buffer once, so a host crossing an
-//! FFI boundary pays one call per column, not one per cell. That is
-//! the difference between an in-process point read spending its budget
-//! on the query or on the boundary.
+//! Results read out column-at-a-time: `zu_result_col_i64` hands back a
+//! whole column as a contiguous buffer, so a host crossing an FFI
+//! boundary pays one call per column, not one per cell. That is the
+//! difference between an in-process point read spending its budget on
+//! the query or on the boundary.
+//!
+//! Where the executor filled the column itself, which is every plan
+//! whose projection is a scan of stored values, that buffer is the
+//! executor's own and the call is a bounds check and a pointer. The
+//! rest, a sort or a computed expression among them, come back as rows
+//! and are converted one column at a time on the first call that asks
+//! for one, which is still one pass rather than one per cell. Which of
+//! the two happened is not something a caller can see or has to care
+//! about: the values, the nulls and the lifetime are the same either
+//! way.
 //!
 //! The same columns read out a chunk at a time as well, through
 //! `zu_result_chunk_count`, `zu_result_chunk`, and the
@@ -112,6 +122,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Temporal};
+use zudb::query::column::{HeldColumn, HeldData};
 use zudb::query::{QueryResult, Value};
 use zudb::zu1::catalog::Catalog;
 use zudb::zu1::file::Zu1File;
@@ -663,6 +674,11 @@ unsafe fn conn_registered<'a>(conn: *mut ZuConn) -> &'a mut Vec<String> {
     unsafe { &mut (*conn).registered }
 }
 
+/// Where the last table name asked for is kept, under a [`Claim`].
+unsafe fn conn_table<'a>(conn: *mut ZuConn) -> &'a mut Option<CString> {
+    unsafe { &mut (*conn).table }
+}
+
 /// The word a running statement reads, cloned so the caller holds no
 /// borrow. This is the one field a second thread touches on purpose
 /// while the first is inside a call.
@@ -714,6 +730,10 @@ pub struct ZuConn {
     /// pointers into them and a name has to be somewhere to be pointed
     /// at.
     registered: Vec<String>,
+    /// The last name [`zu_conn_table_name`] handed out, for the same
+    /// reason: the catalog's copy goes away when the next statement
+    /// changes the catalog, so what the caller holds is this one.
+    table: Option<CString>,
 }
 
 impl ZuConn {
@@ -728,6 +748,7 @@ impl ZuConn {
             stop,
             progress: Mutex::new(None),
             registered: Vec::new(),
+            table: None,
         }
     }
 
@@ -2161,17 +2182,194 @@ fn fill<T>(
     true
 }
 
+/// What the sink's own buffers can answer for one accessor.
+///
+/// The executor fills columns and the sink keeps them, so on the plans
+/// that fill them there is nothing to convert and nothing to walk: a
+/// column of integers already is a contiguous `i64` buffer at an
+/// address that lives as long as the result. [`Served::Lent`] is that
+/// address. Everything else is here because the sink's layout and the
+/// accessor's are not always the same shape, and the fallbacks are
+/// still one pass over one column rather than a pass over the rows.
+#[derive(Clone, Copy)]
+enum Served<T> {
+    /// The buffer the executor filled, at the row the span starts at.
+    /// Nothing was copied, nothing was built, and the pointer is the
+    /// engine's own for as long as the result is.
+    Lent(*const T),
+    /// Written into the buffer the accessor was given, because the
+    /// layout the sink kept is not the one this accessor hands out: a
+    /// bool column is bits, a validity answer is a byte a row, a node
+    /// column is values. One pass over the column, and still no rows.
+    Made,
+    /// The column holds something this accessor does not read, which is
+    /// the same answer the walk over rows would have reached.
+    Refused,
+    /// The sink kept no columns, so the rows are the only answer there
+    /// is. This is a result the executor built across rows, which is
+    /// anything with a sort or a group above the projection.
+    Rows,
+}
+
+/// One bit of a packed bitmap, least significant bit first, which is
+/// the packing a bool column and a validity bitmap both use.
+fn bit(bits: &[u8], at: usize) -> bool {
+    bits.get(at / 8).is_some_and(|b| b & (1u8 << (at % 8)) != 0)
+}
+
+/// The sink's buffer over the span, handed back as it stands.
+///
+/// A span the buffer does not cover is not something to answer with a
+/// pointer into it, so that falls back to the rows rather than trusting
+/// a length two layers away.
+fn lend<T>(values: &[T], span: std::ops::Range<usize>) -> Served<T> {
+    match values.get(span) {
+        Some(slice) => Served::Lent(slice.as_ptr()),
+        None => Served::Rows,
+    }
+}
+
+/// A cell a row is missing reads as the type's zero, which is what the
+/// three numeric accessors promise and what the sink writes into the
+/// flat buffers anyway. A column of nothing but nulls has no buffer to
+/// read it out of, so this is where that column's answer comes from.
+fn zeros<T: Default + Clone>(buf: &mut Vec<T>, span: std::ops::Range<usize>) -> Served<T> {
+    buf.resize(span.len(), T::default());
+    Served::Made
+}
+
+/// The values of a column no buffer covers, read through the accessor's
+/// own reader, which is the same function the walk over rows uses and
+/// so cannot come to a different answer.
+fn convert<T>(
+    values: &[Value],
+    span: std::ops::Range<usize>,
+    buf: &mut Vec<T>,
+    read: fn(&Value) -> Option<T>,
+) -> Served<T> {
+    let Some(values) = values.get(span) else {
+        return Served::Rows;
+    };
+    buf.reserve(values.len());
+    for v in values {
+        match read(v) {
+            Some(v) => buf.push(v),
+            None => return Served::Refused,
+        }
+    }
+    Served::Made
+}
+
+/// [`zu_result_col_i64`] out of the sink's buffers. An integer column
+/// is the buffer itself.
+fn held_i64(col: &HeldColumn, span: std::ops::Range<usize>, buf: &mut Vec<i64>) -> Served<i64> {
+    match &col.data {
+        HeldData::Int(values) => lend(values, span),
+        HeldData::Null => zeros(buf, span),
+        HeldData::Bool { bits } => {
+            buf.extend(span.map(|at| i64::from(bit(bits, at))));
+            Served::Made
+        }
+        HeldData::Complex(values) => convert(values, span, buf, as_i64),
+        HeldData::Float(_) | HeldData::Str(_) => Served::Refused,
+    }
+}
+
+/// [`zu_result_col_f64`] out of the sink's buffers. A real column is
+/// the buffer itself, and an integer column widens the way the walk
+/// over rows widens it.
+fn held_f64(col: &HeldColumn, span: std::ops::Range<usize>, buf: &mut Vec<f64>) -> Served<f64> {
+    match &col.data {
+        HeldData::Float(values) => lend(values, span),
+        HeldData::Null => zeros(buf, span),
+        HeldData::Int(values) => {
+            let Some(values) = values.get(span) else {
+                return Served::Rows;
+            };
+            buf.extend(values.iter().map(|&n| n as f64));
+            Served::Made
+        }
+        HeldData::Complex(values) => convert(values, span, buf, as_f64),
+        HeldData::Bool { .. } | HeldData::Str(_) => Served::Refused,
+    }
+}
+
+/// [`zu_result_col_node_offset`] out of the sink's buffers. A node is
+/// one of the values no buffer covers, so this reads the offsets out of
+/// the column rather than out of the rows. The offsets themselves are
+/// not contiguous anywhere, which is the one accessor here that still
+/// costs a pass.
+fn held_node(col: &HeldColumn, span: std::ops::Range<usize>, buf: &mut Vec<u64>) -> Served<u64> {
+    match &col.data {
+        HeldData::Complex(values) => convert(values, span, buf, as_node_offset),
+        HeldData::Null => zeros(buf, span),
+        HeldData::Int(_) | HeldData::Float(_) | HeldData::Str(_) | HeldData::Bool { .. } => {
+            Served::Refused
+        }
+    }
+}
+
+/// [`zu_result_col_valid`] out of the sink's buffers, which is the
+/// validity bitmap unpacked to a byte a row. No column refuses this
+/// one: every column has nulls or does not.
+fn held_valid(col: &HeldColumn, span: std::ops::Range<usize>, buf: &mut Vec<u8>) -> Served<u8> {
+    // A column of nothing but nulls keeps no bitmap, because every row
+    // of it is the same answer and a buffer saying so twice is a buffer
+    // for nothing.
+    if let HeldData::Null = col.data {
+        buf.resize(span.len(), 0);
+        return Served::Made;
+    }
+    match &col.validity {
+        Some(valid) => {
+            buf.extend(span.map(|at| u8::from(bit(&valid.bits, at))));
+            Served::Made
+        }
+        // Absent where nothing is null, which is most columns.
+        None => {
+            buf.resize(span.len(), 1);
+            Served::Made
+        }
+    }
+}
+
+/// One column of the sink's, through the accessor that reads it, or
+/// [`Served::Rows`] when there is no such column to read.
+///
+/// The span is checked against the result's own row count rather than
+/// against the buffer's length, because a lent pointer is read for as
+/// many rows as the caller was told the result has.
+fn served<T>(
+    r: &ZuResult,
+    c: usize,
+    span: std::ops::Range<usize>,
+    buf: &mut Vec<T>,
+    held: fn(&HeldColumn, std::ops::Range<usize>, &mut Vec<T>) -> Served<T>,
+) -> Served<T> {
+    match r.result.rows.columns() {
+        Some(cols) if span.end <= cols.rows => match cols.columns.get(c) {
+            Some(col) => held(col, span, buf),
+            None => Served::Rows,
+        },
+        _ => Served::Rows,
+    }
+}
+
 /// The body every whole-column accessor shares: check the handle and
 /// the index, answer `Done` for a result with no rows, and otherwise
-/// build the column once and hand back a pointer into it. `read`
-/// answering `None` for any cell means the column holds something this
-/// accessor does not read, which is the caller asking the wrong
-/// question and so misuse rather than an engine failure.
+/// hand back a pointer to the whole column. The sink's own buffer where
+/// there is one, since that is the buffer the caller asked for and it
+/// already exists, and otherwise the column built once out of the rows
+/// and kept until the result is freed. `read` answering `None` for any
+/// cell means the column holds something this accessor does not read,
+/// which is the caller asking the wrong question and so misuse rather
+/// than an engine failure.
 unsafe fn column<T>(
     result: *mut ZuResult,
     col: u32,
     out: *mut *const T,
     slot: impl Fn(&mut ZuResult) -> &mut Option<Vec<T>>,
+    held: fn(&HeldColumn, std::ops::Range<usize>, &mut Vec<T>) -> Served<T>,
     read: fn(&Value) -> Option<T>,
 ) -> ZuStatus {
     if out.is_null() {
@@ -2191,9 +2389,23 @@ unsafe fn column<T>(
             return ZuStatus::Done;
         }
         if slot(r).is_none() {
+            let rows = r.result.rows.len();
             let mut buf = Vec::new();
-            if !fill(&r.result.rows, c, &mut buf, read) {
-                return ZuStatus::Misuse;
+            match served(r, c, 0..rows, &mut buf, held) {
+                // Nothing to keep and nothing to free: the buffer
+                // behind this pointer is the result's own, and asking
+                // again reaches the same one.
+                Served::Lent(at) => {
+                    unsafe { *out = at };
+                    return ZuStatus::Ok;
+                }
+                Served::Refused => return ZuStatus::Misuse,
+                Served::Made => {}
+                Served::Rows => {
+                    if !fill(&r.result.rows, c, &mut buf, read) {
+                        return ZuStatus::Misuse;
+                    }
+                }
             }
             *slot(r) = Some(buf);
         }
@@ -2217,12 +2429,18 @@ fn chunk_span(total: usize, chunk: u64) -> Option<(usize, usize)> {
 /// The body every chunked accessor shares. Same checks as [`column`],
 /// and then one buffer per column reused across chunks: the chunk the
 /// buffer already holds costs nothing, and any other chunk replaces it.
+///
+/// A chunk of a column the sink filled is a span of the sink's buffer,
+/// so the common case here allocates nothing at all and the reusable
+/// buffer stays empty. That is the whole chunked read of a large
+/// integer column reduced to a pointer per chunk.
 unsafe fn chunk_column<T>(
     result: *mut ZuResult,
     chunk: u64,
     col: u32,
     out: *mut *const T,
     slot: impl Fn(&mut ZuResult) -> &mut Chunk<T>,
+    held: fn(&HeldColumn, std::ops::Range<usize>, &mut Vec<T>) -> Served<T>,
     read: fn(&Value) -> Option<T>,
 ) -> ZuStatus {
     if out.is_null() {
@@ -2245,15 +2463,35 @@ unsafe fn chunk_column<T>(
             // The buffer comes out so the rows can be borrowed while it
             // is filled, and goes back either way: a column this
             // accessor cannot read still leaves its allocation behind
-            // for the next chunk that it can.
+            // for the next chunk that it can. The chunk it used to hold
+            // goes now rather than at the end, because the buffer it
+            // named is already empty and every way out of here is a way
+            // out of this block.
             let mut buf = std::mem::take(&mut slot(r).buf);
             buf.clear();
-            let ok = fill(&r.result.rows[lo..hi], c, &mut buf, read);
-            let held = slot(r);
-            held.buf = buf;
-            held.at = ok.then_some(chunk);
-            if !ok {
-                return ZuStatus::Misuse;
+            slot(r).at = None;
+            let mut answer = served(r, c, lo..hi, &mut buf, held);
+            if let Served::Rows = answer {
+                answer = if fill(&r.result.rows[lo..hi], c, &mut buf, read) {
+                    Served::Made
+                } else {
+                    Served::Refused
+                };
+            }
+            let mine = slot(r);
+            mine.buf = buf;
+            if let Served::Made = answer {
+                mine.at = Some(chunk);
+            }
+            match answer {
+                // The sink's own buffer, so this chunk is a pointer
+                // into it and the reusable buffer stays where it is.
+                Served::Lent(at) => {
+                    unsafe { *out = at };
+                    return ZuStatus::Ok;
+                }
+                Served::Refused => return ZuStatus::Misuse,
+                Served::Made | Served::Rows => {}
             }
         }
         unsafe { *out = slot(r).buf.as_ptr() };
@@ -2268,13 +2506,31 @@ unsafe fn chunk_column<T>(
 /// what [`zu_result_col_node_offset`] is for, and doing it quietly
 /// here is how a binding ends up returning an internal row number to a
 /// user who asked for an identity.
+///
+/// The buffer is the executor's own where the executor filled the
+/// column, so the call costs a bounds check and a pointer no matter how
+/// many rows there are, and the result holds one copy of the column
+/// rather than two. Where it did not, a sort or a computed expression
+/// among them, the column is converted here on the first call that asks
+/// for it and kept until the result is freed. Either way the pointer is
+/// good for as long as the result is, and the values a caller reads
+/// through it are the same.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_result_col_i64(
     result: *mut ZuResult,
     col: u32,
     out: *mut *const i64,
 ) -> ZuStatus {
-    unsafe { column(result, col, out, |r| &mut r.i64_cols[col as usize], as_i64) }
+    unsafe {
+        column(
+            result,
+            col,
+            out,
+            |r| &mut r.i64_cols[col as usize],
+            held_i64,
+            as_i64,
+        )
+    }
 }
 
 /// The whole column as contiguous doubles; ints widen and nulls read
@@ -2285,7 +2541,16 @@ pub unsafe extern "C" fn zu_result_col_f64(
     col: u32,
     out: *mut *const f64,
 ) -> ZuStatus {
-    unsafe { column(result, col, out, |r| &mut r.f64_cols[col as usize], as_f64) }
+    unsafe {
+        column(
+            result,
+            col,
+            out,
+            |r| &mut r.f64_cols[col as usize],
+            held_f64,
+            as_f64,
+        )
+    }
 }
 
 /// The whole column as the row offsets of its nodes, which is the
@@ -2305,6 +2570,7 @@ pub unsafe extern "C" fn zu_result_col_node_offset(
             col,
             out,
             |r| &mut r.node_cols[col as usize],
+            held_node,
             as_node_offset,
         )
     }
@@ -2324,6 +2590,7 @@ pub unsafe extern "C" fn zu_result_col_valid(
             col,
             out,
             |r| &mut r.valid_cols[col as usize],
+            held_valid,
             as_valid,
         )
     }
@@ -2388,12 +2655,16 @@ pub unsafe extern "C" fn zu_result_chunk(
 /// [`zu_result_col_i64`] reads.
 ///
 /// The pointer is valid until the next call for this column and this
-/// accessor, which replaces the contents, or until the result is freed.
-/// That is the trade the chunked path makes: the whole-column
+/// accessor, which may replace the contents, or until the result is
+/// freed. That is the trade the chunked path makes: the whole-column
 /// accessors keep every conversion alive and so can promise a pointer
 /// that never changes, and these keep one chunk and so cannot. A host
 /// that needs a chunk to outlive the next one copies it, which is the
-/// copy it was going to make anyway on its way into a host array.
+/// copy it was going to make anyway on its way into a host array. Where
+/// the executor filled the column, a chunk is a window into the buffer
+/// the executor wrote and nothing is converted or replaced at all, but
+/// that is not a promise a caller can read off the pointer, so the rule
+/// above is the one to write against.
 ///
 /// Chunks of one column are independent of chunks of another, so
 /// reading values and validity for the same chunk together, which is
@@ -2412,6 +2683,7 @@ pub unsafe extern "C" fn zu_result_chunk_col_i64(
             col,
             out,
             |r| &mut r.chunk_i64[col as usize],
+            held_i64,
             as_i64,
         )
     }
@@ -2433,6 +2705,7 @@ pub unsafe extern "C" fn zu_result_chunk_col_f64(
             col,
             out,
             |r| &mut r.chunk_f64[col as usize],
+            held_f64,
             as_f64,
         )
     }
@@ -2454,6 +2727,7 @@ pub unsafe extern "C" fn zu_result_chunk_col_node_offset(
             col,
             out,
             |r| &mut r.chunk_node[col as usize],
+            held_node,
             as_node_offset,
         )
     }
@@ -2475,9 +2749,150 @@ pub unsafe extern "C" fn zu_result_chunk_col_valid(
             col,
             out,
             |r| &mut r.chunk_valid[col as usize],
+            held_valid,
             as_valid,
         )
     }
+}
+
+/* ---- Arrow ---- */
+
+/// The names of the tables in a result, straight off the catalog the
+/// connection already holds.
+///
+/// A node value carries the id of its table and nothing else, so
+/// [`zu_arrow`] asks for the name. There is no map built here: the
+/// catalog is the map, and a lookup by id is a binary search over a few
+/// tens of entries.
+#[cfg(feature = "arrow")]
+struct Named<'a>(&'a zudb::zu1::catalog::Catalog);
+
+#[cfg(feature = "arrow")]
+impl zu_arrow::Tables for Named<'_> {
+    fn node(&self, id: u32) -> Option<&str> {
+        self.0.node_by_id(id).map(|table| table.name.as_str())
+    }
+
+    fn rel(&self, id: u32) -> Option<&str> {
+        self.0.rel_by_id(id).map(|table| table.name.as_str())
+    }
+}
+
+/// The whole result as an Arrow C Data Interface stream, moving the
+/// buffers rather than copying them.
+///
+/// This is the only call here that spends the result. It takes the
+/// handle through a pointer to it and writes NULL back, on every path
+/// including the failing ones, because what it does is hand the
+/// executor's own buffers to the Arrow arrays: after that the result
+/// holds nothing to read a second time, and a handle to it would be a
+/// handle to an answer with no rows in it. Do not free it afterwards,
+/// and do not keep a pointer into it: a column buffer or a cell string
+/// taken before this call belongs to the stream now.
+///
+/// That is the whole point. A result that stayed readable would have to
+/// be copied on the way out, and the copy is the whole answer, so a
+/// binding exporting a hundred million rows would move eight hundred
+/// megabytes to hand over eight hundred megabytes it already had. The
+/// borrowing calls above are still there for a caller who wants to read
+/// the result rather than give it away.
+///
+/// `conn` is where the table names come from, since a node value
+/// carries the id of its table and the catalog is what turns that into
+/// a name. It may be NULL, and then a node column names its table `#7`
+/// after the id, which is what a caller who has closed the connection
+/// and kept the result can still be given. When it is not NULL it must
+/// be the connection the result was produced on, and it is claimed for
+/// the length of the call like any other use of one.
+///
+/// `rows_per_batch` is the row count the reader sees per batch, and 0
+/// asks for the library's own, which is 65536. Batches are slices of
+/// arrays that are already in memory, so this is about what a consumer
+/// likes to work in and not about what is allocated.
+///
+/// `out` points at an `ArrowArrayStream` the caller owns, uninitialised
+/// on the way in and released the way that interface says on the way
+/// out: call its `release` and not any function of this library.
+/// `ZU_UNSUPPORTED` when the library was built without the Arrow
+/// feature, which is the one answer that is about the build rather than
+/// the call, and `ZU_MISUSE` with a message naming the column when one
+/// holds something Arrow has no type for, which is a time with an
+/// offset and the two handle types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_arrow(
+    conn: *mut ZuConn,
+    result: *mut *mut ZuResult,
+    rows_per_batch: u64,
+    out: *mut c_void,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    // Spent before anything can go wrong, so that a caller who reuses
+    // the variable across calls cannot be left holding a handle to a
+    // result whose buffers left through this call.
+    let taken = if result.is_null() {
+        None
+    } else {
+        let held = unsafe { *result };
+        unsafe { *result = std::ptr::null_mut() };
+        (!held.is_null()).then(|| unsafe { Box::from_raw(held) })
+    };
+    guard(err, || {
+        let Some(taken) = taken else {
+            return Err(misuse("result is NULL"));
+        };
+        if out.is_null() {
+            return Err(misuse("out is NULL"));
+        }
+        arrow_stream(conn, *taken, rows_per_batch, out)
+    })
+}
+
+/// The half of [`zu_result_arrow`] that the feature turns off, kept
+/// apart so that the checks above are one piece of code however the
+/// library was built.
+#[cfg(feature = "arrow")]
+fn arrow_stream(
+    conn: *mut ZuConn,
+    taken: ZuResult,
+    rows_per_batch: u64,
+    out: *mut c_void,
+) -> Result<ZuStatus, EngineError> {
+    let rows = match usize::try_from(rows_per_batch) {
+        Ok(0) => zu_arrow::BATCH,
+        // A count that does not fit a usize is every row there could
+        // ever be, so it is one batch and not a refusal.
+        Ok(rows) => rows,
+        Err(_) => usize::MAX,
+    };
+    let table = if conn.is_null() {
+        zu_arrow::Table::taken(taken.result, &())
+    } else {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let catalog = unsafe { conn_of(conn) }.session_mut().catalog();
+        zu_arrow::Table::taken(taken.result, &Named(catalog))
+    }
+    .map_err(|why| misuse(why.to_string()))?;
+    // Written rather than assigned: the caller's struct is
+    // uninitialised on the way in, and dropping whatever bytes were
+    // there would call a release pointer that is not one.
+    unsafe {
+        out.cast::<zu_arrow::FFI_ArrowArrayStream>()
+            .write(table.into_stream(rows));
+    }
+    Ok(ZuStatus::Ok)
+}
+
+#[cfg(not(feature = "arrow"))]
+fn arrow_stream(
+    _conn: *mut ZuConn,
+    _taken: ZuResult,
+    _rows_per_batch: u64,
+    _out: *mut c_void,
+) -> Result<ZuStatus, EngineError> {
+    Ok(ZuStatus::Unsupported)
 }
 
 /// One string cell, NUL-terminated, valid until the result is freed,
@@ -5164,6 +5579,49 @@ pub unsafe extern "C" fn zu_conn_registered_name(
         unsafe { *len = name.len() };
     }
     name.as_ptr().cast::<c_char>()
+}
+
+/// What a table id is called, or `NULL` when no table has that id.
+/// `len` may be `NULL`.
+///
+/// A node value is a table id and a row offset and an edge value is a
+/// table id and two of them, so a host that reads one with
+/// [`zu_value_node`] or [`zu_value_rel`] has a number and no way to
+/// say what it is a number of. Every other client reaches the catalog
+/// through its own language; this is the same reach for C. Node and
+/// rel tables share one id space in the engine, so one call answers
+/// for both kinds.
+///
+/// The answer is NUL-terminated and owned by the connection, valid
+/// until the next `zu_conn_table_name` on it or until it closes,
+/// whichever comes first. The length is there so that a host that
+/// already knows how long a name is does not walk it again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_table_name(
+    conn: *mut ZuConn,
+    table: u32,
+    len: *mut usize,
+) -> *const c_char {
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+    if conn.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(_claim) = (unsafe { claim_conn(conn) }) else {
+        return std::ptr::null();
+    };
+    let Some(name) = unsafe { conn_of(conn) }
+        .table_name(table)
+        .and_then(|name| CString::new(name).ok())
+    else {
+        return std::ptr::null();
+    };
+    let held = unsafe { conn_table(conn) }.insert(name);
+    if !len.is_null() {
+        unsafe { *len = held.as_bytes().len() };
+    }
+    held.as_ptr()
 }
 
 #[cfg(test)]

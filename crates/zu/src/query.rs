@@ -126,6 +126,19 @@ pub fn merge_frames(schema: &mut Schema, frames: &FrameSet) -> Result<Vec<u16>> 
         .collect()
 }
 
+/// Whether the text is a statement at all, without a catalog and
+/// without a file.
+///
+/// This is the front end and nothing behind it, which is what an editor
+/// with no database open can still say something true about. A name it
+/// cannot check is a name it does not look at: `MATCH (p:Person)` parses
+/// whether or not a `Person` exists anywhere, so the answer is either a
+/// syntax error at a place in the text or nothing. Everything past the
+/// parser needs a catalog, and [`bind`] is where that starts.
+pub fn check(source: &str) -> Result<()> {
+    parser::parse_statement(source).map(|_| ())
+}
+
 /// Parses and binds one query against a zu1 catalog.
 ///
 /// The epoch the schema is stamped with is zero, and it can be: a

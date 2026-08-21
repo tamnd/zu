@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: list
 doc: The one composite type in the v0 core, and the only place a value can hold other values. A client decoding a list has to have decoded every type inside it, so a list case is a test of the whole decoder rather than one branch of it, and the nesting is where a client written against a flat wire format runs out of room.
 
@@ -419,9 +419,19 @@ cases:
             value: "2"
 
   - name: cardinality-refuses-a-string
-    doc: The element count is a list function only, so it raises on text where size answers, which is the one place the two names differ.
+    doc: A string has a length and not a cardinality, so this raises where size answers, and a client that forwards both names to one implementation has to keep the refusal.
     query: RETURN cardinality('abc') AS n
     raises: "22G03"
+
+  - name: cardinality-of-an-empty-list
+    doc: A list with nothing in it has a cardinality of zero rather than no cardinality, which is the same distinction the empty list case makes about the value itself.
+    query: RETURN cardinality([]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
 
   - name: size-refuses-a-number
     doc: A number has no length, so this raises rather than counting digits, which a client with a permissive fallback would happily do.

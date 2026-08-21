@@ -43,7 +43,7 @@ Every case gets a database of its own. Cases are written as if nothing came befo
 ## What a case looks like
 
 ```yaml
-schema: 3
+schema: 4
 suite: scalar
 doc: The values that cross a language boundary badly.
 
@@ -61,18 +61,20 @@ cases:
 
 | Key | Where | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `3`, which is where `params` arrived. |
+| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `4`, which is where `on` arrived. |
 | `suite` | file | yes | The suite's name, which must equal the file's stem. Two places to write one thing, checked against each other rather than one of them ignored. |
 | `doc` | file and case | yes | Why this is here, in a sentence somebody wrote. A test enforces length and a full stop, which is a floor on effort and not on quality. |
 | `load` | file | no | A table of typed columns and the edges between its rows, put into every case's database through the runner's own bulk load path before the case runs. Most suites have none. |
 | `cases` | file | yes | The cases, in the order they run. |
 | `name` | case | yes | Lower case and dashes, unique within the suite. It is what a report names the case by, so it is stable. |
-| `setup` | case | no | Statements run before `query`, against the case's own empty database. |
+| `setup` | case | no | Statements run before `query`, against the case's own empty database. A statement is one line, or an `on` and a `query` when it runs on a connection of its own. |
+| `on` | case | no | The connection `query` runs on. `main` when the case says nothing, which is nearly every case. |
 | `params` | case | no | The values the statement under test is run with, each a `name` and a value in the same encoding a row is written in. |
 | `query` | case | yes | The statement under test. |
 | `columns` | case | with `rows` | The projected names, in order. The names are part of the answer. |
 | `rows` | case | with `columns` | The rows, in order. Written as `rows:` with nothing under it when the case expects none, which is a real expectation and needs a spelling. |
 | `raises` | case | no | A GQLSTATUS code the statement must raise. Mutually exclusive with `columns`. |
+| `arrow` | case | no | What the same result looks like on the way out through Arrow: the schema of the export, field by field, or `refused` for a result Arrow has no type for. |
 
 ## What a load looks like
 
@@ -131,6 +133,60 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 
 `LIST` is the one type a parameter cannot be today. The C ABI has `zu_bind_null`, `zu_bind_bool`, `zu_bind_i64`, `zu_bind_f64`, `zu_bind_str` and `zu_bind_temporal`, and no call that carries a composite, so a case binding a list would be a case the C runner could not run. The gap is in the ABI rather than in the engine, and the cases arrive when the call does.
 
+## What an export looks like
+
+A client that reads rows one at a time and a client that hands a million of them to a dataframe are the same client, and only the first of those two paths is covered by a case that asserts values. The other one has a contract of its own: a column of dates is a `Date32` and not a string of digits, a year-month duration is a month-day-nano interval because that is the interval every reader implements, a node is a struct of the table it is in and the row it is, and a time with an offset is refused rather than quietly moved to UTC. None of that shows up in a row.
+
+```yaml
+  - name: a-node-is-the-table-it-is-in-and-the-row-it-is
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "person#0"
+    arrow:
+      - name: n
+        format: "+s"
+        children:
+          - name: table
+            format: u
+          - name: offset
+            format: L
+```
+
+A field is a `name`, a `format`, and the fields under it when the format is a nested one. The format is the C Data Interface's own string, `l` for an int64 and `+s` for a struct, because that is the one spelling every language sees the same: a client in Python reads it off a pyarrow field, a client in C reads it out of the struct, and neither has to agree with the other about what to call a type first. A nested format is written with its fields and a flat one without them, and a case that gets that backwards is refused when the file loads rather than reported as a failure. A list has exactly one field under it and the case writes it out, because Arrow names it `item` and a client that named it `element` would export something no reader lines up with what another client wrote.
+
+`arrow: refused` is the other thing a case can say, for a result Arrow has no type for. Today that is a time with an offset, since Arrow has a time and a timestamp and nothing in between, and dropping the offset would move the value.
+
+What a runner checks is the schema and how many rows came back through the stream, against the same statement the rows were compared over. Values are not read back: a consumer that decoded every array by hand in each of nine languages would be nine new decoders under test, which is more of our own code and not more of the contract, and the rows the case already asserts are those same values by another road. The export is checked after the rows and not before, because the export takes the result and the strings a cell handed back go with it.
+
+A client whose language has no Arrow build reads the key and skips the check, which is what a runner built without the export does here too. That is a runner covering less of the corpus rather than a runner disagreeing with another one, and it is the reason the key is optional rather than a second file.
+
+## What a connection is
+
+A transaction is only observable from outside it. A case that opened one, wrote a row and asked for the row back would pass whether the transaction did anything at all, so the cases about transactions need somewhere else to ask from, and that is what naming a connection is for.
+
+```yaml
+  - name: a-committed-transaction-is-visible-to-another-connection
+    setup:
+      - on: writer
+        query: START TRANSACTION
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+      - on: writer
+        query: COMMIT
+    on: reader
+    query: MATCH (t:thing) RETURN count(t) AS n
+```
+
+A connection is made the first time a case names one, and it is made from the case's own connection rather than by opening the file again, which is what a pool hands out: the connections share a write side, so each sees what the other has committed. A name is lower case words joined by dashes, like a case name. The connection a case runs everything on when it says nothing is called `main`, and it is what `on:` means when it is absent, so a case that mentions no connection at all and a case that writes `on: main` everywhere are the same case.
+
+Statements still run one at a time, in the order they are written. Nothing in a runner starts a thread, and no case may depend on one: a corpus that needed two statements to overlap in time would be a corpus that said something different on every client, and on the same client twice. What a case can say is what a connection sees after another connection has finished doing something, which is what the transaction cases are all written as.
+
+A transaction is three statements, `START TRANSACTION`, `COMMIT` and `ROLLBACK`, and `START TRANSACTION READ ONLY` for one that refuses writes. They are statements and not an API, so a client that can run a statement can run one, and the cases are written the way a user writes them rather than the way any one client wraps them.
+
 ## What is in it
 
 | Suite | What it pins |
@@ -148,11 +204,13 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 | `order` | The order values sort in, including across types, which no host comparator gets right by accident. |
 | `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
 | `stored` | Values put in through a client's own loader and read back out through a query, so the value crosses the boundary twice and by two different mechanisms. |
-| `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, and a row that points at itself. |
+| `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, a row that points at itself, and the nodes, edges and paths themselves as values. |
 | `param` | Values handed to a statement rather than written in it, which is the client's own encoder rather than its decoder: every type through a binding, the positions a statement takes one in, and the rules about names. |
 | `pattern` | What a pattern selects: labels and inline properties, direction, an undirected walk, a quantified one, a subquery that only asks whether something exists, and the rows an optional match keeps. |
 | `result` | The shape of an answer rather than the values in it: what a column is named, how many rows come back, what paging and DISTINCT do to them, and where a grouping puts its boundary. |
 | `error` | The condition a statement raises, which is part of its answer rather than a message about it, so two engines that both refuse a statement can be compared on why they refused it. |
+| `arrow` | The result on the way out through the export rather than through the cell accessors: what Arrow type each column type becomes, what a node, an edge and a path look like as structs, and the one value the export refuses. |
+| `transaction` | What a transaction is and what two connections see of each other: a commit that becomes visible, a rollback that never does, and the conditions a start, a commit and a write in the wrong place raise. |
 
 A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet. The few cases that write through a statement instead are the ones asking what a bound value looks like after a round trip through the store, and they declare their table the only way a statement can, which is a bare `INSERT` in `setup:` with the properties the case is about.
 
@@ -184,9 +242,15 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `NULL` carries no `value`. `LIST` carries a sequence of `{type, value}` pairs, and an empty list is written as `value:` with nothing under it.
 
-`DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
+`NODE`, `EDGE`, and `PATH` are the values a graph has and a table does not, and they are written as names rather than as the numbers the engine holds. A node is `"person#1"`, which is the table it is a row of and which row of it. An edge is `"knows#0->1"`, which is its table and the two rows it runs between. Both are quoted, for the same reason the numbers are and a different one: a name and two numbers with punctuation between them is text in every reader and a number in none. A `PATH` is a sequence, like a `LIST`, and holds a node, then an edge and a node for each hop, so it always holds an odd number of values and a case that writes an even number is refused with its line.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1475 values counting the ones inside lists, and both print them the same way.
+The name and not the id, because the id is a number the file decided and every one of the nine clients builds its own file. The runner asks the connection what a table id is called and compares names, which is what makes a case portable. What an edge does not carry is which of two parallel edges it is: a pair may run more than once and the engine tells the copies apart by the row their properties sit in, which is their place in the load order rather than anything the case chose, so a case that has to tell two of them apart asserts a property of them instead.
+
+None of the three can be a parameter or a load column. A parameter and a column are values going in, and a node is a row that exists, so naming one on the way in would be naming a row the case has not written yet.
+
+`DECIMAL` and `BYTES` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
+
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1813 values counting the ones inside lists and paths, and both print them the same way.
 
 ## What the Rust runner does not check
 
@@ -204,4 +268,4 @@ The reason is the reason the TOML reader gives: a construct silently reinterpret
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
 
-There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 20 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 22 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

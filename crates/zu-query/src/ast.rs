@@ -6,7 +6,7 @@
 //! description of the text.
 
 use zu_common::unicode::NormalForm;
-use zu_common::{LogicalType, Temporal};
+use zu_common::{DurationKind, LogicalType, Temporal};
 
 /// One statement: a query that reads, a catalog statement that changes
 /// what the file declares, or one of the three that say where a
@@ -208,7 +208,17 @@ impl Query {
         let mut out = Vec::new();
         self.body.walk(&mut |linear| {
             for simple in &linear.statements {
-                out.extend(simple.clauses.iter());
+                for clause in &simple.clauses {
+                    out.push(clause);
+                    // The block of an inline call is part of the text
+                    // and its statements are statements of the query,
+                    // so a reader asking what the query names has to be
+                    // told about them. An INSERT inside a block writes
+                    // the same graph an INSERT beside it writes.
+                    if let Clause::CallInline { body, .. } = clause {
+                        out.extend(body.clauses());
+                    }
+                }
             }
         });
         out
@@ -487,6 +497,28 @@ pub enum Clause {
         /// function, the alias is what later clauses see.
         yields: Vec<(String, Option<String>)>,
     },
+    /// `CALL { MATCH (a)-[:knows]->(f) RETURN f AS friend }`, the
+    /// inline procedure call of ISO 13.2 and features GP01, GP02 and
+    /// GP03.
+    ///
+    /// The block is a statement of its own written inside another one.
+    /// It runs once for each row that reaches it, the names it is
+    /// allowed to read tie it to that row, and what its `RETURN` names
+    /// is added to the row rather than put in place of it. That last
+    /// part is what makes it a `CALL` and not a `WITH`: the row goes on
+    /// carrying everything it carried, wider by what the block
+    /// answered.
+    ///
+    /// `scope` is the variable scope clause, which says what the block
+    /// may read of the row. `None` is a block written with no clause at
+    /// all, which reads everything (GP02), and `Some` is the list the
+    /// reader wrote (GP03). An empty list is a block that reads nothing
+    /// of the row, which is a whole statement standing on its own, and
+    /// it is written `CALL () { ... }`.
+    CallInline {
+        scope: Option<Vec<String>>,
+        body: Box<Query>,
+    },
     With {
         projection: Projection,
         filter: Option<Expr>,
@@ -529,7 +561,7 @@ pub enum DeleteTarget {
     /// `DELETE n`: a variable an earlier clause bound.
     Variable(String),
     /// `DELETE VALUE { MATCH (p:Person) WHERE p.name = 'Ada' RETURN p }`,
-    /// the value query expression of ISO 20.9. The query inside runs on
+    /// the value query expression of ISO 20.6. The query inside runs on
     /// its own and has to answer one row of one column, because the
     /// item is one element and a query answering two of them has not
     /// said which.
@@ -1132,6 +1164,135 @@ impl RelDirection {
     }
 }
 
+/// Which end of a string an explicit `TRIM` takes characters off, ISO
+/// 20.24's trim specification. The three words are the whole of the
+/// production, and leaving them out means BOTH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimSide {
+    Leading,
+    Trailing,
+    Both,
+}
+
+/// The temporal value functions of ISO 20.27 and 20.29: the words a
+/// statement asks the time with, the constructors that read one out of
+/// a string, and the duration function beside them.
+///
+/// The three CURRENT words answer in the session's displacement and the
+/// two LOCAL ones answer without a displacement at all, which is the
+/// whole of what separates them. All of them are cut from one instant,
+/// so a statement holding CURRENT_DATE and CURRENT_TIMESTAMP cannot
+/// have them land on two different days.
+///
+/// The constructors are the same functions with a string in front of
+/// the instant: `DATE('2024-01-15')` reads the string and `DATE()`
+/// reads the clock, and one kernel answers both because the only
+/// difference is where the value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalFn {
+    /// The date in the session's displacement.
+    CurrentDate,
+    /// The time of day in it, carrying the displacement.
+    CurrentTime,
+    /// The instant, carrying the displacement.
+    CurrentTimestamp,
+    /// The time of day with no displacement on it. The one word of the
+    /// nine that is written both bare and with brackets, which is what
+    /// the standard's `LOCAL_TIME [ ( ... ) ]` says.
+    LocalTime,
+    /// The date and time of day with no displacement on it.
+    LocalTimestamp,
+    /// `DATE('2024-01-15')` or `DATE()`.
+    Date,
+    /// `ZONED_TIME('10:00:00+07:00')` or `ZONED_TIME()`.
+    ZonedTime,
+    /// `ZONED_DATETIME('2024-01-15T10:00:00Z')` or `ZONED_DATETIME()`.
+    ZonedDatetime,
+    /// `LOCAL_DATETIME('2024-01-15T10:00:00')` or `LOCAL_DATETIME()`.
+    LocalDatetime,
+    /// `DURATION('P1Y2M')`, ISO 20.29. The one of these with no form
+    /// that reads the clock: a length of time is not a thing the
+    /// present moment is.
+    Duration,
+}
+
+/// Where a temporal function may write its brackets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brackets {
+    /// Never, which is the five words of ISO 20.27 that are written
+    /// bare. `CURRENT_DATE()` is a call to a function nobody defined.
+    Never,
+    /// Always, and a value inside them or nothing.
+    Always,
+    /// Either, which is `LOCAL_TIME` alone.
+    Optional,
+}
+
+impl TemporalFn {
+    /// The word a statement writes for it, which is also the name the
+    /// registry row carries and the plan prints.
+    pub fn word(self) -> &'static str {
+        match self {
+            TemporalFn::CurrentDate => "current_date",
+            TemporalFn::CurrentTime => "current_time",
+            TemporalFn::CurrentTimestamp => "current_timestamp",
+            TemporalFn::LocalTime => "local_time",
+            TemporalFn::LocalTimestamp => "local_timestamp",
+            TemporalFn::Date => "date",
+            TemporalFn::ZonedTime => "zoned_time",
+            TemporalFn::ZonedDatetime => "zoned_datetime",
+            TemporalFn::LocalDatetime => "local_datetime",
+            TemporalFn::Duration => "duration",
+        }
+    }
+
+    /// The temporal type the word answers, which is also the cut of the
+    /// instant it is and the type a string in front of it is read as.
+    /// Every one of these is a conversion the cast rules already state,
+    /// so they are ten targets and one piece of code rather than ten
+    /// pieces of arithmetic.
+    ///
+    /// The duration target names the day-time kind and is not one: a
+    /// duration string says which kind it is, `P1Y` being months and
+    /// `P1D` nanoseconds, so the target here means read this as a
+    /// duration and the string settles the rest.
+    pub fn target(self) -> LogicalType {
+        match self {
+            TemporalFn::CurrentDate | TemporalFn::Date => LogicalType::Date,
+            TemporalFn::CurrentTime | TemporalFn::ZonedTime => LogicalType::ZonedTime,
+            TemporalFn::CurrentTimestamp | TemporalFn::ZonedDatetime => LogicalType::ZonedDatetime,
+            TemporalFn::LocalTime => LogicalType::LocalTime,
+            TemporalFn::LocalTimestamp | TemporalFn::LocalDatetime => LogicalType::LocalDatetime,
+            TemporalFn::Duration => LogicalType::Duration(DurationKind::DayTime),
+        }
+    }
+
+    /// Where this one's brackets may stand, which is what the parser
+    /// reads it by and the whole of what separates `CURRENT_DATE` from
+    /// `DATE(...)`.
+    pub fn brackets(self) -> Brackets {
+        match self {
+            TemporalFn::CurrentDate
+            | TemporalFn::CurrentTime
+            | TemporalFn::CurrentTimestamp
+            | TemporalFn::LocalTimestamp => Brackets::Never,
+            TemporalFn::LocalTime => Brackets::Optional,
+            TemporalFn::Date
+            | TemporalFn::ZonedTime
+            | TemporalFn::ZonedDatetime
+            | TemporalFn::LocalDatetime
+            | TemporalFn::Duration => Brackets::Always,
+        }
+    }
+
+    /// Whether the brackets may stand empty, which is every one of them
+    /// but the duration: there is a date now and a time now, and there
+    /// is no length of time now.
+    pub fn reads_the_clock(self) -> bool {
+        self != TemporalFn::Duration
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
@@ -1162,6 +1323,49 @@ pub enum Expr {
     Normalize {
         expr: Box<Expr>,
         form: NormalForm,
+    },
+    /// `TRIM(LEADING 'x' FROM s)`, ISO 20.24, GF06. Written like a call
+    /// and not one: the first word names an end of the string rather
+    /// than a value, and FROM is not a separator a call has. The one
+    /// argument form and the multi-character functions are ordinary
+    /// calls and do not come through here.
+    Trim {
+        side: TrimSide,
+        /// The character to trim, or none, which means a space.
+        chars: Option<Box<Expr>>,
+        source: Box<Expr>,
+    },
+    /// The temporal value functions of ISO 20.27 and 20.29. They are
+    /// here rather than resolved by name because where the brackets may
+    /// stand is part of each one: `CURRENT_DATE` takes none,
+    /// `DATE(...)` takes them, and `LOCAL_TIME` takes them or not. A
+    /// name resolved against the registry could not tell those apart.
+    Temporal {
+        func: TemporalFn,
+        /// The string the value is read out of, or none, which means
+        /// read the clock.
+        arg: Option<Box<Expr>>,
+    },
+    /// The instant the statement is running at, which no query writes.
+    /// It is the argument the binder hands each of the words above that
+    /// wrote no string of its own, so that the clock is read in one
+    /// place and cut in as many as ask for it, and so that every one of
+    /// them in a statement answers the same instant.
+    Clock,
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28's datetime subtraction. Written like a call and not one,
+    /// because the qualifier stands behind the closing parenthesis
+    /// where no call has anything, and the two words it is made of name
+    /// fields rather than values.
+    ///
+    /// The arguments are held as written rather than as a pair, so a
+    /// call with the wrong number of them is refused where every other
+    /// call is, by the arity on its row.
+    DurationBetween {
+        args: Vec<Expr>,
+        /// The kind the qualifier asked for, or none when none was
+        /// written, which reads as DAY TO SECOND.
+        kind: Option<DurationKind>,
     },
     /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
     /// function answers, asked as a predicate, and the form defaults the
@@ -1230,7 +1434,7 @@ pub enum Expr {
     /// worth the same wherever they are written. What it answers is a
     /// reference and not the graph, which is what GV60 is.
     GraphRef(GraphRef),
-    /// `LET n = a + b IN n * n END`, ISO 20.7 and GE03: a name that
+    /// `LET n = a + b IN n * n END`, ISO 20.5 and GE03: a name that
     /// stands for a value for the length of one expression.
     ///
     /// The same [`LetItem`] the clause is made of, because it is the
@@ -1246,7 +1450,7 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: LogicalType,
     },
-    /// `CASE`, ISO 19.4 and mandatory feature GE01, in both of the forms
+    /// `CASE`, ISO 20.7 and mandatory feature GE01, in both of the forms
     /// the standard writes it in.
     ///
     /// The searched form asks a condition per branch,

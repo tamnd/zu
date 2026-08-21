@@ -82,6 +82,12 @@ impl Statement {
     /// because a column of the wrong type has to be refused while there
     /// is still a call to refuse it in. Cutting them into batches
     /// afterwards is a slice.
+    ///
+    /// The result is taken and not borrowed, which is what makes the
+    /// arrays the engine's own buffers rather than a copy of them:
+    /// nothing here is going to read the result again, and a driver
+    /// whose whole job is to hand the answer to somebody else should not
+    /// memcpy it on the way past.
     fn table(&mut self) -> Result<zu_arrow::Table> {
         self.cancelled()?;
         let sql = self.text()?.to_string();
@@ -96,7 +102,7 @@ impl Statement {
         self.interrupt.clear();
         let result = ran.map_err(adbc)?;
         let catalog = held.conn.session_mut().catalog();
-        zu_arrow::Table::of(&result, &Named(catalog)).map_err(translation)
+        zu_arrow::Table::taken(result, &Named(catalog)).map_err(translation)
     }
 }
 

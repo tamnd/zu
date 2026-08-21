@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: graph
 doc: The shape a load puts into the store, read back by walking it. A client's loader hands over a table of rows and a list of pairs between them, and every case here asks whether the graph that came out is the one that went in, which is a question about direction, about rows nothing points at, and about a row that points at itself. The fixture is small enough that every answer below can be checked by reading the pairs at the top of this file.
 
@@ -403,3 +403,205 @@ cases:
             value: "5"
           - type: INT64
             value: "4"
+
+  - name: a-node-comes-back-as-the-row-it-is
+    doc: The value a bare node projection hands back, which is the table it is a row of and which row, and is the first case in the corpus to assert one rather than reading a property off it.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "person#0"
+
+  - name: every-row-of-the-load-comes-back-in-the-order-it-went-in
+    doc: All five nodes as values, sorted by the column they were loaded with, which pins that a row keeps its place: a store that renumbered its rows on the way in would answer with the same names and different offsets.
+    query: MATCH (n:person) RETURN n ORDER BY n.name
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "person#0"
+      - values:
+          - type: NODE
+            value: "person#1"
+      - values:
+          - type: NODE
+            value: "person#2"
+      - values:
+          - type: NODE
+            value: "person#3"
+      - values:
+          - type: NODE
+            value: "person#4"
+
+  - name: an-edge-comes-back-as-the-two-rows-it-joins
+    doc: The four edges as values rather than as the names of their ends, which is the same four pairs the load wrote and is how a client that walks a graph rather than reading a table sees them.
+    query: MATCH (a:person)-[e:knows]->(b:person) RETURN e ORDER BY a.name, b.name
+    columns:
+      - e
+    rows:
+      - values:
+          - type: EDGE
+            value: "knows#0->1"
+      - values:
+          - type: EDGE
+            value: "knows#0->2"
+      - values:
+          - type: EDGE
+            value: "knows#1->2"
+      - values:
+          - type: EDGE
+            value: "knows#3->3"
+
+  - name: a-node-and-a-property-of-it-side-by-side
+    doc: The node and one of its columns in one row, which is the projection a client writes when it wants something to hold on to as well as something to show.
+    query: MATCH (n:person) WHERE n.name = 'ed' RETURN n, n.name AS name
+    columns:
+      - n
+      - name
+    rows:
+      - values:
+          - type: NODE
+            value: "person#4"
+          - type: STRING
+            value: ed
+
+  - name: the-row-an-edge-arrives-at
+    doc: The far end of every edge as a node value, which reaches the same row twice because two edges arrive at it, and is where a store that hands back the near end is caught by something other than a name.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN b ORDER BY a.name, b.name
+    columns:
+      - b
+    rows:
+      - values:
+          - type: NODE
+            value: "person#1"
+      - values:
+          - type: NODE
+            value: "person#2"
+      - values:
+          - type: NODE
+            value: "person#2"
+      - values:
+          - type: NODE
+            value: "person#3"
+
+  - name: the-rows-an-edge-arrives-at-counted-once-each
+    doc: The same far ends with the duplicate dropped, which is distinct over a node value rather than over a property and therefore asks whether two nodes of one row are one value.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN DISTINCT b ORDER BY b.name
+    columns:
+      - b
+    rows:
+      - values:
+          - type: NODE
+            value: "person#1"
+      - values:
+          - type: NODE
+            value: "person#2"
+      - values:
+          - type: NODE
+            value: "person#3"
+
+  - name: a-node-that-is-not-there-is-a-null-and-not-a-row-of-nothing
+    doc: The optional match that found nothing, projected as the node itself rather than as a property of it, which is a null in the shape a node would have been.
+    query: MATCH (a:person) WHERE a.name = 'ed' OPTIONAL MATCH (a)-[:knows]->(b:person) RETURN b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: "NULL"
+
+  - name: nodes-gathered-into-a-list
+    doc: Two node values collected into one, which is where a client's decoder meets a graph value inside a composite rather than at the top of a cell.
+    query: MATCH (n:person) WHERE n.name IN ['ann', 'bo'] WITH n ORDER BY n.name RETURN collect(n) AS ns
+    columns:
+      - ns
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: NODE
+                value: "person#0"
+              - type: NODE
+                value: "person#1"
+
+  - name: a-node-in-a-list-the-case-wrote
+    doc: The same nesting reached through a list literal instead of an aggregate, so that a client which special cases collect still has to carry a node through a list it built itself.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN [n] AS ns
+    columns:
+      - ns
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: NODE
+                value: "person#0"
+
+  - name: a-path-is-a-node-an-edge-and-a-node
+    doc: The shortest walk there is, bound to a name and projected whole, which is three values in the order they were walked and is the first case in the corpus to assert a path.
+    query: MATCH p = (a:person)-[:knows]->(b:person) WHERE a.name = 'ann' AND b.name = 'bo' RETURN p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: PATH
+            value:
+              - type: NODE
+                value: "person#0"
+              - type: EDGE
+                value: "knows#0->1"
+              - type: NODE
+                value: "person#1"
+
+  - name: a-path-of-two-edges-carries-the-row-in-the-middle
+    doc: The two edge walk whose middle row is bound to nothing, which is still in the path, because a path is the route and not the ends of it.
+    query: MATCH p = (a:person)-[:knows]->()-[:knows]->(c:person) WHERE a.name = 'ann' RETURN p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: PATH
+            value:
+              - type: NODE
+                value: "person#0"
+              - type: EDGE
+                value: "knows#0->1"
+              - type: NODE
+                value: "person#1"
+              - type: EDGE
+                value: "knows#1->2"
+              - type: NODE
+                value: "person#2"
+
+  - name: a-path-whose-two-ends-are-one-row
+    doc: The self loop as a path, where the same row is both ends of the walk, which is the case a client that builds a path by joining distinct nodes gets wrong.
+    query: MATCH p = (a:person)-[:knows]->(a) RETURN p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: PATH
+            value:
+              - type: NODE
+                value: "person#3"
+              - type: EDGE
+                value: "knows#3->3"
+              - type: NODE
+                value: "person#3"
+
+  - name: a-path-a-range-of-lengths-found
+    doc: The walk a variable length pattern reached, projected as the route rather than counted, which is the one place the length of the value is the engine's decision rather than the pattern's.
+    query: MATCH p = (a:person)-[:knows*1..2]->(b:person) WHERE a.name = 'bo' RETURN p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: PATH
+            value:
+              - type: NODE
+                value: "person#1"
+              - type: EDGE
+                value: "knows#1->2"
+              - type: NODE
+                value: "person#2"

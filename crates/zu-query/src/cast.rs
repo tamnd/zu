@@ -259,7 +259,7 @@ fn to_temporal(v: Value, target: &LogicalType) -> Result<Value> {
 /// The two duration kinds never convert into each other. Months and
 /// nanoseconds have no ratio: a month is 28, 29, 30 or 31 days and
 /// which one depends on a date the duration does not carry.
-fn convert(from: Temporal, target: &LogicalType) -> Option<Temporal> {
+pub(crate) fn convert(from: Temporal, target: &LogicalType) -> Option<Temporal> {
     use LogicalType as L;
     // The local reading of a value and the offset it was written with,
     // which is what every conversion below is stated in.

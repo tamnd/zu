@@ -113,7 +113,7 @@ make test    # cargo test --workspace --all-features
 make lint    # rustfmt check + clippy -D warnings
 ```
 
-Requires Rust 1.97 (pinned in `rust-toolchain.toml`).
+Requires Rust 1.98 (pinned in `rust-toolchain.toml`).
 
 ## License
 

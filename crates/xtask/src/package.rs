@@ -343,6 +343,30 @@ fn dashed(option: &str) -> String {
     }
 }
 
+/// What rustc printed, split into link items rather than into words.
+///
+/// Every item on every platform is one word but one: Apple's linker
+/// takes a framework as `-framework CoreFoundation`, two words that
+/// name one thing. Split on the space and the pair becomes two items,
+/// and the CMake config then hands the second one to a linker that has
+/// been told to expect a framework name: `ld: framework
+/// '-lCoreFoundation' not found`, which is the link failing over a
+/// library nobody asked for. So the flag keeps the word after it.
+fn link_items(printed: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut words = printed.split_whitespace();
+    while let Some(word) = words.next() {
+        match (word, words.clone().next()) {
+            ("-framework", Some(name)) => {
+                words.next();
+                items.push(format!("-framework {name}"));
+            }
+            _ => items.push(dashed(word)),
+        }
+    }
+    items
+}
+
 /// One platform's package, laid out and written.
 #[derive(Debug, Clone)]
 pub struct Package<'a> {
@@ -358,7 +382,7 @@ impl<'a> Package<'a> {
         Package {
             platform,
             version: version.to_string(),
-            syslibs: syslibs.split_whitespace().map(dashed).collect(),
+            syslibs: link_items(syslibs),
         }
     }
 
@@ -686,10 +710,10 @@ mod tests {
         // dx/02 §8 is the v0.5 restructure, and the error model, the
         // cancellation calls, the transaction boundaries, the appender,
         // the diagnostics and the frames added to it are all additive,
-        // so this is 0.11: the number a binding tests for when it wants
-        // to know whether zu_conn_register is there. The two parts are
+        // so this is 0.12: the number a binding tests for when it wants
+        // to know whether zu_result_arrow is there. The two parts are
         // counts rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.11".to_string(), "0.11".to_string()));
+        assert_eq!(abi.revision, ("0.13".to_string(), "0.13".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse
@@ -841,6 +865,60 @@ mod tests {
         assert_eq!(
             Package::new(elf, "0.5.0", "-lgcc_s -lc").syslibs,
             ["-lgcc_s", "-lc"]
+        );
+    }
+
+    /// Apple names a framework in two words, and the two are one thing
+    /// to link. Split them and the CMake list has an item called
+    /// CoreFoundation in it, which reaches the linker as -lCoreFoundation
+    /// and fails the static smoke link of the darwin row.
+    #[test]
+    fn a_framework_and_its_name_are_one_item() {
+        let (table, target) = package("aarch64-apple-darwin");
+        let platform = table.platform(&target).expect("a row");
+        // What rustc prints for this target, framework and all.
+        let apple = Package::new(
+            platform,
+            "0.5.0",
+            "-liconv -framework CoreFoundation -lSystem -lc -lm",
+        );
+        assert_eq!(
+            apple.syslibs,
+            [
+                "-liconv",
+                "-framework CoreFoundation",
+                "-lSystem",
+                "-lc",
+                "-lm"
+            ]
+        );
+        // One item in the CMake list, which CMake passes through as it
+        // stands because it starts with a dash.
+        assert!(
+            apple.cmake_config().contains(
+                "INTERFACE_LINK_LIBRARIES \"-liconv;-framework CoreFoundation;-lSystem;-lc;-lm\""
+            ),
+            "{}",
+            apple.cmake_config()
+        );
+        // The pkg-config line is words either way, and it reads the
+        // same as what rustc printed.
+        assert!(
+            apple
+                .pkg_config()
+                .contains("Libs.private: -liconv -framework CoreFoundation -lSystem -lc -lm\n")
+        );
+        // Two of them, and a trailing flag with nothing after it, which
+        // is not a list rustc prints but is one this must not lose.
+        let two = Package::new(
+            platform,
+            "0.5.0",
+            "-framework Security -framework CFNetwork",
+        );
+        assert_eq!(two.syslibs, ["-framework Security", "-framework CFNetwork"]);
+        assert_eq!(
+            Package::new(platform, "0.5.0", "-lSystem -framework").syslibs,
+            ["-lSystem", "-framework"]
         );
     }
 

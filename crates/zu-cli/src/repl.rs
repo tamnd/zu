@@ -111,7 +111,7 @@ pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
 /// is every property a typed graph has; a graph with no type declared
 /// for it has no property names to offer, and offering the ones from
 /// another graph would be worse than offering none.
-fn names(session: &Session) -> Names {
+pub(crate) fn names(session: &Session) -> Names {
     let catalog = session.catalog();
     let mut names = Names::default();
     for table in catalog.node_tables() {
@@ -173,7 +173,7 @@ fn backslash(session: &mut Session, command: Command<'_>, timing: &mut bool) -> 
 /// table with no properties, and one whose directory will not read,
 /// both come back with nothing, since the shape printed above the
 /// columns is worth having either way.
-fn columns(session: &mut Session, name: &str) -> Vec<Column> {
+pub(crate) fn columns(session: &mut Session, name: &str) -> Vec<Column> {
     let catalog = session.catalog();
     let node = catalog.node_by_name(name).map(|t| t.id);
     let rel = catalog.rel_by_name(name).map(|t| t.id);

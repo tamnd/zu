@@ -6,12 +6,18 @@
 //! probes. The optimizer integration lands with the perf/03 executor;
 //! this module owns the program shape and the evaluator.
 
+use std::sync::Arc;
+
+use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError};
 
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
-use crate::kernels::{BinOp, CmpOp, binary, compare};
+use crate::kernels::{
+    BinOp, CmpOp, MathOp, MathPair, StrCut, StrFold, StrLen, StrTrim, TrimSet, binary, compare,
+    cut, element_ids, fold, length, normalize, normalized, pair, trim, unary,
+};
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
 
@@ -46,6 +52,87 @@ pub enum ExprOp {
         op: BinOp,
         l: Reg,
         r: Reg,
+        dst: Reg,
+    },
+    /// One of the numeric functions over a single number, whose answer
+    /// is a value like any other. The op carries which function it is,
+    /// so a call costs no dispatch per row.
+    Math {
+        op: MathOp,
+        src: Reg,
+        dst: Reg,
+    },
+    /// One of the numeric functions over two numbers: POWER, LOG and
+    /// MOD under its function spelling. Two registers in and one out,
+    /// and both arguments hold the one type by the time they get here.
+    MathPair {
+        op: MathPair,
+        l: Reg,
+        r: Reg,
+        dst: Reg,
+    },
+    /// The length of a string, in characters or in bytes. The answer
+    /// is a number, so this is the one string function whose output
+    /// needs no room in the arena for bytes.
+    StrLen {
+        op: StrLen,
+        src: Reg,
+        dst: Reg,
+    },
+    /// A fold of a string, up or down. The answer is a string, so this
+    /// is the first op whose output carries bytes of its own rather
+    /// than only numbers.
+    StrFold {
+        op: StrFold,
+        src: Reg,
+        dst: Reg,
+    },
+    /// A trim of a string, off either end or both. The set of
+    /// characters is whatever the statement wrote, prepared once at
+    /// compile time and shared by every chunk the program runs over,
+    /// since it is the same set for all of them.
+    StrTrim {
+        ends: StrTrim,
+        set: Arc<TrimSet>,
+        src: Reg,
+        dst: Reg,
+    },
+    /// The characters at one end of a string, counted by a second
+    /// register rather than by something the statement wrote, since
+    /// LEFT and RIGHT take their count as an ordinary argument and a
+    /// column is one of the things that can arrive in it.
+    StrCut {
+        end: StrCut,
+        src: Reg,
+        n: Reg,
+        dst: Reg,
+    },
+    /// A string put into one of the four normal forms. The form is
+    /// whatever the statement wrote, or NFC where it wrote none, and it
+    /// is the same form for every chunk the program runs over.
+    StrNorm {
+        form: NormalForm,
+        src: Reg,
+        dst: Reg,
+    },
+    /// Whether a string is in a normal form already. This is the one
+    /// string op whose answer is a predicate rather than a value, so it
+    /// writes a bitmap the way a comparison does. `negated` carries the
+    /// NOT, which belongs in the kernel: a null row is off in either
+    /// answer, and a complement of the bitmap would have turned it on.
+    StrNormalized {
+        form: NormalForm,
+        negated: bool,
+        src: Reg,
+        dst: Reg,
+    },
+    /// The identifier of a node, which is the one element function
+    /// whose answer is a string. The table comes from the plan, a level
+    /// having one for every row it will ever produce, and the register
+    /// holds the rows themselves.
+    ElementId {
+        table: u32,
+        src: Reg,
         dst: Reg,
     },
     /// Comparison produces a predicate bitmap register.
@@ -120,7 +207,92 @@ impl Program {
                     let out = {
                         let lv = resolve(&regs, *l, chunk)?;
                         let rv = resolve(&regs, *r, chunk)?;
-                        binary(arena, *op, lv, rv)?
+                        binary(arena, *op, lv, rv, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::Math { op, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        unary(arena, *op, v, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::MathPair { op, l, r, dst } => {
+                    let out = {
+                        let lv = resolve(&regs, *l, chunk)?;
+                        let rv = resolve(&regs, *r, chunk)?;
+                        pair(arena, *op, lv, rv, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrLen { op, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        length(arena, *op, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrFold { op, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        fold(arena, *op, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrTrim {
+                    ends,
+                    set,
+                    src,
+                    dst,
+                } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        trim(arena, *ends, set, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrCut { end, src, n, dst } => {
+                    let out = {
+                        let s = resolve(&regs, *src, chunk)?;
+                        let count = resolve(&regs, *n, chunk)?;
+                        cut(arena, *end, s, count, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrNorm { form, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        normalize(arena, *form, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrNormalized {
+                    form,
+                    negated,
+                    src,
+                    dst,
+                } => {
+                    let mut bits = Bitmap::new_in(arena, count, false);
+                    {
+                        let v = resolve(&regs, *src, chunk)?;
+                        normalized(*form, *negated, v, &mut bits)?;
+                    }
+                    regs[*dst as usize] = Slot::Bits(bits);
+                    last = *dst;
+                }
+                ExprOp::ElementId { table, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        element_ids(arena, *table, v)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;

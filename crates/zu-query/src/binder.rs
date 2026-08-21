@@ -16,12 +16,12 @@ use std::fmt;
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{LogicalType, Result, ZuError};
+use zu_common::{DurationKind, LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
     NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SortKey, UnaryOp,
+    SetInto, SetItem, SortKey, TemporalFn, TrimSide, UnaryOp,
 };
 use crate::functions;
 use crate::refs::GraphHandle;
@@ -1258,6 +1258,14 @@ pub enum BoundClause {
         distinct: bool,
         items: Vec<BoundItem>,
         order_by: Vec<SortKey<BoundExpr>>,
+        /// GF20. The aggregates an `ORDER BY` asked for that no item
+        /// carries, each one an accumulator the grouping fills into the
+        /// slot on it and nothing else reads. The keys in `order_by`
+        /// hold that slot rather than the call, so a sort key is read
+        /// off the group the way a projected aggregate is. A key whose
+        /// aggregate the projection already carries reads that item's
+        /// slot instead and leaves nothing here.
+        order_aggs: Vec<BoundItem>,
         skip: Option<BoundExpr>,
         limit: Option<BoundExpr>,
         filter: Option<BoundExpr>,
@@ -1660,6 +1668,45 @@ impl TableFunc {
     }
 }
 
+/// Which of the two standard deviations of GF10 a call asks for, which
+/// is the whole of what tells `STDDEV_SAMP` from `STDDEV_POP`.
+///
+/// A population is every value there is and a sample is some of them,
+/// so a sample's spread is the wider of the two: dividing by one less
+/// than the count is Bessel's correction, and it is there because the
+/// mean a sample is measured against is the sample's own mean and so
+/// sits closer to the sample than the true mean does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Deviation {
+    /// `STDDEV_SAMP`, divided by one less than the count, and null
+    /// where the count is one, a single value being no sample of a
+    /// spread at all.
+    Sample,
+    /// `STDDEV_POP`, divided by the count, and nought where the count
+    /// is one.
+    Population,
+}
+
+/// Which of the two percentiles of GF11 a call asks for, which is what
+/// a fraction landing between two of the values is answered with.
+///
+/// `PERCENTILE_DISC` answers one of the values that were there, so its
+/// answer has the type the values had and is a number somebody could
+/// point at in the input. `PERCENTILE_CONT` answers the point the
+/// fraction names on the line drawn through them, which is a float
+/// whatever went in and is usually not a value that was there at all.
+/// The median of two and four is three under one and two under the
+/// other, and neither is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Percentile {
+    /// `PERCENTILE_CONT`, which interpolates between the two values the
+    /// fraction falls between and always answers a float.
+    Continuous,
+    /// `PERCENTILE_DISC`, which answers the first value whose share of
+    /// the group reaches the fraction, with the type it had.
+    Discrete,
+}
+
 /// Builtin functions the binder accepts in v0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
@@ -1668,7 +1715,22 @@ pub enum Func {
     Avg,
     Min,
     Max,
+    /// ISO 20.9's `COLLECT_LIST`, the set function that answers what it
+    /// was given rather than a number about it. `COLLECT` is the name
+    /// openCypher gives the same function and is kept as a spelling of
+    /// it.
     Collect,
+    /// GF10, ISO 20.9. The standard deviation of what it was given,
+    /// over the sample or over the population. One arm rather than two,
+    /// the two differing only in what the sum of squares is divided by,
+    /// and one accumulator behind both.
+    Stddev(Deviation),
+    /// GF11, ISO 20.9. The one set function that takes two arguments:
+    /// the values, and the fraction of the way through them to answer.
+    /// The fraction is the standard's independent value expression and
+    /// is the same for the whole group, which is checked rather than
+    /// assumed.
+    Percentile(Percentile),
     Id,
     /// G100, ISO 20.10. An identifier for an element, node or edge.
     ///
@@ -1721,10 +1783,30 @@ pub enum Func {
     Upper,
     /// ISO 20.24. The string with every character folded down.
     Lower,
-    /// ISO 20.24. The string with the spaces taken off both ends, which
-    /// is the one form of TRIM every implementation must have; naming
-    /// an end or a character to trim is GF06 and a separate spelling.
-    Trim,
+    /// GF05 and GF06: the trim family, under one arm for the reason the
+    /// numeric library is one. Which end is trimmed and whether the
+    /// characters trimmed are one character or a set of them is what
+    /// [`Trim`] says, and it is a question for the registry and the
+    /// kernel behind it.
+    Trim(Trim),
+    /// ISO 20.24, the substring function: `LEFT` and `RIGHT`, which are
+    /// one family for the reason the trims are, both taking a string
+    /// and a length and both raising the same condition when the length
+    /// is one no string has. Which end the characters are counted from
+    /// is what [`Cut`] says.
+    Cut(Cut),
+    /// ISO 20.27, the datetime value functions. Five cuts of the one
+    /// instant the statement is running at, which is the argument the
+    /// call carries, so the clock is read once per statement however
+    /// many of these it holds and however many rows they answer over.
+    Temporal(TemporalFn),
+    /// ISO 20.28, the datetime subtraction. The kind is on the function
+    /// rather than in the arguments for the reason a normal form is: it
+    /// is a qualifier the statement wrote and not a value a row holds,
+    /// so no row can change whether the answer counts months or
+    /// nanoseconds. A call that wrote no qualifier carries DAY TO
+    /// SECOND, which is what leaving it out means.
+    DurationBetween(DurationKind),
     /// ISO 20.24. The string in one of the four Unicode normal forms.
     /// The form is on the function rather than in the arguments because
     /// it is a word the statement wrote and not a value a row holds, so
@@ -1742,7 +1824,7 @@ pub enum Func {
     Math(Math),
 }
 
-/// ISO 20.19 to 20.21, the functions over one or two numbers: the
+/// ISO 20.22, the functions over one or two numbers: the
 /// arithmetic set, the trigonometric set and the logarithms.
 ///
 /// They are together because they are one family to everything outside
@@ -1800,12 +1882,55 @@ pub enum Math {
     Radians,
 }
 
+/// ISO 20.24, the trim family: which end of a string is trimmed, and
+/// whether what is trimmed is one character or a set of them.
+///
+/// The two questions are one enum because the answers are not
+/// independent of each other in the standard. `TRIM` takes a trim
+/// character, singular, and raises `22027` when it is handed anything
+/// else, and trimming a set of characters is a separate feature with
+/// three functions of its own, which is why an implementation can have
+/// the first without the second. So each of the six is a function, and
+/// the three that trim a set say so in their name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trim {
+    /// `TRIM(s)` and `TRIM([BOTH] [c] FROM s)`: one character off both
+    /// ends, a space when none is named.
+    Both,
+    /// `TRIM(LEADING c FROM s)`: the front only.
+    Leading,
+    /// `TRIM(TRAILING c FROM s)`: the back only.
+    Trailing,
+    /// GF05. `BTRIM(s, cs)`: every character of the set off both ends.
+    Btrim,
+    /// GF05. `LTRIM(s, cs)`: the front only.
+    Ltrim,
+    /// GF05. `RTRIM(s, cs)`: the back only.
+    Rtrim,
+}
+
+/// ISO 20.24, the substring function: which end of a string the
+/// characters are counted from.
+///
+/// GQL has no `SUBSTRING`. The word is reserved for a later standard to
+/// use and these two are the whole of the substring function, so a
+/// query that wants the middle of a string writes one inside the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// `LEFT(s, n)`: the first n characters.
+    Left,
+    /// `RIGHT(s, n)`: the last n characters.
+    Right,
+}
+
 impl Func {
+    /// Whether this is a set function, which the registry row says and
+    /// nothing else does. It was a list here once and a list here is a
+    /// second table: the day a set function is added and the list is
+    /// not touched is the day the executor is asked for an accumulator
+    /// the function has no arm for.
     pub fn is_aggregate(&self) -> bool {
-        matches!(
-            self,
-            Func::Count | Func::Sum | Func::Avg | Func::Min | Func::Max | Func::Collect
-        )
+        functions::row_of(*self).is_some_and(|at| functions::REGISTRY[at as usize].aggregate)
     }
 }
 
@@ -1857,6 +1982,16 @@ pub enum BoundExpr {
         ty: LogicalType,
         negated: bool,
     },
+    /// The instant the statement is running at, the hidden argument
+    /// every datetime value function is handed. No query writes it: the
+    /// binder plants it under the five words of ISO 20.27.
+    ///
+    /// It is a leaf and not a literal on purpose. A literal is folded
+    /// where the arguments are all literals, and folding a clock would
+    /// write the compile time into the plan cache and answer every
+    /// later statement with it. A leaf the run supplies is read where
+    /// the run is, once per statement.
+    Clock,
     Call {
         func: Func,
         /// Which row of the function registry answers this call, found
@@ -2242,7 +2377,7 @@ fn merge_props<'a>(
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) => {}
+        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) | BoundExpr::Clock => {}
         // A value query expression reads the slots the query inside it
         // captured, and nothing at all when it captured none, which is
         // what makes that one a single value for the whole run.
@@ -2323,6 +2458,93 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     }
 }
 
+/// Walks an expression, offering every part to `f` before the parts
+/// under it and putting whatever `f` answers in its place.
+///
+/// A part that is replaced is not walked into: what stands there now is
+/// the answer and not what the query wrote. A value query expression is
+/// a leaf here for the same reason it is one in [`expr_slots`], since
+/// what is inside it is a query of its own and not this expression.
+fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundExpr>) {
+    if let Some(replacement) = f(expr) {
+        *expr = replacement;
+        return;
+    }
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Graph(_)
+        | BoundExpr::Clock
+        | BoundExpr::Scalar { .. }
+        | BoundExpr::Var(_)
+        | BoundExpr::HasLabels { .. } => {}
+        BoundExpr::Property { base, .. } => rewrite(base, f),
+        BoundExpr::Unary { expr, .. } => rewrite(expr, f),
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            rewrite(lhs, f);
+            rewrite(rhs, f);
+        }
+        BoundExpr::IsNull { expr, .. } => rewrite(expr, f),
+        BoundExpr::IsTyped { expr, .. } => rewrite(expr, f),
+        BoundExpr::Call { args, .. } | BoundExpr::Fold { args, .. } => {
+            for arg in args {
+                rewrite(arg, f);
+            }
+        }
+        BoundExpr::List(items) => {
+            for item in items {
+                rewrite(item, f);
+            }
+        }
+        BoundExpr::Map(pairs) => {
+            for (_, value) in pairs {
+                rewrite(value, f);
+            }
+        }
+        BoundExpr::Path(elements) => {
+            for element in elements {
+                rewrite(element, f);
+            }
+        }
+        BoundExpr::Let { values, body } => {
+            for (_, value) in values {
+                rewrite(value, f);
+            }
+            rewrite(body, f);
+        }
+        BoundExpr::Cast { expr, .. } => rewrite(expr, f),
+        BoundExpr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            for expr in subject.iter_mut().chain(otherwise.iter_mut()) {
+                rewrite(expr, f);
+            }
+            for (when, then) in branches {
+                rewrite(when, f);
+                rewrite(then, f);
+            }
+        }
+        BoundExpr::Coalesce(args) => {
+            for arg in args {
+                rewrite(arg, f);
+            }
+        }
+        BoundExpr::NullIf { value, compared } => {
+            rewrite(value, f);
+            rewrite(compared, f);
+        }
+        BoundExpr::IsDirected { expr, .. }
+        | BoundExpr::IsLabeled { expr, .. }
+        | BoundExpr::PropertyExists { expr, .. } => rewrite(expr, f),
+        BoundExpr::IsEndpoint { node, rel, .. } => {
+            rewrite(node, f);
+            rewrite(rel, f);
+        }
+    }
+}
+
 /// Binds one linear query statement, appending whatever parameters it
 /// names to `params` so the positions stay the statement's.
 fn bind_linear(
@@ -2345,6 +2567,7 @@ fn bind_linear(
         captures: Vec::new(),
         groups: HashMap::new(),
         forked: BTreeSet::new(),
+        hidden: Vec::new(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -2449,6 +2672,17 @@ struct Binder<'a> {
     /// because a binding nothing reads is a binding nothing can tell
     /// apart from any other.
     forked: BTreeSet<String>,
+    /// The names an enclosing `CALL` scope clause took out of reach,
+    /// and the slots they are in.
+    ///
+    /// A block that may not read a name still runs on a row that holds
+    /// it, and the clauses after the call read it again, so the value
+    /// has to come along through the block whether or not the block can
+    /// see it. Every place that asks what the row carries asks the
+    /// scope, which is the right question everywhere else, so this is
+    /// what the scope has stopped answering: not a second scope, a note
+    /// of what was put away and where.
+    hidden: Vec<(String, usize)>,
 }
 
 /// A group variable: what the elements are and where the row holds them.
@@ -2725,6 +2959,284 @@ impl Binder<'_> {
         })
     }
 
+    /// Binds `CALL { ... }`, the inline procedure call of ISO 13.2 and
+    /// features GP01, GP02 and GP03.
+    ///
+    /// The block binds into the statement around it rather than into a
+    /// plan of its own, and that is the whole design. A block runs once
+    /// for each row that reaches it and reads that row, which is what a
+    /// clause standing there does anyway, so the clauses of the block
+    /// are the clauses of the statement and the optimizer sees one
+    /// query. The plan a three deep nest produces is the plan the
+    /// flattened text produces, character for character, because after
+    /// this function there is no nest left to see.
+    ///
+    /// What the scope clause says is settled here and costs nothing at
+    /// runtime. A name the block may not read is a name the binder
+    /// cannot find, so the block is refused while it is being read; the
+    /// rows go on carrying every value they carried, because the
+    /// clauses after the call still read them.
+    ///
+    /// What the block's `RETURN` names is added to the row rather than
+    /// put in place of it, which is the difference between this and a
+    /// `WITH`, and it binds the way a `LET` binds: the names in hand go
+    /// through the projection and the new ones follow them.
+    fn bind_call_inline(
+        &mut self,
+        scope: &Option<Vec<String>>,
+        body: &ast::Query,
+    ) -> Result<BoundClause> {
+        let simple = self.splicable(body)?;
+        let outer_scope = self.scope.clone();
+        let outer_groups = std::mem::take(&mut self.groups);
+        let outer_forked = std::mem::take(&mut self.forked);
+        // The row is still whole underneath; this is only what the
+        // block is allowed to see of it.
+        let put_away = self.hidden.len();
+        if let Some(names) = scope {
+            let mut narrowed = HashMap::new();
+            for name in names {
+                let Some(&slot) = outer_scope.get(name) else {
+                    return Err(invalid(format!(
+                        "the scope of a CALL names '{name}', which nothing in front of it bound: name a variable the statement already has, or leave the parentheses off and the block reads them all"
+                    )));
+                };
+                narrowed.insert(name.clone(), slot);
+            }
+            for (name, &slot) in &outer_scope {
+                if !narrowed.contains_key(name) {
+                    self.hidden.push((name.clone(), slot));
+                }
+            }
+            self.scope = narrowed;
+        } else {
+            self.groups.clone_from(&outer_groups);
+            self.forked.clone_from(&outer_forked);
+        }
+        // The names the block itself binds start here, which is what
+        // `RETURN *` stands for and what tells a returned name from a
+        // name the row already carried.
+        let own = self.variables.len();
+
+        let mut bound = Vec::new();
+        let outcome = (|| -> Result<()> {
+            for clause in &simple.clauses {
+                bound.push(self.bind_clause(clause)?);
+                bound.append(&mut self.pending);
+            }
+            Ok(())
+        })();
+        // A block that failed to bind leaves the statement's scope as
+        // it found it, so the message the caller gets is about the
+        // block and not about everything after it.
+        if let Err(e) = outcome {
+            self.scope = outer_scope;
+            self.groups = outer_groups;
+            self.forked = outer_forked;
+            self.hidden.truncate(put_away);
+            return Err(e);
+        }
+
+        let escaping = match &simple.result {
+            Some(projection) => self.bind_call_result(projection, own)?,
+            None => Vec::new(),
+        };
+        self.scope = outer_scope;
+        self.groups = outer_groups;
+        self.forked = outer_forked;
+        self.hidden.truncate(put_away);
+        if let Some(clause) = self.wider(escaping)? {
+            bound.push(clause);
+        }
+        if bound.is_empty() {
+            return Err(invalid(
+                "the block of a CALL is empty, so there is nothing for it to do: write a statement in it".into(),
+            ));
+        }
+        let first = bound.remove(0);
+        self.pending.extend(bound);
+        Ok(first)
+    }
+
+    /// The one simple statement an inline call's block holds, or the
+    /// reason it cannot be read as one.
+    ///
+    /// A block that chains with `NEXT` or joins with a set operator
+    /// answers a table of its own and cannot be spliced into the
+    /// statement around it, and neither can one that names a graph,
+    /// since the clauses beside it are running against another. Each of
+    /// those is a block that needs a plan of its own, which is the next
+    /// piece of this work rather than a thing to get half right here.
+    fn splicable<'q>(&self, body: &'q ast::Query) -> Result<&'q ast::Simple> {
+        if body.use_graph.is_some() {
+            return Err(invalid(
+                "the block of a CALL cannot name a graph of its own yet: take the USE out of it, or write the block as a statement of its own".into(),
+            ));
+        }
+        let ast::Composite::Linear(linear) = &body.body else {
+            return Err(invalid(
+                "the block of a CALL cannot join its statements with UNION, EXCEPT or INTERSECT yet: what those answer is a table of its own rather than more of the row".into(),
+            ));
+        };
+        let [simple] = linear.statements.as_slice() else {
+            return Err(invalid(
+                "the block of a CALL cannot chain with NEXT yet: what a NEXT answers is a table of its own rather than more of the row".into(),
+            ));
+        };
+        if let Some(projection) = &simple.result {
+            let refused = if projection.distinct {
+                Some("say DISTINCT")
+            } else if !projection.group_by.is_empty() {
+                Some("group its rows")
+            } else if !projection.order_by.is_empty() {
+                Some("order its rows")
+            } else if projection.skip.is_some() || projection.limit.is_some() {
+                Some("take a page of its rows")
+            } else {
+                None
+            };
+            if let Some(what) = refused {
+                return Err(invalid(format!(
+                    "the RETURN of a CALL block cannot {what} yet: the block runs for one row and adds to it, so what it answers has no order of its own to speak of"
+                )));
+            }
+        }
+        Ok(simple)
+    }
+
+    /// The items a block's `RETURN` lets out, bound in the block's own
+    /// scope and not yet named outside it.
+    ///
+    /// `own` is where the block's variables start, which is what
+    /// `RETURN *` means: everything the block itself bound, and none of
+    /// what the row already carried, since naming one of those again
+    /// would leave the clause after the call with two of them.
+    fn bind_call_result(
+        &mut self,
+        projection: &ast::Projection,
+        own: usize,
+    ) -> Result<Vec<(String, BoundExpr, Type)>> {
+        let mut out = Vec::new();
+        if projection.star {
+            let mut mine: Vec<(usize, String)> = self
+                .scope
+                .iter()
+                .filter(|(_, slot)| **slot >= own)
+                .map(|(name, slot)| (*slot, name.clone()))
+                .collect();
+            mine.sort_unstable();
+            for (slot, name) in mine {
+                out.push((name, BoundExpr::Var(slot), self.variables[slot].ty.clone()));
+            }
+        }
+        for item in &projection.items {
+            let mut ctx = ExprCtx::new(true);
+            let (expr, ty) = self.bind_expr(&item.expr, &mut ctx)?;
+            if ctx.saw_aggregate {
+                return Err(invalid(
+                    "the RETURN of a CALL block cannot aggregate yet: a set function reads a group of rows and the block runs for one".into(),
+                ));
+            }
+            // A name is what the block is letting out, so an item that
+            // is not already one has to be given one. This is the rule
+            // a WITH goes by rather than the rule a RETURN goes by, and
+            // for the same reason: what is being written is a variable
+            // the clauses after it read, not a column of an answer.
+            let name = match (&item.alias, &item.expr) {
+                (Some(alias), _) => alias.clone(),
+                (None, Expr::Variable(v)) => v.clone(),
+                (None, other) => {
+                    return Err(invalid(format!(
+                        "the RETURN of a CALL block names what the row carries away, so {} needs an alias: write it AS a name",
+                        text(other)
+                    )));
+                }
+            };
+            out.push((name, expr, ty));
+        }
+        Ok(out)
+    }
+
+    /// What puts a block's answer on the row, which most of the time is
+    /// nothing at all.
+    ///
+    /// A block that lets out elements it bound is letting out slots the
+    /// row is already carrying, so there is nothing to compute and no
+    /// operator to run: the name goes in the scope beside the slot it
+    /// stands for and the clauses after the call read it there. That is
+    /// how a three deep nest plans as the flattened text plans, since
+    /// after the binder there is nothing of the nest left over.
+    ///
+    /// A block that names a value rather than an element does need a
+    /// projection, and then everything in hand goes through it, the way
+    /// it goes through a `LET`: what a call answers is added to the row
+    /// rather than put in place of it.
+    fn wider(&mut self, escaping: Vec<(String, BoundExpr, Type)>) -> Result<Option<BoundClause>> {
+        for (name, _, _) in &escaping {
+            if self.scope.contains_key(name) {
+                return Err(invalid(format!(
+                    "the block of a CALL lets out '{name}', which the row already carries, so the clause after it would have two of them to read: write the item AS another name"
+                )));
+            }
+        }
+        if escaping
+            .iter()
+            .all(|(_, e, _)| matches!(e, BoundExpr::Var(_)))
+        {
+            for (name, expr, _) in escaping {
+                let BoundExpr::Var(slot) = expr else {
+                    unreachable!("every item is a variable")
+                };
+                self.scope.insert(name, slot);
+            }
+            return Ok(None);
+        }
+        let mut named: Vec<(usize, String)> = self
+            .scope
+            .iter()
+            .map(|(name, &slot)| (slot, name.clone()))
+            .chain(self.hidden.iter().map(|(name, slot)| (*slot, name.clone())))
+            .collect();
+        named.sort_unstable();
+        let mut items: Vec<BoundItem> = named
+            .into_iter()
+            .map(|(slot, name)| BoundItem {
+                expr: BoundExpr::Var(slot),
+                ty: self.variables[slot].ty.clone(),
+                name,
+                slot: Some(slot),
+                aggregate: false,
+            })
+            .collect();
+        for (name, expr, ty) in escaping {
+            // A variable keeps the slot it is already in, so letting it
+            // out is a name for it and not a copy of it.
+            let slot = match expr {
+                BoundExpr::Var(slot) => {
+                    self.scope.insert(name.clone(), slot);
+                    slot
+                }
+                _ => self.declare(&name, ty.clone())?,
+            };
+            items.push(BoundItem {
+                expr,
+                ty,
+                name,
+                slot: Some(slot),
+                aggregate: false,
+            });
+        }
+        Ok(Some(BoundClause::Project {
+            distinct: false,
+            items,
+            order_by: Vec::new(),
+            order_aggs: Vec::new(),
+            skip: None,
+            limit: None,
+            filter: None,
+        }))
+    }
+
     fn bind_clause(&mut self, clause: &Clause) -> Result<BoundClause> {
         match clause {
             Clause::Match {
@@ -2871,6 +3383,7 @@ impl Binder<'_> {
                 })
             }
             Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
+            Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
             // predicate is queued as exactly this. Binding it to that
@@ -3324,10 +3837,38 @@ impl Binder<'_> {
 
         self.scope = order_scope;
         let mut order_by = Vec::new();
+        let mut order_aggs = Vec::new();
         for key in &projection.order_by {
             let mut ctx = ExprCtx::new(true);
-            let (bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
+            let (mut bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
+            if ctx.saw_aggregate {
+                self.hoist_sort_aggregates(&mut bound, &items, &mut order_aggs);
+            }
             order_by.push(key.with_expr(bound));
+        }
+        // GF20. Sorting by an aggregate makes the clause a grouping
+        // even where no item is one, and behind a grouping a name is
+        // read once per group. The pre-projection variables were in
+        // scope while the keys were bound, because until the keys were
+        // read nothing said this was a grouping, so a key that reads
+        // one of them is refused here rather than answered off
+        // whichever row of the group the engine happened to hold.
+        if !order_aggs.is_empty() && !has_aggregate {
+            let grouped: HashSet<usize> = items
+                .iter()
+                .chain(order_aggs.iter())
+                .filter_map(|item| item.slot)
+                .collect();
+            for key in &order_by {
+                let mut reads = Vec::new();
+                expr_slots(&key.expr, &mut reads);
+                if let Some(slot) = reads.iter().find(|slot| !grouped.contains(slot)) {
+                    return Err(invalid(format!(
+                        "'{}' is read once per group, so it has to be one of the {clause} items or an aggregate over the group",
+                        self.variables[*slot].name
+                    )));
+                }
+            }
         }
         let skip = self.bind_count_limit(&projection.skip, "SKIP")?;
         let limit = self.bind_count_limit(&projection.limit, "LIMIT")?;
@@ -3359,10 +3900,64 @@ impl Binder<'_> {
             distinct: projection.distinct || grouped_without_aggregate,
             items,
             order_by,
+            order_aggs,
             skip,
             limit,
             filter,
         })
+    }
+
+    /// GF20. Takes the aggregates out of one sort key and leaves a name
+    /// where each one stood.
+    ///
+    /// An aggregate answers one value per group, and a sort key behind
+    /// a grouping is read once per group as well, so the key does not
+    /// have to hold the call: it can hold a slot the grouping fills,
+    /// which is what a projected aggregate already is. Where an item
+    /// carries the same call the key reads that item's slot and the
+    /// statement pays for one accumulator; where none does, the call
+    /// gets a slot of its own that no column reads.
+    ///
+    /// What is under a hoisted call is left alone. Those parts are read
+    /// once per row of the group, inside the accumulator, which is the
+    /// one place behind a grouping where a name is still a row's.
+    fn hoist_sort_aggregates(
+        &mut self,
+        key: &mut BoundExpr,
+        items: &[BoundItem],
+        hidden: &mut Vec<BoundItem>,
+    ) {
+        rewrite(key, &mut |node| {
+            let BoundExpr::Call { func, .. } = node else {
+                return None;
+            };
+            if !func.is_aggregate() {
+                return None;
+            }
+            let carried = items
+                .iter()
+                .chain(hidden.iter())
+                .find(|item| item.aggregate && item.expr == *node)
+                .and_then(|item| item.slot);
+            if let Some(slot) = carried {
+                return Some(BoundExpr::Var(slot));
+            }
+            // The slot holds whatever the call answers and nothing
+            // reads it but the key, which is already bound, so there is
+            // no type left for this to be the answer to. The item is
+            // named after the slot rather than after what the query
+            // wrote, so a plan listing names it the same way in the
+            // grouping that fills it and in the sort that reads it.
+            let slot = self.anon_slot(Type::Any);
+            hidden.push(BoundItem {
+                expr: node.clone(),
+                ty: Type::Any,
+                name: self.variables[slot].name.clone(),
+                slot: Some(slot),
+                aggregate: true,
+            });
+            Some(BoundExpr::Var(slot))
+        });
     }
 
     /// Binds a `LET`: the names it gives, added to everything already
@@ -3448,6 +4043,7 @@ impl Binder<'_> {
                 distinct: false,
                 items: carried.chain(stage).collect(),
                 order_by: Vec::new(),
+                order_aggs: Vec::new(),
                 skip: None,
                 limit: None,
                 filter: None,
@@ -3513,6 +4109,7 @@ impl Binder<'_> {
             distinct: false,
             items: bound,
             order_by: Vec::new(),
+            order_aggs: Vec::new(),
             skip: None,
             limit: None,
             filter: None,
@@ -3998,7 +4595,12 @@ impl Binder<'_> {
     /// and the clauses after it read those rows rather than the store,
     /// so every slot they might read has to come along.
     fn carried(&self) -> Vec<usize> {
-        let mut carry: Vec<usize> = self.scope.values().copied().collect();
+        let mut carry: Vec<usize> = self
+            .scope
+            .values()
+            .copied()
+            .chain(self.hidden.iter().map(|(_, slot)| *slot))
+            .collect();
         // A path variable is assembled from the slots of its walk, and
         // the ones the query never named are in no scope, so they come
         // along by way of the shape.
@@ -4947,6 +5549,17 @@ impl Binder<'_> {
             Expr::Normalize { expr, form } => {
                 self.bind_normalize(Func::Normalize(*form), expr, ctx)
             }
+            Expr::Trim {
+                side,
+                chars,
+                source,
+            } => self.bind_trim(*side, chars.as_deref(), source, ctx),
+            Expr::Temporal { func, arg } => self.bind_temporal(*func, arg.as_deref(), ctx),
+            // The instant, which is a value the run supplies and the
+            // type of a temporal value is ANY here, the way a date
+            // literal's is.
+            Expr::Clock => Ok((BoundExpr::Clock, Type::Any)),
+            Expr::DurationBetween { args, kind } => self.bind_duration_between(args, *kind, ctx),
             Expr::IsNormalized {
                 expr,
                 form,
@@ -5517,6 +6130,78 @@ impl Binder<'_> {
     ) -> Result<(BoundExpr, Type)> {
         let at = crate::functions::lookup(name)
             .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        self.bind_row(at, name, distinct, star, args, ctx)
+    }
+
+    /// `TRIM(LEADING 'x' FROM s)`, ISO 20.24 and GF06. The explicit
+    /// form is not written like a call and is one once it is read, so
+    /// the end it names picks the row and the rest is the checking
+    /// every other call gets.
+    fn bind_trim(
+        &mut self,
+        side: TrimSide,
+        chars: Option<&Expr>,
+        source: &Expr,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let trim = match side {
+            TrimSide::Leading => Trim::Leading,
+            TrimSide::Trailing => Trim::Trailing,
+            TrimSide::Both => Trim::Both,
+        };
+        let at = functions::row_of(Func::Trim(trim)).expect("a trim has a row");
+        let mut args = vec![source.clone()];
+        args.extend(chars.cloned());
+        self.bind_row(at, "trim", false, false, &args, ctx)
+    }
+
+    /// The temporal value functions of ISO 20.27 and 20.29. Each is a
+    /// cut of one value, so the call the binder writes takes that value
+    /// as its argument and the row says which cut it is: the string the
+    /// statement wrote, or the instant it is running at where it wrote
+    /// none. The clock is read where the statement runs rather than
+    /// here, which is what keeps a cached plan from carrying the time
+    /// it was compiled at, and it is why the two forms are one row and
+    /// one kernel.
+    fn bind_temporal(
+        &mut self,
+        func: TemporalFn,
+        arg: Option<&Expr>,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let at = functions::row_of(Func::Temporal(func)).expect("a temporal function has a row");
+        let arg = arg.cloned().unwrap_or(Expr::Clock);
+        self.bind_row(at, func.word(), false, false, &[arg], ctx)
+    }
+
+    /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO
+    /// 20.28. The qualifier picks the row and the rest is the checking
+    /// every other call gets, which is how a call written with two
+    /// arguments and one written with three reach the same refusal.
+    fn bind_duration_between(
+        &mut self,
+        args: &[Expr],
+        kind: Option<DurationKind>,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let kind = kind.unwrap_or(DurationKind::DayTime);
+        let at = functions::row_of(Func::DurationBetween(kind))
+            .expect("a datetime subtraction has a row");
+        self.bind_row(at, "duration_between", false, false, args, ctx)
+    }
+
+    /// A call whose row is already settled: the arity, the argument
+    /// types, the folding and the answer's type, which every call gets
+    /// however its name was written or whether it was written at all.
+    fn bind_row(
+        &mut self,
+        at: u16,
+        name: &str,
+        distinct: bool,
+        star: bool,
+        args: &[Expr],
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
         let sig = functions::row(at).expect("a row number came from the table");
         let func = sig.func;
         if sig.aggregate
@@ -5582,8 +6267,8 @@ impl Binder<'_> {
             bound.push(b);
         }
         ctx.in_aggregate = was_in_aggregate;
-        for ty in &arg_tys {
-            if !sig.arg.accepts(ty) {
+        for (at, ty) in arg_tys.iter().enumerate() {
+            if !sig.arg.accepts_at(at, ty) {
                 return Err(bad_type(format!("{}() {}, got {ty}", sig.name, sig.needs)));
             }
         }
@@ -5735,6 +6420,39 @@ pub fn text(expr: &Expr) -> String {
         }
         Expr::Normalize { expr, form } => {
             format!("NORMALIZE({}, {})", text(expr), form.name())
+        }
+        Expr::Trim {
+            side,
+            chars,
+            source,
+        } => {
+            let side = match side {
+                TrimSide::Leading => "LEADING ",
+                TrimSide::Trailing => "TRAILING ",
+                TrimSide::Both => "BOTH ",
+            };
+            let chars = match chars {
+                Some(chars) => format!("{} ", text(chars)),
+                None => String::new(),
+            };
+            format!("TRIM({side}{chars}FROM {})", text(source))
+        }
+        Expr::Temporal { func, arg } => match arg {
+            Some(arg) => format!("{}({})", func.word().to_uppercase(), text(arg)),
+            None => func.word().to_uppercase(),
+        },
+        // The word above is what a reader sees, since the instant is
+        // the binder's own doing and naming a column after it would
+        // name it after a thing the query never wrote.
+        Expr::Clock => "CURRENT_TIMESTAMP".into(),
+        Expr::DurationBetween { args, kind } => {
+            let written: Vec<String> = args.iter().map(text).collect();
+            let qualifier = match kind {
+                Some(DurationKind::YearMonth) => " YEAR TO MONTH",
+                Some(DurationKind::DayTime) => " DAY TO SECOND",
+                None => "",
+            };
+            format!("DURATION_BETWEEN({}){qualifier}", written.join(", "))
         }
         Expr::IsNormalized {
             expr,
@@ -6032,6 +6750,110 @@ mod tests {
             .iter()
             .find(|v| v.name == name)
             .unwrap_or_else(|| panic!("variable {name}"))
+    }
+
+    /// The scope clause is settled while the block is being read and
+    /// costs nothing after that, so a name the block may not read is a
+    /// name the binder cannot find. Every one of these is a message
+    /// about the block rather than about the clause after it.
+    #[test]
+    fn a_block_reads_what_its_scope_clause_says_and_no_more() {
+        let hidden = bind_err(
+            "MATCH (a:Person) CALL () { MATCH (b:Person) WHERE b.age > a.age RETURN b AS b } RETURN b",
+        );
+        assert!(hidden.contains("'a'"), "{hidden}");
+        let unbound =
+            bind_err("MATCH (a:Person) CALL (z) { MATCH (b:Person) RETURN b AS b } RETURN b");
+        assert!(unbound.contains("'z'"), "{unbound}");
+        // Named in the scope clause, so the block reads it.
+        let ok = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS b } RETURN b.name AS name",
+        );
+        assert!(ok.variables.iter().any(|v| v.name == "b"));
+    }
+
+    /// A block that answers a table of its own is one that cannot be
+    /// bound into the statement around it, so each of these says which
+    /// part of the block is the problem rather than refusing the word
+    /// CALL. They are the pieces of the family still to come.
+    #[test]
+    fn a_block_the_statement_cannot_absorb_says_which_part_it_was() {
+        for (source, want) in [
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b NEXT MATCH (b)-[:KNOWS]->(c:Person) RETURN c AS c } RETURN c",
+                "NEXT",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b UNION MATCH (c:Person) RETURN c AS b } RETURN b",
+                "UNION",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN DISTINCT b AS b } RETURN b",
+                "DISTINCT",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b ORDER BY b.age } RETURN b",
+                "order its rows",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS b LIMIT 3 } RETURN b",
+                "page",
+            ),
+            (
+                "MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN count(*) AS n } RETURN n",
+                "aggregate",
+            ),
+        ] {
+            let err = bind_err(source);
+            assert!(err.contains(want), "wanted {want} in {err}");
+        }
+    }
+
+    /// What leaves a block is a name for something, so an item that is
+    /// not already a name needs one, and a name the row already carries
+    /// cannot arrive on it twice.
+    #[test]
+    fn what_a_block_lets_out_is_named_once_each() {
+        let unnamed =
+            bind_err("MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b.age } RETURN a");
+        assert!(unnamed.contains("alias"), "{unnamed}");
+        let twice =
+            bind_err("MATCH (a:Person) CALL (a) { MATCH (b:Person) RETURN b AS a } RETURN a");
+        assert!(twice.contains("already carries"), "{twice}");
+    }
+
+    /// An element a block lets out keeps the slot it was found in, so
+    /// letting it out is a name for it rather than a copy of it, and
+    /// the block leaves no projection behind at all. A block that names
+    /// a value does leave one, and everything in hand goes through it.
+    #[test]
+    fn a_block_that_lets_out_an_element_leaves_no_operator() {
+        let elements = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS friend } RETURN friend.name AS name",
+        );
+        let projections = elements
+            .clauses
+            .iter()
+            .filter(|c| matches!(c, BoundClause::Project { .. }))
+            .count();
+        assert_eq!(projections, 1, "only the RETURN: {:?}", elements.clauses);
+        // The name the block let it out under is a name for the slot
+        // the match found it in, so there is no second variable for it.
+        assert!(
+            elements.variables.iter().all(|v| v.name != "friend"),
+            "{:?}",
+            elements.variables
+        );
+
+        let value = bound(
+            "MATCH (a:Person) CALL (a) { MATCH (a)-[:KNOWS]->(b:Person) RETURN b.age + 1 AS older } RETURN older",
+        );
+        let projections = value
+            .clauses
+            .iter()
+            .filter(|c| matches!(c, BoundClause::Project { .. }))
+            .count();
+        assert_eq!(projections, 2, "the block's and the RETURN's");
     }
 
     /// A chain binds to one list of clauses: the result of a statement

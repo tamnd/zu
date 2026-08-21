@@ -98,8 +98,8 @@ pub fn unpack(packed: &[u8], width: u32, out: &mut [u64]) {
     }
     if width == 64 {
         let n = (packed.len() / 8).min(CHUNK);
-        for (chunk, slot) in packed.chunks_exact(8).zip(out.iter_mut()) {
-            *slot = u64::from_le_bytes(chunk.try_into().unwrap());
+        for (chunk, slot) in packed.as_chunks::<8>().0.iter().zip(out.iter_mut()) {
+            *slot = u64::from_le_bytes(*chunk);
         }
         out[n..].fill(0);
         return;
@@ -130,11 +130,11 @@ fn unpack_transposed<const W: u32>(packed: &[u8], out: &mut [u64]) {
     let mut words = [0u64; LANES * 63];
     for (slot, chunk) in words[..LANES * W as usize]
         .iter_mut()
-        .zip(packed.chunks_exact(8))
+        .zip(packed.as_chunks::<8>().0)
     {
-        *slot = u64::from_le_bytes(chunk.try_into().unwrap());
+        *slot = u64::from_le_bytes(*chunk);
     }
-    for (t, out16) in out.chunks_exact_mut(LANES).enumerate() {
+    for (t, out16) in out.as_chunks_mut::<LANES>().0.iter_mut().enumerate() {
         let bit = t as u32 * W;
         let r = (bit >> 6) as usize;
         let s = bit & 63;
@@ -159,13 +159,13 @@ fn unpack_const<const W: u32>(packed: &[u8], out: &mut [u64]) {
     let mut words = [0u64; 16 * 63];
     for (slot, chunk) in words[..16 * W as usize]
         .iter_mut()
-        .zip(packed.chunks_exact(8))
+        .zip(packed.as_chunks::<8>().0)
     {
-        *slot = u64::from_le_bytes(chunk.try_into().unwrap());
+        *slot = u64::from_le_bytes(*chunk);
     }
     // 64 values consume exactly W words, so unroll in blocks of 64 with a
     // repeating in-block shift pattern the compiler can flatten.
-    for (block, out_block) in out.chunks_exact_mut(64).enumerate() {
+    for (block, out_block) in out.as_chunks_mut::<64>().0.iter_mut().enumerate() {
         let base = block * W as usize;
         for (i, slot) in out_block.iter_mut().enumerate() {
             let bit = i as u32 * W;

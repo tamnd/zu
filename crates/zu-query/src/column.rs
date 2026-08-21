@@ -498,9 +498,10 @@ impl Held {
     /// which is the one copy left on the export path: a memcpy of the
     /// bytes that are already contiguous and already the right shape,
     /// against the two strided walks of a row vector this replaced. It
-    /// goes when a client takes the result by value instead of by
-    /// reference, and not before, because a caller is allowed to ask
-    /// twice.
+    /// is here because a caller is allowed to ask twice, and it goes
+    /// when a caller says it will not: [`QueryResult::into_columns`]
+    /// takes the result by value and hands these buffers over instead
+    /// of copying them.
     pub fn borrow(&self) -> Columns<'_> {
         let columns = self
             .columns
@@ -838,6 +839,38 @@ impl QueryResult {
             })
             .collect();
         Ok(Columns { columns, rows })
+    }
+
+    /// The buffers the sink filled, taken rather than lent.
+    ///
+    /// [`QueryResult::columnar`] copies them, and has to: it hands back a
+    /// view of a result that stays readable, so the buffer behind the view
+    /// is still the result's and cannot be given away. That copy is a
+    /// memcpy of bytes that are already contiguous and already the right
+    /// shape, which is cheap next to what it replaced and not cheap next
+    /// to nothing. A caller turning the whole answer into Arrow and
+    /// throwing the result away is paying it for no reason.
+    ///
+    /// So this takes the result by value and gives up its buffers. What
+    /// comes back is what the executor wrote, and an Arrow array built on
+    /// one of them holds the executor's own allocation rather than a copy
+    /// of it, which is what makes an export of a hundred million integers
+    /// cost the pointer and not the eight hundred megabytes.
+    ///
+    /// A result whose rows were built rather than filled has no buffers to
+    /// give, and comes back untouched rather than converted, because the
+    /// conversion for that shape is [`QueryResult::columnar`] and it
+    /// allocates the buffers fresh anyway, so there is nothing to save and
+    /// no reason for this to have two answers.
+    ///
+    /// # Errors
+    ///
+    /// The result itself, when the sink built rows instead of columns.
+    pub fn into_columns(mut self) -> Result<Held, QueryResult> {
+        match self.rows.take_columns() {
+            Some(held) => Ok(held),
+            None => Err(self),
+        }
     }
 }
 

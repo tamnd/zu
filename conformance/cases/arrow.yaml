@@ -1,0 +1,433 @@
+schema: 4
+suite: arrow
+doc: The other way a result leaves the database. A client that reads rows one at a time and a client that hands a million of them to a dataframe are the same client, and only the first of those paths is covered by a case that asserts values. Every case here asserts both: the rows, as every other suite does, and the schema the export gives for them, written in the C Data Interface's own format strings because that is the one spelling every language sees the same. The fixture is three people and two edges between them, which is enough for a node, an edge and a path to have somewhere to come from.
+
+load:
+  nodes: person
+  edges: knows
+  count: 3
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+
+cases:
+  - name: an-integer-is-an-int64
+    doc: The smallest export there is, and the one that pins the width: an integer is 64 bits on the way out whatever the case wrote it as, because the engine holds one type of integer and a narrower Arrow column would be a value a client cannot get back.
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+    arrow:
+      - name: n
+        format: l
+
+  - name: a-float-is-a-double
+    doc: The same for the other number, which has one width in the engine as well.
+    query: RETURN 1.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.5"
+    arrow:
+      - name: n
+        format: g
+
+  - name: a-boolean-is-a-boolean
+    doc: A bit rather than a byte, which is the layout Arrow keeps booleans in and the one a client reading them into a dataframe expects.
+    query: RETURN true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+    arrow:
+      - name: n
+        format: b
+
+  - name: a-string-is-utf8
+    doc: The narrow offsets, which is what a column of text under two gigabytes exports as. The wide form exists and has its own format string, and no case here is big enough to reach it.
+    query: RETURN 'hi' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: hi
+    arrow:
+      - name: n
+        format: u
+
+  - name: a-column-that-is-only-nulls-is-the-null-type
+    doc: A column whose every row is null has no other type to be, so it exports as Arrow's own null type rather than as a nullable something the engine had to pick.
+    query: RETURN null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: "NULL"
+    arrow:
+      - name: n
+        format: n
+
+  - name: a-null-among-values-does-not-change-the-type
+    doc: The other half of the one above. A null is a bit in the validity map beside the values and not a type of its own, so a column of an integer and a null is still a column of integers, and a client that widened it to something nullable in the schema would be describing a different column.
+    query: UNWIND [1, null] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: "NULL"
+    arrow:
+      - name: n
+        format: l
+
+  - name: a-date-is-days-from-the-epoch
+    doc: Date32, which is days and not milliseconds, and is the one of Arrow's two date types that holds what the engine holds.
+    query: RETURN DATE '2024-01-02' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-02"
+    arrow:
+      - name: n
+        format: tdD
+
+  - name: a-local-time-is-nanoseconds-from-midnight
+    doc: Time64 in nanoseconds, which is the resolution the engine keeps a time at, so nothing is rounded on the way out.
+    query: RETURN LOCAL TIME '12:34:56.123456789' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "12:34:56.123456789"
+    arrow:
+      - name: n
+        format: ttn
+
+  - name: a-local-datetime-is-a-timestamp-with-no-zone
+    doc: The empty zone after the colon is the whole of the assertion: a datetime with no offset in it must not arrive somewhere as a datetime in UTC, because that is a claim about where it happened that nobody made.
+    query: RETURN LOCAL DATETIME '2024-01-01T00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T00:00:00"
+    arrow:
+      - name: n
+        format: "tsn:"
+
+  - name: a-zoned-datetime-carries-the-offset-it-was-written-in
+    doc: The offset rides in the type rather than in the values, which is how Arrow says it, and it is the offset the value was written with rather than the reader's own. A fixed offset and not a region name, because a fixed offset is what the engine stored and no arithmetic recovers a place from one.
+    query: RETURN ZONED DATETIME '2024-01-01T00:00:00+07:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00+07:00"
+    arrow:
+      - name: n
+        format: "tsn:+07:00"
+
+  - name: an-offset-west-of-utc-keeps-its-sign
+    doc: The same, on the side of the meridian where a client that formatted the offset by hand loses the sign or the minutes.
+    query: RETURN ZONED DATETIME '2024-01-01T00:00:00-05:30' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00-05:30"
+    arrow:
+      - name: n
+        format: "tsn:-05:30"
+
+  - name: a-year-month-duration-is-a-month-day-nano-interval
+    doc: Arrow has a year-month interval and it is not the one to use: its type id has no class behind it in pyarrow, so a column of them raises rather than reading. Month-day-nano is the interval every reader implements, and a year-month duration is one with no days and no nanoseconds in it.
+    query: RETURN DURATION 'P1Y2M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"
+    arrow:
+      - name: n
+        format: tin
+
+  - name: a-day-time-duration-is-nanoseconds
+    doc: A duration of days and below is a length of time and not a walk over a calendar, so it is a duration in nanoseconds rather than an interval.
+    query: RETURN DURATION 'PT1H30M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+    arrow:
+      - name: n
+        format: tDn
+
+  - name: a-time-with-an-offset-has-no-arrow-type
+    doc: Arrow has a time and a timestamp and nothing in between, so a time carrying an offset has nowhere to go. The export refuses the whole result rather than dropping the offset, because dropping it moves the value and a client would have no way to know.
+    query: RETURN ZONED TIME '12:34:56+07:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:34:56+07:00"
+    arrow: refused
+
+  - name: a-list-is-a-list-of-what-it-holds
+    doc: The field under a list is named item, which is Arrow's own name for it and is written out here rather than left implied: a client that called it element would export something no reader lines up with what another client wrote.
+    query: RETURN [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+    arrow:
+      - name: n
+        format: "+l"
+        children:
+          - name: item
+            format: l
+
+  - name: a-list-of-lists-nests
+    doc: The same rule one level down, which is where a client that built the schema from the first value it saw rather than from the column's type gets a list of integers.
+    query: RETURN [[1], [2]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LIST
+                value:
+                  - type: INT64
+                    value: "1"
+              - type: LIST
+                value:
+                  - type: INT64
+                    value: "2"
+    arrow:
+      - name: n
+        format: "+l"
+        children:
+          - name: item
+            format: "+l"
+            children:
+              - name: item
+                format: l
+
+  - name: every-column-of-the-projection-is-a-column-of-the-export
+    doc: Three types in one statement, in the order the projection wrote them, which is the case that would catch an export that sorted its columns or dropped one it had no use for.
+    query: RETURN 1 AS a, 'two' AS b, 3.5 AS c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: STRING
+            value: two
+          - type: FLOAT64
+            value: "3.5"
+    arrow:
+      - name: a
+        format: l
+      - name: b
+        format: u
+      - name: c
+        format: g
+
+  - name: every-row-comes-out-through-the-export
+    doc: Three rows in and three rows out, counted over the batches the stream gives rather than off the result, because an export that cut its batches wrong loses or repeats rows at the seam and the schema is right either way.
+    query: UNWIND [1, 2, 3] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "3"
+    arrow:
+      - name: n
+        format: l
+
+  - name: a-result-with-no-rows-still-has-a-schema
+    doc: A consumer that got no batch at all could not tell what the columns were, so an empty result is a schema and an empty batch rather than nothing. The column is the null type because no row ever held a value for the engine to have a type from, which is what a client reading an empty answer has to be ready for.
+    query: UNWIND [1, 2] AS n RETURN n LIMIT 0
+    columns:
+      - n
+    rows:
+    arrow:
+      - name: n
+        format: n
+
+  - name: a-node-is-the-table-it-is-in-and-the-row-it-is
+    doc: The name of the table rather than its id, because the id is a number the file decided and every client builds its own file, and the row offset beside it as an unsigned 64 bit integer. Both fields are the whole of what a node is.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NODE
+            value: "person#0"
+    arrow:
+      - name: n
+        format: "+s"
+        children:
+          - name: table
+            format: u
+          - name: offset
+            format: L
+
+  - name: an-edge-is-its-table-the-two-rows-it-joins-and-which-of-them-it-is
+    doc: An edge carries one more field than a node does: two rows may have several edges between them and the ordinal is which one this is, which the value encoding does not spell and the export does, because a client holding an edge has to be able to name it again.
+    query: MATCH (a:person)-[e:knows]->(b:person) WHERE a.name = 'ann' RETURN e
+    columns:
+      - e
+    rows:
+      - values:
+          - type: EDGE
+            value: "knows#0->1"
+    arrow:
+      - name: e
+        format: "+s"
+        children:
+          - name: table
+            format: u
+          - name: src
+            format: L
+          - name: dst
+            format: L
+          - name: ord
+            format: L
+
+  - name: a-path-is-a-list-of-nodes-and-a-list-of-edges
+    doc: Not a list of the two kinds side by side, which nothing in Arrow can hold, but the walk split into the rows it went through and the edges it took. A reader that zips them back together gets the walk in the order it happened.
+    query: MATCH p = (a:person)-[:knows]->(b:person) WHERE a.name = 'ann' AND b.name = 'bo' RETURN p
+    columns:
+      - p
+    rows:
+      - values:
+          - type: PATH
+            value:
+              - type: NODE
+                value: "person#0"
+              - type: EDGE
+                value: "knows#0->1"
+              - type: NODE
+                value: "person#1"
+    arrow:
+      - name: p
+        format: "+s"
+        children:
+          - name: nodes
+            format: "+l"
+            children:
+              - name: item
+                format: "+s"
+                children:
+                  - name: table
+                    format: u
+                  - name: offset
+                    format: L
+          - name: rels
+            format: "+l"
+            children:
+              - name: item
+                format: "+s"
+                children:
+                  - name: table
+                    format: u
+                  - name: src
+                    format: L
+                  - name: dst
+                    format: L
+                  - name: ord
+                    format: L
+
+  - name: a-node-beside-a-property-of-it
+    doc: A struct column and a flat one in the same export, which is the projection a client writes when it wants something to hold on to as well as something to show, and is where an export that built its schema off the first column gets the second one wrong.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.name AS name, n
+    columns:
+      - name
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: NODE
+            value: "person#0"
+    arrow:
+      - name: name
+        format: u
+      - name: n
+        format: "+s"
+        children:
+          - name: table
+            format: u
+          - name: offset
+            format: L
+
+  - name: nodes-gathered-into-a-list-are-a-list-of-structs
+    doc: A graph value inside a composite, which is where the two halves of this suite meet: the list rule says the field is named item and the node rule says what is under it.
+    query: MATCH (n:person) WHERE n.name IN ['ann', 'bo'] WITH n ORDER BY n.name RETURN collect(n) AS ns
+    columns:
+      - ns
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: NODE
+                value: "person#0"
+              - type: NODE
+                value: "person#1"
+    arrow:
+      - name: ns
+        format: "+l"
+        children:
+          - name: item
+            format: "+s"
+            children:
+              - name: table
+                format: u
+              - name: offset
+                format: L

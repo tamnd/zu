@@ -27,13 +27,25 @@
  * so that two clients disagreeing about a case is a diff rather than a
  * reading exercise, and CI diffs the two over every case and over
  * conformance/c/wrong, which is the failures the corpus cannot show
- * because it passes. Two places are outside that. A load that cannot go
- * in is refused by the ABI and reported in the ABI's words, because the
- * two runners refuse it in different places: the Rust one knows the
- * line the column was written on and the loader knows the column. And a
- * cell holding a node, a rel, a path or a record is named rather than
- * printed, since the encoding reserves those names and a cv has no arm
- * for one. Neither can happen in a case that passes.
+ * because it passes. Three places are outside that. A load that cannot
+ * go in is refused by the ABI and reported in the ABI's words, because
+ * the two runners refuse it in different places: the Rust one knows the
+ * line the column was written on and the loader knows the column. A
+ * cell holding a record is named rather than printed, since the
+ * encoding has no spelling for one and a cv has no arm for one. And an
+ * export the engine has no Arrow type for is reported in the ABI's
+ * words too, which are the same words with the ABI's own "invalid
+ * argument" in front of them, since a refusal reaches this side as a
+ * zu_error and reaches the other side as the export's own error. None
+ * of the three can happen in a case that passes.
+ *
+ * A case may run its statements on more than one connection, which is
+ * how a case about a transaction is written: the connection that opened
+ * it is not the one that can say what is visible from outside it. The
+ * extra ones come from zu_conn_duplicate, so they share a write side
+ * with the case's own and see each other's commits. Statements still
+ * run one at a time in the order they were written, and nothing here
+ * starts a thread.
  *
  * An outcome is one of three things. Passed and failed are obvious.
  * Unsupported is a statement the engine refuses with a GQLSTATUS in
@@ -54,7 +66,19 @@
 
 /* The schema this runner reads. A file from another one says so here
  * rather than failing somewhere in the middle of its cases. */
-#define RUNNER_SCHEMA 3
+#define RUNNER_SCHEMA 4
+
+/* How many connections one case may name. A case about a transaction
+ * needs two, one to open it and one to ask what is visible from
+ * outside it, and nothing in the corpus has ever wanted a third. The
+ * ceiling is here so that the set is an array on the stack rather than
+ * an allocation per case, and a case that reached it is refused with
+ * this number in the message rather than silently reusing one. */
+#define MAX_CONNS 4
+
+/* The connection a statement runs on when its case does not name one,
+ * which is every statement in nearly every case. */
+#define MAIN_CONN "main"
 
 typedef enum outcome { OUT_PASSED, OUT_FAILED, OUT_UNSUPPORTED } outcome;
 
@@ -67,11 +91,29 @@ typedef struct run {
     int strict;
     int quiet;
     cv_arena *arena;
+    /* The connection the case is running on, which is here because
+     * turning a node into a value the case can be compared against
+     * needs the name of its table and the connection is what knows
+     * one. NULL outside a case. */
+    zu_conn *conn;
     unsigned long cases;
     unsigned long passed;
     unsigned long failed;
     unsigned long unsupported;
 } run;
+
+/* The connections one case runs on, made as they are first named.
+ *
+ * The first is the case's own, from zu_create or zu_open; the rest are
+ * duplicates of it, which is what a pool does and what the reference
+ * runner does, so they share a write side and each sees what the other
+ * has committed. The names point into the document, which outlives the
+ * case, except for the first, which is the literal below. */
+typedef struct conns {
+    const char *name[MAX_CONNS];
+    zu_conn *conn[MAX_CONNS];
+    size_t count;
+} conns;
 
 /* What a refusal said and the condition it named, copied out of the
  * handle so that the handle can be released here rather than at every
@@ -157,12 +199,39 @@ static void *slots(run *r, size_t n, size_t size) {
 
 static const char *type_name(int32_t type) {
     switch (type) {
-    case ZU_TYPE_NODE: return "NODE";
-    case ZU_TYPE_REL: return "REL";
-    case ZU_TYPE_PATH: return "PATH";
     case ZU_TYPE_RECORD: return "RECORD";
     default: return "value of a type this header does not name";
     }
+}
+
+/* What a table id is called, copied into the arena.
+ *
+ * Copied rather than borrowed because the connection keeps one name at
+ * a time and the next call replaces it, so a path of four nodes that
+ * held the pointer would be four pointers at one name.
+ *
+ * A table the catalog does not name is spelled `#7` after its id, which
+ * is what the reference runner does and for the reason it gives: a
+ * report saying "the case wants person#1 and this is #7" is more use to
+ * whoever has to fix it than a runner that stopped. */
+static int table_name(run *r, uint32_t table, zy_str *out) {
+    size_t len = 0;
+    const char *name = zu_conn_table_name(r->conn, table, &len);
+    char spelled[16];
+    char *copy;
+    if (name == NULL) {
+        len = (size_t)snprintf(spelled, sizeof spelled, "#%lu", (unsigned long)table);
+        name = spelled;
+    }
+    copy = (char *)cv_alloc(r->arena, len + 1);
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    out->ptr = copy;
+    out->len = len;
+    return 0;
 }
 
 /* One cell of a result as the value the encoding compares, so that what
@@ -175,10 +244,14 @@ static const char *type_name(int32_t type) {
  * therefore the one place this has to allocate, and it allocates in the
  * arena so that its items die with the case the decoded ones do.
  *
- * A node, a rel, a path or a record is a failure naming what came back.
- * The encoding reserves those names and no case can write one, so a
- * cell holding one is a case whose statement returns something the
- * corpus has no way to assert. */
+ * A node, an edge and a path carry the name of their table rather than
+ * its id, because the id is a number the file decided and every client
+ * builds its own file, so the name is what a case can assert and the
+ * connection is what is asked for it.
+ *
+ * A record is a failure naming what came back. The encoding has no
+ * spelling for one, so a cell holding one is a case whose statement
+ * returns something the corpus has no way to assert. */
 static int engine_value(run *r, const zu_value *v, const char *where, cv *out, char *detail,
                         size_t len) {
     int32_t type = zu_value_type(v);
@@ -240,6 +313,36 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
         out->as.temporal.offset = offset;
         return 0;
     }
+    case ZU_TYPE_NODE: {
+        uint32_t table = 0;
+        uint64_t offset = 0;
+        if (zu_value_node(v, &table, &offset) != ZU_OK) {
+            return say(detail, len, "%s says it is a NODE and does not read as one", where);
+        }
+        if (table_name(r, table, &out->as.node.table) != 0) {
+            return say(detail, len, "%s is a node with no memory to name its table", where);
+        }
+        out->kind = CV_NODE;
+        out->as.node.offset = offset;
+        return 0;
+    }
+    case ZU_TYPE_REL: {
+        uint32_t table = 0;
+        uint64_t src = 0, dst = 0;
+        if (zu_value_rel(v, &table, &src, &dst) != ZU_OK) {
+            return say(detail, len, "%s says it is an EDGE and does not read as one", where);
+        }
+        if (table_name(r, table, &out->as.edge.table) != 0) {
+            return say(detail, len, "%s is an edge with no memory to name its table", where);
+        }
+        out->kind = CV_EDGE;
+        out->as.edge.src = src;
+        out->as.edge.dst = dst;
+        return 0;
+    }
+    /* A path walks with the accessors a list walks with, which is why
+     * it is read here rather than in a case of its own. */
+    case ZU_TYPE_PATH:
     case ZU_TYPE_LIST: {
         uint64_t count = zu_value_len(v), i;
         cv *items = (cv *)slots(r, (size_t)count, sizeof(cv));
@@ -257,7 +360,7 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
                 return -1;
             }
         }
-        out->kind = CV_LIST;
+        out->kind = type == ZU_TYPE_PATH ? CV_PATH : CV_LIST;
         out->as.list.items = items;
         out->as.list.count = (size_t)count;
         return 0;
@@ -271,15 +374,21 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
 /* The names the case wrote, and the names the result carries, in the
  * one shape the comparison and the report both want. */
 static const zy_str *wanted_names(run *r, const zy_node *columns, size_t *count) {
+    const zy_node *items = NULL;
     zy_str *out;
     size_t i;
-    *count = columns->count;
-    out = (zy_str *)slots(r, columns->count, sizeof(zy_str));
-    for (i = 0; out != NULL && i < columns->count; i++) {
-        if (columns->items[i].kind != ZY_SCALAR) {
+    /* A `columns:` with nothing under it is a result with no columns,
+     * which is what FINISH answers, so it goes through the same
+     * accessor `rows:` does rather than reading the fields directly. */
+    if (zy_seq_or_empty(columns, &items, count) != 0) {
+        return NULL;
+    }
+    out = (zy_str *)slots(r, *count, sizeof(zy_str));
+    for (i = 0; out != NULL && i < *count; i++) {
+        if (items[i].kind != ZY_SCALAR) {
             return NULL;
         }
-        out[i] = columns->items[i].text;
+        out[i] = items[i].text;
     }
     return out;
 }
@@ -374,6 +483,220 @@ static int compare(run *r, const zy_node *columns, const zy_node *rows, zu_resul
     if ((uint64_t)want_count != got_count) {
         return say(detail, len, "%lu rows where the case wants %lu", (unsigned long)got_count,
                    (unsigned long)want_count);
+    }
+    return 0;
+}
+
+/* ---- the export ----
+ *
+ * The same result on the way out through Arrow, which a case describes
+ * with `arrow:` and which crates/zu-corpus/src/arrow.rs says the whole
+ * of the why about. What is checked here is the schema, in the C Data
+ * Interface's own format strings, and how many rows came back through
+ * the stream: this side reads those strings out of the struct where the
+ * reference runner reads them off an FFI_ArrowSchema, and the two are
+ * the same bytes, which is the point of asserting the format string
+ * rather than a name for the type. */
+
+/* One field of the schema, as the case wrote it. The strings point into
+ * the document, which outlives the case, so only the arrays are the
+ * arena's. */
+typedef struct afield {
+    zy_str name;
+    zy_str format;
+    const struct afield *children;
+    size_t count;
+} afield;
+
+static int arrow_fields(run *r, const zy_node *node, const afield **out, size_t *count,
+                        char *detail, size_t len);
+
+static int arrow_field(run *r, const zy_node *node, afield *out, char *detail, size_t len) {
+    static const char *const KEYS[3] = {"name", "format", "children"};
+    const zy_node *name, *format, *children;
+    zy_str extra;
+
+    if (node->kind != ZY_MAP) {
+        return say(detail, len, "an Arrow field is a mapping of `name` and `format`");
+    }
+    extra = zy_unknown(node, KEYS, 3);
+    if (extra.ptr != NULL) {
+        return say(detail, len, "an Arrow field has no key \"%s\"", extra.ptr);
+    }
+    name = zy_get(node, "name");
+    format = zy_get(node, "format");
+    if (name == NULL || name->kind != ZY_SCALAR) {
+        return say(detail, len, "an Arrow field has a `name:`");
+    }
+    if (format == NULL || format->kind != ZY_SCALAR || format->text.len == 0) {
+        return say(detail, len, "an Arrow field has a `format:`");
+    }
+    out->name = name->text;
+    out->format = format->text;
+    out->children = NULL;
+    out->count = 0;
+    children = zy_get(node, "children");
+    if (children == NULL) {
+        return 0;
+    }
+    return arrow_fields(r, children, &out->children, &out->count, detail, len);
+}
+
+static int arrow_fields(run *r, const zy_node *node, const afield **out, size_t *count,
+                        char *detail, size_t len) {
+    afield *fields;
+    size_t i;
+
+    if (node->kind != ZY_SEQ) {
+        return say(detail, len, "`arrow:` is a sequence of fields");
+    }
+    fields = (afield *)slots(r, node->count, sizeof(afield));
+    if (fields == NULL) {
+        return say(detail, len, "the fields did not read");
+    }
+    for (i = 0; i < node->count; i++) {
+        if (arrow_field(r, &node->items[i], &fields[i], detail, len) != 0) {
+            return -1;
+        }
+    }
+    *out = fields;
+    *count = node->count;
+    return 0;
+}
+
+/* The fields under one place of the schema against the ones the case
+ * wrote, where the place is the dotted path of the field they are under
+ * and the empty one is the result itself. The first difference and not
+ * all of them, for the reason the row comparison gives. */
+static int arrow_schema(const char *prefix, struct ArrowSchema **got, size_t found,
+                        const afield *want, size_t count, char *detail, size_t len) {
+    char place[512];
+    size_t i;
+
+    if (prefix[0] == '\0') {
+        snprintf(place, sizeof place, "the result");
+    } else {
+        snprintf(place, sizeof place, "\"%s\"", prefix);
+    }
+    if (found != count) {
+        return say(detail, len, "arrow gives %lu fields in %s where the case wants %lu",
+                   (unsigned long)found, place, (unsigned long)count);
+    }
+    for (i = 0; i < count; i++) {
+        /* A field of a schema may carry no name at all, which is not
+         * something this export produces and is still not a reason to
+         * follow a NULL into a comparison. */
+        const char *name = got[i]->name != NULL ? got[i]->name : "";
+        const char *format = got[i]->format != NULL ? got[i]->format : "";
+        char path[512];
+        if (strcmp(name, want[i].name.ptr) != 0) {
+            return say(detail, len, "arrow field %lu in %s is named \"%s\" where the case wants \"%s\"",
+                       (unsigned long)(i + 1), place, name, want[i].name.ptr);
+        }
+        if (prefix[0] == '\0') {
+            snprintf(path, sizeof path, "%s", want[i].name.ptr);
+        } else {
+            snprintf(path, sizeof path, "%s.%s", prefix, want[i].name.ptr);
+        }
+        if (strcmp(format, want[i].format.ptr) != 0) {
+            return say(detail, len, "arrow field \"%s\" is \"%s\" where the case wants \"%s\"", path,
+                       format, want[i].format.ptr);
+        }
+        if (arrow_schema(path, got[i]->children, (size_t)got[i]->n_children, want[i].children,
+                         want[i].count, detail, len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* What the export gave that the case did not want, or 0 if the two
+ * agree.
+ *
+ * This spends the result, which is why it takes the handle through a
+ * pointer to it and why it runs after the rows have been compared:
+ * zu_result_arrow writes NULL back on every path and the buffers a cell
+ * string was borrowed from belong to the stream afterwards. The caller
+ * still frees what it has, which is then NULL and a no-op. */
+static int arrow_export(run *r, zu_result **result, const zy_node *arrow, uint64_t rows,
+                        char *detail, size_t len) {
+    struct ArrowArrayStream stream;
+    struct ArrowSchema schema;
+    struct ArrowArray batch;
+    const afield *want = NULL;
+    size_t count = 0;
+    int refused = 0, wrong;
+    uint64_t given = 0;
+    zu_status status;
+    zu_error *e = NULL;
+    refusal f;
+
+    if (arrow->kind == ZY_SCALAR) {
+        if (!zy_eq(arrow->text, "refused")) {
+            return say(detail, len, "`arrow:` is the columns the export gives, or `refused`");
+        }
+        refused = 1;
+    } else if (arrow_fields(r, arrow, &want, &count, detail, len) != 0) {
+        return -1;
+    }
+
+    status = zu_result_arrow(r->conn, result, 0, &stream, &e);
+    /* A library built without the export answers this and nothing else,
+     * and a runner that graded it would be grading how the library was
+     * built rather than what it does. The reference runner skips the
+     * same check for the same reason, so the two still agree. */
+    if (status == ZU_UNSUPPORTED) {
+        zu_error_free(e);
+        return 0;
+    }
+    if (status != ZU_OK) {
+        take(status, e, &f);
+        if (refused) {
+            return 0;
+        }
+        /* The one report here that is not word for word the reference
+         * runner's, for the reason at the top of this file: what the
+         * ABI hands back is the export's own account with the ABI's
+         * category in front of it. */
+        return say(detail, len, "arrow refused the result: %s", f.message);
+    }
+    if (refused) {
+        stream.release(&stream);
+        return say(detail, len, "arrow exported the result where the case wants a refusal");
+    }
+    if (stream.get_schema(&stream, &schema) != 0) {
+        const char *why = stream.get_last_error(&stream);
+        say(detail, len, "arrow would not describe the schema: %s", why != NULL ? why : "no reason");
+        stream.release(&stream);
+        return -1;
+    }
+    /* The stream's schema is the struct of the columns, so what the
+     * case wrote is compared against the fields under it. */
+    wrong = arrow_schema("", schema.children, (size_t)schema.n_children, want, count, detail, len);
+    schema.release(&schema);
+    if (wrong != 0) {
+        stream.release(&stream);
+        return -1;
+    }
+    for (;;) {
+        if (stream.get_next(&stream, &batch) != 0) {
+            const char *why = stream.get_last_error(&stream);
+            say(detail, len, "arrow would not give the rows: %s", why != NULL ? why : "no reason");
+            stream.release(&stream);
+            return -1;
+        }
+        /* A batch that was never filled is the end of the stream, which
+         * is how the interface says so rather than through a status. */
+        if (batch.release == NULL) {
+            break;
+        }
+        given += (uint64_t)batch.length;
+        batch.release(&batch);
+    }
+    stream.release(&stream);
+    if (given != rows) {
+        return say(detail, len, "arrow gives %lu rows where the case wants %lu",
+                   (unsigned long)given, (unsigned long)rows);
     }
     return 0;
 }
@@ -717,6 +1040,43 @@ static int bind_param(run *r, zu_stmt *stmt, const zy_node *param, char *detail,
     return 0;
 }
 
+/* The connection a case named, made if this is the first mention of it.
+ *
+ * A new one is a duplicate of the case's own rather than a second open
+ * of the path: the two share the write side, so each sees what the
+ * other has committed, where opening the file twice would be two
+ * databases that happen to be the same file. Returns -1 with the
+ * account in detail, which can only happen to a case that names more
+ * connections than there are slots or on a duplicate the engine
+ * refuses. */
+static int connection(conns *set, const char *name, zu_conn **out, char *detail, size_t len) {
+    zu_conn *made = NULL;
+    zu_error *e = NULL;
+    zu_status status;
+    refusal f;
+    size_t i;
+
+    for (i = 0; i < set->count; i++) {
+        if (strcmp(set->name[i], name) == 0) {
+            *out = set->conn[i];
+            return 0;
+        }
+    }
+    if (set->count == MAX_CONNS) {
+        return say(detail, len, "a case runs on at most %d connections", MAX_CONNS);
+    }
+    status = zu_conn_duplicate(set->conn[0], &made, &e);
+    if (status != ZU_OK) {
+        take(status, e, &f);
+        return say(detail, len, "connecting as \"%s\": %s", name, f.message);
+    }
+    set->name[set->count] = name;
+    set->conn[set->count] = made;
+    set->count++;
+    *out = made;
+    return 0;
+}
+
 /* Runs the statement under test, with the parameters the case binds.
  *
  * A case with none goes through zu_query, which is the call a client
@@ -761,12 +1121,14 @@ static int statement(run *r, zu_conn *conn, const zy_node *node, const zy_node *
 
 /* The statement under test, and what the case says it has to produce.
  * Returns the outcome and writes the account of why into detail. */
-static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, size_t len) {
+static outcome answer(run *r, conns *set, const zy_node *node, char *detail, size_t len) {
     const zy_node *query = zy_get(node, "query");
     const zy_node *raises = zy_get(node, "raises");
     const zy_node *columns = zy_get(node, "columns");
     const zy_node *rows = zy_get(node, "rows");
     const zy_node *setup = zy_get(node, "setup");
+    const zy_node *on = zy_get(node, "on");
+    zu_conn *conn = NULL;
     zu_result *result = NULL;
     zu_status status;
     zu_error *e = NULL;
@@ -785,11 +1147,28 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
             return OUT_FAILED;
         }
         for (i = 0; i < count; i++) {
-            if (items[i].kind != ZY_SCALAR) {
-                say(detail, len, "a setup statement is one line");
+            /* A setup statement is a line of text, which runs on the
+             * connection every other case runs everything on, or the
+             * connection it runs on and the statement. */
+            const zy_node *text = &items[i];
+            const char *where = MAIN_CONN;
+            if (items[i].kind == ZY_MAP) {
+                const zy_node *named = zy_get(&items[i], "on");
+                text = zy_get(&items[i], "query");
+                if (named == NULL || named->kind != ZY_SCALAR || text == NULL
+                    || text->kind != ZY_SCALAR) {
+                    say(detail, len, "a setup statement is one line, or `on:` and `query:`");
+                    return OUT_FAILED;
+                }
+                where = named->text.ptr;
+            } else if (items[i].kind != ZY_SCALAR) {
+                say(detail, len, "a setup statement is one line, or `on:` and `query:`");
                 return OUT_FAILED;
             }
-            status = zu_query(conn, items[i].text.ptr, items[i].text.len, &result, &e);
+            if (connection(set, where, &conn, detail, len) != 0) {
+                return OUT_FAILED;
+            }
+            status = zu_query(conn, text->text.ptr, text->text.len, &result, &e);
             zu_result_free(result);
             result = NULL;
             if (status == ZU_OK) {
@@ -807,6 +1186,17 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         }
     }
 
+    if (on != NULL && on->kind != ZY_SCALAR) {
+        say(detail, len, "`on:` is the name of a connection");
+        return OUT_FAILED;
+    }
+    if (connection(set, on != NULL ? on->text.ptr : MAIN_CONN, &conn, detail, len) != 0) {
+        return OUT_FAILED;
+    }
+    /* Turning a node into a value the case can be compared against
+     * needs the name of its table, and it is this connection's catalog
+     * that has to answer, since it is the one the statement ran on. */
+    r->conn = conn;
     if (statement(r, conn, node, query, &status, &result, &e, detail, len) != 0) {
         return OUT_FAILED;
     }
@@ -837,7 +1227,8 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         return out;
     }
 
-    if (columns == NULL || columns->kind != ZY_SEQ || rows == NULL) {
+    if (columns == NULL || (columns->kind != ZY_SEQ && columns->kind != ZY_EMPTY)
+        || rows == NULL) {
         zu_result_free(result);
         zu_error_free(e);
         say(detail, len, "a case says what it produces, with `columns:` and `rows:` or `raises:`");
@@ -849,9 +1240,21 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         return ahead_of_the_engine(&f) ? OUT_UNSUPPORTED : OUT_FAILED;
     }
     /* The comparison happens before the result is freed, because a
-     * string that came back is borrowed from it. */
+     * string that came back is borrowed from it. The export happens
+     * after it and not before, because the export takes the result and
+     * those same strings go with it; what it leaves behind is a NULL
+     * the free below is a no-op on. */
     {
         outcome out = compare(r, columns, rows, result, detail, len) == 0 ? OUT_PASSED : OUT_FAILED;
+        const zy_node *arrow = zy_get(node, "arrow");
+        if (out == OUT_PASSED && arrow != NULL) {
+            const zy_node *want = NULL;
+            size_t count = 0;
+            (void)zy_seq_or_empty(rows, &want, &count);
+            if (arrow_export(r, &result, arrow, (uint64_t)count, detail, len) != 0) {
+                out = OUT_FAILED;
+            }
+        }
         zu_result_free(result);
         return out;
     }
@@ -866,6 +1269,7 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
     zu_error *e = NULL;
     refusal f;
     outcome out;
+    conns set;
 
     detail[0] = '\0';
     if (name == NULL || name->kind != ZY_SCALAR) {
@@ -905,8 +1309,17 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
         return;
     }
 
-    out = answer(r, conn, node, detail, sizeof detail);
-    zu_conn_close(conn);
+    set.name[0] = MAIN_CONN;
+    set.conn[0] = conn;
+    set.count = 1;
+    r->conn = conn;
+    out = answer(r, &set, node, detail, sizeof detail);
+    r->conn = NULL;
+    /* The duplicates go before the one they were made from, which is
+     * the order a client closes a pool in. */
+    while (set.count > 0) {
+        zu_conn_close(set.conn[--set.count]);
+    }
     report(r, suite, name->text.ptr, node->line, out, detail);
     cv_arena_reset(r->arena);
     /* A failure leaves its database behind, which is the one thing

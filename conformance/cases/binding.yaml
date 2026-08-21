@@ -1,0 +1,189 @@
+schema: 4
+suite: binding
+doc: The binding variable definition block, ISO 13.3, which is the head a statement may carry naming things no row does. A definition stands for a value, a binding table or a graph, and it is worked out once, before the first row, in the order the definitions are written. That ordering is what most of these cases are about, because it is the difference between a name and an expression written out longhand: a name read in a hundred rows costs one evaluation, and a definition may read the ones in front of it and nothing that comes after. The fixture is the procedure suite's, four people and three edges with one running from a node to itself, so a count here can be read beside a count there.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+    - from: 3
+      to: 3
+
+cases:
+  - name: a-value-variable-is-a-name-for-a-value
+    doc: The simplest definition there is, read where a value goes. One row comes back because nothing was matched, which is also what says a definition is not a source of rows the way a clause is.
+    query: VALUE n = 20 + 2 RETURN n AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "22"
+
+  - name: a-value-variable-read-more-than-once
+    doc: A name read twice in one expression is the same value twice, which is what worked out once means when it is said about an expression that has no graph in it. Nothing here can tell the two readings apart, and that is the point: the case is here so that an engine which evaluated the definition per reading would still have to answer this.
+    query: VALUE n = 21 RETURN n + n AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: a-value-variable-read-against-the-graph
+    doc: A definition read in a predicate, which is where a value worked out per row rather than once would show up as work rather than as a wrong answer. Three of the four people are over the cut.
+    query: VALUE cut = 35 MATCH (p:person) WHERE p.age > cut RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-definition-reads-the-ones-in-front-of-it
+    doc: The block is a block and not a list of unrelated names, so a definition may read the ones written before it. That is also what fixes the order they are worked out in.
+    query: VALUE a = 7 VALUE b = a * 6 RETURN b AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: a-value-variable-defined-out-of-a-query
+    doc: GP07. What stands after the equals may be a whole query, so a definition may match, aggregate and page, and it is still worked out once. The oldest person is fifty, which is one row of one column and therefore one value.
+    query: "VALUE oldest = { MATCH (p:person) RETURN max(p.age) AS a } MATCH (p:person) WHERE p.age = oldest RETURN p.name AS x"
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-value-variable-out-of-a-query-read-per-row
+    doc: The same definition read once per row, which is the shape a reader writes when they want a whole table measured against one number the table itself decided. Every row reads the same fifty and the arithmetic is done against it.
+    query: "VALUE oldest = { MATCH (p:person) RETURN max(p.age) AS a } MATCH (p:person) RETURN p.name AS x, oldest - p.age AS d ORDER BY x"
+    columns:
+      - x
+      - d
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "20"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "10"
+      - values:
+          - type: STRING
+            value: cy
+          - type: INT64
+            value: "0"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "10"
+
+  - name: a-binding-table-variable-holds-rows
+    doc: GP08. A binding table variable is the whole result of a query held as one value, and CARDINALITY is how many rows that is. BINDING is a word the definition may carry and neither reading needs.
+    query: "BINDING TABLE t = { MATCH (p:person) RETURN p.name AS name } RETURN cardinality(t) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-binding-table-variable-run-over
+    doc: GP10. The other thing a table is for: running over its rows. Three people are over the cut and the FOR answers a row for each.
+    query: "TABLE t = { MATCH (p:person) WHERE p.age > 35 RETURN p.name AS name } FOR r IN t RETURN count(*) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-graph-variable-is-a-reference
+    doc: GP11. A graph variable names a graph and what it holds is a reference to one rather than the graph itself, which is why it can be a value at all. The graph named here is the one the session is working in.
+    query: GRAPH g = CURRENT_PROPERTY_GRAPH RETURN (g IS NOT NULL) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-definition-written-with-the-type-it-answers
+    doc: A definition may be written with a type, which is a statement about what the query is going to answer and is checked against the answer. It is the same decision IS TYPED makes, so a type means one thing wherever it is written.
+    query: "VALUE oldest INT = { MATCH (p:person) RETURN max(p.age) AS a } RETURN oldest AS x"
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: a-definition-that-does-not-answer-its-type
+    doc: The declared type turning out to be wrong is a condition about a value and not about the text, so it is a data exception rather than a syntax one, and it is raised where the value was worked out rather than where the name is read.
+    query: VALUE n STRING = 1 + 1 RETURN n AS x
+    raises: "22G03"
+
+  - name: a-definition-that-answers-more-than-one-column
+    doc: A value variable stands for one value, so what defines it has to answer one column. Two columns is a definition that cannot be read, and it is refused where it is written rather than at the first reader.
+    query: "VALUE v = { MATCH (p:person) RETURN p.name AS a, p.age AS b } RETURN v AS x"
+    raises: "42001"
+
+  - name: a-definition-that-writes
+    doc: A statement taken apart at its write runs in parts, and each part fills the parameter positions it reads, so a definition that wrote would write once per part. Reading a graph twice answers the same thing and writing to it twice does not, so a definition that writes is refused.
+    query: "VALUE n = { INSERT (x:person) RETURN 1 AS a } RETURN n AS x"
+    raises: "42001"
+
+  - name: a-name-defined-twice
+    doc: A definition is worked out once, so a second definition of the same name would have nothing to say and no way to be read. The statement parses, so this is a reference condition and not a syntax one.
+    query: VALUE v = 1 VALUE v = 2 RETURN v AS x
+    raises: "42002"
+
+  - name: a-definition-that-reads-a-row
+    doc: A definition is worked out before anything has been matched, so there is no row for it to read, and a definition inside a block may not reach for the row the block is running for either.
+    query: "MATCH (p:person) CALL (p) { VALUE mine = p.age RETURN mine AS a } RETURN count(*) AS n"
+    raises: "42002"
+
+  - name: a-block-defines-names-of-its-own
+    doc: GP17. A block carries a definition block of its own, and what it defines is in reach inside it. Every person over the cut who is also older than the person the row is for, which is three for ann, one for bo, none for cy and one for di.
+    query: "MATCH (p:person) CALL (p) { VALUE cut = 35 MATCH (q:person) WHERE q.age > cut AND q.age > p.age RETURN q.name AS f } RETURN count(*) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: a-name-a-block-defined-is-gone-after-it
+    doc: The other half of GP17. What a block defines goes out of scope with the block, so the statement around it cannot read the name, and the refusal is the same one any undefined name gets.
+    query: "MATCH (p:person) CALL (p) { VALUE cut = 35 MATCH (q:person) WHERE q.age > cut RETURN q.name AS f } RETURN cut AS x"
+    raises: "42002"

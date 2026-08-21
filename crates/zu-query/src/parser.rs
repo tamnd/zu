@@ -17,13 +17,13 @@ use zu_common::{
 };
 
 use crate::ast::{
-    BinaryOp, Brackets, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd,
-    ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef,
-    GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern,
-    NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection, ProjectionItem,
-    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto,
-    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp,
-    YieldItem,
+    BinaryOp, BindingDef, BindingInit, BindingKind, Brackets, CatalogStmt, Clause, Composite,
+    Conjunction, DeleteTarget, EdgeEnd, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
+    GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
+    MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection,
+    ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat,
+    Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide,
+    TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -1466,12 +1466,90 @@ impl Parser<'_> {
         Ok(query)
     }
 
+    /// The binding variable definition block (ISO 13.3, GP17): the
+    /// definitions written between the `USE` and the first statement.
+    ///
+    /// Three words open one and none of them can open a statement, so
+    /// no lookahead past the first token is needed to know a definition
+    /// is coming: nothing that runs begins with `VALUE`, `TABLE` or
+    /// `GRAPH`, the statements that name a graph beginning with the
+    /// verb instead. `BINDING` and `PROPERTY` are the optional long
+    /// spellings the standard allows on the two reference types, and
+    /// they are read the same way here as in a type.
+    fn parse_binding_block(&mut self) -> Result<Vec<BindingDef>> {
+        let mut out = Vec::new();
+        loop {
+            let kind = if self.at_kw("VALUE") {
+                self.pos += 1;
+                BindingKind::Value
+            } else if self.at_kw("TABLE") || (self.at_kw("BINDING") && self.kw_at(1, "TABLE")) {
+                self.eat_kw("BINDING");
+                self.pos += 1;
+                BindingKind::Table
+            } else if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+                self.eat_kw("PROPERTY");
+                self.pos += 1;
+                BindingKind::Graph
+            } else {
+                return Ok(out);
+            };
+            out.push(self.parse_binding_def(kind)?);
+        }
+    }
+
+    /// One definition: the name, the type it was written with if any,
+    /// and what it is initialized with.
+    ///
+    /// The initializer is where the three kinds part company. A brace
+    /// is a query for a table and for a graph, ISO's nested binding
+    /// table query and nested graph query, and is the one place a brace
+    /// after an equals is not a map. A value takes an expression, which
+    /// is enough for it: the query form of a value is `VALUE { ... }`,
+    /// already an expression, so a value variable defined out of a
+    /// query is that expression written after the equals rather than a
+    /// second rule here.
+    fn parse_binding_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
+        let name = self.expect_name("a binding variable name")?;
+        let ty = if self.at(&TokenKind::Eq) {
+            None
+        } else {
+            Some(self.parse_value_type()?)
+        };
+        self.expect(&TokenKind::Eq)?;
+        // `VALUE v = VALUE { ... }` is the standard's spelling and the
+        // word is redundant here, the equals having already said a
+        // definition is coming, so it is read and dropped.
+        let word = kind == BindingKind::Value
+            && self.at_kw("VALUE")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
+        if word {
+            self.pos += 1;
+        }
+        let init = if self.at(&TokenKind::LBrace) {
+            BindingInit::Query(Box::new(self.parse_call_block()?))
+        } else if kind == BindingKind::Graph {
+            BindingInit::Expr(Expr::GraphRef(self.parse_graph_ref()?))
+        } else {
+            BindingInit::Expr(self.parse_expr()?)
+        };
+        Ok(BindingDef {
+            kind,
+            name,
+            ty,
+            init,
+        })
+    }
+
     /// The body of a composite query and how its last statement ended,
     /// stopping wherever the operands run out. What may follow is the
     /// caller's business: the end of the text for a statement, a
     /// closing brace for a nested query.
     fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
         let use_graph = self.parse_use_graph()?;
+        let bindings = self.parse_binding_block()?;
         let (linear, ending) = self.parse_linear()?;
         let mut body = Composite::Linear(linear);
         let mut ending = ending;
@@ -1499,7 +1577,14 @@ impl Parser<'_> {
                 right,
             };
         }
-        Ok((Query { use_graph, body }, ending))
+        Ok((
+            Query {
+                use_graph,
+                bindings,
+                body,
+            },
+            ending,
+        ))
     }
 
     /// A linear query statement: simple statements chained by `NEXT`,

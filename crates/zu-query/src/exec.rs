@@ -8319,6 +8319,107 @@ fn one_value(
     }
 }
 
+/// The binding variables of a statement, worked out (ISO 13.3, GP05
+/// through GP13 and GP17).
+///
+/// Each one is a query and a parameter position: the query is run
+/// here, once, and its answer is written into the position, so
+/// everything that reads the name below this reads a parameter. They
+/// are done in written order because a definition may read the ones in
+/// front of it, and each is run against the parameters the ones before
+/// it filled.
+///
+/// What is read out of the run is the one thing the kind asks for. A
+/// value and a graph stand for one value, so they take the value the
+/// query answered the way a `VALUE { ... }` does. A binding table
+/// stands for the whole result, so it takes every row, and that is the
+/// one place in the engine where a query's rows become a value.
+fn fill_bindings(
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<Vec<Value>> {
+    let mut filled = params.to_vec();
+    if filled.len() < query.params.len() {
+        filled.resize(query.params.len(), Value::Null);
+    }
+    for binding in &query.bindings {
+        let built = crate::plan::build(&binding.query)?;
+        let plan = crate::optimizer::optimize(built, &binding.query, schema)?;
+        let value = match binding.kind {
+            crate::ast::BindingKind::Table => {
+                let result = run_stages(
+                    &plan,
+                    &binding.query,
+                    schema,
+                    graph,
+                    &filled,
+                    options,
+                    Extras::default(),
+                )?;
+                // Epoch nought, which is the one a table that outlives
+                // nothing is given. A handle records the epoch it was
+                // read at so that a session can say the snapshot under
+                // it has moved, and this table is made and read inside
+                // one statement, so there is no later for it to be
+                // stale in. A table the caller passed in is the one
+                // that needs a real epoch, and it arrives with one.
+                Value::BindingTable(crate::refs::BindingTable::new(
+                    result.columns.clone(),
+                    result.rows.into_vec(),
+                    0,
+                ))
+            }
+            _ => one_value(&plan, &binding.query, schema, graph, &filled, options)?,
+        };
+        // What it was written as and what it turned out to be have to
+        // agree, because the name is going to be read as one of the
+        // three and a reader that finds another thing there has no way
+        // to say so later.
+        let wrong = match binding.kind {
+            crate::ast::BindingKind::Graph => !matches!(value, Value::Graph(_) | Value::Null),
+            crate::ast::BindingKind::Value => {
+                matches!(value, Value::Graph(_) | Value::BindingTable(_))
+            }
+            crate::ast::BindingKind::Table => false,
+        };
+        if wrong {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                format!(
+                    "{} '{}' was defined with something that is not one: what it answered is {}",
+                    binding.kind.word(),
+                    binding.name,
+                    crate::cast::value_type(&value)
+                ),
+            ));
+        }
+        // A definition written with a type is a statement about what
+        // the query is going to answer, and it is checked here because
+        // here is where the answer is. `IS TYPED` decides it, so a
+        // declared type means the same thing in a definition as it
+        // means in a predicate and there is one place that meaning
+        // lives.
+        if let Some(ty) = &binding.ty
+            && !crate::typed::is_of(&value, ty)
+        {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                format!(
+                    "'{}' was defined as {} and what defines it answered {}",
+                    binding.name,
+                    ty,
+                    crate::cast::value_type(&value)
+                ),
+            ));
+        }
+        filled[binding.param] = value;
+    }
+    Ok(filled)
+}
+
 /// The warning a statement carries for every value query expression it
 /// could not decorrelate.
 ///
@@ -8374,6 +8475,18 @@ fn run_stages(
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }
+    // The binding variables written at the head of this statement and
+    // at the head of every block in it (GP17). They come first because
+    // everything after this may read one, and they are worked out
+    // before the first row exists because a definition cannot read a
+    // row.
+    let filled;
+    let params = if query.bindings.is_empty() {
+        params
+    } else {
+        filled = fill_bindings(query, schema, graph, params, options)?;
+        &filled
+    };
     // Every value query expression this query holds (GQ18). The ones
     // that read nothing from the rows around them are answered here,
     // once, which is the whole cost of one however many rows read it.

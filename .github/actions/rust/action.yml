@@ -64,13 +64,23 @@ runs:
         # stable turns main red on somebody else's release schedule, the
         # same argument the dated nightly above is pinned for. A job
         # that names stable or a nightly asked for it on purpose.
+        #
+        # The pieces that file names come with it, because that is what
+        # a developer's rustup does when it reads the same file, and a
+        # job asking for the pin asked for the toolchain a developer
+        # has. The one this catches is rustfmt: a test that generates
+        # source runs it, a hosted image has one for the stable it
+        # shipped with, and a fresh minimal install of the pin has none.
         if [ "$toolchain" = pinned ]; then
-          toolchain=$(sed -n 's/^ *channel *= *"\(.*\)"/\1/p' \
-            "${GITHUB_WORKSPACE:-.}/rust-toolchain.toml")
+          pin="${GITHUB_WORKSPACE:-.}/rust-toolchain.toml"
+          toolchain=$(sed -n 's/^ *channel *= *"\(.*\)"/\1/p' "$pin")
           if [ -z "$toolchain" ]; then
             echo "rust-toolchain.toml has no channel to pin to" >&2
             exit 1
           fi
+          named=$(sed -n 's/^ *components *= *\[\(.*\)\]/\1/p' "$pin" \
+            | tr -d '"' | tr ',' ' ')
+          components="$components $named"
         fi
 
         # One install rather than an install and then an add per piece,

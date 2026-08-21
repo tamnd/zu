@@ -109,6 +109,28 @@ macro_rules! minmax {
                         consider(v.constant_value::<i64>());
                     }
                 }
+                // A column with nothing missing in it, which is the
+                // scan this reduction is on the hot path of, and the
+                // one shape here written for the vectorizer rather than
+                // for the reader. The accumulator is an i64 and not an
+                // Option of one, and the row is a select rather than a
+                // branch, which is the pair of things that turn into a
+                // lane wide minimum. Written as the loop below it, over
+                // an Option that is empty until the first row and a
+                // validity nobody has to ask about, it folds a row at a
+                // time: on x86-64 it did until the compiler was pinned
+                // and then it did not, which is the drift the
+                // disassembly gate is there to catch.
+                (VecEncoding::Flat, None) if v.validity.is_none() => {
+                    let vals = v.values::<i64>();
+                    if let Some((&first, rest)) = vals.split_first() {
+                        let mut acc = first;
+                        for &x in rest {
+                            acc = if x $better acc { x } else { acc };
+                        }
+                        consider(acc);
+                    }
+                }
                 (VecEncoding::Flat, None) => {
                     for (i, &x) in v.values::<i64>().iter().enumerate() {
                         if v.is_valid(i) {

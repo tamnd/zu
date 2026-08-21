@@ -1034,3 +1034,28 @@ cases:
       - values:
           - type: LOCALDATETIME
             value: "2262-04-11T00:00:00"
+
+  - name: two-durations-of-one-kind-add
+    doc: Addition over two durations of the same kind, which is the sum of the counts under them. The answer is a duration and not a number, so the kind survives the arithmetic and the result is written back in the same units.
+    query: RETURN DURATION('PT1H') + DURATION('PT30M') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: two-durations-of-one-kind-subtract
+    doc: Subtraction over two year-month durations. A year is twelve months whatever month it starts in, so the difference is a count of months and the answer carries back into years without a calendar being consulted.
+    query: RETURN DURATION('P2Y') - DURATION('P3M') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y9M"
+
+  - name: durations-of-two-kinds-do-not-add
+    doc: A month is not a number of seconds, since months are of different lengths, so there is no count a year-month duration and a day-time duration share and no sum for the two of them to have. The two kinds exist to say this, and asking for it is an error rather than an answer in whichever kind was written first.
+    query: RETURN DURATION('P1M') + DURATION('PT1H') AS n
+    raises: "22G14"

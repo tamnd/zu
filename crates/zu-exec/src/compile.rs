@@ -835,13 +835,19 @@ fn is_window(node: &LogicalPlan) -> bool {
 /// stored column can hold both, so the grouping goes back to the
 /// engine that already agrees with itself about them.
 /// A temporal value as a constant of its lane, `None` for a zoned one,
-/// which is two numbers and does not fit a lane.
-fn lane_const(t: &Temporal) -> Option<OwnedValue> {
+/// which is two numbers and does not fit a lane. The lane comes back
+/// alongside, since a register that holds the constant carries it the
+/// same way a register that read a column does.
+fn lane_const(t: &Temporal) -> Option<(OwnedValue, TemporalLane)> {
     let lane = TemporalLane::of(&t.logical_type())?;
-    Some(OwnedValue::Lane {
-        phys: lane.phys(),
-        word: lane.word(t)?,
-    })
+    let word = lane.word(t)?;
+    Some((
+        OwnedValue::Lane {
+            phys: lane.phys(),
+            word,
+        },
+        lane,
+    ))
 }
 
 fn keyable(r: ScalarRef) -> bool {
@@ -3353,10 +3359,7 @@ impl Compiler<'_> {
         let Some(level) = self.expr_level(expr) else {
             return Ok(None);
         };
-        let mut b = ProgBuilder {
-            ops: Vec::new(),
-            types: Vec::new(),
-        };
+        let mut b = ProgBuilder::new();
         let Some(root) = self.value_reg(&mut b, expr, level, false)? else {
             return Ok(None);
         };
@@ -3367,6 +3370,17 @@ impl Compiler<'_> {
             // bytes it made along with the views, so the sink reads one
             // back exactly the way it reads a stored column.
             PhysType::Str => ColType::Str,
+            // A temporal value, whose word is a count of something the
+            // physical type alone does not name: an interval counts
+            // months or nanoseconds and a timestamp counts nanoseconds
+            // into a day or since the epoch. The lane names it, and a
+            // register only carries one where the compiler knew it the
+            // whole way through, so a program that lost the lane
+            // declines here rather than handing back the bare number.
+            PhysType::Date | PhysType::Timestamp | PhysType::Interval => match b.lane(root) {
+                Some(lane) => ColType::Temporal(lane),
+                None => return Ok(None),
+            },
             _ => return Ok(None),
         };
         if may_raise(&b.ops) {
@@ -4016,10 +4030,7 @@ impl Compiler<'_> {
     /// when the expression needs anything beyond comparisons, boolean
     /// combinators, and integer arithmetic over this level's columns.
     fn build_prog(&mut self, expr: &BoundExpr, level: usize) -> Result<Option<Program>> {
-        let mut b = ProgBuilder {
-            ops: Vec::new(),
-            types: Vec::new(),
-        };
+        let mut b = ProgBuilder::new();
         let root = self.pred_reg(&mut b, expr, level)?;
         match root {
             Some(_) => Ok(Some(Program {
@@ -4411,22 +4422,23 @@ impl Compiler<'_> {
         level: usize,
         outer: bool,
     ) -> Result<Option<Reg>> {
-        let (from, mut col, ty) = match r {
+        let (from, mut col, ty, lane) = match r {
             // A property is never a constant, so this is the arm
             // nothing reaches rather than a shape to build a program
             // out of.
             ScalarRef::Const { .. } => return Ok(None),
-            ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
-            ScalarRef::Col { level, vec, ty } => (
-                level,
-                vec,
-                match ty {
-                    ColType::Int => PhysType::Int64,
-                    ColType::Float => PhysType::Float64,
-                    ColType::Str => PhysType::Str,
-                    ColType::Temporal(lane) => lane.phys(),
-                },
-            ),
+            ScalarRef::RowId { level } => (level, 0, PhysType::Int64, None),
+            ScalarRef::Col { level, vec, ty } => match ty {
+                ColType::Int => (level, vec, PhysType::Int64, None),
+                ColType::Float => (level, vec, PhysType::Float64, None),
+                ColType::Str => (level, vec, PhysType::Str, None),
+                // The column knows what its words are a count of and
+                // the register takes it from there, so an operator over
+                // two of them can check they agree and the sink can
+                // hand back what it read rather than the number under
+                // it.
+                ColType::Temporal(lane) => (level, vec, lane.phys(), Some(lane)),
+            },
             ScalarRef::Node { .. } => return Ok(None),
         };
         if from != level {
@@ -4451,7 +4463,7 @@ impl Compiler<'_> {
         let Ok(col) = u8::try_from(col) else {
             return Ok(None);
         };
-        let dst = b.push_type(ty)?;
+        let dst = b.push_reg(ty, lane)?;
         b.ops.push(ExprOp::LoadCol { col, dst });
         Ok(Some(dst))
     }
@@ -4483,7 +4495,7 @@ impl Compiler<'_> {
             // has no lane and declines here, the same way a zoned column
             // never resolves in the first place.
             BoundExpr::Literal(Literal::Temporal(t)) => match lane_const(t) {
-                Some(v) => b.push_const(v).map(Some),
+                Some((v, lane)) => b.push_const_lane(v, lane).map(Some),
                 None => Ok(None),
             },
             BoundExpr::Param(ix) => match self.params.get(*ix) {
@@ -4491,7 +4503,7 @@ impl Compiler<'_> {
                 Some(Value::Float(f)) => b.push_const(OwnedValue::Float(*f)).map(Some),
                 Some(Value::Str(s)) => b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some),
                 Some(Value::Temporal(t)) => match lane_const(t) {
-                    Some(v) => b.push_const(v).map(Some),
+                    Some((v, lane)) => b.push_const_lane(v, lane).map(Some),
                     None => Ok(None),
                 },
                 _ => Ok(None),
@@ -4579,10 +4591,34 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 let ty = b.types[l as usize];
-                if !matches!(ty, PhysType::Int64 | PhysType::Float64) {
+                // Two durations of one kind add and subtract, and that
+                // is the whole of the temporal arithmetic that is a
+                // kernel. The words are counts of the same unit, so the
+                // sum is the integer sum and the answer is a duration
+                // of the kind both sides were.
+                //
+                // Two of different kinds do not add, which is what the
+                // kinds exist to say, and a lane on each register is
+                // what lets this notice. An instant shifted by a
+                // duration is not here either: it clamps a month onto
+                // a day, refuses a time of day landing on a date, and
+                // stops at the end of the calendar, none of which the
+                // arith kernel has an op for.
+                let lane = match (b.lane(l), b.lane(r)) {
+                    (None, None) => None,
+                    (Some(a), Some(c))
+                        if a == c
+                            && matches!(a, TemporalLane::Duration(_))
+                            && matches!(bin, BinOp::Add | BinOp::Sub) =>
+                    {
+                        Some(a)
+                    }
+                    _ => return Ok(None),
+                };
+                if !matches!(ty, PhysType::Int64 | PhysType::Float64 | PhysType::Interval) {
                     return Ok(None);
                 }
-                let dst = b.push_type(ty)?;
+                let dst = b.push_reg(ty, lane)?;
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
                 Ok(Some(dst))
             }
@@ -5007,13 +5043,40 @@ fn narrow_float(op: BinaryOp, c: f64) -> Option<(CmpOp, i64)> {
 }
 
 /// Register and type bookkeeping for one program build.
+///
+/// Every register has a physical type and some of them have a lane
+/// besides. The physical type is what the kernels read: it says how
+/// wide the register is and how it compares. The lane is what the sink
+/// reads, and only the temporal registers carry one, because
+/// `PhysType::Interval` is a word of either months or nanoseconds and
+/// `PhysType::Timestamp` is a word of either a time of day or an
+/// instant. Nothing about the word says which, so the answer of a
+/// program that ends on one would be a bare number without this.
 struct ProgBuilder {
     ops: Vec<ExprOp>,
     types: Vec<PhysType>,
+    lanes: Vec<Option<TemporalLane>>,
 }
 
 impl ProgBuilder {
+    fn new() -> ProgBuilder {
+        ProgBuilder {
+            ops: Vec::new(),
+            types: Vec::new(),
+            lanes: Vec::new(),
+        }
+    }
+
     fn push_type(&mut self, ty: PhysType) -> Result<Reg> {
+        self.push_reg(ty, None)
+    }
+
+    /// A register holding a temporal value of a known lane.
+    fn push_lane(&mut self, lane: TemporalLane) -> Result<Reg> {
+        self.push_reg(lane.phys(), Some(lane))
+    }
+
+    fn push_reg(&mut self, ty: PhysType, lane: Option<TemporalLane>) -> Result<Reg> {
         if self.types.len() >= usize::from(Reg::MAX) {
             // A 255-register filter is not a query anyone writes; the
             // fallback handles it if one ever shows up.
@@ -5022,7 +5085,14 @@ impl ProgBuilder {
             ));
         }
         self.types.push(ty);
+        self.lanes.push(lane);
         Ok((self.types.len() - 1) as Reg)
+    }
+
+    /// The lane of a register, or `None` for one that holds a number,
+    /// a string or a temporal value nobody named the lane of.
+    fn lane(&self, reg: Reg) -> Option<TemporalLane> {
+        self.lanes[reg as usize]
     }
 
     fn push_const(&mut self, v: OwnedValue) -> Result<Reg> {
@@ -5034,6 +5104,14 @@ impl ProgBuilder {
             _ => PhysType::Int64,
         };
         let dst = self.push_type(ty)?;
+        self.ops.push(ExprOp::LoadConst { v, dst });
+        Ok(dst)
+    }
+
+    /// A temporal constant, which carries its lane the way a temporal
+    /// column does, so the two can meet in an operator.
+    fn push_const_lane(&mut self, v: OwnedValue, lane: TemporalLane) -> Result<Reg> {
+        let dst = self.push_lane(lane)?;
         self.ops.push(ExprOp::LoadConst { v, dst });
         Ok(dst)
     }

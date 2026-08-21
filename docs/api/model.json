@@ -585,6 +585,27 @@
       "signature": "YearMonth"
     },
     {
+      "id": "zu::Engine",
+      "kind": "enum",
+      "name": "Engine",
+      "source": "zu_query::exec::Engine",
+      "doc": "Which executor runs a plan the pipeline one covers. `Pipeline` is\nevery plan it takes, falling back to the row-at-a-time executor for\nthe rest, and is the default. `Rows` pins the row executor for the\nwhole statement, which is how the differential tests get an oracle\nto compare an answer against.\n\nIt is a switch on the options rather than a reading of the\nenvironment because the environment is one variable for a whole\nprocess and a test binary runs its tests in parallel threads: a\ntest that set it for its own statement was setting it for whichever\nother test happened to be between plans, and that answered on the\nwrong engine (#513)."
+    },
+    {
+      "id": "zu::Engine::Pipeline",
+      "kind": "variant",
+      "name": "Pipeline",
+      "of": "zu::Engine",
+      "signature": "Pipeline"
+    },
+    {
+      "id": "zu::Engine::Rows",
+      "kind": "variant",
+      "name": "Rows",
+      "of": "zu::Engine",
+      "signature": "Rows"
+    },
+    {
       "id": "zu::Epoch",
       "kind": "type-alias",
       "name": "Epoch",
@@ -1568,6 +1589,84 @@
       "doc": "Values produced across all pulls. Rows over pulls is the\naverage vector length, the factorization stat."
     },
     {
+      "id": "zu::Options",
+      "kind": "struct",
+      "name": "Options",
+      "source": "zu_query::exec::Options",
+      "doc": "Execution switches. `flat` forces tuple-at-a-time execution by\nflattening after every producer, the differential oracle for the\nfactorized paths; flat runs also stay single-threaded so the\noracle is the fully sequential baseline."
+    },
+    {
+      "id": "zu::Options::clock",
+      "kind": "field",
+      "name": "clock",
+      "of": "zu::Options",
+      "signature": "Option<zu_common::Clock>",
+      "doc": "The instant the datetime value functions of ISO 20.27 answer,\n`None` for a run that has not read a clock yet.\n\nIt is here for the reason the interrupt is: it is state one\nstatement has and every path through the executor already\ncarries the switches. [`run_stages`] fills it in on the way in\nand hands the filled copy down, so a query written inside an\nexpression answers the same instant as the query around it\nrather than reading a clock of its own halfway through the scan.\nA caller may set it before running, which is how a test pins the\ntime."
+    },
+    {
+      "id": "zu::Options::engine",
+      "kind": "field",
+      "name": "engine",
+      "of": "zu::Options",
+      "signature": "Engine",
+      "doc": "Which executor runs a plan the pipeline one covers. Read here\nrather than from the environment so that one statement can ask\nfor the row executor without answering for every statement\nrunning beside it (#513)."
+    },
+    {
+      "id": "zu::Options::flat",
+      "kind": "field",
+      "name": "flat",
+      "of": "zu::Options",
+      "signature": "bool"
+    },
+    {
+      "id": "zu::Options::interrupt",
+      "kind": "field",
+      "name": "interrupt",
+      "of": "zu::Options",
+      "signature": "zu_common::Interrupt",
+      "doc": "The handle whoever asked for the statement can stop it through,\nand the count of rows it has read so far. Here rather than as a\nparameter of its own because every execution path already\ncarries the switches, and a cancellation that only some of them\nwere handed would be a cancellation that works on some\nstatements. The default is the handle nobody armed, so a caller\nwho wants none pays a branch per chunk."
+    },
+    {
+      "id": "zu::Options::morsel_rows",
+      "kind": "field",
+      "name": "morsel_rows",
+      "of": "zu::Options",
+      "signature": "usize",
+      "doc": "Rows per morsel, 0 picks the 2048-tuple target from docs/02.\nSmaller values force many morsels on small graphs, which is how\nthe tests drive the parallel path over the mock fixtures."
+    },
+    {
+      "id": "zu::Options::sink",
+      "kind": "field",
+      "name": "sink",
+      "of": "zu::Options",
+      "signature": "Sink",
+      "doc": "What the sink of a plain projection keeps."
+    },
+    {
+      "id": "zu::Options::sip",
+      "kind": "field",
+      "name": "sip",
+      "of": "zu::Options",
+      "signature": "Sip",
+      "doc": "Whether a join hands what it knows about its keys to the\noperators producing its probe side, the sideways pass of\nperf/13 §1."
+    },
+    {
+      "id": "zu::Options::threads",
+      "kind": "field",
+      "name": "threads",
+      "of": "zu::Options",
+      "signature": "usize",
+      "doc": "Worker threads for morsel-parallel stages: 0 picks\n`min(cores, 8)` per docs/02, 1 forces sequential execution."
+    },
+    {
+      "id": "zu::Options::wcoj",
+      "kind": "field",
+      "name": "wcoj",
+      "of": "zu::Options",
+      "signature": "Wcoj",
+      "doc": "How closing-edge probes reach the `MultiwayIntersect`, the\nWCOJ closing step of docs/07 §4."
+    },
+    {
       "id": "zu::PlanNode",
       "kind": "struct",
       "name": "PlanNode",
@@ -1965,6 +2064,48 @@
       "doc": "True when the statement kept its result. Warnings ride along with\nan answer; exceptions replace it."
     },
     {
+      "id": "zu::Sink",
+      "kind": "enum",
+      "name": "Sink",
+      "source": "zu_query::exec::Sink",
+      "doc": "What the sink of a projection with nothing above it keeps.\n`Columns` fills the buffers the executor computed in, which is the\ndefault and is what a columnar client reads without a transpose.\n`Rows` flattens each row as it is found, the way every other sink\ndoes, and is the baseline the columns are measured against and the\nanswer they have to match."
+    },
+    {
+      "id": "zu::Sink::Columns",
+      "kind": "variant",
+      "name": "Columns",
+      "of": "zu::Sink",
+      "signature": "Columns"
+    },
+    {
+      "id": "zu::Sink::Rows",
+      "kind": "variant",
+      "name": "Rows",
+      "of": "zu::Sink",
+      "signature": "Rows"
+    },
+    {
+      "id": "zu::Sip",
+      "kind": "enum",
+      "name": "Sip",
+      "source": "zu_query::exec::Sip",
+      "doc": "The sideways information passing switch. `On` lets a join publish a\nfilter over its build keys to the level its probe key is read from,\nwhich is the default. `Off` pins the plain probe, so a run with it\nis the baseline the filter is measured against and the rows either\nway have to match."
+    },
+    {
+      "id": "zu::Sip::Off",
+      "kind": "variant",
+      "name": "Off",
+      "of": "zu::Sip",
+      "signature": "Off"
+    },
+    {
+      "id": "zu::Sip::On",
+      "kind": "variant",
+      "name": "On",
+      "of": "zu::Sip",
+      "signature": "On"
+    },
+    {
       "id": "zu::Snapshot",
       "kind": "trait",
       "name": "Snapshot",
@@ -2176,6 +2317,34 @@
       "of": "zu::Temporal",
       "signature": "fn parse_sql_interval(text: &str, qualifier: &IntervalQualifier) -> Option<Temporal>",
       "doc": "The duration `text` spells when it is written the way SQL\nwrites one, `INTERVAL '3 04:05:06' DAY TO SECOND`, with the\nqualifier already read.\n\nThe qualifier is not decoration. It is the whole of what says\nhow to read the string, because `'1-2'` is a year and two\nmonths under `YEAR TO MONTH` and is nothing at all under `DAY`,\nand `'3'` is three of whichever single field was named. So this\nreads the fields the qualifier lists, in order, and refuses\nanything the qualifier did not ask for.\n\nThe leading field is unbounded and the ones behind it are not:\n`'25' HOUR` is twenty five hours, and `'1 25:00:00' DAY TO\nSECOND` is not a day and an hour, because a written hour that\nfollows a written day has 24 of its own and the standard says\nso. A number that runs over its field is refused rather than\ncarried, since carrying it would answer a question the\nstatement did not ask."
+    },
+    {
+      "id": "zu::Wcoj",
+      "kind": "enum",
+      "name": "Wcoj",
+      "source": "zu_query::exec::Wcoj",
+      "doc": "The WCOJ fusion switch. The optimizer marks cyclic closes on the\nplan; `Auto` honors those marks, which is the default path. `Force`\nfuses every close the fusion can structurally take, marked or not,\nand `Off` pins the binary ExpandInto/AspJoin pair, the baseline for\ndifferential runs."
+    },
+    {
+      "id": "zu::Wcoj::Auto",
+      "kind": "variant",
+      "name": "Auto",
+      "of": "zu::Wcoj",
+      "signature": "Auto"
+    },
+    {
+      "id": "zu::Wcoj::Force",
+      "kind": "variant",
+      "name": "Force",
+      "of": "zu::Wcoj",
+      "signature": "Force"
+    },
+    {
+      "id": "zu::Wcoj::Off",
+      "kind": "variant",
+      "name": "Off",
+      "of": "zu::Wcoj",
+      "signature": "Off"
     },
     {
       "id": "zu::ZuError",
@@ -5073,6 +5242,13 @@
       "name": "run",
       "signature": "fn run(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)]) -> zu_common::Result<QueryResult>",
       "doc": "Parses, plans, optimizes, and executes one query against an open\nzu1 file, returning the result rows. Scan-driven stages run on the\nmorsel scheduler with `min(cores, 8)` workers; `ZU_THREADS` in the\nenvironment overrides the count, `ZU_THREADS=1` forces sequential\nexecution."
+    },
+    {
+      "id": "zu::query::run_with",
+      "kind": "function",
+      "name": "run_with",
+      "signature": "fn run_with(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)], options: &exec::Options) -> zu_common::Result<QueryResult>",
+      "doc": "The same read under switches the caller chose rather than the ones\nthe environment names.\n\n[`run`] is this with [`env_options`], and everything true of one is\ntrue of the other. What this adds is a statement that can ask for\nsomething the environment cannot say per statement: the row\nexecutor as a differential oracle, a thread count for one query, a\npinned clock. A test binary runs its tests in parallel threads and\nan environment variable belongs to the process, so a test that set\none was setting it for every test running beside it (#513).\n\nA session takes its switches once, at open, and\n[`crate::session::Session::set_options`] replaces them. This is the\nsame thing for the entry point that has no session behind it."
     },
     {
       "id": "zu::query::schema_of",

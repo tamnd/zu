@@ -1347,6 +1347,29 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// environment overrides the count, `ZU_THREADS=1` forces sequential
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+    run_with(source, db, params, &env_options())
+}
+
+/// The same read under switches the caller chose rather than the ones
+/// the environment names.
+///
+/// [`run`] is this with [`env_options`], and everything true of one is
+/// true of the other. What this adds is a statement that can ask for
+/// something the environment cannot say per statement: the row
+/// executor as a differential oracle, a thread count for one query, a
+/// pinned clock. A test binary runs its tests in parallel threads and
+/// an environment variable belongs to the process, so a test that set
+/// one was setting it for every test running beside it (#513).
+///
+/// A session takes its switches once, at open, and
+/// [`crate::session::Session::set_options`] replaces them. This is the
+/// same thing for the entry point that has no session behind it.
+pub fn run_with(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+    options: &exec::Options,
+) -> Result<QueryResult> {
     match not_a_query(source)? {
         Some(NotAQuery::Catalog(stmt)) => {
             crate::catalog_stmt::apply(db, &stmt, params)?;
@@ -1364,18 +1387,17 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
         None => {}
     }
     let p = prepare(source, db, params)?;
-    let options = env_options();
     // A match written several ways is a plan per way over the rows the
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a
     // read gets this far: a write was refused while it was prepared.
     if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
         return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
-            read_one(plan, query, &p.schema, db, &p.catalog, args, &options)
+            read_one(plan, query, &p.schema, db, &p.catalog, args, options)
         });
     }
     read_one(
-        &p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, &options,
+        &p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, options,
     )
 }
 
@@ -1392,7 +1414,7 @@ fn read_one(
     args: &[Value],
     options: &exec::Options,
 ) -> Result<QueryResult> {
-    if exec2_enabled() {
+    if options.engine == exec::Engine::Pipeline {
         let mut snap = crate::snapshot::Zu1Snapshot::new(db, catalog.clone());
         if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, options)? {
             return Ok(r);
@@ -1402,11 +1424,20 @@ fn read_one(
     exec::execute(plan, query, schema, &mut graph, args, options)
 }
 
-/// Whether plans the pipeline executor covers run there. On by
-/// default; `ZU_EXEC2=0` pins every query to the old executor, which
-/// is how the differential tests get their oracle rows.
-pub(crate) fn exec2_enabled() -> bool {
-    std::env::var("ZU_EXEC2").as_deref() != Ok("0")
+/// Which executor the environment asks for. On the pipeline by
+/// default; `ZU_EXEC2=0` pins the whole process to the old executor.
+///
+/// This is read once, when the switches for a statement or a session
+/// are built, and the answer is carried on [`exec::Options`] from
+/// there. A caller wanting one statement on the other engine sets the
+/// option rather than the variable: the variable belongs to the
+/// process and a test setting it was setting it for every test running
+/// beside it (#513).
+fn env_engine() -> exec::Engine {
+    match std::env::var("ZU_EXEC2").as_deref() {
+        Ok("0") => exec::Engine::Rows,
+        _ => exec::Engine::Pipeline,
+    }
 }
 
 /// The execution options both entry points honor, so a profile always
@@ -1441,6 +1472,7 @@ pub(crate) fn env_options() -> exec::Options {
         Ok("rows") => exec::Sink::Rows,
         _ => exec::Sink::Columns,
     };
+    options.engine = env_engine();
     options
 }
 
@@ -1450,8 +1482,22 @@ pub(crate) fn env_options() -> exec::Options {
 /// stage. The grammar has no EXPLAIN keyword yet, so this is the API
 /// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
-    let (profile, notes) = profile_noted(source, db, params)?;
-    let listing = match decisions(source, db, params)? {
+    analyze_with(source, db, params, &env_options())
+}
+
+/// The same listing under switches the caller chose, which is what
+/// [`run_with`] is to [`run`] and is here for the same reason: the
+/// engine a statement is pinned to changes the listing, and pinning it
+/// through the environment pins it for every statement in the process
+/// (#513).
+fn analyze_with(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+    options: &exec::Options,
+) -> Result<String> {
+    let (profile, notes) = profile_noted(source, db, params, options)?;
+    let listing = match decisions(source, db, params, options)? {
         Some(d) => format!("{}decisions:\n{}", profile.render(), d.render()),
         None => profile.render(),
     };
@@ -1468,20 +1514,15 @@ fn decisions(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
+    options: &exec::Options,
 ) -> Result<Option<zu_exec::decide::Decisions>> {
-    if !exec2_enabled() {
+    if options.engine != exec::Engine::Pipeline {
         return Ok(None);
     }
     let p = prepare(source, db, params)?;
     let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
-    let run = zu_exec::try_execute_profiled(
-        &p.plan,
-        &p.query,
-        &p.schema,
-        &mut snap,
-        &p.args,
-        &env_options(),
-    )?;
+    let run =
+        zu_exec::try_execute_profiled(&p.plan, &p.query, &p.schema, &mut snap, &p.args, options)?;
     Ok(run.map(|(_, d)| d))
 }
 
@@ -1489,7 +1530,7 @@ fn decisions(
 /// rendering. The cardinality phase of the LDBC bench reads q-error
 /// off this (perf/12 §4).
 pub fn profile(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<exec::Profile> {
-    Ok(profile_noted(source, db, params)?.0)
+    Ok(profile_noted(source, db, params, &env_options())?.0)
 }
 
 /// The profiled run plus the optimizer's notes, which the rendering
@@ -1498,17 +1539,12 @@ fn profile_noted(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
+    options: &exec::Options,
 ) -> Result<(exec::Profile, Vec<String>)> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
-    let (_, profile) = exec::execute_profiled(
-        &p.plan,
-        &p.query,
-        &p.schema,
-        &mut graph,
-        &p.args,
-        &env_options(),
-    )?;
+    let (_, profile) =
+        exec::execute_profiled(&p.plan, &p.query, &p.schema, &mut graph, &p.args, options)?;
     Ok((profile, p.notes))
 }
 
@@ -2388,18 +2424,19 @@ mod tests {
         );
 
         // Pinned to the old engine there is no pipeline to report on,
-        // and the listing says nothing rather than saying zero.
-        // SAFETY: single-threaded test, no other thread reads the
-        // environment while this is set.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let text = explain_analyze(
+        // and the listing says nothing rather than saying zero. Pinned
+        // on this call, so the tests running beside it in this binary
+        // keep the engine they asked for (#513).
+        let text = analyze_with(
             "MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n",
             &mut db,
             &[],
+            &exec::Options {
+                engine: exec::Engine::Rows,
+                ..exec::Options::default()
+            },
         )
         .expect("explain analyze");
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("ZU_EXEC2") };
         assert!(!text.contains("decisions:"), "got:\n{text}");
     }
 

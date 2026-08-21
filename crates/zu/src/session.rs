@@ -1068,7 +1068,7 @@ impl Session {
         // streaming API for the wrong reason. It has handed nothing over
         // when it answers false, so the fallback below starts on a
         // handoff nothing has been fed through.
-        if query::exec2_enabled() {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1149,7 +1149,7 @@ impl Session {
             return self.settle(out, held);
         }
         let options = self.options.clone();
-        if query::exec2_enabled() {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1477,7 +1477,7 @@ impl Session {
         args: &[Value],
         options: &exec::Options,
     ) -> Result<QueryResult> {
-        if query::exec2_enabled() {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1638,7 +1638,7 @@ impl Session {
         source: &str,
         params: &[(&str, Value)],
     ) -> Result<Option<zu_exec::decide::Decisions>> {
-        if !query::exec2_enabled() {
+        if self.options.engine != exec::Engine::Pipeline {
             return Ok(None);
         }
         let cached = self.plan_for(source, params)?;

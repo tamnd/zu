@@ -73,6 +73,17 @@ pub struct Platform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
     pub artifact: String,
+    /// The platform this ceiling is for, when it is for one. A row
+    /// without a target is the artifact's ceiling everywhere, and a row
+    /// with one replaces it on that platform only.
+    ///
+    /// The reason the exception exists is that the same code is not the
+    /// same number of bytes on every platform: an object format carries
+    /// its own overhead, and a linker that cannot merge what another
+    /// merges keeps what it could not. That is a fact about the
+    /// toolchain rather than about the code, and a single ceiling set
+    /// high enough for the worst format stops holding the rest.
+    pub target: Option<String>,
     pub mib: i64,
     pub repo: String,
     pub doc: String,
@@ -298,16 +309,20 @@ impl Table {
         }
 
         let mut budgets = Vec::new();
-        let mut named: BTreeMap<String, usize> = BTreeMap::new();
+        let mut named: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
         for table in doc.array("budget") {
             let line = table.line;
-            if let Some(key) = table.unknown(&["artifact", "mib", "repo", "doc"]).first() {
+            if let Some(key) = table
+                .unknown(&["artifact", "target", "mib", "repo", "doc"])
+                .first()
+            {
                 return Err(format!("line {line}: a budget has no key {key:?}"));
             }
             let artifact = table
                 .str("artifact")
                 .ok_or_else(|| format!("line {line}: a budget for no artifact"))?
                 .to_string();
+            let target = table.str("target").map(str::to_string);
             let mib = match table.int("mib") {
                 Some(mib) if mib > 0 => mib,
                 found => {
@@ -324,18 +339,47 @@ impl Table {
                 .str("doc")
                 .ok_or_else(|| format!("line {line}: {artifact} has no doc"))?
                 .to_string();
-            if let Some(before) = named.insert(artifact.clone(), line) {
+            if let Some(before) = named.insert((artifact.clone(), target.clone()), line) {
+                let where_ = match &target {
+                    Some(target) => format!("{artifact} on {target}"),
+                    None => artifact.clone(),
+                };
                 return Err(format!(
-                    "line {line}: {artifact} is capped twice, and first on line {before}"
+                    "line {line}: {where_} is capped twice, and first on line {before}"
                 ));
             }
             budgets.push(Budget {
                 artifact,
+                target,
                 mib,
                 repo,
                 doc,
                 line,
             });
+        }
+
+        // An exception is read against the two things it names, because
+        // both of the ways it can be wrong leave a ceiling that looks
+        // gated and holds nothing: a target this table does not build
+        // is never asked about, and an artifact with no general row is
+        // an artifact capped on one platform and free on the rest.
+        for budget in budgets.iter().filter(|b| b.target.is_some()) {
+            let line = budget.line;
+            let target = budget.target.as_deref().unwrap_or_default();
+            let artifact = &budget.artifact;
+            if !platforms.iter().any(|p| p.target == target) {
+                return Err(format!(
+                    "line {line}: {artifact} is capped on {target}, which is not a platform {PATH} has"
+                ));
+            }
+            if !budgets
+                .iter()
+                .any(|b| &b.artifact == artifact && b.target.is_none())
+            {
+                return Err(format!(
+                    "line {line}: {artifact} is capped on {target} and nowhere else"
+                ));
+            }
         }
 
         Ok(Table {
@@ -351,9 +395,22 @@ impl Table {
         self.platforms.iter().find(|p| p.target == target)
     }
 
-    /// The budget for this artifact.
+    /// The budget for this artifact, meaning the one it is held to
+    /// everywhere an exception does not say otherwise.
     pub fn budget(&self, artifact: &str) -> Option<&Budget> {
-        self.budgets.iter().find(|b| b.artifact == artifact)
+        self.budgets
+            .iter()
+            .find(|b| b.artifact == artifact && b.target.is_none())
+    }
+
+    /// The budget this artifact is held to on this platform, which is
+    /// the exception for it when the table writes one and the general
+    /// ceiling when it does not.
+    pub fn budget_on(&self, artifact: &str, target: &str) -> Option<&Budget> {
+        self.budgets
+            .iter()
+            .find(|b| b.artifact == artifact && b.target.as_deref() == Some(target))
+            .or_else(|| self.budget(artifact))
     }
 
     /// What this repository's artifacts for `target` weigh, given the
@@ -370,12 +427,22 @@ impl Table {
             .platform(target)
             .ok_or_else(|| format!("{target} is not a platform {PATH} has"))?;
         let mut out = Vec::new();
-        for budget in self.budgets.iter().filter(|b| b.repo == REPO) {
+        // The general rows are the list of artifacts, and each one's
+        // ceiling here is whatever this platform is held to, so an
+        // artifact with an exception is still weighed once.
+        for budget in self
+            .budgets
+            .iter()
+            .filter(|b| b.repo == REPO && b.target.is_none())
+        {
             let file = match budget.artifact.as_str() {
                 "libzu" => &platform.lib,
                 "zu" => &platform.exe,
                 other => return Err(format!("{REPO} does not build {other}")),
             };
+            let mib = self
+                .budget_on(&budget.artifact, target)
+                .map_or(budget.mib, |b| b.mib);
             let path = dir.join(file);
             let bytes = std::fs::metadata(&path)
                 .map_err(|e| format!("{}: {e}", path.display()))?
@@ -384,7 +451,7 @@ impl Table {
                 artifact: budget.artifact.clone(),
                 file: file.clone(),
                 bytes,
-                cap: budget.mib as u64 * 1024 * 1024,
+                cap: mib as u64 * 1024 * 1024,
             });
         }
         Ok(out)
@@ -721,6 +788,68 @@ mod tests {
         let text = format!("{TABLE}\n{}", &TABLE[TABLE.find("[[platform]]").unwrap()..]);
         let error = Table::parse(&text).expect_err("two rows with one target");
         assert!(error.contains("is written twice"), "{error}");
+    }
+
+    /// The exception a platform gets is for that platform, and the
+    /// point of it is that the rest keep the ceiling they had.
+    #[test]
+    fn a_ceiling_for_one_platform_holds_there_and_nowhere_else() {
+        let text = format!(
+            "{TABLE}\n[[budget]]\nartifact = \"libzu\"\ntarget = \"x86_64-apple-darwin\"\n\
+             mib = 20\nrepo = \"zu\"\ndoc = \"An object format that carries more.\"\n"
+        );
+        let table = Table::parse(&text).expect("the table parses");
+        assert_eq!(table.budget("libzu").map(|b| b.mib), Some(14));
+        assert_eq!(
+            table
+                .budget_on("libzu", "x86_64-apple-darwin")
+                .map(|b| b.mib),
+            Some(20)
+        );
+        assert_eq!(
+            table
+                .budget_on("libzu", "x86_64-unknown-linux-gnu")
+                .map(|b| b.mib),
+            Some(14)
+        );
+
+        // And the weight it is measured against is the one for the
+        // platform it was built for, so the same file passes on one and
+        // fails on the other.
+        let dir = std::env::temp_dir().join(format!("zu-platforms-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+        std::fs::write(dir.join("libzu.so"), vec![0u8; 16 << 20]).expect("writes");
+        std::fs::write(dir.join("libzu.dylib"), vec![0u8; 16 << 20]).expect("writes");
+        let linux = table
+            .weigh("x86_64-unknown-linux-gnu", &dir)
+            .expect("weighs");
+        let darwin = table.weigh("x86_64-apple-darwin", &dir).expect("weighs");
+        assert_eq!(linux.len(), 1, "{linux:?}");
+        assert_eq!(darwin.len(), 1, "{darwin:?}");
+        assert!(linux[0].over(), "{:?}", linux[0]);
+        assert!(!darwin[0].over(), "{:?}", darwin[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ceiling_for_a_platform_the_table_does_not_have_is_refused() {
+        let text = format!(
+            "{TABLE}\n[[budget]]\nartifact = \"libzu\"\ntarget = \"x86_64-apple-darwn\"\n\
+             mib = 20\nrepo = \"zu\"\ndoc = \"A target with a typo in it.\"\n"
+        );
+        let error = Table::parse(&text).expect_err("no such platform");
+        assert!(error.contains("is not a platform"), "{error}");
+    }
+
+    #[test]
+    fn an_artifact_capped_on_one_platform_and_nowhere_else_is_refused() {
+        let text = format!(
+            "{TABLE}\n[[budget]]\nartifact = \"zu\"\ntarget = \"x86_64-apple-darwin\"\n\
+             mib = 20\nrepo = \"zu\"\ndoc = \"An exception to a ceiling nobody wrote.\"\n"
+        );
+        let error = Table::parse(&text).expect_err("an exception to nothing");
+        assert!(error.contains("and nowhere else"), "{error}");
     }
 
     #[test]

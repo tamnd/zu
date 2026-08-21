@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: param
 doc: Values handed to a statement rather than written in it. Every other suite asks what a value means on the way out of a client, and a client that reads a date correctly and writes one a day early passes all of them. A parameter is that value going the other way, through the client's own binding call, so a case here fails when the encoder is wrong even where the decoder is right. The statement is kept as small as the position under test allows, because what is being graded is the value and not the plan.
 

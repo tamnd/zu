@@ -122,7 +122,7 @@ fn a_file_whose_name_and_suite_disagree_is_refused_rather_than_reported_under_on
     let temp = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
         temp.path().join("named.yaml"),
-        "schema: 3\nsuite: other\ndoc: a suite whose file says one name and whose text says another\ncases:\n  - name: a\n    doc: a case, which this test never gets as far as running\n    query: RETURN 1 AS n\n    raises: \"22012\"\n",
+        "schema: 4\nsuite: other\ndoc: a suite whose file says one name and whose text says another\ncases:\n  - name: a\n    doc: a case, which this test never gets as far as running\n    query: RETURN 1 AS n\n    raises: \"22012\"\n",
     )
     .expect("writing the fixture");
     let err = load(temp.path()).expect_err("refused");

@@ -39,6 +39,14 @@
  * zu_error and reaches the other side as the export's own error. None
  * of the three can happen in a case that passes.
  *
+ * A case may run its statements on more than one connection, which is
+ * how a case about a transaction is written: the connection that opened
+ * it is not the one that can say what is visible from outside it. The
+ * extra ones come from zu_conn_duplicate, so they share a write side
+ * with the case's own and see each other's commits. Statements still
+ * run one at a time in the order they were written, and nothing here
+ * starts a thread.
+ *
  * An outcome is one of three things. Passed and failed are obvious.
  * Unsupported is a statement the engine refuses with a GQLSTATUS in
  * class 42 or 0A, which is a case written ahead of the engine and
@@ -58,7 +66,19 @@
 
 /* The schema this runner reads. A file from another one says so here
  * rather than failing somewhere in the middle of its cases. */
-#define RUNNER_SCHEMA 3
+#define RUNNER_SCHEMA 4
+
+/* How many connections one case may name. A case about a transaction
+ * needs two, one to open it and one to ask what is visible from
+ * outside it, and nothing in the corpus has ever wanted a third. The
+ * ceiling is here so that the set is an array on the stack rather than
+ * an allocation per case, and a case that reached it is refused with
+ * this number in the message rather than silently reusing one. */
+#define MAX_CONNS 4
+
+/* The connection a statement runs on when its case does not name one,
+ * which is every statement in nearly every case. */
+#define MAIN_CONN "main"
 
 typedef enum outcome { OUT_PASSED, OUT_FAILED, OUT_UNSUPPORTED } outcome;
 
@@ -81,6 +101,19 @@ typedef struct run {
     unsigned long failed;
     unsigned long unsupported;
 } run;
+
+/* The connections one case runs on, made as they are first named.
+ *
+ * The first is the case's own, from zu_create or zu_open; the rest are
+ * duplicates of it, which is what a pool does and what the reference
+ * runner does, so they share a write side and each sees what the other
+ * has committed. The names point into the document, which outlives the
+ * case, except for the first, which is the literal below. */
+typedef struct conns {
+    const char *name[MAX_CONNS];
+    zu_conn *conn[MAX_CONNS];
+    size_t count;
+} conns;
 
 /* What a refusal said and the condition it named, copied out of the
  * handle so that the handle can be released here rather than at every
@@ -1007,6 +1040,43 @@ static int bind_param(run *r, zu_stmt *stmt, const zy_node *param, char *detail,
     return 0;
 }
 
+/* The connection a case named, made if this is the first mention of it.
+ *
+ * A new one is a duplicate of the case's own rather than a second open
+ * of the path: the two share the write side, so each sees what the
+ * other has committed, where opening the file twice would be two
+ * databases that happen to be the same file. Returns -1 with the
+ * account in detail, which can only happen to a case that names more
+ * connections than there are slots or on a duplicate the engine
+ * refuses. */
+static int connection(conns *set, const char *name, zu_conn **out, char *detail, size_t len) {
+    zu_conn *made = NULL;
+    zu_error *e = NULL;
+    zu_status status;
+    refusal f;
+    size_t i;
+
+    for (i = 0; i < set->count; i++) {
+        if (strcmp(set->name[i], name) == 0) {
+            *out = set->conn[i];
+            return 0;
+        }
+    }
+    if (set->count == MAX_CONNS) {
+        return say(detail, len, "a case runs on at most %d connections", MAX_CONNS);
+    }
+    status = zu_conn_duplicate(set->conn[0], &made, &e);
+    if (status != ZU_OK) {
+        take(status, e, &f);
+        return say(detail, len, "connecting as \"%s\": %s", name, f.message);
+    }
+    set->name[set->count] = name;
+    set->conn[set->count] = made;
+    set->count++;
+    *out = made;
+    return 0;
+}
+
 /* Runs the statement under test, with the parameters the case binds.
  *
  * A case with none goes through zu_query, which is the call a client
@@ -1051,12 +1121,14 @@ static int statement(run *r, zu_conn *conn, const zy_node *node, const zy_node *
 
 /* The statement under test, and what the case says it has to produce.
  * Returns the outcome and writes the account of why into detail. */
-static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, size_t len) {
+static outcome answer(run *r, conns *set, const zy_node *node, char *detail, size_t len) {
     const zy_node *query = zy_get(node, "query");
     const zy_node *raises = zy_get(node, "raises");
     const zy_node *columns = zy_get(node, "columns");
     const zy_node *rows = zy_get(node, "rows");
     const zy_node *setup = zy_get(node, "setup");
+    const zy_node *on = zy_get(node, "on");
+    zu_conn *conn = NULL;
     zu_result *result = NULL;
     zu_status status;
     zu_error *e = NULL;
@@ -1075,11 +1147,28 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
             return OUT_FAILED;
         }
         for (i = 0; i < count; i++) {
-            if (items[i].kind != ZY_SCALAR) {
-                say(detail, len, "a setup statement is one line");
+            /* A setup statement is a line of text, which runs on the
+             * connection every other case runs everything on, or the
+             * connection it runs on and the statement. */
+            const zy_node *text = &items[i];
+            const char *where = MAIN_CONN;
+            if (items[i].kind == ZY_MAP) {
+                const zy_node *named = zy_get(&items[i], "on");
+                text = zy_get(&items[i], "query");
+                if (named == NULL || named->kind != ZY_SCALAR || text == NULL
+                    || text->kind != ZY_SCALAR) {
+                    say(detail, len, "a setup statement is one line, or `on:` and `query:`");
+                    return OUT_FAILED;
+                }
+                where = named->text.ptr;
+            } else if (items[i].kind != ZY_SCALAR) {
+                say(detail, len, "a setup statement is one line, or `on:` and `query:`");
                 return OUT_FAILED;
             }
-            status = zu_query(conn, items[i].text.ptr, items[i].text.len, &result, &e);
+            if (connection(set, where, &conn, detail, len) != 0) {
+                return OUT_FAILED;
+            }
+            status = zu_query(conn, text->text.ptr, text->text.len, &result, &e);
             zu_result_free(result);
             result = NULL;
             if (status == ZU_OK) {
@@ -1097,6 +1186,17 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         }
     }
 
+    if (on != NULL && on->kind != ZY_SCALAR) {
+        say(detail, len, "`on:` is the name of a connection");
+        return OUT_FAILED;
+    }
+    if (connection(set, on != NULL ? on->text.ptr : MAIN_CONN, &conn, detail, len) != 0) {
+        return OUT_FAILED;
+    }
+    /* Turning a node into a value the case can be compared against
+     * needs the name of its table, and it is this connection's catalog
+     * that has to answer, since it is the one the statement ran on. */
+    r->conn = conn;
     if (statement(r, conn, node, query, &status, &result, &e, detail, len) != 0) {
         return OUT_FAILED;
     }
@@ -1169,6 +1269,7 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
     zu_error *e = NULL;
     refusal f;
     outcome out;
+    conns set;
 
     detail[0] = '\0';
     if (name == NULL || name->kind != ZY_SCALAR) {
@@ -1208,10 +1309,17 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
         return;
     }
 
+    set.name[0] = MAIN_CONN;
+    set.conn[0] = conn;
+    set.count = 1;
     r->conn = conn;
-    out = answer(r, conn, node, detail, sizeof detail);
+    out = answer(r, &set, node, detail, sizeof detail);
     r->conn = NULL;
-    zu_conn_close(conn);
+    /* The duplicates go before the one they were made from, which is
+     * the order a client closes a pool in. */
+    while (set.count > 0) {
+        zu_conn_close(set.conn[--set.count]);
+    }
     report(r, suite, name->text.ptr, node->line, out, detail);
     cv_arena_reset(r->arena);
     /* A failure leaves its database behind, which is the one thing

@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: graph
 doc: The shape a load puts into the store, read back by walking it. A client's loader hands over a table of rows and a list of pairs between them, and every case here asks whether the graph that came out is the one that went in, which is a question about direction, about rows nothing points at, and about a row that points at itself. The fixture is small enough that every answer below can be checked by reading the pairs at the top of this file.
 

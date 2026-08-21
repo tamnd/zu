@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: error
 doc: The condition a statement raises, which is part of its answer rather than a message about it. Every case names one GQLSTATUS and nothing else, so two engines that both refuse a statement can be compared on why they refused it, and a client that turns a condition into an exception has something to test its mapping against. The cases are grouped by where the condition comes from and not by its class, because the same five characters raised by the parser, by the binder and by the executor are three different promises: a parser condition is about text, a binder condition is about names, and an executor condition is about a value that only existed once the statement ran.
 

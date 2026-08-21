@@ -112,7 +112,7 @@ fn tempdir() -> Result<std::path::PathBuf, String> {
 mod tests {
     use super::*;
 
-    const HEAD: &str = "schema: 3\nsuite: t\ndoc: a suite the command's own tests run\n\ncases:\n";
+    const HEAD: &str = "schema: 4\nsuite: t\ndoc: a suite the command's own tests run\n\ncases:\n";
 
     /// Writes a one-suite corpus and returns the directory holding it.
     /// The file is named `t.yaml` because `load` checks the suite's name

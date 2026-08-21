@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: stored
 doc: Values put in through a client's bulk load path and read back out through a query. Every other suite asks what a value means on the way out, which is half the question, because a client that decodes a date correctly and encodes it a day early is still wrong and no expression can catch that. Here the value crosses the boundary twice and by two different mechanisms, so a client passes only if its loader and its reader agree with each other and with this file.
 

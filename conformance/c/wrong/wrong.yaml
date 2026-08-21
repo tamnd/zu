@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: wrong
 doc: Cases the engine does not answer the way they say, so that the two runners can be compared on what they say when a case fails. The corpus itself passes, which is the point of it and also why it can never show this. These are not corpus cases and are not packed with them; they live beside the C runner because they are a test of the C runner.
 
@@ -125,6 +125,34 @@ cases:
           - type: INT8
             value: 1
     arrow: refused
+
+  - name: a-wrong-answer-on-another-connection
+    doc: A case whose write and whose read are on different connections and whose count is wrong anyway, so the two runners are compared on a report from a connection neither of them opened the case with.
+    setup:
+      - on: writer
+        query: "INSERT (:thing {n: 1})"
+    on: reader
+    query: MATCH (t:thing) RETURN count(t) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-setup-that-fails-on-another-connection
+    doc: A setup statement that raises, written in the form that names the connection it runs on. The report says which setup statement and what it raised, and it says it the same way whichever connection the statement was on.
+    setup:
+      - on: writer
+        query: RETURN 1 / 0
+    on: writer
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
 
   - name: ahead-of-the-engine
     doc: A statement this engine does not implement, which is the third outcome and neither of the other two.

@@ -7,7 +7,8 @@
 //! a wrong one, and that the two conditions the corpus asks for come
 //! back with their gqlstatus codes attached.
 
-use zu::query::{Value, run};
+use zu::query::{Value, run, run_with};
+use zu::{Engine, Options};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
@@ -31,6 +32,19 @@ fn status(db: &mut Zu1File, source: &str) -> String {
         .unwrap_or_else(|| panic!("{source} raised {err}, which carries no gqlstatus"))
         .code()
         .to_string()
+}
+
+/// The same statement pinned to the row executor, which is the oracle
+/// the pipeline answer is compared against. A switch on the call
+/// rather than a variable in the environment: the environment belongs
+/// to the process and this binary runs its tests in parallel, so
+/// setting it here set it for whichever test was between plans (#513).
+fn on_rows(db: &mut Zu1File, source: &str) -> zu::query::QueryResult {
+    let options = Options {
+        engine: Engine::Rows,
+        ..Options::default()
+    };
+    run_with(source, db, &[], &options).unwrap_or_else(|e| panic!("{source}: {e}"))
 }
 
 /// One case per feature in the integer tower, written the way the
@@ -171,11 +185,7 @@ fn a_cast_in_a_filter_agrees_between_the_two_executors() {
     let mut db = graph(dir.path());
     let source = "MATCH (p:person) WHERE CAST('1' AS INT8) = 1 RETURN count(p) AS n";
     let with_exec2 = run(source, &mut db, &[]).unwrap();
-    // SAFETY: single-threaded test, and the variable is read back by
-    // this process only.
-    unsafe { std::env::set_var("ZU_EXEC2", "0") };
-    let without = run(source, &mut db, &[]).unwrap();
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    let without = on_rows(&mut db, source);
     assert_eq!(with_exec2.rows, without.rows);
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }

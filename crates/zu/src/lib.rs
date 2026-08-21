@@ -13,6 +13,11 @@ pub use zu_common::{
     C_ABI_VERSION, DiagnosticRecord, DurationKind, Epoch, FloatBits, GqlStatus, IntBits, Interrupt,
     LogicalType, NodeId, Position, Result, Severity, Temporal, ZuError,
 };
+/// The switches a statement runs under. [`query::run`] reads them from
+/// the environment and [`query::run_with`] takes them, which is how one
+/// statement asks for something the process cannot be told per
+/// statement.
+pub use zu_query::exec::{Engine, Options, Sink, Sip, Wcoj};
 pub use zu_query::exec::{OpProfile, Profile, StageProfile, Streamed};
 /// Registering a caller's own columns as a table of a connection: the
 /// replacement scan a client's `register()` is built on.

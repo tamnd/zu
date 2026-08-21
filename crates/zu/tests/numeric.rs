@@ -8,22 +8,27 @@
 //! own. Every case below is run twice, once with the pipeline engine and
 //! once pinned to the row engine, and the two are compared.
 //!
-//! It is one test on purpose. Which engine runs is read from the
-//! environment, the tests of a binary share one, and a second test
-//! toggling it beside this one would be reading whichever value the
-//! other had set.
+//! Which engine takes a statement is a switch on the connection, so
+//! the two runs below are two connections and neither can be disturbed
+//! by a test running beside it (#513).
 
-use zu::Database;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
+use zu::{Database, Engine, Options};
 
 const NODES: u32 = 6;
 
 /// The answers a statement gives, as the words a reader compares, and
-/// the condition it raised where it has none.
-fn answers(path: &std::path::Path, source: &str) -> String {
+/// the condition it raised where it has none. `engine` is the one that
+/// takes it, which is the whole of what differs between the two runs.
+fn answers(path: &std::path::Path, source: &str, engine: Engine) -> String {
     let db = Database::open(path).expect("open");
     let mut conn = db.connect().expect("connect");
+    let options = Options {
+        engine,
+        ..conn.session_mut().options().clone()
+    };
+    conn.session_mut().set_options(options);
     match conn.query(source) {
         Err(err) => format!("raised {err}"),
         Ok(result) => result
@@ -136,11 +141,8 @@ fn the_numeric_functions_answer_the_same_on_both_engines() {
     ];
 
     for source in cases {
-        unsafe { std::env::remove_var("ZU_EXEC2") };
-        let pipeline = answers(&path, source);
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let rows = answers(&path, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let pipeline = answers(&path, source, Engine::Pipeline);
+        let rows = answers(&path, source, Engine::Rows);
         assert_eq!(pipeline, rows, "the two engines differ on {source}");
         assert!(!pipeline.is_empty(), "{source} answered nothing at all");
     }

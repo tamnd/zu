@@ -11,7 +11,7 @@
 use zu::query::Value;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
-use zu::{Database, Flow};
+use zu::{Database, Engine, Flow, Options};
 
 const NODES: u32 = 500;
 
@@ -43,6 +43,20 @@ fn opened_with(name: &str, nodes: u32) -> (tempfile::TempDir, Database) {
 
 /// Every row a statement returns, read the ordinary way, so a streamed
 /// run has something to be equal to.
+/// Pins which executor the connection's statements run on. A switch
+/// on the session rather than a variable in the environment: the
+/// environment belongs to the process and the tests of a binary run in
+/// parallel, so setting it here was setting it for whichever test was
+/// between plans (#513). The interrupt handle survives the swap, which
+/// is what lets the stop test hold one across both engines.
+fn pin(conn: &mut zu::Connection, engine: Engine) {
+    let options = Options {
+        engine,
+        ..conn.session_mut().options().clone()
+    };
+    conn.session_mut().set_options(options);
+}
+
 fn buffered(conn: &mut zu::Connection, source: &str) -> Vec<i64> {
     conn.query(source)
         .expect("query")
@@ -222,11 +236,9 @@ fn the_two_executors_stream_the_same_rows_in_the_same_order() {
 
     for source in statements {
         let pipeline = read(&mut conn, source);
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
+        pin(&mut conn, Engine::Rows);
         let old = read(&mut conn, source);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        pin(&mut conn, Engine::Pipeline);
         assert_eq!(pipeline.0, old.0, "{source}");
         assert_eq!(pipeline.1, old.1, "{source}");
         assert!(pipeline.2 && old.2, "both streamed {source}");
@@ -262,20 +274,18 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
         (rows, out)
     };
 
-    for engine in ["1", "0"] {
-        // SAFETY: single-threaded test, and the variable is read back
-        // by this process only.
-        unsafe { std::env::set_var("ZU_EXEC2", engine) };
+    for engine in [Engine::Pipeline, Engine::Rows] {
+        pin(&mut conn, engine);
         let (rows, out) = stopping(&mut conn);
         let err = out.expect_err("the statement was interrupted");
-        assert!(matches!(err, zu::ZuError::Interrupted), "{engine}: {err}");
+        assert!(matches!(err, zu::ZuError::Interrupted), "{engine:?}: {err}");
         assert!(
             rows < u64::from(MANY),
-            "{engine}: {rows} rows is the whole scan"
+            "{engine:?}: {rows} rows is the whole scan"
         );
         interrupt.clear();
     }
-    unsafe { std::env::remove_var("ZU_EXEC2") };
+    pin(&mut conn, Engine::Pipeline);
 
     // Exactly as it was: a statement that was stopped leaves the
     // session holding nothing, so the next one reads the whole table.

@@ -864,6 +864,11 @@ pub struct Options {
     pub sip: Sip,
     /// What the sink of a plain projection keeps.
     pub sink: Sink,
+    /// Which executor runs a plan the pipeline one covers. Read here
+    /// rather than from the environment so that one statement can ask
+    /// for the row executor without answering for every statement
+    /// running beside it (#513).
+    pub engine: Engine,
     /// The handle whoever asked for the statement can stop it through,
     /// and the count of rows it has read so far. Here rather than as a
     /// parameter of its own because every execution path already
@@ -921,6 +926,25 @@ pub enum Sip {
 pub enum Sink {
     #[default]
     Columns,
+    Rows,
+}
+
+/// Which executor runs a plan the pipeline one covers. `Pipeline` is
+/// every plan it takes, falling back to the row-at-a-time executor for
+/// the rest, and is the default. `Rows` pins the row executor for the
+/// whole statement, which is how the differential tests get an oracle
+/// to compare an answer against.
+///
+/// It is a switch on the options rather than a reading of the
+/// environment because the environment is one variable for a whole
+/// process and a test binary runs its tests in parallel threads: a
+/// test that set it for its own statement was setting it for whichever
+/// other test happened to be between plans, and that answered on the
+/// wrong engine (#513).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    #[default]
+    Pipeline,
     Rows,
 }
 

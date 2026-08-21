@@ -612,6 +612,20 @@ fn covered_queries() -> &'static [&'static str] {
          WHERE SAME(a, c) AND ID(a) < 20 RETURN count(*) AS n",
         "MATCH (a:person)-[:knows]->(b:person) \
          WHERE ALL_DIFFERENT(a, b) AND a.age > 50 RETURN count(*) AS n",
+        // ELEMENT_ID, which is the same two numbers written as the
+        // string the standard asks for. It stands where a string column
+        // stands, so the shapes are the fold's shapes: a projection, a
+        // comparison against something the statement wrote, an order, a
+        // group key, and a string function reading it.
+        "MATCH (p:person) RETURN ELEMENT_ID(p) AS e, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) WHERE ELEMENT_ID(p) = 'n:0:7' RETURN p.name AS s",
+        "MATCH (p:person) WHERE ID(p) < 30 RETURN ELEMENT_ID(p) AS e ORDER BY e",
+        "MATCH (p:person) WHERE ID(p) < 12 RETURN ELEMENT_ID(p) AS e, count(*) AS n ORDER BY e",
+        "MATCH (p:person) RETURN count(DISTINCT ELEMENT_ID(p)) AS n",
+        "MATCH (p:person) WHERE char_length(ELEMENT_ID(p)) > 6 RETURN count(*) AS n",
+        "MATCH (p:person) WHERE ID(p) < 5 RETURN upper(ELEMENT_ID(p)) AS e ORDER BY e",
+        "MATCH (a:person)-[:knows]->(b:person) \
+         WHERE ID(a) < 20 RETURN ELEMENT_ID(a) AS x, ELEMENT_ID(b) AS y ORDER BY x, y",
         "MATCH (p:person) WHERE power(p.age, 2) > 1600 RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.age > 0 AND log(2, p.age) < 6 RETURN count(*) AS n",
         // count(DISTINCT ...), which groups on its own argument and

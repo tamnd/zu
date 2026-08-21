@@ -3309,7 +3309,8 @@ impl Compiler<'_> {
                         | Func::Lower
                         | Func::Trim(_)
                         | Func::Cut(_)
-                        | Func::Normalize(_),
+                        | Func::Normalize(_)
+                        | Func::ElementId,
                     ..
                 }
         ) {
@@ -4464,6 +4465,40 @@ impl Compiler<'_> {
                 };
                 self.ref_reg(b, r, level, outer)
             }
+            // ELEMENT_ID of a node, which is the same two numbers ID
+            // reads written as the string the standard asks for. The
+            // table is the level's and is the same for every row it
+            // will ever produce, so the kernel writes it once for the
+            // chunk and a row's own number after it.
+            //
+            // An edge declines here as it declines above, and for a
+            // longer reason: an edge is its table, the pair it runs
+            // between and which copy of that pair it is, and a level
+            // carries none of those as a column.
+            BoundExpr::Call {
+                func: Func::ElementId,
+                distinct: false,
+                star: false,
+                args,
+                ..
+            } => {
+                let [arg] = args.as_slice() else {
+                    return Ok(None);
+                };
+                let Some(ScalarRef::Node { level: node }) = self.item_ref(arg)? else {
+                    return Ok(None);
+                };
+                let Some(table) = self.levels.get(node).map(|l| l.table) else {
+                    return Ok(None);
+                };
+                let Some(src) = self.ref_reg(b, ScalarRef::RowId { level: node }, level, outer)?
+                else {
+                    return Ok(None);
+                };
+                let dst = b.push_type(PhysType::Str)?;
+                b.ops.push(ExprOp::ElementId { table, src, dst });
+                Ok(Some(dst))
+            }
             // A cast the values cannot notice. GA05 put CAST in filter
             // position and a cast is a per-row conversion with a
             // condition behind it, so it belongs to the row engine in
@@ -5041,12 +5076,15 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         // so does a trim: the trim family's one condition is about the
         // set a statement wrote and the compiler settles it there. So
         // do both normalizations, every string having a normal form and
-        // either being in it or not.
+        // either being in it or not. And so does an identifier: a node
+        // has one, and the two numbers it is written from are a level's
+        // own rather than anything a row can be wrong about.
         ExprOp::StrLen { .. }
         | ExprOp::StrFold { .. }
         | ExprOp::StrTrim { .. }
         | ExprOp::StrNorm { .. }
-        | ExprOp::StrNormalized { .. } => false,
+        | ExprOp::StrNormalized { .. }
+        | ExprOp::ElementId { .. } => false,
         // A cut is the one string op whose condition is about a value
         // rather than about what the statement wrote, a string having
         // no negative number of characters and a column being able to

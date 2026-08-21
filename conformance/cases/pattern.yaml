@@ -1102,6 +1102,25 @@ cases:
           - type: STRING
             value: "n:0:0"
 
+  - name: element-id-names-every-node-of-a-chunk
+    doc: The identifier is written for a whole chunk of rows at once rather than for the one row a WHERE picked out, and what varies across a chunk is the number at the end of it. The people load in the order they are written above, so their identifiers count from nought with them.
+    query: MATCH (n:person) RETURN element_id(n) AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "n:0:0"
+      - values:
+          - type: STRING
+            value: "n:0:1"
+      - values:
+          - type: STRING
+            value: "n:0:2"
+      - values:
+          - type: STRING
+            value: "n:0:3"
+
   - name: element-id-names-an-edge-as-well-as-a-node
     doc: The argument is an element and not a node, so an edge has one too, and an edge's is its table, the pair it runs between and which copy of that pair it is. Nothing an edge answers can collide with what a node answers, because the two spellings start differently.
     query: MATCH (a:person)-[r:knows]->(b:person) WHERE a.name = 'ann' RETURN element_id(r) AS a

@@ -24,6 +24,6 @@ pub use hash::{hash_slice, hash64};
 pub use math::{MathOp, MathPair, pair, unary};
 pub use setops::intersect_sorted;
 pub use strings::{
-    StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet, cut, fold, length, normalize, normalized,
-    trim,
+    StrCut, StrFold, StrLen, StrNorm, StrTrim, TrimSet, cut, element_ids, fold, length, normalize,
+    normalized, trim,
 };

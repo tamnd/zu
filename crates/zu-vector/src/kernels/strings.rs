@@ -1102,6 +1102,109 @@ pub fn cut(
     Ok(out)
 }
 
+/// The longest a number takes here: twenty digits and a sign.
+const DIGITS: usize = 21;
+
+/// `n` written into the end of `buf`, answered as the part of `buf`
+/// that holds it.
+///
+/// Backwards, because the last digit is the one arithmetic hands over
+/// first. Writing it forwards means measuring the number before writing
+/// it, which is the same chain of divides a second time, and a division
+/// per digit is most of what an identifier costs.
+fn written(n: i64, buf: &mut [u8; DIGITS]) -> &[u8] {
+    let mut at = buf.len();
+    let mut left = n.unsigned_abs();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (left % 10) as u8;
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
+/// The identifiers of a chunk's nodes, which is `n:` and then the table
+/// and the row each node sits at.
+///
+/// A level of a plan has one table for every row it will ever produce
+/// and carries the row itself as a column, so the identifier is a head
+/// written once for the whole chunk and a number written once a row.
+/// That is the reason this is a kernel rather than a call: the argument
+/// is a node and no chunk holds one, but the two numbers a node is made
+/// of are both here already.
+///
+/// The row is an integer and not a string, so nothing about the answer
+/// is read out of the argument the way a trim or a substring reads its
+/// answer out of the string it was handed. Every identifier is written,
+/// and nearly all of them are written into the view itself: a table
+/// under ten and a row under nine digits is twelve bytes, which is what
+/// fits inline, so a chunk of a normal graph fills no buffer at all.
+///
+/// A negative row cannot come out of storage and is written with its
+/// sign rather than being refused, since a kernel that answers for
+/// every input it can be handed is one fewer thing to get right.
+pub fn element_ids(arena: &mut MorselArena, table: u32, rows: &ValueVector) -> Result<ValueVector> {
+    if !matches!(rows.phys, PhysType::Int64) {
+        return Err(ZuError::InvalidArgument(format!(
+            "no ELEMENT_ID() kernel for {:?}",
+            rows.phys
+        )));
+    }
+    if matches!(rows.encoding, VecEncoding::Dict { .. }) {
+        return Err(ZuError::InvalidArgument(
+            "element identifiers over a dict vector: materialize first".into(),
+        ));
+    }
+    let len = rows.len as usize;
+    // `n:` and the table and a colon, which is at most thirteen bytes
+    // and the same bytes for every row of the chunk.
+    let mut digits = [0u8; DIGITS];
+    let table = written(i64::from(table), &mut digits);
+    let mut buf = [0u8; 13];
+    buf[0] = b'n';
+    buf[1] = b':';
+    buf[2..2 + table.len()].copy_from_slice(table);
+    buf[2 + table.len()] = b':';
+    let head = &buf[..3 + table.len()];
+
+    let mut out = ValueVector::flat_uninit(arena, PhysType::Str, len);
+    let mut build = StrBuilder::new();
+    let mut row_digits = [0u8; DIGITS];
+    let one = |build: &mut StrBuilder, row: i64, room: &mut [u8; DIGITS]| {
+        let tail = written(row, room);
+        build.push_with(head.len() + tail.len(), |dst| {
+            dst[..head.len()].copy_from_slice(head);
+            dst[head.len()..].copy_from_slice(tail);
+        })
+    };
+    match rows.encoding {
+        VecEncoding::Constant => {
+            let view = one(&mut build, rows.constant_value::<i64>(), &mut row_digits);
+            out.values_mut::<StrView>()[..len].fill(view);
+        }
+        // Flat, the dictionary having been turned away above.
+        _ => {
+            let vals = rows.values::<i64>();
+            let dst = out.values_mut::<StrView>();
+            for (slot, &row) in dst[..len].iter_mut().zip(vals) {
+                *slot = one(&mut build, row, &mut row_digits);
+            }
+        }
+    }
+    out.aux = Aux::Str(Arc::new(build.finish()));
+    // A row broadcast in from an optional match that found nothing is
+    // null, and the identifier of a node that is not there is null too.
+    out.validity = carried(arena, rows, len);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,5 +1988,83 @@ mod tests {
             panic!("a number was cut as a string");
         };
         assert!(err.to_string().contains("left()"), "{err}");
+    }
+
+    /// An identifier is the head the chunk shares and the row itself,
+    /// and the rows a graph really holds are counted from nought, so
+    /// the digits are the whole of what varies.
+    #[test]
+    fn an_identifier_is_the_table_and_the_row() {
+        let mut arena = MorselArena::new();
+        let rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &[0i64, 7, 1234567]);
+        let ids = element_ids(&mut arena, 3, &rows).unwrap();
+        assert_eq!(ids.phys, PhysType::Str);
+        assert_eq!(read(&ids), vec!["n:3:0", "n:3:7", "n:3:1234567"]);
+    }
+
+    /// The row engine writes the same two numbers with the same
+    /// punctuation, and the two engines answering one query differently
+    /// is the failure this kernel exists to not have.
+    #[test]
+    fn an_identifier_is_what_the_row_engine_writes() {
+        let mut arena = MorselArena::new();
+        for (table, row) in [(0u32, 0i64), (1, 2), (10, 99), (u32::MAX, 4_294_967_296)] {
+            let rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &[row]);
+            let ids = element_ids(&mut arena, table, &rows).unwrap();
+            assert_eq!(read(&ids), vec![format!("n:{table}:{row}")]);
+        }
+    }
+
+    /// A row past the twelve bytes a view holds is written into the
+    /// buffer behind it, and the answer reads back the same either way.
+    #[test]
+    fn an_identifier_too_long_to_sit_inline_goes_to_the_buffer() {
+        let mut arena = MorselArena::new();
+        let rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &[5i64, 9_876_543_210_123]);
+        let ids = element_ids(&mut arena, 65535, &rows).unwrap();
+        let views = ids.values::<StrView>();
+        assert!(views[0].is_inline(), "a short identifier stays in the view");
+        assert!(!views[1].is_inline(), "a long one does not");
+        assert_eq!(
+            read(&ids),
+            vec!["n:65535:5", "n:65535:9876543210123"],
+            "and both read back the same"
+        );
+    }
+
+    /// One row standing for the chunk is written once.
+    #[test]
+    fn a_constant_row_is_written_once() {
+        let mut arena = MorselArena::new();
+        let rows = ValueVector::constant(&mut arena, PhysType::Int64, 12i64, 4);
+        let ids = element_ids(&mut arena, 0, &rows).unwrap();
+        assert_eq!(read(&ids), vec!["n:0:12"; 4]);
+    }
+
+    /// A node that is not there has no identifier, which is the row an
+    /// optional match left behind.
+    #[test]
+    fn a_null_row_has_no_identifier() {
+        let mut arena = MorselArena::new();
+        let mut rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, 0, 3]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        rows.validity = Some(valid);
+        let ids = element_ids(&mut arena, 2, &rows).unwrap();
+        let valid = ids.validity.as_ref().expect("the answer carries validity");
+        assert!(valid.get(0) && !valid.get(1) && valid.get(2));
+    }
+
+    /// The two numbers a node is made of are numbers, so a column of
+    /// anything else is not a chunk of nodes and is refused rather than
+    /// read as one.
+    #[test]
+    fn identifiers_want_a_column_of_rows() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["ann"]);
+        let Err(err) = element_ids(&mut arena, 0, &v) else {
+            panic!("a column of strings was read as rows");
+        };
+        assert!(err.to_string().contains("ELEMENT_ID()"), "{err}");
     }
 }

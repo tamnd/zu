@@ -16,7 +16,7 @@ use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
     BinOp, CmpOp, MathOp, MathPair, StrCut, StrFold, StrLen, StrTrim, TrimSet, binary, compare,
-    cut, fold, length, normalize, normalized, pair, trim, unary,
+    cut, element_ids, fold, length, normalize, normalized, pair, trim, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -123,6 +123,15 @@ pub enum ExprOp {
     StrNormalized {
         form: NormalForm,
         negated: bool,
+        src: Reg,
+        dst: Reg,
+    },
+    /// The identifier of a node, which is the one element function
+    /// whose answer is a string. The table comes from the plan, a level
+    /// having one for every row it will ever produce, and the register
+    /// holds the rows themselves.
+    ElementId {
+        table: u32,
         src: Reg,
         dst: Reg,
     },
@@ -278,6 +287,14 @@ impl Program {
                         normalized(*form, *negated, v, &mut bits)?;
                     }
                     regs[*dst as usize] = Slot::Bits(bits);
+                    last = *dst;
+                }
+                ExprOp::ElementId { table, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        element_ids(arena, *table, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;
                 }
                 ExprOp::Compare { op, l, r, dst } => {

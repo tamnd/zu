@@ -1063,6 +1063,35 @@ cases:
           - type: INT64
             value: "4"
 
+  - name: id-numbers-a-node
+    doc: ID is zu's own function and older than the standard's ELEMENT_ID. What it answers is where in its table the node sits, counted from nought, which is the number the storage already keeps and not one made up for the answer. The people load in the order they are written above, so cy is the third of them.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN id(n) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: id-of-an-edge-is-nothing
+    doc: An edge has a place of its own but not a place in a table of nodes, and a number that named one would be a number a node also answers to. So ID takes nodes and says so by answering null for anything else, which is what ELEMENT_ID is for.
+    query: MATCH (a:person)-[r:knows]->(b:person) WHERE a.name = 'ann' RETURN id(r) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: id-tells-the-ends-of-an-edge-apart
+    doc: Two nodes of one table are the same node exactly when their numbers agree, so this is the same question SAME asks and the fixture's edge from a node to itself is the row that answers yes.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE id(a) = id(b) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
   - name: element-id-names-a-node
     doc: ELEMENT_ID of ISO 20.10 answers an identifier for an element, and what the identifier is the standard leaves to the engine. zu answers a string that says which kind of element it names, then which table, then where in it, so the spelling is here rather than only in the declaration; a client that stores one of these is relying on it.
     query: MATCH (n:person) WHERE n.name = 'ann' RETURN element_id(n) AS a
@@ -1072,6 +1101,25 @@ cases:
       - values:
           - type: STRING
             value: "n:0:0"
+
+  - name: element-id-names-every-node-of-a-chunk
+    doc: The identifier is written for a whole chunk of rows at once rather than for the one row a WHERE picked out, and what varies across a chunk is the number at the end of it. The people load in the order they are written above, so their identifiers count from nought with them.
+    query: MATCH (n:person) RETURN element_id(n) AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "n:0:0"
+      - values:
+          - type: STRING
+            value: "n:0:1"
+      - values:
+          - type: STRING
+            value: "n:0:2"
+      - values:
+          - type: STRING
+            value: "n:0:3"
 
   - name: element-id-names-an-edge-as-well-as-a-node
     doc: The argument is an element and not a node, so an edge has one too, and an edge's is its table, the pair it runs between and which copy of that pair it is. Nothing an edge answers can collide with what a node answers, because the two spellings start differently.

@@ -651,6 +651,35 @@ fn main() {
         per_sec_cut_counted / per_sec_cut
     );
 
+    // The identifier of a node, which is the string kernel with no
+    // string on its input side: a level's rows go in and `n:0:<row>`
+    // comes out. Every answer is written rather than read out of an
+    // argument, so this is the fold's cost without the fold's copy, and
+    // the rows here are the rows a graph really has, counted from
+    // nought, so nearly every answer fits in the twelve bytes a view
+    // holds and the buffer stays empty.
+    let ids: Vec<i64> = (0..VECTOR).map(|i| i as i64).collect();
+    let id_rows = ValueVector::flat_from(&mut arena, PhysType::Int64, &ids);
+    let per_sec_ids = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::element_ids(&mut arith_scratch, 0, black_box(&id_rows))
+                .unwrap()
+                .len,
+        );
+    });
+    let ids_grows = per_sec_ids * VECTOR as f64 / 1e9;
+    println!(
+        "str_element_id: {ids_grows:.2} G rows/s over a level's rows ({:.1}x the fold of a string column, no spec target)",
+        per_sec_ids / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_element_id_grows_s")
+        && ids_grows < floor
+    {
+        println!("GATE FAIL vec_str_element_id_grows_s: {ids_grows:.2} < floor {floor}");
+        failed = true;
+    }
+
     // Sorted intersection, balanced inputs: the multiway join inner
     // loop. Throughput counts every element the merge consumes.
     let a: Vec<u64> = (0..4096u64).map(|i| i * 3).collect();

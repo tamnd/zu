@@ -2067,3 +2067,20 @@ vec_str_normalize_grows_s = 0.08
 # and a busy machine has measured a third of a light one elsewhere in
 # this file. Raise floors, never lower them.
 vec_str_cut_grows_s = 0.04
+
+# The identifiers of a 2048-row level, which is the one element function
+# whose answer is a string and so the one that has to write anything.
+# The table is the level's and is the same for every row, so the head of
+# an identifier is written once for the whole chunk and only a row's own
+# number goes round the loop, backwards into a stack buffer so the
+# digits are divided out once rather than once to measure them and again
+# to write them. Nearly every answer fits the twelve bytes a string view
+# holds inline, so a chunk of a normal graph fills no buffer at all, and
+# the bench prints it beside the fold of a string column to show what a
+# kernel that writes seven bytes a row costs against one that writes
+# fourteen. Floor sits well under the observed run, which was 0.05 at
+# load 6.0 on ten cores in a run where the fold beside it measured 0.02
+# against its own floor of 0.03, so the machine was swamped and the
+# margin is written for that rather than for the number. Raise floors,
+# never lower them.
+vec_str_element_id_grows_s = 0.02

@@ -3305,6 +3305,7 @@ impl Compiler<'_> {
                     func: Func::Math(_)
                         | Func::CharLength
                         | Func::OctetLength
+                        | Func::Size
                         | Func::Upper
                         | Func::Lower
                         | Func::Trim(_)
@@ -4585,20 +4586,27 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::MathPair { op, l, r, dst });
                 Ok(Some(dst))
             }
-            // GF04, the two questions about a string whose answer is a
+            // GF04, the questions about a string whose answer is a
             // number. They come before the rest of the string library
             // because an answer that is a count needs no room in the
             // arena for bytes, which is the question the folds and the
-            // trims still have to settle.
+            // trims still have to settle. `SIZE` is here because a
+            // string is one of the things it counts, and over a string
+            // it counts exactly what `CHAR_LENGTH` counts, so the two
+            // are the same kernel under two spellings. Over a list it
+            // is something else and there is no kernel for it yet,
+            // which needs no rule here: the length of anything that is
+            // not a string has no answer type, so those arguments fall
+            // back the way an unhandled expression does.
             BoundExpr::Call {
-                func: func @ (Func::CharLength | Func::OctetLength),
+                func: func @ (Func::CharLength | Func::OctetLength | Func::Size),
                 args,
                 distinct: false,
                 star: false,
                 ..
             } if args.len() == 1 => {
                 let op = match func {
-                    Func::CharLength => StrLen::Chars,
+                    Func::CharLength | Func::Size => StrLen::Chars,
                     _ => StrLen::Octets,
                 };
                 let Some(src) = self.value_reg(b, &args[0], level, false)? else {

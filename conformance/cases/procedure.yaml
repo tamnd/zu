@@ -89,6 +89,103 @@ cases:
           - type: STRING
             value: di
 
+  - name: an-optional-block-keeps-the-row-it-answers-nothing-for
+    doc: GP03. The same call written with OPTIONAL, which is the word that says the row survives the block answering nothing. The fourth person is back, and what the block would have let out is null on that row, so a reader who wants every person and their friends where they have them writes this and not the call above.
+    query: "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN b.name AS f } RETURN a.name AS x, f AS y ORDER BY x"
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: cy
+          - type: NULL
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-optional-block-nulls-a-value-it-would-have-answered
+    doc: What the word says is about the row the block answered and not about the graph it read, so a column that never had a graph in it is null too where the block matched nothing. The one written here is the constant an engine that dropped the OPTIONAL and left the projection alone would answer on every row, and there is a row it may not answer it on.
+    query: "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN 1 AS n } RETURN a.name AS x, n AS y ORDER BY x"
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: cy
+          - type: NULL
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "1"
+
+  - name: an-optional-block-matches-whole-or-not-at-all
+    doc: A block is one operand, so what the word makes optional is the whole of what it is written out of rather than each step of it. The second step here is a friend of a friend, which ann has and bo does not, and bo's row carries two nulls rather than the one friend the first step found.
+    query: "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b:person)-[:knows]->(c:person) RETURN b.name AS f, c.name AS g } RETURN a.name AS x, f AS y, g AS z ORDER BY x"
+    columns:
+      - x
+      - y
+      - z
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: bo
+          - type: NULL
+          - type: NULL
+      - values:
+          - type: STRING
+            value: cy
+          - type: NULL
+          - type: NULL
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-optional-block-that-binds-nothing-of-its-own
+    doc: Whether the block matched is read off what the block bound, there being nothing else on the row that a block answering nothing changed. A block written out of nothing but the names it was handed leaves the row exactly as it found it either way, so the two cases cannot be told apart and the statement is refused rather than answered wrongly.
+    query: "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a) RETURN 1 AS n } RETURN a.name AS x, n AS y"
+    raises: "42001"
+
+  - name: an-optional-procedure-named-in-the-catalog
+    doc: The word says the row is kept where what follows it answers nothing, and a procedure named in the catalog answers a table of its own rather than more of the row. There is no row of the statement for it to keep, so the word has nothing to say there and is refused where it is written.
+    query: "OPTIONAL CALL zu.ping() YIELD ok"
+    raises: "42001"
+
   - name: a-star-is-what-the-block-itself-bound
     doc: A block that returns everything returns what it bound rather than what it was handed, since a name the row already carries cannot arrive on it twice. So the star below is the friend the block walked to and not the person it started from.
     query: MATCH (a:person) CALL (a) { MATCH (a)-[:knows]->(b:person) RETURN * } RETURN a.name AS x, b.name AS y ORDER BY x, y

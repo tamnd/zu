@@ -959,6 +959,12 @@ pub enum Type {
     Int,
     Float,
     Str,
+    /// GV35, a byte string. It is beside `Str` and not under it: the
+    /// two have different lengths for the same value, order by
+    /// different units, and the standard gives the byte string its own
+    /// functions, so a rule written for one is not a rule for the
+    /// other.
+    Bytes,
     Node,
     Rel,
     Path,
@@ -993,6 +999,7 @@ impl fmt::Display for Type {
             Type::Int => write!(f, "INT"),
             Type::Float => write!(f, "FLOAT"),
             Type::Str => write!(f, "STRING"),
+            Type::Bytes => write!(f, "BYTES"),
             Type::Node => write!(f, "NODE"),
             Type::Rel => write!(f, "REL"),
             Type::Path => write!(f, "PATH"),
@@ -6113,6 +6120,7 @@ impl Binder<'_> {
                     Literal::Int(_) => Type::Int,
                     Literal::Float(_) => Type::Float,
                     Literal::Str(_) => Type::Str,
+                    Literal::Bytes(_) => Type::Bytes,
                     // The static lattice has no temporal type yet, so a
                     // temporal literal is only known to be a value. It
                     // reaches the runtime typed and the checks that
@@ -7102,6 +7110,7 @@ pub fn text(expr: &Expr) -> String {
         Expr::Literal(Literal::Int(v)) => v.to_string(),
         Expr::Literal(Literal::Float(v)) => v.to_string(),
         Expr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        Expr::Literal(Literal::Bytes(b)) => zu_common::bytes::literal(b),
         Expr::Literal(Literal::Temporal(t)) => t.to_string(),
         Expr::Param(p) => format!("${p}"),
         Expr::Variable(v) => v.clone(),

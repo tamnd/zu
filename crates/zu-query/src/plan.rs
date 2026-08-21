@@ -1343,6 +1343,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Int(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Float(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        BoundExpr::Literal(Literal::Bytes(b)) => zu_common::bytes::literal(b),
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
         BoundExpr::Graph(handle) => handle.label(),

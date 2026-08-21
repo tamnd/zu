@@ -612,6 +612,12 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
             }
         }
         (LogicalType::Str { .. }, Value::Str(s)) => Cell::Str(s.as_bytes().to_vec()),
+        // A byte string goes down the same side of the store a
+        // character string does, which is the blob side, because the
+        // store keeps a run of bytes and a run of bytes is what both
+        // of them are. What tells the two apart is the column's own
+        // type, and this pairing is the whole of the telling.
+        (LogicalType::Bytes { .. }, Value::Bytes(b)) => Cell::Str(b.clone()),
         (LogicalType::Date, Value::Temporal(Temporal::Date(d))) => Cell::Int(*d as i64 as u64),
         (LogicalType::LocalTime, Value::Temporal(Temporal::LocalTime(t))) => Cell::Int(*t as u64),
         (LogicalType::LocalDatetime, Value::Temporal(Temporal::LocalDatetime(t))) => {
@@ -641,6 +647,7 @@ pub(crate) fn describe(value: &Value) -> &'static str {
         Value::Int(_) => "an integer",
         Value::Float(_) => "a float",
         Value::Str(_) => "a string",
+        Value::Bytes(_) => "a byte string",
         Value::Node { .. } => "a node",
         Value::Rel { .. } => "an edge",
         Value::List(_) => "a list",

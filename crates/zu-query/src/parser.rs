@@ -4332,6 +4332,10 @@ impl Parser<'_> {
                 self.pos += 1;
                 Ok(Expr::Literal(Literal::Str(s)))
             }
+            TokenKind::Bytes(b) => {
+                self.pos += 1;
+                Ok(Expr::Literal(Literal::Bytes(b)))
+            }
             TokenKind::Param(p) => {
                 self.pos += 1;
                 Ok(Expr::Param(p))

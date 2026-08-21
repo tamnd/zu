@@ -44,6 +44,13 @@ pub enum Kind {
     Number,
     /// A character string.
     Str,
+    /// A character string or a byte string, which is what the two
+    /// functions ISO defines twice take: `OCTET_LENGTH` counts the
+    /// octets of either, and `TRIM` takes either and answers the same
+    /// type it was given. Both arguments of a trim have to be the same
+    /// one of the two, and that is the kernel's check rather than this
+    /// one's, since a kind reads one argument at a time.
+    Octets,
     /// A list, and not a string that could be read as one.
     List,
     /// A list, a string or a path: the three things that have a count
@@ -74,6 +81,7 @@ impl Kind {
             Kind::Any => true,
             Kind::Number => matches!(ty, Type::Any | Type::Int | Type::Float),
             Kind::Str => matches!(ty, Type::Any | Type::Str),
+            Kind::Octets => matches!(ty, Type::Any | Type::Str | Type::Bytes),
             Kind::List => matches!(ty, Type::Any | Type::List(_)),
             Kind::Sized => matches!(ty, Type::Any | Type::List(_) | Type::Str | Type::Path),
             // A binding table reference has no arm of its own in
@@ -154,6 +162,14 @@ pub enum Ret {
     /// one and a float where any of them is, which is the rule the
     /// arithmetic operators follow and so is the rule `MOD` follows.
     Wider,
+    /// A character string, or a byte string where the first argument is
+    /// one. This is what the trim family answers: it hands back the
+    /// type it was given, and the two types it takes are these. Reading
+    /// the first argument rather than saying `Same` keeps a trim of a
+    /// property, whose type nobody declared, binding as a string, which
+    /// is what it was before byte strings existed and what it is in
+    /// every query that is not about octets.
+    Trimmed,
 }
 
 impl Ret {
@@ -171,6 +187,10 @@ impl Ret {
             Ret::Temporal => Type::Any,
             Ret::Same => first(),
             Ret::ListOf => Type::List(Box::new(first())),
+            Ret::Trimmed => match first() {
+                Type::Bytes => Type::Bytes,
+                _ => Type::Str,
+            },
             Ret::Wider => {
                 if args.iter().any(|ty| matches!(ty, Type::Any)) {
                     Type::Any
@@ -510,8 +530,8 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::OctetLength,
         arity: Arity::Exactly(1),
-        arg: Kind::Str,
-        needs: "needs a string",
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
         ret: Ret::Int,
         deterministic: true,
         aggregate: false,
@@ -552,9 +572,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Both),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -571,9 +591,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Leading),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -585,9 +605,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Trailing),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -599,9 +619,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Btrim),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -613,9 +633,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Ltrim),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -627,9 +647,9 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Rtrim),
         arity: Arity::Between(1, 2),
-        arg: Kind::Str,
-        needs: "needs a string",
-        ret: Ret::Str,
+        arg: Kind::Octets,
+        needs: "needs a string or a byte string",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -1278,6 +1298,7 @@ pub fn value_of(lit: &Literal) -> Value {
         Literal::Int(i) => Value::Int(*i),
         Literal::Float(f) => Value::Float(*f),
         Literal::Str(s) => Value::Str(s.clone()),
+        Literal::Bytes(b) => Value::Bytes(b.clone()),
         Literal::Temporal(t) => Value::Temporal(*t),
     }
 }
@@ -1436,6 +1457,13 @@ fn identity_kernel(func: Func, args: &[Value]) -> Result<Value> {
 fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     let s = match settle(one(func, args)?.clone()) {
         Value::Str(s) => s,
+        // OCTET_LENGTH is the one question here that a byte string
+        // answers, and it answers it without decoding anything first:
+        // the octets are the value. The rest of these are questions
+        // about characters, and a byte string has none.
+        Value::Bytes(b) if matches!(func, Func::OctetLength) => {
+            return Ok(Value::Int(b.len() as i64));
+        }
         Value::Null => return Ok(Value::Null),
         other => return Err(bad_type(func, "a string", &other)),
     };
@@ -1483,9 +1511,18 @@ fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
             return Err(invalid(format!("{}() is not a trim", name_of(other))));
         }
     };
-    let text = match str_arg(func, args.first())? {
-        Some(text) => text,
-        None => return Ok(Value::Null),
+    let source = settle(
+        args.first()
+            .ok_or_else(|| invalid(format!("{}() was given no string", name_of(func))))?
+            .clone(),
+    );
+    if let Value::Bytes(bytes) = source {
+        return trim_bytes(func, trim, &bytes, args.get(1));
+    }
+    let text = match source {
+        Value::Str(text) => text,
+        Value::Null => return Ok(Value::Null),
+        other => return Err(bad_type(func, "a string", &other)),
     };
     let chars = match args.get(1) {
         None => Some(" ".to_string()),
@@ -1519,6 +1556,61 @@ fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
         out = out.trim_end_matches(|c| set.contains(&c));
     }
     Ok(Value::Str(out.to_string()))
+}
+
+/// ISO 21.3, the same six functions over a byte string: octets off the
+/// front, off the back, or off both.
+///
+/// The octet nobody wrote is `X'00'` and not a space, because a space
+/// is a character and a byte string has none. `X'00'` is the octet a
+/// fixed length byte string is padded out with, so it is the one a trim
+/// that names no octet takes off, which is the same reasoning that
+/// makes a space the default over characters. The one octet check is
+/// the `22027` the character form raises, counted in octets, and the
+/// three set trims take as many as they are given.
+fn trim_bytes(func: Func, trim: Trim, bytes: &[u8], octets: Option<&Value>) -> Result<Value> {
+    let set = match octets {
+        None => vec![0],
+        Some(value) => match settle(value.clone()) {
+            Value::Bytes(set) => set,
+            Value::Null => return Ok(Value::Null),
+            other => return Err(bad_type(func, "a byte string", &other)),
+        },
+    };
+    let one_octet = matches!(trim, Trim::Both | Trim::Leading | Trim::Trailing);
+    if one_octet && set.len() != 1 {
+        return Err(gql(
+            codes::C22027,
+            format!(
+                "{}() trims one octet and was given {} of them, which is what btrim, ltrim and rtrim are for",
+                name_of(func),
+                set.len()
+            ),
+        ));
+    }
+    let front = matches!(trim, Trim::Both | Trim::Leading | Trim::Btrim | Trim::Ltrim);
+    let back = matches!(
+        trim,
+        Trim::Both | Trim::Trailing | Trim::Btrim | Trim::Rtrim
+    );
+    let mut out = bytes;
+    if front {
+        while let [first, rest @ ..] = out {
+            if !set.contains(first) {
+                break;
+            }
+            out = rest;
+        }
+    }
+    if back {
+        while let [rest @ .., last] = out {
+            if !set.contains(last) {
+                break;
+            }
+            out = rest;
+        }
+    }
+    Ok(Value::Bytes(out.to_vec()))
 }
 
 /// ISO 20.24, the substring function: the first characters of a string
@@ -2297,6 +2389,92 @@ mod tests {
                 "{trim:?}"
             );
         }
+    }
+
+    /// GF07. The same six functions over a byte string trim octets, and
+    /// which end each one trims is the same answer it gives over
+    /// characters: the two forms are one function taking two types.
+    #[test]
+    fn a_trim_takes_octets_off_a_byte_string_the_same_way() {
+        let bin = Value::Bytes(vec![0, 0, 0xAB, 0xCD, 0]);
+        let nought = Value::Bytes(vec![0]);
+        for (trim, want) in [
+            (Trim::Both, vec![0xAB, 0xCD]),
+            (Trim::Leading, vec![0xAB, 0xCD, 0]),
+            (Trim::Trailing, vec![0, 0, 0xAB, 0xCD]),
+            (Trim::Btrim, vec![0xAB, 0xCD]),
+            (Trim::Ltrim, vec![0xAB, 0xCD, 0]),
+            (Trim::Rtrim, vec![0, 0, 0xAB, 0xCD]),
+        ] {
+            let got = trimmed(trim, &[bin.clone(), nought.clone()]).unwrap();
+            assert_eq!(got, Value::Bytes(want), "{trim:?}");
+        }
+        // The three set trims take as many octets as they are given,
+        // the way they take as many characters.
+        assert_eq!(
+            trimmed(
+                Trim::Btrim,
+                &[
+                    Value::Bytes(vec![0, 1, 0xAB, 1, 0]),
+                    Value::Bytes(vec![0, 1])
+                ]
+            )
+            .unwrap(),
+            Value::Bytes(vec![0xAB])
+        );
+        // The octet nobody wrote is X'00' and not a space, a space
+        // being a character and a byte string having none.
+        assert_eq!(
+            trimmed(Trim::Both, std::slice::from_ref(&bin)).unwrap(),
+            Value::Bytes(vec![0xAB, 0xCD])
+        );
+        // A byte string of nothing but the trim octet trims away to a
+        // byte string of no octets, which is a value and not a null.
+        assert_eq!(
+            trimmed(Trim::Both, &[Value::Bytes(vec![0, 0, 0])]).unwrap(),
+            Value::Bytes(Vec::new())
+        );
+    }
+
+    /// GF07 raises the same `22027` GF05 does, counted in octets, and
+    /// the two types do not mix: a byte string is not trimmed with
+    /// characters and a string is not trimmed with octets.
+    #[test]
+    fn trimming_a_byte_string_counts_octets_and_takes_no_characters() {
+        for trim in [Trim::Both, Trim::Leading, Trim::Trailing] {
+            let err = trimmed(
+                trim,
+                &[Value::Bytes(vec![0, 0xAB]), Value::Bytes(vec![0, 0x11])],
+            )
+            .expect_err("a trim error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22027), "{trim:?}");
+        }
+        for args in [
+            [Value::Bytes(vec![0, 0xAB]), Value::Str("x".into())],
+            [Value::Str("xax".into()), Value::Bytes(vec![0x78])],
+        ] {
+            let err = trimmed(Trim::Both, &args).expect_err("a type error");
+            assert_eq!(err.gqlstatus(), Some(codes::C22G03));
+        }
+    }
+
+    /// GF07 and ISO 20.22. OCTET_LENGTH counts the octets of a byte
+    /// string as readily as the octets a string encodes to, which is
+    /// the one question in the string family that takes both.
+    #[test]
+    fn octet_length_counts_a_byte_string_too() {
+        assert_eq!(
+            call("octet_length", &[Value::Bytes(vec![0, 0xAB, 0])]).unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            call("octet_length", &[Value::Bytes(Vec::new())]).unwrap(),
+            Value::Int(0)
+        );
+        // CHAR_LENGTH is not among them: a byte string has no
+        // characters, so there is nothing for it to count.
+        let err = call("char_length", &[Value::Bytes(vec![0x41])]).expect_err("a type error");
+        assert_eq!(err.gqlstatus(), Some(codes::C22G03));
     }
 
     /// ISO 20.24. LEFT counts from the front and RIGHT from the back,

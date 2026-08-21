@@ -213,6 +213,10 @@ pub const ZU_TYPE_RECORD: i32 = 10;
 /// tag is the whole of what a binding can say about the cell.
 pub const ZU_TYPE_GRAPH: i32 = 11;
 pub const ZU_TYPE_BINDING_TABLE: i32 = 12;
+/// GV35, a byte string. It is read through [`zu_value_bytes`] and not
+/// through [`zu_value_str`], because the bytes need not be text and a
+/// host that took them for a string would decode them.
+pub const ZU_TYPE_BYTES: i32 = 13;
 
 /// Which temporal a temporal cell is, on [`zu_value_temporal`].
 ///
@@ -2125,6 +2129,7 @@ pub unsafe extern "C" fn zu_result_cell_type(
         Some(Value::Int(_)) => ZU_TYPE_INT,
         Some(Value::Float(_)) => ZU_TYPE_FLOAT,
         Some(Value::Str(_)) => ZU_TYPE_STR,
+        Some(Value::Bytes(_)) => ZU_TYPE_BYTES,
         Some(Value::Node { .. }) => ZU_TYPE_NODE,
         Some(Value::Rel { .. }) => ZU_TYPE_REL,
         Some(Value::List(_)) => ZU_TYPE_LIST,
@@ -3050,6 +3055,7 @@ pub unsafe extern "C" fn zu_value_type(v: *const ZuValue) -> i32 {
         Some(Value::Int(_)) => ZU_TYPE_INT,
         Some(Value::Float(_)) => ZU_TYPE_FLOAT,
         Some(Value::Str(_)) => ZU_TYPE_STR,
+        Some(Value::Bytes(_)) => ZU_TYPE_BYTES,
         Some(Value::Node { .. }) => ZU_TYPE_NODE,
         Some(Value::Rel { .. }) => ZU_TYPE_REL,
         Some(Value::List(_)) => ZU_TYPE_LIST,
@@ -3142,6 +3148,40 @@ pub unsafe extern "C" fn zu_value_str(
             unsafe {
                 *out = s.as_ptr().cast::<c_char>();
                 *len = s.len();
+            }
+            ZuStatus::Ok
+        }
+        _ => ZuStatus::Misuse,
+    }
+}
+
+/// A byte string cell as a pointer and a length, on the same terms as
+/// [`zu_value_str`]: the bytes belong to the result and are neither
+/// copied nor NUL-terminated.
+///
+/// It is a separate accessor from the string one because the two hold
+/// different types, and one accessor answering both would let a host
+/// read octets as text without ever asking whether they were.
+///
+/// `Misuse` for anything that is not a byte string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_bytes(
+    v: *const ZuValue,
+    out: *mut *const u8,
+    len: *mut usize,
+) -> ZuStatus {
+    if out.is_null() || len.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe {
+        *out = std::ptr::null();
+        *len = 0;
+    }
+    match unsafe { value_of(v) } {
+        Some(Value::Bytes(b)) => {
+            unsafe {
+                *out = b.as_ptr();
+                *len = b.len();
             }
             ZuStatus::Ok
         }

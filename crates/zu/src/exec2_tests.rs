@@ -1192,6 +1192,16 @@ fn fallback_queries() -> &'static [&'static str] {
         // not agree on a lane declines rather than guessing which one
         // the answer takes.
         "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.shift * 2 AS d ORDER BY id",
+        // A byte string, which the vector layer has no lane for: the
+        // ten physical types are the ten a kernel computes over, and a
+        // sequence of octets is a blob the way a string is without
+        // being the string lane, since a kernel over the string lane
+        // folds and normalizes and a byte string does neither. Both the
+        // value and the trim over it go back to the row engine, which
+        // is where the whole of GF07 lives.
+        "MATCH (p:person) WHERE p.id < 5 RETURN p.id AS id, X'00AB00' AS b ORDER BY id",
+        "MATCH (p:person) WHERE p.id < 5 RETURN p.id AS id, \
+         OCTET_LENGTH(TRIM(BOTH X'00' FROM X'00AB00')) AS n ORDER BY id",
         // ORDER BY over something the projection does not return has
         // no output column to read, so it stays with the old engine.
         "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",

@@ -1174,6 +1174,18 @@ impl Compiler<'_> {
             let Some(col) = self.snap.table_function(func.name(), *rel, &vals)? else {
                 return Ok(None);
             };
+            // A kernel answers for the rel table's node domain, which
+            // is what the adjacency was built over, and the node table
+            // may have grown since: a node inserted after the edges
+            // were loaded is in the table and not in the domain. The
+            // old engine yields what the kernel answered and stops
+            // there, so a scan of the whole table beside a shorter
+            // answer is a shape this engine does not have, and it
+            // hands the statement back rather than reading past the
+            // end of the column.
+            if col.values.len() < self.snap.table_rows(*table)? as usize {
+                return Ok(None);
+            }
             it.next();
             self.slot_level.insert(node_slot, 0);
             self.slot_level.insert(value_slot, 0);

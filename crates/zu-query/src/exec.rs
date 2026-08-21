@@ -5579,14 +5579,34 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             // does not have, and the kernel counts nothing for those
             // rather than failing the query over them.
             if matches!(func, TableFunc::Betweenness) {
-                let Some(Value::List(items)) = vals.first() else {
-                    return Err(invalid(format!(
-                        "betweenness's sources must be a list of node ids, got {:?}",
-                        vals.first()
-                    )));
+                // GP14. The sources may be written as a list or handed
+                // in as a binding table, which is a column of node ids
+                // and so is the same thing said by a query rather than
+                // by hand. A table of any other shape is refused here
+                // rather than read down its first column, since a
+                // sample nobody meant is worse than a refusal.
+                let items = match vals.first() {
+                    Some(Value::List(items)) => items.clone(),
+                    Some(Value::BindingTable(table)) if table.columns().len() == 1 => {
+                        table.rows().iter().map(|row| row[0].clone()).collect()
+                    }
+                    Some(Value::BindingTable(table)) => {
+                        return Err(ZuError::gql(
+                            codes::C22G03,
+                            format!(
+                                "betweenness's sources are one column of node ids and this binding table has {}",
+                                table.columns().len()
+                            ),
+                        ));
+                    }
+                    other => {
+                        return Err(invalid(format!(
+                            "betweenness's sources must be a list of node ids, got {other:?}"
+                        )));
+                    }
                 };
                 let mut offsets = Vec::with_capacity(items.len());
-                for item in items {
+                for item in &items {
                     let Value::Int(key) = item else {
                         return Err(invalid(format!(
                             "betweenness's sources must be node ids, got {item:?}"
@@ -10207,6 +10227,17 @@ mod tests {
             (
                 "CALL pagerank('IS_LOCATED_IN') YIELD node, rank RETURN rank",
                 "over one node table",
+            ),
+            // GP15 against a schema built with no catalog behind it:
+            // a graph reference names a graph in the catalog, so
+            // there is nothing here for it to name.
+            (
+                "CALL pagerank(CURRENT_PROPERTY_GRAPH, 'KNOWS') YIELD node, rank RETURN rank",
+                "compiled without one behind it",
+            ),
+            (
+                "GRAPH g = { MATCH (p:Person) RETURN p.name AS g } CALL pagerank(g, 'KNOWS') YIELD node, rank RETURN rank",
+                "defined as a graph reference",
             ),
             (
                 "CALL pagerank('KNOWS', 1) YIELD node, rank RETURN rank",

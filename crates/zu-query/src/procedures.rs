@@ -1,4 +1,5 @@
-//! The procedure catalog (ISO 13.1 and 13.4, feature GP04).
+//! The procedure catalog (ISO 13.1 and 13.4, features GP04, GP14 and
+//! GP15).
 //!
 //! A named procedure call is a call to something the catalog holds, so
 //! the name in the statement is a catalog object reference and not a
@@ -20,6 +21,17 @@
 //! columns are read off it, so adding a procedure is a row in a table
 //! rather than an arm in three matches, and the refusals a caller reads
 //! are built from the same words the table holds.
+//!
+//! Two of the things a call may be handed are not values. A graph may
+//! be written in front of the arguments, `CALL wcc(/twin, 'knows')`,
+//! and it says which graph the procedure reads, which is GP15. It has
+//! to be a graph reference or a name defined as one, because the rel
+//! table named after it is looked for in that graph while the statement
+//! is being bound, and a graph a query would answer is not known by
+//! then. A binding table may stand where a list of arguments stands,
+//! `CALL betweenness('knows', seeds)`, which is GP14. That one is read
+//! when the call runs, so it may be anything a query answered, as long
+//! as it is the one column the list would have been.
 
 use crate::binder::TableFunc;
 

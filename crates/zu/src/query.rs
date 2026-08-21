@@ -3,6 +3,7 @@
 //! frontend. The binder itself is engine-agnostic; this is where zu1
 //! table definitions become labels and relationship types.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
@@ -80,6 +81,25 @@ pub fn schema_of_graph(catalog: &Catalog, graph: u32, epoch: u64) -> Result<Sche
         })
         .collect();
     let mut schema = Schema::with_labels(nodes, rels, catalog.labels().to_vec())?;
+    // GP15. The rel tables of the other graphs, for a procedure handed
+    // a graph to read. They are not tables a pattern may match: a
+    // statement matches the graph it runs against and no other, and
+    // what a procedure needs of another graph is which table to walk.
+    let mut others: BTreeMap<u32, Vec<RelDef>> = BTreeMap::new();
+    for rel in catalog.rel_tables() {
+        if rel.graph == graph {
+            continue;
+        }
+        others.entry(rel.graph).or_default().push(RelDef {
+            id: rel.id,
+            name: rel.name.clone(),
+            from: rel.from,
+            to: rel.to,
+            edge_count: rel.edge_count,
+            undirected: rel.undirected,
+        });
+    }
+    schema.set_graph_rels(others);
     // GE01. Every graph in the catalog and not only the one being
     // bound against, because `GRAPH other` names a graph this
     // statement is not running against and answering it is the point:

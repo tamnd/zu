@@ -190,3 +190,43 @@ cases:
     doc: A name no schema holds, which is the shape of every typo in a procedure name and of every call to something this engine does not have.
     query: CALL nonsense('knows') YIELD node, component RETURN count(*) AS a
     raises: "42002"
+
+  - name: a-procedure-handed-the-graph-it-reads
+    doc: GP15. A graph written in front of the arguments says which graph the procedure reads, and the rel table named after it is looked for in that graph. Naming the graph the statement is already running against is the call that named no graph, said out loud, so it answers what that call answers.
+    query: CALL wcc(CURRENT_PROPERTY_GRAPH, 'knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-procedure-handed-a-graph-a-name-stands-for
+    doc: A graph variable is a name for a graph, so it stands where a reference stands. It has to be defined as a reference rather than by a query, because which rel table the call walks is settled while the statement is being bound and a query has not run by then.
+    query: GRAPH g = CURRENT_PROPERTY_GRAPH CALL wcc(g, 'knows') YIELD node, component RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-rel-table-the-named-graph-does-not-hold
+    doc: The rel table is looked for in the graph that was named and nowhere else, so a name that graph does not hold is a reference condition even where the graph the statement runs in holds one.
+    query: CALL wcc(CURRENT_PROPERTY_GRAPH, 'nonsense') YIELD node, component RETURN count(*) AS a
+    raises: "42002"
+
+  - name: a-procedure-handed-a-binding-table-of-arguments
+    doc: GP14. The sources of a centrality run are a sample, and a sample is the sort of thing a query picks, so a binding table of one column of node ids stands where the list of them stands. Every node is answered whatever the sample was, the sample saying which paths are counted and not which nodes are scored.
+    query: BINDING TABLE seeds = { MATCH (p:person) WHERE p.age < 45 RETURN p.id AS id } CALL betweenness('knows', seeds) YIELD node, centrality RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-binding-table-of-arguments-of-the-wrong-shape
+    doc: A binding table of more than one column is refused rather than read down its first, since nothing in the call says which column holds the node ids and a sample nobody meant is worse than a refusal.
+    query: BINDING TABLE seeds = { MATCH (p:person) RETURN p.id AS id, p.age AS age } CALL betweenness('knows', seeds) YIELD node, centrality RETURN count(*) AS a
+    raises: "22G03"

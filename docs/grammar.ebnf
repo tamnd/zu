@@ -179,7 +179,14 @@ variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
    whitespace is nothing to the lexer and a path after a path reads as
    one longer path. What a procedure takes and what it yields are the
    procedure's own, so the arguments and the YIELD columns are checked
-   against the catalog and not against this grammar. *)
+   against the catalog and not against this grammar.
+
+   An argument is an expression, and two of the things an expression may
+   be are not values: a graph reference or a name standing for one says
+   which graph the procedure reads (GP15), and a name standing for a
+   binding table stands where a list of arguments stands (GP14). Neither
+   is a shape of its own here, since both are already expressions, and
+   which procedure takes which is the catalog's to say. *)
 named_procedure_call
                 = [ "AT" , schema_path ] , procedure_ref , "(" ,
                   [ expression , { "," , expression } ] , ")" ,

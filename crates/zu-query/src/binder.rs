@@ -634,6 +634,12 @@ pub struct Schema {
     /// from a catalog carries that catalog's order rather than one of
     /// its own.
     labels: Vec<String>,
+    /// GP15. The rel tables of every other graph in the catalog, by
+    /// graph id, for a procedure that was handed a graph to read.
+    /// Empty for a schema built without a catalog behind it, and a
+    /// call naming another graph is then refused rather than answered
+    /// against the wrong table.
+    graph_rels: BTreeMap<u32, Vec<RelDef>>,
     /// GV60 and GE01. The graphs a graph reference expression may
     /// name, which is every graph in the catalog the statement was
     /// bound against, with the working one and the home one called out
@@ -683,6 +689,7 @@ impl Schema {
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
             labels,
+            graph_rels: BTreeMap::new(),
             graphs: Vec::new(),
             working_graph: None,
             home_graph: None,
@@ -850,6 +857,46 @@ impl Schema {
     /// catalog behind this schema holds.
     fn graph_by_id(&self, id: u32) -> Option<&GraphHandle> {
         self.graphs.iter().find(|g| g.id == id)
+    }
+
+    /// Tells the schema the rel tables of the other graphs in the
+    /// catalog, by graph id (GP15).
+    ///
+    /// A statement reads the tables of the graph it runs against and
+    /// no others, which is what lets two graphs in one file both hold
+    /// a `person`, and none of that changes here: these are not tables
+    /// a pattern may match. They are here for the one thing that names
+    /// a graph and a table in the same breath, which is a procedure
+    /// handed a graph, and all it needs is the id of the rel table and
+    /// the node table under it.
+    pub fn set_graph_rels(&mut self, rels: BTreeMap<u32, Vec<RelDef>>) {
+        self.graph_rels = rels;
+    }
+
+    /// The rel table of that name in that graph. The graph the
+    /// statement runs against answers out of its own tables, so a call
+    /// that named the graph it is already in is the call that did not
+    /// name one.
+    pub fn rel_in_graph(&self, graph: u32, name: &str) -> Option<&RelDef> {
+        if self.working_graph == Some(graph) {
+            return self.rel_by_name(name);
+        }
+        self.graph_rels.get(&graph)?.iter().find(|r| r.name == name)
+    }
+
+    /// The name of a rel table by id, looked for in every graph the
+    /// schema knows about. It is what a listing prints, and a listing
+    /// of a procedure that read another graph would otherwise have
+    /// nothing to print.
+    pub fn rel_name_anywhere(&self, id: u32) -> Option<&str> {
+        if let Some(rel) = self.rel_by_id(id) {
+            return Some(&rel.name);
+        }
+        self.graph_rels
+            .values()
+            .flatten()
+            .find(|r| r.id == id)
+            .map(|r| r.name.as_str())
     }
 
     /// How far the ceilings may run past the estimates before the join
@@ -2203,6 +2250,62 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
     Ok(bound)
 }
 
+/// The handle a graph reference names, out of the graphs the schema
+/// was told about.
+///
+/// A parameter is refused rather than resolved, and the reason is
+/// worth writing down: `USE $g` is settled when the statement runs
+/// because the clause is read before anything is bound, while an
+/// expression is bound once and read many times, so a parameter in
+/// this position would have to be a handle carried to the executor
+/// instead of a handle settled here. That is GE04's work and not this
+/// one's.
+///
+/// It is a free function because two callers need it and only one of
+/// them is a binder: a graph reference in an expression is bound by
+/// the binder, and a graph written as the whole of a binding
+/// variable's definition is resolved while that definition is being
+/// bound, which is before any binder exists.
+fn graph_of_ref(schema: &Schema, reference: &GraphRef) -> Result<GraphHandle> {
+    if schema.graphs.is_empty() {
+        return Err(ZuError::gql(
+            codes::C42002,
+            "a graph reference names a graph in the catalog, and this statement was compiled without one behind it".to_string(),
+        ));
+    }
+    let by_id = |id: Option<u32>, which: &str| -> Result<GraphHandle> {
+        id.and_then(|id| schema.graph_by_id(id))
+            .cloned()
+            .ok_or_else(|| {
+                ZuError::gql(
+                    codes::C42002,
+                    format!("{which} is no graph this statement can name"),
+                )
+            })
+    };
+    match reference {
+        GraphRef::Current => by_id(schema.working_graph, "the working graph"),
+        GraphRef::Home => by_id(schema.home_graph, "the home graph"),
+        GraphRef::Named(name) => {
+            let path = name.schema.as_deref().unwrap_or("/");
+            schema
+                .graphs
+                .iter()
+                .find(|g| g.schema == path && g.name == name.name)
+                .cloned()
+                .ok_or_else(|| {
+                    ZuError::gql(
+                        codes::C42002,
+                        format!("'{}' is no graph in '{path}'", name.name),
+                    )
+                })
+        }
+        GraphRef::Param(name) => Err(not_yet(
+            format!("a graph parameter in an expression, ${name}").as_str(),
+        )),
+    }
+}
+
 /// Binds one binding variable definition block, appending a parameter
 /// position and a definition for each name it defines.
 ///
@@ -2218,10 +2321,10 @@ fn bind_bindings(
     schema: &Schema,
     params: &mut Vec<String>,
     out: &mut Vec<BoundBinding>,
-    visible: &mut Vec<(String, usize)>,
+    visible: &mut Vec<Visible>,
 ) -> Result<()> {
     for def in defs {
-        if visible.iter().any(|(name, _)| *name == def.name) {
+        if visible.iter().any(|v| v.name == def.name) {
             return Err(bad_reference(format!(
                 "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
                 def.name
@@ -2279,7 +2382,24 @@ fn bind_bindings(
         }
         let param = params.len();
         params.push(binding_param(&def.name));
-        visible.push((def.name.clone(), param));
+        // GP15. A graph defined as a reference says which graph while
+        // the statement is being bound, and a procedure handed the
+        // name needs it then, because the rel table it walks is
+        // resolved then. A graph defined by a query says it when the
+        // definition runs, which is later, so the handle is absent and
+        // a call that wanted one is refused by name.
+        let graph = match (&def.kind, &def.init) {
+            (ast::BindingKind::Graph, ast::BindingInit::Expr(ast::Expr::GraphRef(reference))) => {
+                graph_of_ref(schema, reference).ok()
+            }
+            _ => None,
+        };
+        visible.push(Visible {
+            name: def.name.clone(),
+            param,
+            kind: def.kind,
+            graph,
+        });
         out.push(BoundBinding {
             name: def.name.clone(),
             kind: def.kind,
@@ -2289,6 +2409,24 @@ fn bind_bindings(
         });
     }
     Ok(())
+}
+
+/// A binding variable a reference may resolve to (GP05 through GP15).
+///
+/// The name and the parameter position are what every reader needs: a
+/// definition is worked out once, before the first row, and reading
+/// the name is reading the position its value was written into. The
+/// kind and the graph are for the one reader that needs more than a
+/// value. A procedure that reads a graph has to know which graph while
+/// the statement is being bound, because the rel table it walks is
+/// resolved then, so a graph written as a reference carries its handle
+/// here and one written as a query does not.
+#[derive(Debug, Clone)]
+struct Visible {
+    name: String,
+    param: usize,
+    kind: ast::BindingKind,
+    graph: Option<GraphHandle>,
 }
 
 /// The query `RETURN expr AS name`, which is what an initializer
@@ -2345,7 +2483,7 @@ fn bind_body(
     schema: &Schema,
     params: &mut Vec<String>,
     outer: &[String],
-    visible: &[(String, usize)],
+    visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut operands = Vec::new();
     collect_operands(body, &mut operands);
@@ -2734,7 +2872,7 @@ fn bind_linear(
     schema: &Schema,
     params: &mut Vec<String>,
     outer: &[String],
-    visible: &[(String, usize)],
+    visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
@@ -2869,7 +3007,7 @@ struct Binder<'a> {
     /// the end of it and takes them off again when the block closes,
     /// which is the whole of the lexical scoping: what a definition
     /// can be read from is where it stands in this list.
-    visible: Vec<(String, usize)>,
+    visible: Vec<Visible>,
     /// The names an enclosing `CALL` scope clause took out of reach,
     /// and the slots they are in.
     ///
@@ -3779,6 +3917,49 @@ impl Binder<'_> {
     /// lookup is read off the descriptor, so a procedure is a row in a
     /// table rather than an arm in three matches, and the refusals are
     /// built out of the same words the row holds.
+    /// The graph a named call was handed, and the arguments past it
+    /// (GP15, ISO 13.1).
+    ///
+    /// A graph goes in front because it says which graph the rest is
+    /// read in: the rel table named next is that graph's table, and a
+    /// call that names no graph reads the graph the statement runs
+    /// against, which is what every call written before this could do
+    /// and all most of them ever want.
+    ///
+    /// It has to be a reference or a name defined as one, and the
+    /// reason is the same reason the rel table is a literal: which
+    /// table the kernel walks is settled while the statement is being
+    /// bound, so a graph that is only known once the statement is
+    /// running is a graph the call cannot be planned against. A graph
+    /// defined by a query is that, and it is refused by name rather
+    /// than read as a rel table and refused for the wrong reason.
+    fn call_graph<'e>(
+        &mut self,
+        proc: &str,
+        args: &'e [Expr],
+    ) -> Result<(Option<GraphHandle>, &'e [Expr])> {
+        match args.first() {
+            Some(Expr::GraphRef(reference)) => {
+                Ok((Some(self.resolve_graph_ref(reference)?), &args[1..]))
+            }
+            Some(Expr::Variable(name)) => {
+                let Some(found) = self.visible.iter().rev().find(|v| v.name == *name) else {
+                    return Ok((None, args));
+                };
+                if found.kind != ast::BindingKind::Graph {
+                    return Ok((None, args));
+                }
+                match &found.graph {
+                    Some(handle) => Ok((Some(handle.clone()), &args[1..])),
+                    None => Err(invalid(format!(
+                        "{proc} reads the graph '{name}' names, and which rel table it walks is settled while the statement is bound, so '{name}' has to be defined as a graph reference rather than by a query"
+                    ))),
+                }
+            }
+            _ => Ok((None, args)),
+        }
+    }
+
     fn bind_table_call(
         &mut self,
         at: Option<&str>,
@@ -3817,18 +3998,34 @@ impl Binder<'_> {
             }
         })?;
         let func = proc.func;
+        // GP15. A graph in front of the arguments says which graph the
+        // procedure reads, and leaving it out is the graph the
+        // statement runs against.
+        let (graph, args) = self.call_graph(proc.name, args)?;
         // The rel table must resolve at bind time, so the first
-        // argument is a string literal, not an expression.
+        // argument past the graph is a string literal, not an
+        // expression.
         let Some(Expr::Literal(Literal::Str(rel_name))) = args.first() else {
             return Err(invalid(format!(
                 "{}'s first argument must be a string naming a rel table",
                 proc.name
             )));
         };
-        let rel = self
-            .schema
-            .rel_by_name(rel_name)
-            .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?;
+        let rel = match &graph {
+            Some(handle) => self
+                .schema
+                .rel_in_graph(handle.id, rel_name)
+                .ok_or_else(|| {
+                    bad_reference(format!(
+                        "the graph '{}' holds no rel table '{rel_name}'",
+                        handle.name
+                    ))
+                })?,
+            None => self
+                .schema
+                .rel_by_name(rel_name)
+                .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?,
+        };
         if rel.from != rel.to {
             return Err(invalid(format!(
                 "{} needs a rel table over one node table, '{}' connects two",
@@ -5568,54 +5765,10 @@ impl Binder<'_> {
         ))
     }
 
-    /// The handle a graph reference expression names, out of the
-    /// graphs the schema was told about.
-    ///
-    /// A parameter is refused rather than resolved, and the reason is
-    /// worth writing down: `USE $g` is settled when the statement runs
-    /// because the clause is read before anything is bound, while an
-    /// expression is bound once and read many times, so a parameter in
-    /// this position would have to be a handle carried to the executor
-    /// instead of a handle settled here. That is GE04's work and not
-    /// this one's.
+    /// The handle a graph reference expression names, which is
+    /// [`graph_of_ref`] against this binder's schema.
     fn resolve_graph_ref(&self, reference: &GraphRef) -> Result<GraphHandle> {
-        if self.schema.graphs.is_empty() {
-            return Err(ZuError::gql(
-                codes::C42002,
-                "a graph reference names a graph in the catalog, and this statement was compiled without one behind it".to_string(),
-            ));
-        }
-        let by_id = |id: Option<u32>, which: &str| -> Result<GraphHandle> {
-            id.and_then(|id| self.schema.graph_by_id(id))
-                .cloned()
-                .ok_or_else(|| {
-                    ZuError::gql(
-                        codes::C42002,
-                        format!("{which} is no graph this statement can name"),
-                    )
-                })
-        };
-        match reference {
-            GraphRef::Current => by_id(self.schema.working_graph, "the working graph"),
-            GraphRef::Home => by_id(self.schema.home_graph, "the home graph"),
-            GraphRef::Named(name) => {
-                let schema = name.schema.as_deref().unwrap_or("/");
-                self.schema
-                    .graphs
-                    .iter()
-                    .find(|g| g.schema == schema && g.name == name.name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ZuError::gql(
-                            codes::C42002,
-                            format!("'{}' is no graph in '{schema}'", name.name),
-                        )
-                    })
-            }
-            GraphRef::Param(name) => Err(not_yet(
-                format!("a graph parameter in an expression, ${name}").as_str(),
-            )),
-        }
+        graph_of_ref(self.schema, reference)
     }
 
     fn bind_expr(&mut self, expr: &Expr, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
@@ -5665,8 +5818,8 @@ impl Binder<'_> {
                 // is the parameter its value was written into and the
                 // reader costs a parameter read however many rows
                 // there are.
-                if let Some((_, param)) = self.visible.iter().rev().find(|(n, _)| n == name) {
-                    return Ok((BoundExpr::Param(*param), Type::Any));
+                if let Some(found) = self.visible.iter().rev().find(|v| v.name == *name) {
+                    return Ok((BoundExpr::Param(found.param), Type::Any));
                 }
                 // A name the query around this one defined, which this
                 // query may read: it makes the value query expression

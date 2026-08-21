@@ -186,6 +186,18 @@ cases:
     query: "CREATE GRAPH side ANY NEXT INSERT (:thing {n: 1}) NEXT RETURN 1 / 0 AS n"
     raises: "22012"
 
+  - name: a-catalog-statement-at-the-front-of-a-call-body
+    doc: A call body is a procedure body, so the mixing GP18 asks for may be written inside one. The call is the front of the statement here, so the body runs for the one row every statement starts from, and the catalog statement in it runs once whichever way a client reads it. The count is a count of the rows the body found, which is what the call hands to the statement around it.
+    setup:
+      - "INSERT (:thing {n: 1}), (:thing {n: 2})"
+    query: "CALL { CREATE GRAPH side ANY NEXT MATCH (t:thing) RETURN count(t) AS n } RETURN n AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
   - name: a-transaction-word-is-not-a-part-of-a-block
     doc: A block runs as one transaction, so a word that begins or ends one has nothing to say among its parts and is a syntax condition rather than a block that quietly committed halfway.
     query: "CREATE GRAPH side ANY NEXT COMMIT"

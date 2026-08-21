@@ -194,11 +194,20 @@ reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
    and a name, a path or AT is the named one. *)
 call_clause     = "CALL" , ( inline_procedure_call | named_procedure_call ) ;
 inline_procedure_call
-                = [ variable_scope ] , "{" ,
+                = [ variable_scope ] , "{" , [ leading_catalog_part ] ,
                   [ use_clause ] , composite_query , "}" ;
-(* A composite query and not a statement block: the body runs once for
-   every row that reaches the call, and a catalog statement makes or
-   unmakes a thing once, so it is written beside the call. *)
+leading_catalog_part
+                = catalog_statement , "NEXT" ,
+                  { catalog_statement , "NEXT" } ;
+(* GP18 again. A call body is a procedure body, so a catalog statement
+   may open one, and where it does the parts are taken out of the body
+   and put in front of the statement. That only holds for a call the
+   statement begins with, which runs for the one row a statement starts
+   from; anywhere else the body runs once for every row that reaches
+   it, a thing is made once or not at all, and a catalog statement in
+   there is refused rather than hoisted out of the loop it was written
+   in. Behind the data statements of a body it is refused too, since
+   taking it out would run it before the statements it follows. *)
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 (* GP04, ISO 13.1. The named procedure call. The name is a catalog

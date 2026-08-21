@@ -52,3 +52,5 @@ pub mod snapshot;
 mod split;
 pub mod sqlite;
 pub mod write;
+#[cfg(test)]
+mod write_parity;

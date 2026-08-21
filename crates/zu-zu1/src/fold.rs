@@ -1043,9 +1043,18 @@ fn fold_rel_props(
                             }
                             old[*at]
                         }
+                        // An added edge says the absence the same way a
+                        // written one does, and for the same reason:
+                        // the lane is fixed width, so the bit says
+                        // there is nothing there and the word under it
+                        // is never read.
                         Came::Overlay(at) => match cell(*at)? {
                             Cell::Int(x) => *x,
-                            Cell::Str(_) | Cell::Null => return Err(mismatch(&col.name)),
+                            Cell::Null => {
+                                valid.clear(slot as u64);
+                                0
+                            }
+                            Cell::Str(_) => return Err(mismatch(&col.name)),
                         },
                     },
                 });
@@ -1082,7 +1091,11 @@ fn fold_rel_props(
                         }
                         Came::Overlay(at) => match cell(*at)? {
                             Cell::Str(s) => s.as_slice(),
-                            Cell::Int(_) | Cell::Null => return Err(mismatch(&col.name)),
+                            Cell::Null => {
+                                valid.clear(slot as u64);
+                                &[]
+                            }
+                            Cell::Int(_) => return Err(mismatch(&col.name)),
                         },
                     },
                 });

@@ -889,10 +889,14 @@ impl Zu1File {
             published: false,
             began_at: self.db.epoch,
         });
-        // Blocks freed before the transaction and not published yet are
-        // referenced by the header it keeps, so they go straight into
-        // the list it may not write into.
-        self.frozen.append(&mut self.pending_free);
+        // Blocks freed before the transaction and not published yet stay
+        // where they are. They are held out of allocation already, being
+        // pending, and they are held out for a reason the transaction
+        // does not end: the header on disk still reaches them, so until
+        // a checkpoint says otherwise a crash reads them. A checkpoint
+        // inside the transaction is what moves them, and it moves them
+        // to the frozen list, because from there on it is the kept
+        // header rather than the durable one that reaches them.
         Ok(())
     }
 
@@ -916,6 +920,13 @@ impl Zu1File {
         // What it freed is free for good now, so it goes back into the
         // list allocation draws from. The next checkpoint publishes it
         // as free either way; this is about reuse, not about the list.
+        //
+        // Frozen is the whole of what comes back, and frozen is only
+        // ever what a checkpoint listed as free and the transaction was
+        // holding on top of that. A block freed with no checkpoint
+        // behind it is still pending, and pending is where it stays: the
+        // header on disk reaches it and the end of a transaction is not
+        // a publish.
         //
         // It goes by way of the retained list rather than straight in,
         // because a block the transaction freed is a block the epoch it

@@ -2717,6 +2717,54 @@ mod tests {
         assert_eq!(string(&out.rows[0], 2), "gym");
     }
 
+    /// And so does the twentieth of them, which is the one that used to
+    /// come back to a file that would not open at all.
+    ///
+    /// Every statement holds the file for the length of itself, and a
+    /// statement that folds without publishing leaves the blocks it
+    /// replaced free with nothing on disk saying so: the header a crash
+    /// finds is the older one and it still reads them. Handing those
+    /// back to allocation at the end of the statement put a rebuilt
+    /// adjacency segment on top of the table index the durable header
+    /// names, so the file read back as corrupt rather than as the graph
+    /// the log describes. One statement never showed it because one
+    /// statement has nothing to hand back yet.
+    #[test]
+    fn a_run_of_edge_inserts_survives_a_crash_before_the_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash-edges.zu1");
+        seeded_loner(&path);
+
+        let people = ["ada", "kay", "joe", "amy", "zoe"];
+        let mut session = Session::open(&path).expect("open");
+        for i in 0..20 {
+            let (from, to) = (people[i % 5], people[(i + 2) % 5]);
+            session
+                .run(
+                    &format!(
+                        "MATCH (a:person), (b:person) \
+                         WHERE a.name = '{from}' AND b.name = '{to}' \
+                         INSERT (a)-[:knows]->(b)"
+                    ),
+                    &[],
+                )
+                .expect("write an edge");
+        }
+        std::mem::forget(session);
+        crate::shared::forget(&path);
+
+        let mut session = Session::open(&path).expect("reopen");
+        let out = session
+            .run(
+                "MATCH (:person)-[:knows]->(:person) RETURN count(*) AS edges",
+                &[],
+            )
+            .expect("read");
+        // The three the fixture loaded and the twenty the statements
+        // wrote, every one of them in a frame its commit synced.
+        assert_eq!(out.rows[0][0], Value::Int(23));
+    }
+
     /// And so is a detach delete. The pairs and the row are in the
     /// frame the commit synced, so the fold recovery does on the way
     /// back in leaves the graph the statement left behind.

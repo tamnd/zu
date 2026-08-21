@@ -994,3 +994,43 @@ cases:
       - values:
           - type: DURATION
             value: "P1Y2M"
+
+  - name: a-date-past-the-end-of-the-datetime-range
+    doc: A datetime is nanoseconds since the epoch in one signed word and a date runs from year 1 to year 9999, so the calendar is the wider of the two. A date the word has no room for is a legal date that names no datetime, and the cast is 22008 rather than a wrap into a year on the other side of the epoch.
+    query: RETURN LOCAL_DATETIME(DATE '9999-12-31') AS d
+    raises: "22008"
+
+  - name: a-zoned-datetime-past-the-end-of-the-range
+    doc: The same limit under the other constructor, since the two zoned types count in the same word the local ones do.
+    query: RETURN ZONED_DATETIME(DATE '9999-12-31') AS d
+    raises: "22008"
+
+  - name: a-datetime-string-past-the-end-of-the-range
+    doc: A string is read at the type the word names, and a string naming an instant the type cannot hold is not a value of that type. This is 22007 and not 22008 because nothing was converted, the reading itself failed.
+    query: RETURN LOCAL_DATETIME('9999-12-31T00:00:00') AS d
+    raises: "22007"
+
+  - name: a-datetime-shifted-past-the-end-of-the-range
+    doc: A thousand years takes the year 2000 to the year 3000, which the calendar has and the word does not, so the shift raises where the calendar check alone would have let it through.
+    query: RETURN LOCAL_DATETIME('2000-01-01T00:00:00') + DURATION 'P1000Y' AS d
+    raises: "22008"
+
+  - name: a-time-shifted-by-more-than-the-word-holds
+    doc: A time of day has no date behind it, so a duration past the end of the day wraps round the clock rather than overflowing, and there is no length of time it has no answer for. Two and a half million hours is twenty three hours past a whole number of days.
+    query: RETURN LOCAL_TIME('12:00:00') + DURATION 'PT2562047H' AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "11:00:00"
+
+  - name: the-last-datetime-the-word-holds
+    doc: The other side of the limit, so the range is pinned at both ends rather than only where it stops. 2262-04-11 is the last day a nanosecond count reaches and it reads back as itself.
+    query: RETURN LOCAL_DATETIME('2262-04-11T00:00:00') AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2262-04-11T00:00:00"

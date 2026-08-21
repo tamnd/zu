@@ -1614,7 +1614,7 @@ fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
             )
         }),
         Some(Value::Temporal(instant)) => {
-            cast::convert(instant, &which.target()).ok_or_else(|| {
+            cast::convert(instant, &which.target())?.ok_or_else(|| {
                 gql(
                     codes::C22G03,
                     format!(

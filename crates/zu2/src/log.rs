@@ -924,6 +924,19 @@ impl Log {
     }
 
     /// Reads an evicted record into an 8 byte aligned buffer.
+    ///
+    /// The checksum is checked here and nowhere else on the read path,
+    /// and the reason is that this is the only place a record arrives
+    /// from the device without recovery having read it first. A resident
+    /// record was either written by this run or walked by the scan, so
+    /// it has been through a checksum already; one that comes off the
+    /// file now has not, and under a checkpoint recovery there can be a
+    /// great many of those, since a checkpoint's whole purpose is to not
+    /// read the log below its boundary. A block the device lost down
+    /// there is then a record that reads as zeros, and the alternative
+    /// to reporting it is answering that a key the database is holding
+    /// an entry for does not exist. The cost is a crc over one record
+    /// beside a read syscall that has already happened.
     pub fn load(&self, address: Address, into: &mut Vec<u64>) -> Result<()> {
         let mut header = [0u8; record::HEADER];
         file::read_exact_at(&self.file, &mut header, address)?;
@@ -943,6 +956,14 @@ impl Log {
         // because it is a Vec<u64>.
         let bytes = unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), size) };
         file::read_exact_at(&self.file, bytes, address)?;
+        // SAFETY: the buffer holds the whole record, sized from the
+        // lengths in its own header and bounded against a page above.
+        if !unsafe { record::RecordRef::new(bytes.as_ptr()).intact() } {
+            return Err(Error::Malformed {
+                address,
+                why: "checksum does not hold",
+            });
+        }
         Ok(())
     }
 
@@ -967,6 +988,65 @@ impl Log {
         let bytes = unsafe { std::slice::from_raw_parts_mut(base, len) };
         file::read_exact_at(&self.file, bytes, page_start(page))?;
         Ok(())
+    }
+
+    /// Reads a page back into memory while the database is running, for
+    /// the thread that warms up what a checkpoint recovery did not read.
+    /// Answers whether this call is the one that made it resident.
+    ///
+    /// [`Log::restore_page`] cannot be used for that. It publishes the
+    /// page and then fills it, which is fine when recovery is the only
+    /// thread there is and is a page of zeros handed to a reader when it
+    /// is not. This fills a page nobody can see and publishes it after,
+    /// so a reader sees either no page or the whole page.
+    ///
+    /// `check` is what says the page is worth publishing, and a page it
+    /// turns down is left on the device rather than made resident. That
+    /// is how a checkpointed database keeps saying something about
+    /// damage: a record read off the file has its checksum checked in
+    /// [`Log::load`] and a record read out of a resident page does not,
+    /// so warming a page with a bad record in it would turn an error
+    /// that names an address into a key that quietly does not exist.
+    pub fn warm_page(
+        &self,
+        page: usize,
+        len: usize,
+        check: impl Fn(&[u8]) -> bool,
+    ) -> Result<bool> {
+        let slot = self.ensure_slot(page)?;
+        if !slot.load(Ordering::Acquire).is_null() {
+            return Ok(false);
+        }
+        // SAFETY: the layout is non-zero sized and correctly aligned.
+        let fresh = unsafe { alloc_zeroed(page_layout()) };
+        if fresh.is_null() {
+            std::alloc::handle_alloc_error(page_layout());
+        }
+        // SAFETY: the allocation is a whole page and len is bounded by
+        // the caller to the page size.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(fresh, len) };
+        if let Err(error) = file::read_exact_at(&self.file, bytes, page_start(page)) {
+            // SAFETY: allocated here with this layout and never
+            // published, so nothing else can hold it.
+            unsafe { std::alloc::dealloc(fresh, page_layout()) };
+            return Err(error.into());
+        }
+        // SAFETY: filled by the read above and owned here.
+        if !check(unsafe { std::slice::from_raw_parts(fresh, len) }) {
+            // SAFETY: as above.
+            unsafe { std::alloc::dealloc(fresh, page_layout()) };
+            return Ok(false);
+        }
+        // The same lock the allocating path takes, so that the two
+        // cannot both decide the slot is empty and both fill it.
+        let _guard = self.allocating.lock().expect("zu2 page allocation");
+        if !slot.load(Ordering::Acquire).is_null() {
+            // SAFETY: as above.
+            unsafe { std::alloc::dealloc(fresh, page_layout()) };
+            return Ok(false);
+        }
+        slot.store(fresh, Ordering::Release);
+        Ok(true)
     }
 
     /// Writes a page of memory back over the file.
@@ -1006,6 +1086,18 @@ impl Log {
         let mut path = self.path.clone().into_os_string();
         path.push(".relink");
         PathBuf::from(path)
+    }
+
+    /// Where the checkpoint of the two planes lives, and the name it is
+    /// written under before it is renamed into place. Beside the log for
+    /// the same reason the relink journal is: there is nowhere in the
+    /// log to put it. See [`crate::checkpoint`].
+    pub fn checkpoint_path(&self) -> (PathBuf, PathBuf) {
+        let mut path = self.path.clone().into_os_string();
+        path.push(".ckpt");
+        let mut writing = path.clone();
+        writing.push(".writing");
+        (PathBuf::from(path), PathBuf::from(writing))
     }
 
     /// Commits the log file's bytes to the device outside the flusher's

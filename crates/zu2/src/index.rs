@@ -388,6 +388,42 @@ impl Index {
         drop(unsafe { Box::from_raw(old) });
     }
 
+    /// Replaces the table with one of exactly `buckets`, before there is
+    /// anything in the one it replaces, and says whether it could.
+    ///
+    /// Checkpoint recovery only. A checkpoint records entries and not
+    /// keys, and an entry says which bucket it belongs in only by the
+    /// bucket it was written to, so a table of a different size cannot
+    /// take it: the mask that picked the bucket would pick another one.
+    /// A caller that pinned the size with `grow_index` off and pinned it
+    /// somewhere else than the checkpoint was written at therefore gets
+    /// a refusal here rather than a rehash, and the reopen falls back to
+    /// reading the log.
+    pub fn adopt(&self, buckets: usize) -> bool {
+        debug_assert_eq!(self.keys(), 0, "adopt after the table has keys in it");
+        let buckets = buckets.max(1).next_power_of_two();
+        if self.buckets() == buckets {
+            return true;
+        }
+        if self.fixed {
+            return false;
+        }
+        let fresh = Box::into_raw(Box::new(Table::new(buckets)));
+        let old = self.live.swap(fresh, Ordering::Release);
+        // SAFETY: nothing else is running, so nothing holds a reference
+        // to the table being replaced.
+        drop(unsafe { Box::from_raw(old) });
+        true
+    }
+
+    /// Sets the key count a checkpoint recorded, which is what the load
+    /// factor is measured against. Without it a restored table would
+    /// think it was empty and would not double until it had been filled
+    /// a second time.
+    pub fn adopt_keys(&self, keys: usize) {
+        self.keys.store(keys, Ordering::Release);
+    }
+
     /// The table in use.
     ///
     /// # Safety of the reference

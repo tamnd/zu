@@ -40,6 +40,7 @@
 //! same binary and a benchmark can put them side by side.
 
 pub mod addr;
+pub mod checkpoint;
 pub mod compact;
 pub mod db;
 pub mod epoch;
@@ -51,6 +52,7 @@ pub mod log;
 pub mod record;
 pub mod recover;
 
+pub use checkpoint::Checkpointed;
 pub use compact::Compacted;
 pub use db::{Compaction, Db, Options, Session};
 pub use error::{Error, Result};

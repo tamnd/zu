@@ -26,8 +26,8 @@
 //! rather than on every operation. That is FASTER's session model and
 //! it is why a benchmark thread holds one session for its whole run.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// A slot nobody has claimed.
 const FREE: u64 = 0;
@@ -83,6 +83,16 @@ pub struct Epochs {
     /// right here: the queue is touched on eviction and on drain, never
     /// on the read or write path.
     deferred: Mutex<Vec<(u64, Action)>>,
+    /// Whether the gate is shut, read once by every operation.
+    ///
+    /// An atomic beside the mutex rather than the mutex alone, because
+    /// the answer is no on every operation of every run that never takes
+    /// a checkpoint, and the whole cost of asking should be one load of
+    /// a line nobody writes. See [`Epochs::shut`].
+    barred: AtomicBool,
+    /// The gate itself, and who is waiting at it.
+    gate: Mutex<bool>,
+    lifted: Condvar,
 }
 
 impl Epochs {
@@ -100,6 +110,59 @@ impl Epochs {
                 .collect(),
             claimed: AtomicUsize::new(0),
             deferred: Mutex::new(Vec::new()),
+            barred: AtomicBool::new(false),
+            gate: Mutex::new(false),
+            lifted: Condvar::new(),
+        }
+    }
+
+    /// Shuts the gate, so that a session which is not inside an
+    /// operation cannot start one.
+    ///
+    /// This is half of a barrier and it is useless alone. The other half
+    /// is [`Epochs::wait_for_quiescence`], which waits out the sessions
+    /// that were already inside one when this was called. After both,
+    /// and until [`Epochs::lift`], nothing in the engine is reading or
+    /// writing either plane, which is what a checkpoint needs to write
+    /// down a state that a log address can be named for.
+    ///
+    /// The engine's own sessions go through the gate rather than wait at
+    /// it. The flusher is why: a checkpoint makes its boundary durable
+    /// before it captures anything, and the thread that would carry that
+    /// write to the device is the one the gate would have stopped, so a
+    /// gate that held it would be waiting for a flush that is waiting
+    /// for the gate. What keeps compaction out is not this but the
+    /// maintenance lock, which is the right tool for it: compaction is
+    /// off the hot path and can afford a mutex, and a checkpoint has to
+    /// exclude it for a whole pass rather than for an operation.
+    pub fn shut(&self) {
+        let mut gate = self.gate.lock().expect("zu2 gate");
+        *gate = true;
+        self.barred.store(true, Ordering::SeqCst);
+    }
+
+    /// Opens the gate and wakes everyone waiting at it.
+    pub fn lift(&self) {
+        let mut gate = self.gate.lock().expect("zu2 gate");
+        *gate = false;
+        self.barred.store(false, Ordering::SeqCst);
+        drop(gate);
+        self.lifted.notify_all();
+    }
+
+    /// Whether the gate is shut. One load of a read-mostly line.
+    #[inline]
+    fn barred(&self) -> bool {
+        self.barred.load(Ordering::Acquire)
+    }
+
+    /// Waits until the gate opens. Called by a session that has already
+    /// stood its epoch down, which is what stops the wait from holding
+    /// up the quiescence the gate closer is waiting for.
+    fn wait_at_gate(&self) {
+        let mut gate = self.gate.lock().expect("zu2 gate");
+        while *gate {
+            gate = self.lifted.wait(gate).expect("zu2 gate");
         }
     }
 
@@ -290,18 +353,29 @@ impl Epochs {
 pub struct Slotted<'a> {
     epochs: &'a Epochs,
     slot: usize,
+    /// Whether this is one of the engine's own sessions, which pass
+    /// through a shut gate rather than wait at it. See [`Epochs::shut`].
+    engine: bool,
 }
 
 impl<'a> Slotted<'a> {
     /// A slot for the host, or `None` when its sessions are all open.
     pub fn claim(epochs: &'a Epochs) -> Option<Self> {
-        epochs.claim().map(|slot| Self { epochs, slot })
+        epochs.claim().map(|slot| Self {
+            epochs,
+            slot,
+            engine: false,
+        })
     }
 
     /// A slot for the engine's own flushing and compaction, which the
     /// host cannot take.
     pub fn reserved(epochs: &'a Epochs) -> Option<Self> {
-        epochs.claim_reserved().map(|slot| Self { epochs, slot })
+        epochs.claim_reserved().map(|slot| Self {
+            epochs,
+            slot,
+            engine: true,
+        })
     }
 
     /// Announces the current epoch. Every operation that dereferences
@@ -323,11 +397,25 @@ impl<'a> Slotted<'a> {
     /// The epoch it announces can be one behind by the time it lands,
     /// and that is fine: an epoch older than the truth holds reclamation
     /// back rather than letting it run early.
+    /// The gate is read after the announcement and not before, which is
+    /// the order that makes the barrier hold. A session that read an
+    /// open gate and then announced could announce after the closer had
+    /// already seen every slot idle, and would then be inside an
+    /// operation the closer believes nobody is inside. Announcing first
+    /// means the closer either sees the announcement, and waits for it,
+    /// or has already shut the gate, and this sees that and stands down.
     #[inline]
     pub fn protect(&self) {
-        self.epochs.slots[self.slot]
-            .epoch
-            .swap(self.epochs.current(), Ordering::SeqCst);
+        loop {
+            self.epochs.slots[self.slot]
+                .epoch
+                .swap(self.epochs.current(), Ordering::SeqCst);
+            if self.engine || !self.epochs.barred() {
+                return;
+            }
+            self.unprotect();
+            self.epochs.wait_at_gate();
+        }
     }
 
     /// Stands down, so nothing this session did holds reclamation up.

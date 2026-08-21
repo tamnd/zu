@@ -385,6 +385,74 @@ impl Graph {
         self.next.fetch_max(node + 1, Ordering::AcqRel);
     }
 
+    /// The neighbours of `node`, read with nothing running beside this.
+    ///
+    /// The seqlock is not taken and the epoch is not announced, which is
+    /// only allowed because of what the caller has already done: a
+    /// checkpoint shuts the gate and waits for quiescence before it
+    /// reads a byte, so there is no writer to race and no retired block
+    /// to fall into. See [`crate::epoch::Epochs::shut`].
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the barrier described above for the whole call
+    /// and for the life of the slice.
+    pub(crate) unsafe fn quiesced(&self, direction: Direction, node: u32) -> &[u32] {
+        match self.table(direction).get(node) {
+            // SAFETY: the caller's barrier, as above.
+            Some(entry) => unsafe { entry.slice() },
+            None => &[],
+        }
+    }
+
+    /// Puts a captured neighbourhood back into a graph nothing is using
+    /// yet, which is what recovery from a checkpoint does instead of
+    /// replaying the edge records that built it.
+    ///
+    /// The neighbours arrive sorted because that is how they were
+    /// captured, and the invariant every reader depends on is therefore
+    /// carried rather than rebuilt.
+    pub(crate) fn adopt(&self, direction: Direction, node: u32, neighbours: &[u32]) -> Result<()> {
+        if neighbours.is_empty() {
+            return Ok(());
+        }
+        let Some(entry) = self.table(direction).ensure(node) else {
+            return Err(Error::NodeOutOfRange {
+                node,
+                max: self.capacity(),
+            });
+        };
+        if neighbours.len() <= INLINE_DEGREE {
+            // SAFETY: recovery is single threaded and this entry is
+            // untouched, so nothing else can be reading the cell.
+            unsafe {
+                let slots = &mut *entry.inline.get();
+                slots[..neighbours.len()].copy_from_slice(neighbours);
+            }
+        } else {
+            // Exactly as many as there are, not the doubling the write
+            // path uses: a restored neighbourhood is not mid-growth, and
+            // a block sized to its contents is what makes the memory a
+            // reopen costs the memory the graph needs. `Retired` frees
+            // with the capacity recorded here, so the two must agree,
+            // which is why this is a `vec!` of a length rather than a
+            // `with_capacity` that may round up.
+            let mut fresh = vec![0u32; neighbours.len()];
+            fresh.copy_from_slice(neighbours);
+            let raw = fresh.leak().as_mut_ptr();
+            entry.cap.store(neighbours.len() as u32, Ordering::Release);
+            entry.block.store(raw, Ordering::Release);
+        }
+        entry.len.store(neighbours.len() as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Sets the id counter to what a checkpoint recorded, so that a node
+    /// with no edges does not have its id handed out again.
+    pub(crate) fn adopt_nodes(&self, count: u32) {
+        self.next.fetch_max(count, Ordering::AcqRel);
+    }
+
     /// Applies an edge change to memory. The log record is written first
     /// by the caller, which is what makes it durable.
     pub(crate) fn apply(&self, epochs: &Epochs, add: bool, src: u32, dst: u32) -> Result<()> {

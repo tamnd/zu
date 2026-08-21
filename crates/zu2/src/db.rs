@@ -14,11 +14,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
+use crate::checkpoint::{self, Checkpointed};
 use crate::epoch::Slotted;
 use crate::error::{Error, Result};
 use crate::graph::Graph;
@@ -123,6 +125,17 @@ pub struct Options {
     /// operator's to make rather than the library's. See
     /// [`Error::LogHole`](crate::Error::LogHole).
     pub salvage: bool,
+    /// Whether closing a database takes a checkpoint of it.
+    ///
+    /// On, because the alternative is that a reopen reads every record
+    /// in the file and the whole point of a checkpoint is that it does
+    /// not have to. The cost is paid by whoever is closing, who by
+    /// definition has nothing else to do, and it is a write of the index
+    /// and the graph rather than of anything in the log.
+    ///
+    /// Off is for a run that is about to throw the file away, and for
+    /// measuring what recovery costs without one.
+    pub checkpoint_on_close: bool,
 }
 
 impl Default for Options {
@@ -140,6 +153,7 @@ impl Default for Options {
             provision_bytes: log::PROVISION_CHUNK,
             space_target_percent: 200,
             salvage: false,
+            checkpoint_on_close: true,
         }
     }
 }
@@ -202,6 +216,21 @@ pub struct Core {
     compact_at: AtomicU64,
     compaction: Compaction,
     pub(crate) recovered: Recovered,
+    /// Held by the jobs that move the log or the index out from under a
+    /// reader of the whole of either: a compaction pass, an index
+    /// doubling, and a checkpoint.
+    ///
+    /// They excluded each other by accident before, through the reserved
+    /// epoch slots, and a checkpoint is what makes the exclusion have to
+    /// be deliberate: it captures both planes at once and every one of
+    /// the others is a plane changing shape. The background thread takes
+    /// it with `try_lock`, because its jobs have no deadline and the
+    /// foreground's do.
+    pub(crate) maintenance: Mutex<()>,
+    /// How far up the log the pages are not in memory, set by a
+    /// recovery that read a checkpoint and left zero by every other
+    /// open. See [`warm`].
+    pub(crate) warm_upto: AtomicU64,
 }
 
 impl Core {
@@ -279,6 +308,8 @@ impl Core {
 pub struct Db {
     core: Arc<Core>,
     flusher: Option<JoinHandle<()>>,
+    warmer: Option<JoinHandle<()>>,
+    options: Options,
 }
 
 impl Db {
@@ -347,10 +378,22 @@ impl Db {
             compact_at: AtomicU64::new(options.compact_below),
             compaction: Compaction::default(),
             recovered: Recovered::default(),
+            maintenance: Mutex::new(()),
+            warm_upto: AtomicU64::new(0),
         })
     }
 
     fn start(core: Arc<Core>, options: Options) -> Self {
+        // A recovery that read a checkpoint left the log below the
+        // boundary on the device, so the pages come back here rather
+        // than during the open. See [`warm`].
+        let warmer = (core.warm_upto.load(Ordering::Acquire) > 0).then(|| {
+            let background = Arc::clone(&core);
+            std::thread::Builder::new()
+                .name("zu2-warm".into())
+                .spawn(move || warm(&background, options))
+                .expect("zu2 warm thread")
+        });
         // Async never waits on the flusher, but it still wants one:
         // without it the log would grow in memory forever and eviction
         // would have nothing durable to evict.
@@ -362,6 +405,8 @@ impl Db {
         Self {
             core,
             flusher: Some(flusher),
+            warmer,
+            options,
         }
     }
 
@@ -476,7 +521,74 @@ impl Db {
     /// and spent 5793 MiB of addresses to save 115 MiB. It also stopped
     /// early on the other side, because a first pass over an all live
     /// region ended the loop with the dead records above it untouched.
+    /// Writes the index and the graph down beside the log, so that the
+    /// next open reads them back instead of replaying every record.
+    ///
+    /// What it captures is the state at a boundary address, and what a
+    /// reopen does with it is install both planes and replay the records
+    /// above that address. So a checkpoint is never the whole answer and
+    /// never has to be: it is a prefix, and the log is still the write
+    /// ahead log for everything after it.
+    ///
+    /// Every session pauses for the length of the capture, which is why
+    /// [`Checkpointed::pause`] is reported rather than left to be
+    /// guessed at. See [`crate::checkpoint`] for why the pause is here
+    /// at all when Concurrent Prefix Recovery does not need one.
+    ///
+    /// A database whose log was written before pad records existed does
+    /// not get one, and says so.
+    pub fn checkpoint(&self) -> Result<Checkpointed> {
+        if !checkpoint::writable(self.core.log.format()) {
+            return Err(Error::Checkpoint {
+                why: "the log was written before pad records existed",
+            });
+        }
+        // Before the gate rather than after it, because a doubling that
+        // is half done is state a checkpoint cannot describe and the
+        // thing that finishes one is a maintenance session that would be
+        // waiting on the other side of the gate.
+        let _maintenance = self.core.maintenance.lock().expect("zu2 maintenance");
+        while self.core.index.resizing() {
+            let mut session = self.core.maintenance_session()?;
+            session.drain_index()?;
+            drop(session);
+            self.core.epochs().drain();
+        }
+        let started = Instant::now();
+        self.core.epochs().shut();
+        let captured = self.capture();
+        self.core.epochs().lift();
+        let pause = started.elapsed();
+
+        let (buf, mut taken) = captured?;
+        taken.pause = pause;
+        // The boundary has to be on the device before anything names it,
+        // or a crash after the rename leaves a checkpoint whose prefix
+        // the file does not hold. Out here rather than behind the gate,
+        // because what a session is waiting for is the planes to stop
+        // moving and not for a disk.
+        self.core
+            .log
+            .make_durable(taken.boundary, Durability::Durable)?;
+        checkpoint::publish(&self.core, &buf)?;
+        Ok(taken)
+    }
+
+    /// The part of a checkpoint that runs behind the gate, split out so
+    /// that the gate is lifted on the way out of an error as well as on
+    /// the way out of a capture.
+    fn capture(&self) -> Result<(Vec<u8>, Checkpointed)> {
+        // Everything that was in flight when the gate shut, finished.
+        // What is being waited for is the window between an append and
+        // the index swing or the graph link that publishes it: a record
+        // below the boundary that has not been applied yet is a record
+        // the capture would miss and the replay would not replay.
+        self.core.epochs().wait_for_quiescence();
+        checkpoint::capture(&self.core, self.core.log.tail())
+    }
+
     pub fn compact(&self) -> Result<u64> {
+        let _maintenance = self.core.maintenance.lock().expect("zu2 maintenance");
         let mut session = self.core.maintenance_session()?;
         let mut reclaimed = 0;
         let started_at = page_start(page_of(self.core.log.tail()));
@@ -484,6 +596,13 @@ impl Db {
             let upto = compact::ceiling(&session).min(started_at);
             let pass = compact::compact(&mut session, upto)?;
             self.core.compaction.note(&pass);
+            if pass.scanned > 0 {
+                // The pass moved begin, so any checkpoint beside the log
+                // names addresses that are now a hole. The reader
+                // refuses one on exactly that test, so this is tidiness
+                // and not safety.
+                checkpoint::discard(&self.core);
+            }
             reclaimed += pass.reclaimed;
             if pass.scanned == 0 {
                 return Ok(reclaimed);
@@ -550,6 +669,50 @@ impl Db {
     }
 }
 
+/// Reads the pages a checkpoint recovery skipped back into memory,
+/// bottom up, while the database serves.
+///
+/// The open is what a checkpoint is for and the pages are what it costs.
+/// A recovery that reads one installs both planes and walks only the
+/// records above the boundary, so the log below it is never read, and
+/// every entry the checkpoint installed points down there. Left alone,
+/// each of those reads is a read of the device: on six and a half
+/// million records the open went from 2.2 seconds to 45 milliseconds and
+/// then the first pass over the keys went from 1.9 seconds to 21, which
+/// is not a trade anybody asked for.
+///
+/// So the residency comes back on a thread of its own instead of on the
+/// open. A read that gets there first pays a device read and the ones
+/// after it do not, and nothing waits for this to finish.
+///
+/// `memory_pages` is the ceiling, which is the same ceiling eviction
+/// works to. It defaults to no ceiling at all, so the default is the
+/// residency every open had before checkpoints existed, and a caller who
+/// wants the log to stay on the device says so with the option that has
+/// always meant that.
+fn warm(core: &Core, options: Options) {
+    let upto = core.warm_upto.load(Ordering::Acquire);
+    let Ok(len) = core.log.file_len() else {
+        return;
+    };
+    let last = page_of(upto.min(len).saturating_sub(1));
+    for page in page_of(core.log.begin())..=last {
+        if core.log.stopping() || core.log.resident_pages() >= options.memory_pages {
+            return;
+        }
+        let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+        if core
+            .log
+            .warm_page(page, bytes, recover::page_intact)
+            .is_err()
+        {
+            // A page that cannot be read is a page the read path will
+            // fail on too, and it will say so with the address in hand.
+            return;
+        }
+    }
+}
+
 /// The background thread: flush, then compact if the log has outgrown
 /// its budget, then sleep until there is more to do.
 ///
@@ -608,6 +771,12 @@ fn maintain(core: &Core, options: Options) {
 /// cold half would hold that half forever and never be allowed to double
 /// again.
 fn resize_index(core: &Core) -> Result<()> {
+    let Ok(_maintenance) = core.maintenance.try_lock() else {
+        // A checkpoint or a foreground compaction has it. Neither runs
+        // for long and the loop comes round again, and a doubling that
+        // waits a little is a few lookups that walk a chain.
+        return Ok(());
+    };
     if core.index.wants_growth() {
         core.index.grow(core.epochs());
     }
@@ -631,10 +800,16 @@ fn resize_index(core: &Core) -> Result<()> {
 /// span, which is what stops a database nobody is rewriting from being
 /// scanned over and over for nothing.
 fn compact_slice(core: &Core, options: Options) -> Result<()> {
+    let Ok(_maintenance) = core.maintenance.try_lock() else {
+        return Ok(());
+    };
     let mut session = core.maintenance_session()?;
     let upto = compact::slice(&session);
     let pass = compact::compact(&mut session, upto)?;
     core.compaction.note(&pass);
+    if pass.scanned > 0 {
+        checkpoint::discard(core);
+    }
     if pass.scanned == 0 {
         // Nothing was compactable, which happens when the whole log is
         // still inside the mutable window. Try again a page later
@@ -652,8 +827,19 @@ fn compact_slice(core: &Core, options: Options) -> Result<()> {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        // Before the flusher is told to stop, because a checkpoint makes
+        // its boundary durable and the flusher is what carries that to
+        // the device. A failure here costs the next open its head start
+        // and nothing else, so it goes the way every other best effort
+        // in this function goes.
+        if self.options.checkpoint_on_close {
+            let _ = self.checkpoint();
+        }
         self.core.log.stop();
         if let Some(handle) = self.flusher.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.warmer.take() {
             let _ = handle.join();
         }
         // After the last flush, so the frontier it trims back to is the
@@ -1563,6 +1749,18 @@ impl<'a> Session<'a> {
 /// walks the records. Lives here because it needs both the log and the
 /// page arithmetic.
 pub(crate) fn restore_pages(core: &Core) -> Result<u64> {
+    restore_pages_from(core, core.log.begin())
+}
+
+/// The same, from an address rather than from the begin marker.
+///
+/// A recovery that read a checkpoint only walks the records above the
+/// boundary, so those are the only pages it has to have in memory, and
+/// on a database whose log is much larger than the writes since the last
+/// checkpoint that is nearly none of them. What is below stays on the
+/// device and reaches the read path through [`Session::locate`], which
+/// is the same path an evicted page reaches it by.
+pub(crate) fn restore_pages_from(core: &Core, from: Address) -> Result<u64> {
     let len = core.log.file_len()?;
     if len <= FIRST {
         return Ok(FIRST);
@@ -1571,7 +1769,7 @@ pub(crate) fn restore_pages(core: &Core) -> Result<u64> {
     // From the begin marker's page, not from zero. What is below it is
     // a hole, and restoring a hole would allocate 4 MiB of memory to
     // hold zeros.
-    for page in page_of(core.log.begin())..=last {
+    for page in page_of(from.max(core.log.begin()))..=last {
         let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
         core.log.restore_page(page, bytes)?;
     }

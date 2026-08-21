@@ -38,15 +38,21 @@
 //! and gets the old reading, since it holds nothing the new conclusion
 //! could be drawn from.
 //!
-//! This is deliberately not a checkpoint. Concurrent Prefix Recovery
-//! (Prasaad, Chandramouli, Kossmann, SIGMOD 2019) is the model for one,
-//! and until it exists a scan of a young log is fast and a wrong
-//! checkpoint is worse than no checkpoint.
+//! A scan is what runs when there is nothing else to go on, and it is
+//! still the whole of the durability argument: the log is the write
+//! ahead log and reading it is always enough. What it is not is bounded
+//! by anything but the size of the live set. A checkpoint beside the
+//! file bounds it by the writes since the checkpoint was taken instead,
+//! and [`from_checkpoint`] is the path that uses one. Everything below
+//! it is what happens when there is not one, or when it does not check
+//! out, which are the same thing: a wrong checkpoint is worse than no
+//! checkpoint, so every doubt about one ends here. See
+//! [`crate::checkpoint`].
 
 use std::collections::BTreeSet;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
-use crate::db::{Core, restore_pages};
+use crate::db::{Core, restore_pages, restore_pages_from};
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::index::{self, EMPTY, Index, SLOTS};
@@ -69,6 +75,20 @@ type Repairs = Vec<(Address, Address)>;
 /// `salvage` is [`crate::Options::salvage`]: what to do about a file
 /// that has records above where the scan stopped. See [`hole_above`].
 pub fn replay(core: &Core, salvage: bool) -> Result<()> {
+    if from_checkpoint(core, salvage)? {
+        return Ok(());
+    }
+    // A checkpoint that was refused is a checkpoint nobody will ever
+    // accept, and leaving it beside the file is not merely untidy. The
+    // scan below repairs the links in the log to fit the table it is
+    // filling, which is a different table from the one the checkpoint
+    // holds, since a table of the same size would have been adopted. So
+    // the records the checkpoint's entries point at end up chained for
+    // somebody else's table, and an entry that walks its chain walks
+    // into keys that are no longer under it. A pinned reopen at another
+    // size followed by an ordinary one lost ten keys out of twenty
+    // thousand exactly that way.
+    crate::checkpoint::discard(core);
     let len = restore_pages(core)?;
     // Before anything reads a record, because a journal that is still
     // there is a reopen that died part way through writing its repairs
@@ -106,6 +126,7 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
 
     let mut rewritten = Rewritten::new();
     let mut repairs = Repairs::new();
+    let mut scratch = Vec::new();
     let mut version = 0u64;
     let end = walk(core, from, len, |header, address| {
         if header.kind() == record::KIND_EDGE {
@@ -124,7 +145,14 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
                 // SAFETY: as above.
                 graph::replay_node(core, unsafe { header.value_unchecked() });
             }
-            install(core, header, address, &mut rewritten, &mut repairs);
+            install(
+                core,
+                header,
+                address,
+                &mut rewritten,
+                &mut repairs,
+                &mut scratch,
+            );
         }
         version = version.max(header.version());
         Ok(())
@@ -151,6 +179,151 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     core.log.sync_file()?;
     journal::clear(core);
     Ok(())
+}
+
+/// Recovery from a checkpoint: install both planes as they were at the
+/// boundary, then walk the records above it. Answers false when there is
+/// no checkpoint to read or it is not one this file can use, and then
+/// the scan runs as it always has.
+///
+/// The scan above the boundary is the ordinary one, doing the ordinary
+/// things: an install there can still find that the record's chain
+/// pointer belongs to a table of another size and repair it. What it
+/// cannot do is repair a link in a record below the boundary, and it
+/// never wants to. The links down there were built under the table the
+/// checkpoint just restored, which is the table they were written for.
+/// That is the second thing a checkpoint is worth, after the reading:
+/// the reopen that repaired up to a third of the records in a compacted
+/// file (#463) has nothing left to repair.
+///
+/// A relink journal beside the file turns the checkpoint down. It means
+/// the run before this one died part way through writing repairs back,
+/// so the file may hold a record whose checksum does not hold, and the
+/// repairs it names are anywhere in the log rather than above the
+/// boundary. Applying it means having those pages in memory, which is
+/// the thing this path exists not to do. It is also the rarest case
+/// there is: a crash inside one page write of one reopen.
+fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
+    if journal::present(core) {
+        return Ok(false);
+    }
+    let len = core.log.file_len()?;
+    if len <= FIRST {
+        return Ok(false);
+    }
+    let Some(restored) = crate::checkpoint::restore(core, len)? else {
+        return Ok(false);
+    };
+    restore_pages_from(core, restored.boundary)?;
+    // What was not restored, for the thread that reads it back while the
+    // database serves. See [`crate::db::warm`].
+    core.warm_upto
+        .store(restored.boundary, std::sync::atomic::Ordering::Release);
+    let mut version = restored.version;
+    let mut rewritten = Rewritten::new();
+    let mut repairs = Repairs::new();
+    let mut scratch = Vec::new();
+    let mut records = 0u64;
+    let end = walk(core, restored.boundary, len, |header, address| {
+        records += 1;
+        if header.kind() == record::KIND_EDGE {
+            // SAFETY: the walk bounded the lengths against the page and
+            // nothing else is running.
+            graph::replay_edge(core, unsafe { header.value_unchecked() })?;
+        } else {
+            if header.kind() == record::KIND_VERTEX {
+                // SAFETY: as above.
+                graph::replay_node(core, unsafe { header.value_unchecked() });
+            }
+            install(
+                core,
+                header,
+                address,
+                &mut rewritten,
+                &mut repairs,
+                &mut scratch,
+            );
+        }
+        version = version.max(header.version());
+        Ok(())
+    })?;
+    // The same test the full scan makes, over the same records: a stop
+    // with live records above it is a hole rather than a torn tail, and
+    // what is above it is unreachable. There is nothing to check below
+    // the boundary, because the checkpoint is what says those records
+    // were read.
+    if let Some(above) = hole_above(core, end, len) {
+        if !salvage {
+            return Err(Error::LogHole { at: end, above });
+        }
+        core.recovered
+            .discarded
+            .store(len - end, std::sync::atomic::Ordering::Relaxed);
+    }
+    core.log.resume_at(end);
+    core.set_version(version);
+    core.recovered
+        .records
+        .store(records, std::sync::atomic::Ordering::Relaxed);
+    core.recovered
+        .pages
+        .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if rewritten.is_empty() {
+        return Ok(true);
+    }
+    journal::write(core, &repairs)?;
+    for page in rewritten {
+        let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+        core.log.rewrite_page(page, bytes)?;
+    }
+    core.log.sync_file()?;
+    journal::clear(core);
+    Ok(true)
+}
+
+/// Whether every record in a page of the log parses and holds its
+/// checksum, which is what the warming thread asks before it makes a
+/// page resident. See [`crate::log::Log::warm_page`].
+///
+/// This is the scan's own reading of a page, minus the installing: a
+/// record start at the top of the page, records end to end after it,
+/// and either a pad record or a gap shorter than a header where the
+/// allocator moved on. Anything else is either damage or a page that
+/// was never fully written, and both are answered the same way, by
+/// leaving the page where it is so that whoever reads a record out of it
+/// reads it off the device and finds out.
+///
+/// A zeroed header is where this is stricter than the scan. The scan
+/// reads one as the end of the page and moves to the next, which it can
+/// afford because it goes on to look for a record above where it
+/// stopped. There is nothing above a page here, so zeros that are not a
+/// pad record are treated as a page not worth trusting, and a padless
+/// file, which has no pad records to tell padding from a hole, warms
+/// only its full pages.
+pub(crate) fn page_intact(bytes: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at + record::HEADER <= bytes.len() {
+        // SAFETY: a whole header fits in what is left of the buffer, and
+        // the lengths are bounded against it before anything past the
+        // header is touched.
+        let step = unsafe {
+            let header = RecordRef::new(bytes.as_ptr().add(at));
+            let key_len = header.key_len();
+            let value_len = header.value_len();
+            let size = record::size_of(key_len, value_len);
+            if key_len == 0 && value_len == 0 {
+                // A pad record is the end of the page and says so with a
+                // checksum. Anything else that reads as empty is a hole.
+                return header.kind() == record::KIND_PAD && header.intact();
+            }
+            if at + size > bytes.len() || !header.intact() {
+                return false;
+            }
+            size
+        };
+        at += step;
+    }
+    true
 }
 
 /// Where the file still holds a record above the address the scan
@@ -335,6 +508,7 @@ fn install(
     address: Address,
     rewritten: &mut Rewritten,
     repairs: &mut Repairs,
+    scratch: &mut Vec<u64>,
 ) {
     let key = header.key();
     let hash = index::hash(key);
@@ -354,7 +528,7 @@ fn install(
         if index::tag_of(entry) != tag && !index::is_foreign(entry) {
             continue;
         }
-        if let Some(installed) = chain_version(core, entry, key) {
+        if let Some(installed) = chain_version(core, entry, key, scratch) {
             // Not greater than: a pass that copies a copy leaves two
             // records carrying the same version, and the higher address
             // is the one that is still there after the region below it
@@ -448,17 +622,28 @@ fn relink(
 /// below it there is nothing left to find.
 ///
 /// The first match is the answer, because a chain runs newest first.
-fn chain_version(core: &Core, entry: u64, key: &[u8]) -> Option<u64> {
+///
+/// A record that is not in memory is read off the device, the way
+/// [`crate::Session::locate`] reads one. The full scan never meets that
+/// case, since it restores the whole file first, but a recovery that
+/// read a checkpoint restores only the pages above the boundary and
+/// every entry the checkpoint installed points below it. Answering
+/// `None` there would say the table has never seen a key it is holding
+/// an entry for, and the install would put a second entry in the bucket
+/// for it and let a later lookup answer out of the stale one.
+fn chain_version(core: &Core, entry: u64, key: &[u8], scratch: &mut Vec<u64>) -> Option<u64> {
     let mut address = index::address_of(entry);
     let foreign = index::is_foreign(entry);
     let floor = core.log.begin();
     while address >= floor && address != crate::addr::NULL {
-        let base = core.log.resident(address);
+        let mut base = core.log.resident(address);
         if base.is_null() {
-            return None;
+            core.log.load(address, scratch).ok()?;
+            base = scratch.as_ptr().cast();
         }
-        // SAFETY: the whole file was restored into pages before the
-        // scan, so any address a record points at is resident.
+        // SAFETY: the record is either in a restored page or in the
+        // scratch buffer, which `load` sized to hold the whole of it and
+        // which is a Vec<u64> and so is 8 byte aligned.
         let previous = unsafe {
             let r = RecordRef::new(base);
             if r.key() == key {
@@ -546,6 +731,13 @@ mod journal {
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         buf
+    }
+
+    /// Whether there is a journal beside the file at all, which is the
+    /// one question the checkpoint path asks before it decides whether
+    /// it may skip the pages a journal would need.
+    pub fn present(core: &Core) -> bool {
+        core.log.journal_path().exists()
     }
 
     /// Takes the journal away, which is what says the repairs are all in

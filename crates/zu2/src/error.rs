@@ -88,6 +88,14 @@ pub enum Error {
     /// `Options::sessions` to the number of threads that will hold one.
     #[error("all {max} sessions are open, raise Options::sessions")]
     NoSessions { max: usize },
+
+    /// A capture met state it cannot describe. Every reason is a broken
+    /// precondition rather than damage, so this fails the checkpoint and
+    /// never the database: the log is still the write ahead log and a
+    /// reopen without a checkpoint is a slower reopen and not a lost
+    /// one.
+    #[error("cannot take a checkpoint: {why}")]
+    Checkpoint { why: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -44,6 +44,10 @@ fn options(buckets: usize, grow: bool, compact: bool) -> Options {
         max_pages: 1 << 14,
         max_nodes: 1 << 10,
         compact_below: if compact { 1 << 20 } else { 0 },
+        // Off, because what this measures is what the scan repairs and
+        // a checkpoint is what stops the scan happening. See
+        // `examples/checkpointing.rs` for the other side of that.
+        checkpoint_on_close: false,
         ..Options::default()
     }
 }

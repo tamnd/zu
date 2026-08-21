@@ -36,6 +36,12 @@ fn options() -> Options {
         // Off, so what is damaged is the log the writes left and not
         // one a compaction pass happened to have rewritten.
         compact_below: 0,
+        // Off, because every test here is about what the scan makes of
+        // the file and a checkpoint is what stops the scan happening.
+        // What a checkpoint does about damage is its own question and
+        // `a_hole_under_a_checkpoint_is_reported_when_it_is_read` is
+        // where it is asked.
+        checkpoint_on_close: false,
         ..Options::default()
     }
 }
@@ -287,5 +293,61 @@ fn an_older_file_keeps_the_older_reading() {
     assert!(
         holes[0].1 < KEYS - 1,
         "an older file was read under the new rule, so it lost its whole suffix"
+    );
+}
+
+/// What a checkpoint does about a hole, which is not what the scan does
+/// and cannot be. The scan reads every record and so meets the damage at
+/// open; a checkpoint exists precisely so that the log below its
+/// boundary is not read, so the damage is met by whoever reads the
+/// record. What matters is that it is met at all: the reply is an error
+/// naming the address and not an answer that the key is missing.
+///
+/// This is the trade `Options::checkpoint_on_close` is there to turn
+/// down. Off, every open reads the whole log and a hole in it stops the
+/// open, which is the behaviour every other test in this file pins.
+#[test]
+fn a_hole_under_a_checkpoint_is_reported_when_the_record_is_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("checkpointed.zu2");
+    let taking = Options {
+        checkpoint_on_close: true,
+        ..options()
+    };
+    {
+        let db = Db::create(&path, taking).expect("create");
+        let mut session = db.session();
+        let value = vec![b'x'; VALUE];
+        for i in 0..KEYS {
+            session.upsert(&key(i), &value).expect("upsert");
+        }
+        drop(session);
+        db.sync().expect("sync");
+    }
+    patch(&path, DAMAGE_AT, &[0u8; 4096]);
+
+    // The open itself is fine, because the checkpoint is fine: it
+    // describes a prefix of a log that is still as long as it was.
+    let db = Db::open(&path, taking).expect("a checkpointed open reads the checkpoint");
+    let mut session = db.session();
+    let mut out = Vec::new();
+    let mut damaged = 0;
+    let mut missing = 0;
+    for i in 0..KEYS {
+        match session.read(&key(i), &mut out) {
+            Ok(true) => {}
+            Ok(false) => missing += 1,
+            Err(Error::Malformed { .. }) => damaged += 1,
+            Err(other) => panic!("user{i:016} failed with {other}"),
+        }
+    }
+    println!("{damaged} records reported damaged, {missing} silently missing");
+    assert!(
+        damaged > 0,
+        "4 KiB of zeros in the middle of the log cost no record its checksum"
+    );
+    assert_eq!(
+        missing, 0,
+        "{missing} keys came back as absent rather than as damaged"
     );
 }

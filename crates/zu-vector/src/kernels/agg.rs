@@ -115,12 +115,20 @@ macro_rules! minmax {
                 // for the reader. The accumulator is an i64 and not an
                 // Option of one, and the row is a select rather than a
                 // branch, which is the pair of things that turn into a
-                // lane wide minimum. Written as the loop below it, over
-                // an Option that is empty until the first row and a
-                // validity nobody has to ask about, it folds a row at a
-                // time: on x86-64 it did until the compiler was pinned
-                // and then it did not, which is the drift the
-                // disassembly gate is there to catch.
+                // lane wide minimum. The loop below it, folding an
+                // Option that is empty until the first row over a
+                // validity nobody here has to ask about, takes a row at
+                // a time and measured 0 vector instructions on both
+                // architectures; this one takes 31 on aarch64.
+                //
+                // Where it lands is the ISA's to say. NEON compares two
+                // 64 bit lanes with cmgt and selects with bsl, so the
+                // reduction folds. A generic x86-64 build has neither:
+                // the packed 64 bit compare is SSE4.2 and the packed 64
+                // bit minimum is AVX-512, and with only SSE2 to hand
+                // LLVM leaves the loop scalar. The disassembly gate
+                // knows that and asks for lanes on the one where they
+                // are reachable.
                 (VecEncoding::Flat, None) if v.validity.is_none() => {
                     let vals = v.values::<i64>();
                     if let Some((&first, rest)) = vals.split_first() {

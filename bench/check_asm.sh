@@ -20,11 +20,20 @@ if [ -z "$bin" ]; then
 fi
 
 arch=$(uname -m)
+# min_want: an integer minimum over 64 bit lanes needs a packed 64 bit
+# compare, and only one of the two architectures here has one to spare.
+# NEON compares with cmgt and selects with bsl, both there since ARMv8,
+# so the reduction folds. On x86-64 the packed compare is SSE4.2 and the
+# packed minimum is AVX-512, and a build for the generic baseline may use
+# neither, so LLVM keeps the loop scalar however it is written. Asking
+# for lanes there would be asking the source to do what the instruction
+# set cannot, so the count is reported and the reduction is gated where
+# it can be held.
 case "$arch" in
     # The arrangement suffix rides the register (GNU: v0.2d) or the
     # mnemonic (Apple: add.2d v0); match the suffix itself.
-    arm64|aarch64) simd_pat='\.(2d|4s|8h|16b)\b' ;;
-    x86_64|amd64)  simd_pat='%[xy]mm[0-9]+' ;;
+    arm64|aarch64) simd_pat='\.(2d|4s|8h|16b)\b'; min_want=simd ;;
+    x86_64|amd64)  simd_pat='%[xy]mm[0-9]+'; min_want=scalar ;;
     *) echo "check_asm: unknown arch $arch" >&2; exit 1 ;;
 esac
 
@@ -53,7 +62,7 @@ zu_asm_cmp_i64_pair:3cmp7compare:simd
 zu_asm_cmp_dict_const:3cmp7compare:simd
 zu_asm_sum_i64:3agg7sum_i64:simd
 zu_asm_sum_f64:3agg7sum_f64:scalar
-zu_asm_min_i64:3agg7min_i64:simd
+zu_asm_min_i64:3agg7min_i64:$min_want
 zu_asm_intersect:6setops:scalar
 zu_asm_bitmap_to_sel:9SelVector11from_bitmap:scalar
 zu_asm_hash:4hash10hash_slice:scalar

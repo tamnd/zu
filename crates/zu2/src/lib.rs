@@ -55,7 +55,7 @@ pub mod recover;
 
 pub use checkpoint::Checkpointed;
 pub use compact::Compacted;
-pub use db::{Compaction, Db, Options, Session};
+pub use db::{Compaction, Db, Options, Session, Transaction};
 pub use error::{Error, Result};
 pub use graph::{Direction, Graph};
 pub use log::{Durability, PROVISION_CHUNK};

@@ -212,12 +212,30 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
                         Placement::Dead
                     }
                 }),
+                // A marker's whole job is to say whether the records
+                // between it and its partner were committed, and a pass
+                // can only reach a region whose transactions have all
+                // finished one way or the other, so by the time one is
+                // read it has nothing left to say. Dropping it is also
+                // what keeps it out of `copy_forward`, which would look
+                // it up under the empty key.
+                record::KIND_BEGIN | record::KIND_END => Ok(Placement::Dead),
                 _ => session.copy_forward(
                     &Carried {
                         key: &key,
                         value: &value,
                         tombstone,
-                        kind,
+                        // A copy is not provisional. Its transaction
+                        // committed long before a pass could reach it,
+                        // and a copy written as one would sit above the
+                        // end marker that would have released it and be
+                        // dropped by the next replay. See
+                        // [`crate::record::KIND_TXN`].
+                        kind: if kind == record::KIND_TXN {
+                            record::KIND_VALUE
+                        } else {
+                            kind
+                        },
                         version,
                     },
                     address,

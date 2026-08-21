@@ -75,6 +75,33 @@ pub const KIND_EDGE: u32 = 1;
 /// counter without a second record per node.
 pub const KIND_VERTEX: u32 = 2;
 
+/// A keyed value written inside a multi-statement transaction, which
+/// the index names exactly as it names a [`KIND_VALUE`] record and
+/// which recovery holds back until it has seen the transaction's end
+/// marker.
+///
+/// The kind is what tells a replay that a record is provisional, and it
+/// is a kind rather than a flag bit so that every `kind() ==` test
+/// already written keeps meaning what it meant. A copy made by
+/// compaction is written as [`KIND_VALUE`]: by the time a pass can reach
+/// a record the transaction that wrote it has committed, and a copy with
+/// no end marker above it would be held back forever.
+pub const KIND_TXN: u32 = 4;
+
+/// The first record of a transaction. Its value is the eight bytes of
+/// the transaction's version, which its end marker repeats.
+pub const KIND_BEGIN: u32 = 5;
+
+/// The last record of a transaction, and the thing that commits it.
+/// Every [`KIND_TXN`] record below it and above its begin marker becomes
+/// visible to a replay at the moment this record is read, and a replay
+/// that runs out of log before reading one drops them all.
+///
+/// Both markers carry a value rather than being bare headers, because a
+/// record with no key and no value is how the log writes padding and how
+/// the device writes a hole, and the walk stops on the second of those.
+pub const KIND_END: u32 = 6;
+
 /// The rest of this page is padding, written where the allocator
 /// skipped to the next page because a record did not fit in what was
 /// left.

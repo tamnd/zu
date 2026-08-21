@@ -71,6 +71,167 @@ type Rewritten = BTreeSet<usize>;
 /// [`journal`].
 type Repairs = Vec<(Address, Address)>;
 
+/// The records of a transaction the scan has read and not yet installed,
+/// because it has not reached the end marker that would commit them.
+///
+/// Addresses rather than bytes. The records are on the log where the
+/// scan found them, and the install needs them there anyway: it may
+/// repair a chain pointer, and a repair written into a copy would be
+/// thrown away with the copy.
+///
+/// There is no transaction id in a record and none is needed, because a
+/// commit holds a lock across the whole of its writing, so between a
+/// begin marker and an end marker the only provisional records are that
+/// transaction's. See [`crate::db::Core::committing`].
+#[derive(Default)]
+struct Uncommitted {
+    /// The id in the begin marker, or `None` when the scan is not
+    /// inside a transaction.
+    id: Option<u64>,
+    held: Vec<Address>,
+}
+
+impl Uncommitted {
+    /// A begin marker. Anything still held belongs to a transaction
+    /// whose end marker went missing without the log ending, which
+    /// cannot happen, so it is dropped rather than guessed at.
+    fn opened(&mut self, id: u64) {
+        self.held.clear();
+        self.id = Some(id);
+    }
+
+    /// An end marker: hands back the records it releases, or nothing
+    /// when the marker does not match the transaction being held.
+    ///
+    /// An end with nothing held is ordinary rather than wrong. A
+    /// compaction pass takes whole regions, so a region that ends
+    /// between a transaction's records and its end marker leaves the
+    /// marker with nothing below it.
+    fn closed(&mut self, id: u64) -> Vec<Address> {
+        let held = std::mem::take(&mut self.held);
+        let opened = self.id.take();
+        match opened {
+            Some(opened) if opened == id => held,
+            _ => Vec::new(),
+        }
+    }
+
+    /// A provisional record. Answers false when the scan is not inside
+    /// a transaction, which means a pass has taken the begin marker and
+    /// everything below it, and the record is committed by the fact that
+    /// it survived.
+    fn holds(&mut self, address: Address) -> bool {
+        if self.id.is_none() {
+            return false;
+        }
+        self.held.push(address);
+        true
+    }
+}
+
+/// Installs the records an end marker released.
+///
+/// A page that left memory between the record and the marker is read
+/// back rather than given up on, because the alternative is dropping a
+/// record whose transaction committed.
+fn release(
+    core: &Core,
+    held: Vec<Address>,
+    len: u64,
+    rewritten: &mut Rewritten,
+    repairs: &mut Repairs,
+    scratch: &mut Vec<u64>,
+) -> Result<()> {
+    for address in held {
+        let mut base = core.log.resident(address);
+        if base.is_null() {
+            let page = page_of(address);
+            let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+            core.log.restore_page(page, bytes)?;
+            base = core.log.resident(address);
+        }
+        if base.is_null() {
+            return Err(Error::Malformed {
+                address,
+                why: "a committed transaction record could not be read back",
+            });
+        }
+        // SAFETY: the address came from the walk, which read a whole
+        // record there, and the page it is in has just been made
+        // resident.
+        let header = unsafe { RecordRef::new(base) };
+        install(core, header, address, rewritten, repairs, scratch);
+    }
+    Ok(())
+}
+
+/// What a scan carries from record to record: the repairs it owes the
+/// file, and the transaction it is in the middle of.
+///
+/// A struct rather than four arguments threaded through every call,
+/// which is what it was before transactions gave it a fourth.
+#[derive(Default)]
+struct Building {
+    rewritten: Rewritten,
+    repairs: Repairs,
+    scratch: Vec<u64>,
+    open: Uncommitted,
+}
+
+/// One record of the log into the planes, which is the whole of what a
+/// replay does and is the same whether the scan started at the begin
+/// marker or at a checkpoint boundary.
+fn replay_one(
+    core: &Core,
+    header: RecordRef<'_>,
+    address: Address,
+    len: u64,
+    building: &mut Building,
+) -> Result<()> {
+    match header.kind() {
+        record::KIND_EDGE => {
+            // Edge records are not keyed, so nothing goes in the index.
+            // A remove that replays after the add it cancels lands the
+            // same way it did the first time, because the log is in
+            // commit order.
+            // SAFETY: the walk bounded the lengths against the page and
+            // nothing else is running.
+            graph::replay_edge(core, unsafe { header.value_unchecked() })?;
+        }
+        record::KIND_BEGIN => building.open.opened(header.version()),
+        record::KIND_END => {
+            let held = building.open.closed(header.version());
+            release(
+                core,
+                held,
+                len,
+                &mut building.rewritten,
+                &mut building.repairs,
+                &mut building.scratch,
+            )?;
+        }
+        record::KIND_TXN if building.open.holds(address) => {}
+        kind => {
+            if kind == record::KIND_VERTEX {
+                // A node with no edges yet would otherwise leave no
+                // trace, and the next allocation would hand its id out
+                // again.
+                // SAFETY: as above.
+                graph::replay_node(core, unsafe { header.value_unchecked() });
+            }
+            install(
+                core,
+                header,
+                address,
+                &mut building.rewritten,
+                &mut building.repairs,
+                &mut building.scratch,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rebuilds the index from the file and leaves the log ready to append.
 ///
 /// `salvage` is [`crate::Options::salvage`]: what to do about a file
@@ -132,36 +293,10 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     core.index
         .presize((records + cold_records as usize).div_ceil(4));
 
-    let mut rewritten = Rewritten::new();
-    let mut repairs = Repairs::new();
-    let mut scratch = Vec::new();
+    let mut building = Building::default();
     let mut version = 0u64;
     let end = walk(core, from, len, |header, address| {
-        if header.kind() == record::KIND_EDGE {
-            // Edge records are not keyed, so nothing goes in the index.
-            // A remove that replays after the add it cancels lands the
-            // same way it did the first time, because the log is in
-            // commit order.
-            // SAFETY: the walk bounded the lengths against the page and
-            // nothing else is running.
-            graph::replay_edge(core, unsafe { header.value_unchecked() })?;
-        } else {
-            if header.kind() == record::KIND_VERTEX {
-                // A node with no edges yet would otherwise leave no
-                // trace, and the next allocation would hand its id out
-                // again.
-                // SAFETY: as above.
-                graph::replay_node(core, unsafe { header.value_unchecked() });
-            }
-            install(
-                core,
-                header,
-                address,
-                &mut rewritten,
-                &mut repairs,
-                &mut scratch,
-            );
-        }
+        replay_one(core, header, address, len, &mut building)?;
         version = version.max(header.version());
         Ok(())
     })?;
@@ -170,22 +305,29 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     // After the log and not before it, so that a key with a record in
     // both tiers is decided by the version rule with both records in
     // hand, and so that rehoming has a log to append to. See [`cold`].
-    let cold_read = cold_scan(core, None, &mut rewritten, &mut repairs, &mut scratch)?;
+    let cold_read = cold_scan(
+        core,
+        None,
+        &mut building.rewritten,
+        &mut building.repairs,
+        &mut building.scratch,
+    )?;
     core.recovered.records.store(
         records as u64 + cold_read,
         std::sync::atomic::Ordering::Relaxed,
     );
-    core.recovered
-        .pages
-        .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    if rewritten.is_empty() {
+    core.recovered.pages.store(
+        building.rewritten.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if building.rewritten.is_empty() {
         return Ok(());
     }
     // The journal goes down and is committed before a single page moves,
     // so that whatever a crash leaves in the file can be finished from
     // it. Then the pages, then a sync, then the journal comes off.
-    journal::write(core, &repairs)?;
-    for page in rewritten {
+    journal::write(core, &building.repairs)?;
+    for page in building.rewritten {
         let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
         core.log.rewrite_page(page, bytes)?;
     }
@@ -233,30 +375,11 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     core.warm_upto
         .store(restored.boundary, std::sync::atomic::Ordering::Release);
     let mut version = restored.version;
-    let mut rewritten = Rewritten::new();
-    let mut repairs = Repairs::new();
-    let mut scratch = Vec::new();
+    let mut building = Building::default();
     let mut records = 0u64;
     let end = walk(core, restored.boundary, len, |header, address| {
         records += 1;
-        if header.kind() == record::KIND_EDGE {
-            // SAFETY: the walk bounded the lengths against the page and
-            // nothing else is running.
-            graph::replay_edge(core, unsafe { header.value_unchecked() })?;
-        } else {
-            if header.kind() == record::KIND_VERTEX {
-                // SAFETY: as above.
-                graph::replay_node(core, unsafe { header.value_unchecked() });
-            }
-            install(
-                core,
-                header,
-                address,
-                &mut rewritten,
-                &mut repairs,
-                &mut scratch,
-            );
-        }
+        replay_one(core, header, address, len, &mut building)?;
         version = version.max(header.version());
         Ok(())
     })?;
@@ -281,21 +404,22 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     let cold_read = cold_scan(
         core,
         Some(restored.cold_tail),
-        &mut rewritten,
-        &mut repairs,
-        &mut scratch,
+        &mut building.rewritten,
+        &mut building.repairs,
+        &mut building.scratch,
     )?;
     core.recovered
         .records
         .store(records + cold_read, std::sync::atomic::Ordering::Relaxed);
-    core.recovered
-        .pages
-        .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    if rewritten.is_empty() {
+    core.recovered.pages.store(
+        building.rewritten.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if building.rewritten.is_empty() {
         return Ok(true);
     }
-    journal::write(core, &repairs)?;
-    for page in rewritten {
+    journal::write(core, &building.repairs)?;
+    for page in building.rewritten {
         let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
         core.log.rewrite_page(page, bytes)?;
     }
@@ -1220,6 +1344,94 @@ mod tests {
             out,
             b"new".to_vec(),
             "the replay took the copy that lost its race"
+        );
+    }
+
+    /// A transaction the crash caught in the middle: a begin marker, the
+    /// records it had written by then, and no end marker. None of those
+    /// records were committed, so the replay has to leave every one of
+    /// them out, and everything around them has to come back.
+    ///
+    /// Written by hand, because the public API has no way to stop a
+    /// commit part way through and a test that killed a process would
+    /// only reach this shape by luck.
+    #[test]
+    fn a_transaction_with_no_end_marker_is_left_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.zu2");
+        let options = Options {
+            durability: crate::log::Durability::Async,
+            // The scan, rather than a checkpoint, since the records
+            // below are on the log and never in the index and a
+            // checkpoint would replay from above them.
+            checkpoint_on_close: false,
+            ..Options::default()
+        };
+        let before = |i: u32| format!("before{i:04}").into_bytes();
+        let inside = |i: u32| format!("inside{i:04}").into_bytes();
+        let records = 8u32;
+        {
+            let db = Db::create(&path, options).expect("create");
+            let mut s = db.session();
+            for i in 0..records {
+                s.upsert(&before(i), b"kept").expect("before");
+            }
+
+            let id = s.core.next_version();
+            let marker = id.to_le_bytes();
+            s.slot.protect();
+            let torn = (|| {
+                s.core.log.append(
+                    &s.slot,
+                    NULL,
+                    id,
+                    &[],
+                    &marker,
+                    false,
+                    crate::record::KIND_BEGIN,
+                )?;
+                for i in 0..records {
+                    s.core.log.append(
+                        &s.slot,
+                        NULL,
+                        id,
+                        &inside(i),
+                        b"never",
+                        false,
+                        crate::record::KIND_TXN,
+                    )?;
+                }
+                // And no end marker, which is the whole point.
+                Ok::<(), crate::Error>(())
+            })();
+            s.slot.unprotect();
+            torn.expect("torn");
+
+            // A record from another session, above the begin marker and
+            // outside the group. Commits are serialised against each
+            // other and not against ordinary writes, so this is a shape
+            // the log really produces, and it has to survive.
+            s.upsert(b"beside", b"kept").expect("beside");
+            drop(s);
+            db.sync().expect("sync");
+        }
+
+        let db = Db::open(&path, options).expect("reopen");
+        let mut s = db.session();
+        let mut out = Vec::new();
+        for i in 0..records {
+            assert!(
+                s.read(&before(i), &mut out).expect("read"),
+                "the replay lost before{i:04}, which was committed"
+            );
+            assert!(
+                !s.read(&inside(i), &mut out).expect("read"),
+                "the replay kept inside{i:04}, which no end marker released"
+            );
+        }
+        assert!(
+            s.read(b"beside", &mut out).expect("read"),
+            "the replay lost a record that was only next to the group"
         );
     }
 }

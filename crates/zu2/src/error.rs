@@ -96,6 +96,15 @@ pub enum Error {
     /// one.
     #[error("cannot take a checkpoint: {why}")]
     Checkpoint { why: &'static str },
+
+    /// A transaction committed on the log and then could not finish
+    /// putting its records into the index, so what is in memory is part
+    /// of a transaction and what is on the log is all of it. Nothing
+    /// keyed runs after that. The log is the database and it is intact,
+    /// so closing and reopening builds the index from it and comes back
+    /// with the whole transaction applied.
+    #[error("database is wedged by a transaction memory could not finish applying: {why}")]
+    Wedged { why: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

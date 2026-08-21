@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -201,6 +201,220 @@ pub(crate) struct Carried<'a> {
     pub version: u64,
 }
 
+/// One write a transaction is holding until it commits.
+struct Staged {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    tombstone: bool,
+}
+
+/// A group of writes that lands all at once or not at all.
+///
+/// Every other write path in this engine is its own commit, which is
+/// the right default and is not enough for a host that has to move two
+/// records together. What makes a group atomic here is a pair of marker
+/// records: the writes go on the log with a kind that says provisional,
+/// and an end marker above them is what a replay takes as permission to
+/// install them. A crash between the two leaves records a replay reads,
+/// counts, and drops.
+///
+/// The writes are held in memory until [`commit`](Self::commit), so a
+/// transaction that is dropped instead has written nothing and there is
+/// nothing to roll back. That also fixes what other sessions see: a
+/// record only reaches the index at commit, so no reader can be shown a
+/// value that is going to be taken away again. Inside the transaction
+/// the write set is consulted first, so it reads its own writes.
+///
+/// What this is not is serialisable. Two transactions on the same key
+/// interleave the way two upserts on the same key interleave, last
+/// commit wins, and a read taken inside a transaction is a read taken at
+/// the moment it runs rather than at the moment the transaction started.
+/// Isolation needs a version to read at and a validation at commit, and
+/// this milestone is atomicity and durability, which is what the log can
+/// give on its own. Edges are not covered either: the graph plane writes
+/// its own records and replays them into the adjacency rather than the
+/// index.
+pub struct Transaction<'s, 'a> {
+    session: &'s mut Session<'a>,
+    staged: Vec<Staged>,
+    /// Where a key already in `staged` is, so that writing a key twice
+    /// leaves one record rather than two and a read finds the newer.
+    placed: HashMap<Vec<u8>, usize>,
+}
+
+impl<'s, 'a> Transaction<'s, 'a> {
+    /// Stages a write. Nothing reaches the log until the commit.
+    pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.stage(key, value, false)
+    }
+
+    /// Stages a delete.
+    ///
+    /// It does not answer whether the key was there, which the
+    /// session's [`delete`](Session::delete) does. The honest answer
+    /// would be whether it is there at commit time, and by then the
+    /// caller has already had to decide to write this.
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.stage(key, &[], true)
+    }
+
+    fn stage(&mut self, key: &[u8], value: &[u8], tombstone: bool) -> Result<()> {
+        if key.len() > record::MAX_KEY {
+            return Err(Error::RecordTooLarge {
+                size: record::size_of(key.len(), value.len()),
+                page: crate::addr::PAGE_SIZE,
+            });
+        }
+        match self.placed.get(key) {
+            Some(&at) => {
+                let held = &mut self.staged[at];
+                held.value.clear();
+                held.value.extend_from_slice(value);
+                held.tombstone = tombstone;
+            }
+            None => {
+                self.placed.insert(key.to_vec(), self.staged.len());
+                self.staged.push(Staged {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    tombstone,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a key, seeing this transaction's own writes.
+    pub fn read(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+        if let Some(&at) = self.placed.get(key) {
+            let held = &self.staged[at];
+            if held.tombstone {
+                return Ok(false);
+            }
+            out.clear();
+            out.extend_from_slice(&held.value);
+            return Ok(true);
+        }
+        self.session.read(key, out)
+    }
+
+    /// How many writes are staged, counting a key written twice once.
+    pub fn len(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// Whether nothing is staged.
+    pub fn is_empty(&self) -> bool {
+        self.staged.is_empty()
+    }
+
+    /// Throws the writes away. The same as dropping it, and here so that
+    /// a caller can say which one it meant.
+    pub fn rollback(self) {}
+
+    /// Puts the whole group on the log and then into the index.
+    ///
+    /// Everything that can fail happens first: each key is looked up
+    /// before a byte is written, which walks the chain the write is
+    /// about to extend and drains any index migration the buckets are
+    /// in the middle of, so a transaction that cannot read what it is
+    /// about to overwrite fails with nothing on the log. Then, under the
+    /// commit lock, the begin marker, then the records through the
+    /// ordinary write path with a provisional kind, then the end marker,
+    /// which is the commit point.
+    ///
+    /// So a record is in the index before the transaction it belongs to
+    /// has committed, and the reason that is safe is that memory does
+    /// not outlive the crash that would expose it. Every session that
+    /// can see the index can also see the commit that is about to
+    /// happen; a crash before the end marker takes the index with it,
+    /// and the replay that rebuilds it drops the provisional records. A
+    /// record another session chained onto in the window does not bring
+    /// the dropped value back either, because every chain walk compares
+    /// the key at every step and stops at the newer record for that key.
+    ///
+    /// What is not survivable is an install that fails part way, since
+    /// there is no way to take a record back out of a chain another
+    /// session may already be pointing at. That wedges the database,
+    /// which is loud, rare, and fixed by a reopen, because the log is
+    /// where the transaction really lives. See [`Core::wedged`].
+    pub fn commit(mut self) -> Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        // The lookups that warm the chains, before anything is written.
+        // This is also what drains a pending index migration for every
+        // bucket the commit is about to touch.
+        for staged in &self.staged {
+            let hash = index::hash(&staged.key);
+            let tag = Index::tag(hash);
+            self.session.slot.protect();
+            let found = self
+                .session
+                .bucket_of(hash)
+                .and_then(|bucket| self.session.lookup(bucket, tag, &staged.key));
+            self.session.slot.unprotect();
+            found?;
+        }
+
+        let core = self.session.core;
+        let id = core.next_version();
+        let marker = id.to_le_bytes();
+        let staged = std::mem::take(&mut self.staged);
+        let end = {
+            let _committing = core
+                .committing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.log.append(
+                &self.session.slot,
+                NULL,
+                id,
+                &[],
+                &marker,
+                false,
+                record::KIND_BEGIN,
+            )?;
+            for write in &staged {
+                let hash = index::hash(&write.key);
+                let tag = Index::tag(hash);
+                self.session.slot.protect();
+                let outcome = self.session.bucket_of(hash).and_then(|bucket| {
+                    self.session.install(
+                        bucket,
+                        tag,
+                        &write.key,
+                        &write.value,
+                        write.tombstone,
+                        record::KIND_TXN,
+                    )
+                });
+                self.session.slot.unprotect();
+                // A failure here is before the end marker, so nothing
+                // this transaction wrote is committed and a replay drops
+                // all of it. What is already in the index is the part
+                // that has to come back out, and it cannot, for the
+                // reason in the doc comment above. This is the same
+                // wedge and the same fix.
+                if let Err(error) = outcome {
+                    core.wedged.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+            core.log.append(
+                &self.session.slot,
+                NULL,
+                id,
+                &[],
+                &marker,
+                false,
+                record::KIND_END,
+            )? + record::size_of(0, marker.len()) as u64
+        };
+        self.session.make_durable(end)
+    }
+}
+
 /// Where a compaction pass put a record it found still live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -296,6 +510,25 @@ pub struct Core {
     /// it with `try_lock`, because its jobs have no deadline and the
     /// foreground's do.
     pub(crate) maintenance: Mutex<()>,
+    /// Held across the whole of one transaction's commit, so that the
+    /// records of two transactions are never interleaved on the log.
+    ///
+    /// That is what lets a replay do without a transaction id in every
+    /// record: with one commit writing at a time, every provisional
+    /// record between a begin marker and its end marker belongs to that
+    /// transaction, and a record from an ordinary write that lands
+    /// between them says so with its kind. The lock is held for a run of
+    /// memcpys into a mapped page and is let go before the wait for the
+    /// device, which is where the microseconds are.
+    pub(crate) committing: Mutex<()>,
+    /// Set when a transaction reached its end marker and then could not
+    /// finish putting its records into the index, which is the one
+    /// failure this engine cannot undo: the log says committed and
+    /// memory holds part of it. Every keyed operation refuses from then
+    /// on, because the alternative is answering out of a half applied
+    /// transaction, and a reopen builds the index from the log and comes
+    /// back whole.
+    pub(crate) wedged: AtomicBool,
     /// How far up the log the pages are not in memory, set by a
     /// recovery that read a checkpoint and left zero by every other
     /// open. See [`warm`].
@@ -473,6 +706,8 @@ impl Db {
             compaction: Compaction::default(),
             recovered: Recovered::default(),
             maintenance: Mutex::new(()),
+            committing: Mutex::new(()),
+            wedged: AtomicBool::new(false),
             warm_upto: AtomicU64::new(0),
             // A page, never zero. The tier's threshold is raised by
             // every pass that reads it, and the first one has nothing to
@@ -1196,6 +1431,14 @@ impl<'a> Session<'a> {
     /// there is nothing for it to have to reread.
     fn bucket_of(&mut self, hash: u64) -> Result<&'a Bucket> {
         let core = self.core;
+        // Every keyed operation, read or write, comes through here, so
+        // this is the one place the wedge has to be tested. See
+        // [`Core::wedged`].
+        if core.wedged.load(Ordering::Relaxed) {
+            return Err(Error::Wedged {
+                why: "the index is missing part of a committed transaction, reopen the database",
+            });
+        }
         loop {
             // The live table is read before the migration and not after.
             // A grow publishes the migration first, so a caller that saw
@@ -1624,6 +1867,16 @@ impl<'a> Session<'a> {
         self.finish(end)
     }
 
+    /// A group of writes that commits all at once. See
+    /// [`Transaction`].
+    pub fn transaction(&mut self) -> Transaction<'_, 'a> {
+        Transaction {
+            session: self,
+            staged: Vec::new(),
+            placed: HashMap::new(),
+        }
+    }
+
     pub(crate) fn write(
         &mut self,
         key: &[u8],
@@ -1708,7 +1961,16 @@ impl<'a> Session<'a> {
             }
 
             if let Some((i, entry, address)) = found {
-                if !tombstone && let Some(end) = self.update_in_place(address, value) {
+                // A transaction's record never takes the in place path.
+                // Rewriting the value inside a record that is already on
+                // the log would publish an uncommitted value to every
+                // reader of that key, and there would be nothing to undo
+                // it with: the record it overwrote belongs to a
+                // transaction that already committed.
+                if !tombstone
+                    && kind != record::KIND_TXN
+                    && let Some(end) = self.update_in_place(address, value)
+                {
                     return Ok(Some(end));
                 }
                 let version = self.core.next_version();

@@ -795,7 +795,7 @@
       "name": "lane",
       "of": "zu::Frame",
       "signature": "fn lane(&self, col: ColId) -> Option<ColType>",
-      "doc": "What the vector layer would carry this column as, `None` for a\ncolumn it has no lane for. The three lanes are integers, doubles\nand strings; a date or a boolean resolves to nothing here and\nthe statement reads it a row at a time, which is the same answer\na stored column of one gets."
+      "doc": "What the vector layer would carry this column as, `None` for a\ncolumn it has no lane for. The lanes a frame hands over are\nintegers, doubles and strings; a boolean or a temporal column\nresolves to nothing here and the statement reads it a row at a\ntime. A stored temporal column does have a lane, because it is\nwritten as the count it is and read back as one; a frame holds\nwhatever a caller lent it, and there is no temporal layout to\nlend yet."
     },
     {
       "id": "zu::Frame::name",
@@ -5788,7 +5788,7 @@
       "kind": "enum",
       "name": "ColType",
       "source": "zu_query::snapshot::ColType",
-      "doc": "The storage type of a property column, the three the props\ndirectory hands the vector layer today; the full typed catalog is\nM3."
+      "doc": "The storage type of a property column, the ones the props\ndirectory hands the vector layer today; the full typed catalog is\nM3."
     },
     {
       "id": "zu::snapshot::ColType::Float",
@@ -5811,6 +5811,14 @@
       "name": "Str",
       "of": "zu::snapshot::ColType",
       "signature": "Str"
+    },
+    {
+      "id": "zu::snapshot::ColType::Temporal",
+      "kind": "variant",
+      "name": "Temporal",
+      "of": "zu::snapshot::ColType",
+      "signature": "Temporal(TemporalLane)",
+      "doc": "A date, a time, a datetime or a duration, all of which are one\ncount in one word and differ only in what the count is of. The\ntag says which, so the lane stays the integer lane and only the\nvalue the sink hands back is different."
     },
     {
       "id": "zu::snapshot::CsrPin",
@@ -6126,6 +6134,93 @@
       "doc": "Node table id from the catalog."
     },
     {
+      "id": "zu::snapshot::TemporalLane",
+      "kind": "enum",
+      "name": "TemporalLane",
+      "source": "zu_query::snapshot::TemporalLane",
+      "doc": "Which temporal type a one word lane holds.\n\nThe zoned types are not here. A zoned value is a count and an offset\nfrom UTC, which is two numbers, and a lane is one word: reading one\nthrough a lane would drop the offset and answer an instant that\nprints somewhere else. Those columns stay off the vector path until\nthere is somewhere to put the second number."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::Date",
+      "kind": "variant",
+      "name": "Date",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "Date",
+      "doc": "Days since 1970-01-01, widened from the 32 bits they are stored\nin, since a lane is a word wide whatever it holds."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::Duration",
+      "kind": "variant",
+      "name": "Duration",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "Duration(zu_common::DurationKind)",
+      "doc": "Months for a year-month duration, nanoseconds for a day-time\none, which is what the kind says."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::LocalDatetime",
+      "kind": "variant",
+      "name": "LocalDatetime",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "LocalDatetime",
+      "doc": "Nanoseconds since 1970-01-01T00:00:00."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::LocalTime",
+      "kind": "variant",
+      "name": "LocalTime",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "LocalTime",
+      "doc": "Nanoseconds since midnight."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::column_type",
+      "kind": "method",
+      "name": "column_type",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn column_type(self) -> ColumnType",
+      "doc": "What a result column of this lane is called."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::logical_type",
+      "kind": "method",
+      "name": "logical_type",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn logical_type(self) -> LogicalType",
+      "doc": "The temporal type this lane is a lane of."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::of",
+      "kind": "method",
+      "name": "of",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn of(ty: &LogicalType) -> Option<TemporalLane>",
+      "doc": "The lane a temporal type takes, `None` for the zoned types,\nwhich take none."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::phys",
+      "kind": "method",
+      "name": "phys",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn phys(self) -> PhysType",
+      "doc": "The physical lane the words ride in. A date counts days and the\nother three count one thing each, so the width is a word either\nway and the type is what a kernel reads to know the ordering is\nthe integer ordering."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::value",
+      "kind": "method",
+      "name": "value",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn value(self, word: i64) -> Temporal",
+      "doc": "The value one word of this lane holds."
+    },
+    {
+      "id": "zu::snapshot::TemporalLane::word",
+      "kind": "method",
+      "name": "word",
+      "of": "zu::snapshot::TemporalLane",
+      "signature": "fn word(self, value: &Temporal) -> Option<i64>",
+      "doc": "The word a value of this lane rides as, `None` for a value of\nsome other temporal type: a date is not a datetime and a lane\nthat took one for the other would answer the wrong instant."
+    },
+    {
       "id": "zu::snapshot::ZonePred",
       "kind": "struct",
       "name": "ZonePred",
@@ -6235,7 +6330,7 @@
       "id": "zu::write",
       "kind": "module",
       "name": "write",
-      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape: a value written onto a column of a row that is\nalready there, whether the row is a node or an edge the graph runs\nthrough. Those go into a [`CellPatch`] per table,\nthe readers put them over the values their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape: a value written onto a column of a row that is\nalready there, whether the row is a node or an edge the graph runs\nthrough. Those go into a [`CellPatch`] per table,\nthe readers put them over the values their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken as much as\n[`checkpoint_due`] allows. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
     },
     {
       "id": "zu::write::Patches",

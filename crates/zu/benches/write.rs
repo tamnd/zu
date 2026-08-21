@@ -1341,6 +1341,14 @@ fn run_unsynced(rows: u64) -> Cost {
 
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
+    // Whether the box this is running on is a shared runner rather than
+    // a machine with its cores to itself. One ceiling here is a product
+    // target rather than a number fitted to what was measured, and a
+    // target is about the product and not about whatever vCPU a hosted
+    // runner handed out, so on a shared box that key is enforced against
+    // a second ceiling written for a shared box. Both are ceilings and
+    // both are enforced; neither is the other's excuse.
+    let shared = std::env::var("ZU_GATE_SHARED").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
     let sync = sync_cpu(root.path());
     println!("one sync costs this machine {sync:.0} us of processor time");
@@ -1539,6 +1547,14 @@ fn main() {
         ("write_cpu_nosync_us", unsynced.cpu),
     ];
     for (key, got) in checks {
+        // The one key with a ceiling per box class. On a shared runner
+        // the target below it is not the question being asked, so the
+        // shared ceiling is read instead, and the line says which one
+        // was enforced so a log is not quietly measuring the other.
+        let key = match (key, shared) {
+            ("write_cpu_nosync_us", true) => "write_cpu_nosync_shared_us",
+            (key, _) => key,
+        };
         if let Some(ceiling) = budget(key)
             && got > ceiling
         {

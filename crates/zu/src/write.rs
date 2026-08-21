@@ -34,8 +34,8 @@
 //! on disk, and on a platform where the only barrier is a full sync it
 //! costs two of them, against one for the log frame the commit already
 //! synced. So a commit folds and stops, and the file is checkpointed
-//! when the folds since the last one have taken
-//! [`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the
+//! when the folds since the last one have taken as much as
+//! [`checkpoint_due`] allows. Nothing is at risk in between: the
 //! frame is the durability point, the header on disk still names the
 //! epoch the last checkpoint folded through, and a crash replays the
 //! log from there back to where the folds had got to. What it costs is
@@ -63,15 +63,49 @@ use crate::zu1::props::{
 use crate::zu1::txn::{Cell, Deferred, Mvcc, WriteTxn};
 use crate::zu1::wal::{Commits, Wal};
 
-/// How much a run of folds may take before one of them checkpoints.
+/// The most a run of folds may take before one of them checkpoints.
 ///
-/// Every fold in a run takes fresh blocks for what it rewrites, so this
-/// is the file growth a writer that never stops is allowed to carry,
-/// 16 MiB at the 256 KiB block. A one cell write folds a handful of
-/// blocks, so a statement pays the two syncs of a checkpoint about
-/// once in a dozen and the log stays about that long, which is also
-/// about how much a recovery has to replay.
-const THRESHOLD_BLOCKS: u64 = 256;
+/// Every fold in a run takes fresh blocks for what it rewrites and
+/// gives back nothing, because until a checkpoint publishes, the header
+/// a crash would find still reads what they replaced. So this is file
+/// growth, and it is growth that stays: the high-water mark is what the
+/// file is on disk and it never comes back down. 64 MiB at the 256 KiB
+/// block, which is the ceiling rather than the number, and it is here
+/// for the store big enough that one fold approaches it on its own.
+const CEILING_BLOCKS: u64 = 256;
+
+/// The least it may take, for the store too small to have a quarter
+/// worth speaking of.
+///
+/// A checkpoint is two syncs, so the floor is really a statement rate:
+/// a small store folds a handful of blocks at a time, which puts a
+/// checkpoint every few folds and a few folds is a thousand statements
+/// or so. Far enough apart that the syncs land nowhere near the
+/// interesting end of the latency distribution, close enough that a
+/// four megabyte store stays an eight megabyte file rather than a
+/// seventy megabyte one.
+const FLOOR_BLOCKS: u64 = 16;
+
+/// What the file may grow by between checkpoints, as a fraction of what
+/// it already is.
+///
+/// A big store folds big segments, and a checkpoint per fold would put
+/// the two syncs back on the statement that the deferred path exists to
+/// take them off. Letting the slack scale with the file keeps the
+/// number of folds between checkpoints about the same whatever the
+/// store is, and bounds the waste at a quarter rather than at whatever
+/// a fixed block count works out to for the store in front of it.
+const GROWTH_SHARE: u64 = 4;
+
+/// How many blocks a fold may take before the next commit checkpoints
+/// rather than staging.
+///
+/// See [`CEILING_BLOCKS`], [`FLOOR_BLOCKS`] and [`GROWTH_SHARE`]: the
+/// slack is a quarter of the file, held between the two of them.
+fn checkpoint_due(db: &Zu1File) -> bool {
+    let slack = (db.db_header().block_count / GROWTH_SHARE).clamp(FLOOR_BLOCKS, CEILING_BLOCKS);
+    db.unpublished_blocks() >= slack
+}
 
 /// How many commits in a row may go without a fold.
 ///
@@ -366,7 +400,7 @@ impl Writer {
                 // marker before the next commit goes on top.
                 db.stage_deferred();
             } else {
-                match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
+                match checkpoint_due(db) {
                     true => self.fold(db)?,
                     false => {
                         staged_fold(db, &mut self.mvcc, &mut self.wal)?;
@@ -444,7 +478,7 @@ impl Writer {
         if self.deferred >= DEFERRED_COMMITS
             || self.patches.cells() + written_cells(&changes) > DEFERRED_CELLS
             || self.patches.bytes() + written_bytes(&changes) > DEFERRED_BYTES
-            || db.unpublished_blocks() >= THRESHOLD_BLOCKS
+            || checkpoint_due(db)
         {
             return Ok(None);
         }
@@ -1281,6 +1315,68 @@ mod tests {
             ],
         )
         .expect("props");
+    }
+
+    /// What a run of folds is allowed to add to the file, which is a
+    /// share of the file and not a number of blocks.
+    ///
+    /// It was a number of blocks, a flat 256, and the difference is a
+    /// store of 3.9 MB that ran to 71.8 before the first checkpoint
+    /// published anything: the threshold had been set when blocks were
+    /// coming back mid transaction and it was never what bounded the
+    /// file, so nothing noticed it was eighteen times too loose for a
+    /// small store. Now it is a quarter, and the floor and the ceiling
+    /// are what a quarter has to be held between: a small store folds a
+    /// handful of blocks at a time and a quarter of it would checkpoint
+    /// every other fold, and a store big enough that one fold is a
+    /// quarter of it would checkpoint every fold, which is the two
+    /// syncs a statement that the deferred path exists to avoid.
+    #[test]
+    fn the_checkpoint_threshold_is_a_share_of_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("threshold.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+
+        // A file of nothing. The floor is what answers, because a
+        // quarter of nothing would checkpoint on the first block.
+        db.db_header_mut().block_count = 0;
+        for _ in 0..FLOOR_BLOCKS - 1 {
+            db.allocate_block();
+            assert!(!checkpoint_due(&db), "under the floor is not due");
+        }
+        db.allocate_block();
+        assert!(checkpoint_due(&db), "the floor is due");
+
+        // A file big enough that the share is what answers, and small
+        // enough that it is still under the ceiling.
+        let mut db = Zu1File::create(&dir.path().join("big.zu1")).expect("create");
+        db.db_header_mut().block_count = 400;
+        let mut taken = 0;
+        while !checkpoint_due(&db) {
+            db.allocate_block();
+            taken += 1;
+            assert!(taken < 1000, "the share has to fall due somewhere");
+        }
+        // A block taken past the end of the file is also a block the
+        // file is longer by, so the two climb together and meet where a
+        // quarter of what the file has become is what has been taken
+        // out of it.
+        assert_eq!(taken, db.db_header().block_count / GROWTH_SHARE);
+        assert!(
+            taken > FLOOR_BLOCKS && taken < CEILING_BLOCKS,
+            "neither end of the clamp answered this one: {taken}"
+        );
+
+        // And a file so big that a quarter of it is more garbage than
+        // anything wants to carry, where the ceiling answers instead.
+        let mut db = Zu1File::create(&dir.path().join("huge.zu1")).expect("create");
+        db.db_header_mut().block_count = 1_000_000;
+        for _ in 0..CEILING_BLOCKS - 1 {
+            db.allocate_block();
+        }
+        assert!(!checkpoint_due(&db), "under the ceiling is not due");
+        db.allocate_block();
+        assert!(checkpoint_due(&db), "the ceiling is due whatever the share");
     }
 
     fn string(row: &[Value], at: usize) -> String {

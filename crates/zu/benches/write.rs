@@ -88,6 +88,29 @@ const LARGE: u64 = 100_000;
 /// enough to keep the bench in seconds and large enough that one slow
 /// sync does not decide the number.
 const WRITES: u64 = 200;
+/// Statements the sustained run makes before its clock starts.
+///
+/// A store that has just been loaded has never folded and has nothing
+/// on its free list, so its first thousand statements are a ramp: the
+/// file grows because no checkpoint has published anything to hand back
+/// yet, and what those statements cost is not what a running store
+/// costs. This is past the point where the small store stops growing.
+const RAMP: u64 = 1_500;
+/// Statements in the measured sustained window.
+///
+/// Long enough to hold folds at the rate they happen and more than one
+/// checkpoint, which on the small store is a fold every few hundred
+/// statements and a checkpoint every few folds. The length is the whole
+/// point of the run: a window short enough to fall between two folds
+/// measures a write path with its housekeeping taken out, and the
+/// housekeeping is not optional.
+const SUSTAINED: u64 = 2_500;
+/// How often the sustained run stops to look at the two files.
+///
+/// A stat is a microsecond against a statement that is thousands of
+/// them, and the run needs the shape of the two curves rather than
+/// every point on them.
+const SAMPLE: u64 = 25;
 /// Timed passes over the `SET` loop, of which the fastest is the
 /// number. Three, because the two clocks it protects are divided by
 /// each other and the gate machines are shared vCPUs.
@@ -286,16 +309,30 @@ fn sync_cpu(dir: &Path) -> f64 {
 /// Every byte the database occupies, which is the file and the log
 /// beside it.
 fn disk(dir: &Path) -> u64 {
-    let mut total = 0;
+    let (store, log) = parts(dir);
+    store + log
+}
+
+/// The same, with the log told apart from the store.
+///
+/// The two move for different reasons and the sustained run watches
+/// both: the store grows when a fold takes blocks no checkpoint has
+/// published yet, and the log shrinks when one finally does. A run that
+/// wants to know whether it churned asks the second, because cutting
+/// the log back is the one thing only a checkpoint does.
+fn parts(dir: &Path) -> (u64, u64) {
+    let (mut store, mut log) = (0, 0);
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return (0, 0);
     };
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            total += meta.len();
+        let Ok(meta) = entry.metadata() else { continue };
+        match entry.path().extension().and_then(|e| e.to_str()) {
+            Some("wal") => log += meta.len(),
+            _ => store += meta.len(),
         }
     }
-    total
+    (store, log)
 }
 
 /// What one run of a statement cost, per statement where that is the
@@ -1096,6 +1133,104 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// What a sustained run cost, which is a [`Cost`] and the two things
+/// only a long window can say.
+struct Sustained {
+    cost: Cost,
+    /// The store at its biggest over the run against the store as it
+    /// was loaded.
+    file_x: f64,
+    /// The store at its biggest inside the measured window against what
+    /// it was when the window opened.
+    window_x: f64,
+}
+
+/// The write path measured across its own housekeeping rather than
+/// between two rounds of it.
+///
+/// Every other run in this file is [`WRITES`] statements on a store
+/// that was loaded a moment earlier, and that window falls entirely
+/// inside the first deferred batch: no fold happens in it, no
+/// checkpoint happens in it, and the growth column reads zero because
+/// nothing that grows a file has run yet. That is an honest number for
+/// the deferred path and a misleading one for a store being written to,
+/// which is the whole reason this run exists. It ramps past the point
+/// where the file stops growing, then measures a window long enough to
+/// hold folds at their own rate and more than one checkpoint, and says
+/// what a statement costs with its share of both inside it.
+///
+/// It also says what the store was at its worst against what it was
+/// loaded as. A fold takes fresh blocks for whatever it rewrites and
+/// gives back none of them until a checkpoint publishes, so that ratio
+/// is the transient garbage the deferred path carries, and it is the
+/// number that says whether the bound on it is set anywhere near right.
+/// It was eighteen once, for a store that fit in four megabytes and ran
+/// to seventy-one.
+///
+/// What the caller checks the run against is the pair of numbers that
+/// says the housekeeping was inside the window rather than beside it.
+/// The bytes are the first: a statement that only commits pushes its
+/// log frame and nothing else, so bytes above what the short run
+/// pushes are the folds and there is nothing else they can be. The
+/// second is that the store held still while that was going on, which
+/// is not the same as the zero the short runs report. A fold that
+/// nobody published would show up as a file getting steadily bigger,
+/// one block per column it rewrote; a file that folds all window and
+/// ends the size it started is a file whose blocks are coming back,
+/// and a checkpoint publishing them is the only thing that hands a
+/// block back. Neither number can be had by a run that quietly stopped
+/// churning, which is the point of checking them.
+fn run_sustained(dir: &Path, rows: u64) -> Sustained {
+    let path = build(dir, rows);
+    let loaded = parts(dir).0;
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    let mut age = 0;
+    let set = |conn: &mut zu::Connection, age: u64| {
+        conn.query(&format!(
+            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
+        ))
+        .expect("set");
+    };
+    for _ in 0..RAMP {
+        set(&mut conn, age % rows);
+        age += 1;
+    }
+
+    let before = usage();
+    let store_before = parts(dir).0;
+    let mut peak = store_before;
+    let start = Instant::now();
+    for i in 0..SUSTAINED {
+        set(&mut conn, age % rows);
+        age += 1;
+        if (i + 1) % SAMPLE == 0 {
+            peak = peak.max(parts(dir).0);
+        }
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let store_after = parts(dir).0;
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        rows as i64,
+        "no row was added or lost"
+    );
+    Sustained {
+        cost: Cost {
+            us: elapsed.as_nanos() as f64 / 1e3 / SUSTAINED as f64,
+            cpu: after.cpu.saturating_sub(before.cpu) as f64 / SUSTAINED as f64,
+            written: after.written.saturating_sub(before.written) as f64 / SUSTAINED as f64,
+            growth: store_after.saturating_sub(store_before) as f64 / SUSTAINED as f64,
+            rss: after.rss,
+            peak: after.peak_rss.saturating_sub(before.peak_rss),
+        },
+        file_x: peak as f64 / loaded.max(1) as f64,
+        window_x: peak as f64 / store_before.max(1) as f64,
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
@@ -1153,6 +1288,47 @@ fn main() {
 
     let detach = run_detach(&root.path().join("detach"), SMALL);
     detach.report(&format!("DETACH DELETE, {SMALL} rows"), sync);
+
+    let sustained = run_sustained(&root.path().join("sustained"), SMALL);
+    sustained
+        .cost
+        .report(&format!("SET sustained, {SMALL} rows"), sync);
+    // Every run above this line reports a growth of zero, and the
+    // reason is that none of them is long enough to fold: two hundred
+    // statements all land in the first deferred batch. This one is long
+    // enough, so its growth column is a store that is holding steady
+    // rather than a store that has not started yet, and the ratio
+    // beside it is how much bigger than itself the store gets while it
+    // holds steady.
+    println!(
+        "sustained_file_x: {:.2}x store at its peak against the store as loaded",
+        sustained.file_x
+    );
+    // A run that quietly stopped churning would score better on every
+    // column above, so it fails on these two instead. The bytes say the
+    // folds were inside the window: a statement that only commits
+    // pushes its log frame, and the short run above is exactly that, so
+    // anything over it is a fold. The file says a checkpoint published
+    // them: blocks come back from nowhere else.
+    let sustained_fold_x = sustained.cost.written / set_small.written.max(1.0);
+    println!("sustained_fold_x: {sustained_fold_x:.2}x the bytes of a run that never folds");
+    println!(
+        "sustained_window_x: {:.2}x store at its peak against the store as the window opened",
+        sustained.window_x
+    );
+    assert!(
+        sustained_fold_x > 1.05,
+        "the sustained window has to contain the folds it is measuring, and it pushed \
+         {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
+        sustained.cost.written / 1024.0,
+        set_small.written / 1024.0
+    );
+    assert!(
+        sustained.window_x < 1.25,
+        "a fold nobody published grows the file by every block it rewrote, and this one \
+         grew {:.2}x over the window, so the blocks are not coming back",
+        sustained.window_x
+    );
 
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
@@ -1230,6 +1406,15 @@ fn main() {
         ("set_peak_rss_mb", set_small.peak as f64 / MB),
         ("set_fold_x", fold_x),
         ("set_write_x", write_x),
+        ("sustained_stmt_us", sustained.cost.us),
+        ("sustained_stmt_cpu_us", sustained.cost.cpu),
+        (
+            "sustained_stmt_cpu_nosync_us",
+            sustained.cost.cpu_less_sync(sync),
+        ),
+        ("sustained_stmt_kb", sustained.cost.written / 1024.0),
+        ("sustained_stmt_growth_b", sustained.cost.growth),
+        ("sustained_file_x", sustained.file_x),
     ];
     for (key, got) in checks {
         if let Some(ceiling) = budget(key)

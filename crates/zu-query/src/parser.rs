@@ -468,30 +468,31 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         lengths: Vec::new(),
         taken: 0,
         spans: Vec::new(),
+        lifted: Vec::new(),
+        hoisted: None,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
         return Ok(Statement::Transaction(stmt));
     }
-    let start = parser.here();
-    let (first, mut ending) = parser.parse_block_part()?;
-    if !parser.at_kw("NEXT") {
-        parser.finish(ending)?;
-        return Ok(first);
-    }
     // GP18, ISO 13.6. A linear statement is all query or all catalog,
     // so a chain that is neither is a statement block, and this is the
     // one place it can be told: the parts have been read and one of
     // them changes the catalog.
-    let mut parts = vec![source[start..parser.here()].trim().to_string()];
+    let start = parser.here();
+    let (first, mut ending) = parser.parse_block_part()?;
+    let mut spans = vec![(start, parser.here())];
     while parser.eat_kw("NEXT") {
         let at = parser.here();
         let (_, next) = parser.parse_block_part()?;
         ending = next;
-        parts.push(source[at..parser.here()].trim().to_string());
+        spans.push((at, parser.here()));
     }
     parser.finish(ending)?;
-    Ok(Statement::Block(parts))
+    if spans.len() == 1 && parser.lifted.is_empty() {
+        return Ok(first);
+    }
+    Ok(Statement::Block(parser.block_parts(&spans)))
 }
 
 struct Parser<'a> {
@@ -534,6 +535,25 @@ struct Parser<'a> {
     /// The range each of those stretches was written with, gathered as
     /// they are read, which is what the choices are made out of.
     spans: Vec<(usize, usize)>,
+    /// The catalog statements taken out of a call body at the head of
+    /// the statement and put in front of it (GP18).
+    lifted: Vec<Lift>,
+    /// The statements of the body of a call the statement begins with,
+    /// waiting for the chain they go in, and how the last of them
+    /// ended. See `hoist_a_leading_call`.
+    hoisted: Option<(Vec<Simple>, Ending)>,
+}
+
+/// A catalog statement lifted out of a call body (GP18).
+///
+/// `from` and `to` are the statement itself, which becomes a part of
+/// the block, and `from` to `cut` is what comes out of the text the
+/// rest of the statement is made of: the statement and the `NEXT`
+/// handing over to what follows it.
+struct Lift {
+    from: usize,
+    to: usize,
+    cut: usize,
 }
 
 impl Parser<'_> {
@@ -753,13 +773,15 @@ impl Parser<'_> {
                 self.parse_graph_stmt(creating, or_replace)?
             }
         };
-        // Two things may follow and both belong to the caller: the
-        // semicolon that ends the text, and a `NEXT` handing over to
-        // the rest of a statement block (GP18). Neither is eaten here,
-        // so the block reads a part that stops where the part stops;
-        // anything else is a mistake named here rather than left to a
-        // caller that would have to guess what was written.
-        if !self.at_kw("NEXT") {
+        // Three things may follow and all of them belong to the
+        // caller: the semicolon that ends the text, a `NEXT` handing
+        // over to the rest of a statement block (GP18), and the brace
+        // closing a call body, which the call names better than this
+        // could. None is eaten here, so the block reads a part that
+        // stops where the part stops; anything else is a mistake named
+        // here rather than left to a caller that would have to guess
+        // what was written.
+        if !self.at_kw("NEXT") && !self.at(&TokenKind::RBrace) {
             let past = usize::from(self.at(&TokenKind::Semicolon));
             if let Some(token) = self.tokens.get(self.pos + past) {
                 return Err(ZuError::gql_in(
@@ -1461,6 +1483,37 @@ impl Parser<'_> {
         self.peek().map_or(self.source.len(), |t| t.start)
     }
 
+    /// The text of each part of a statement block, in the order the
+    /// parts run (GP18).
+    ///
+    /// The spans are the parts as they were written, one per link of
+    /// the `NEXT` chain. Anything lifted out of a call body comes
+    /// first, since a lift only happens at the head of the statement,
+    /// and the text it was cut from is what is left of the span it fell
+    /// in. Cuts do not overlap and are gathered in the order they were
+    /// read, so one walk over each span is enough.
+    fn block_parts(&self, spans: &[(usize, usize)]) -> Vec<String> {
+        let mut parts: Vec<String> = self
+            .lifted
+            .iter()
+            .map(|lift| self.source[lift.from..lift.to].trim().to_string())
+            .collect();
+        for &(from, to) in spans {
+            let mut text = String::new();
+            let mut at = from;
+            for lift in &self.lifted {
+                if lift.from < at || lift.cut > to {
+                    continue;
+                }
+                text.push_str(&self.source[at..lift.from]);
+                at = lift.cut;
+            }
+            text.push_str(&self.source[at..to]);
+            parts.push(text.trim().to_string());
+        }
+        parts
+    }
+
     /// The end of the text, which is where a statement ends: the
     /// optional semicolon after it, and nothing else past that.
     fn finish(&mut self, ending: Ending) -> Result<()> {
@@ -1567,23 +1620,122 @@ impl Parser<'_> {
     /// with a `RETURN`, because a block that returns nothing is a
     /// perfectly good one. It says the row it ran for goes on unchanged
     /// or, where the block wrote something, that the writing happened.
-    fn parse_call_block(&mut self) -> Result<Query> {
+    ///
+    /// `head` says the call is the whole front of the statement, with
+    /// nothing written before the word, which is what lets a catalog
+    /// statement open the body (GP18). See `lift_catalog_out_of_a_call`
+    /// for why it is only allowed there.
+    fn parse_call_block(&mut self, head: bool) -> Result<(Query, Ending)> {
         self.expect(&TokenKind::LBrace)?;
-        self.refuse_catalog_in_a_call()?;
-        let (query, _) = self.parse_query_body()?;
+        while self.at_catalog_stmt() {
+            self.lift_catalog_out_of_a_call(head)?;
+        }
+        let (query, ending) = self.parse_query_body()?;
         self.refuse_catalog_in_a_call()?;
         self.expect(&TokenKind::RBrace)?;
-        Ok(query)
+        Ok((query, ending))
     }
 
-    /// A catalog statement inside a call body is refused (GP18).
+    /// Takes a catalog statement standing at the top of a call body out
+    /// of the body and puts it in front of the statement (GP18).
     ///
-    /// ISO lets a procedure body hold one and a statement written to a
-    /// session is a procedure body here, so that is where it goes. A
-    /// call body is not that: it runs once for every row that reaches
-    /// it, and a graph is made once or not at all, so a block that made
-    /// one would work for a call over one row and raise for a call over
-    /// two.
+    /// ISO lets a procedure body hold a catalog statement among its
+    /// data statements, and the corpus writes the mix inside a `CALL`,
+    /// which is a procedure body too. The trouble with a call body is
+    /// that it runs once for every row that reaches it, and a graph is
+    /// made once or not at all, so a body that made one would work for
+    /// a call over one row and raise for a call over two. A call
+    /// written as the front of the statement has exactly one row to run
+    /// for, the unit row every statement starts from, so there the mix
+    /// means something, and `CALL { A NEXT B } rest` says what
+    /// `A NEXT CALL { B } rest` says. That rewrite is what this does,
+    /// which is why the lift is refused anywhere else: it is not that
+    /// the standard forbids the mix further in, it is that lifting it
+    /// there would move a statement out of the loop it was written in.
+    fn lift_catalog_out_of_a_call(&mut self, head: bool) -> Result<()> {
+        if !head {
+            return self.refuse_catalog_in_a_call();
+        }
+        let from = self.here();
+        self.parse_catalog_stmt()?;
+        let to = self.here();
+        if !self.eat_kw("NEXT") {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.here(),
+                format_args!(
+                    "a call body answers the rows the call adds to the row it ran for and a catalog statement answers none, so one written in a body hands over to a statement that does"
+                ),
+            ));
+        }
+        self.lifted.push(Lift {
+            from,
+            to,
+            cut: self.here(),
+        });
+        Ok(())
+    }
+
+    /// Takes the body of a call the statement begins with out of the
+    /// call and puts its statements in the `NEXT` chain around it,
+    /// answering `None` where it did and the body back where it did
+    /// not.
+    ///
+    /// A call adds what its body answers to the row it ran for. The
+    /// row a call at the front of a statement runs for is the unit row
+    /// every statement starts from, which carries nothing, so what the
+    /// row becomes is what the body answered and `CALL { A } rest` says
+    /// what `A NEXT rest` says. Written the second way it is a chain of
+    /// statements, and a statement of a chain may do the things a
+    /// spliced body may not: count its rows, order them, take a page of
+    /// them, or be several statements itself.
+    ///
+    /// Four things hold it back. A scope clause naming variables is
+    /// asking about a row that has none, and it is refused rather than
+    /// quietly made to mean nothing. A body naming a graph of its own,
+    /// or one written out of set operators, is not a chain to be put in
+    /// one. And a body that does not end with `RETURN` answers no rows
+    /// for a `NEXT` to read, so it stays where it was written.
+    fn hoist_a_leading_call(
+        &mut self,
+        scope: &Option<Vec<String>>,
+        body: Query,
+        ending: Ending,
+    ) -> Option<Query> {
+        if scope.as_ref().is_some_and(|names| !names.is_empty())
+            || body.use_graph.is_some()
+            || !body.bindings.is_empty()
+            || ending != Ending::Result
+        {
+            return Some(body);
+        }
+        let Query {
+            use_graph,
+            bindings,
+            body,
+        } = body;
+        match body {
+            Composite::Linear(linear) => {
+                self.hoisted = Some((linear.statements, ending));
+                None
+            }
+            body => Some(Query {
+                use_graph,
+                bindings,
+                body,
+            }),
+        }
+    }
+
+    /// A catalog statement inside a call body is refused (GP18) where
+    /// it cannot be lifted out of one.
+    ///
+    /// That is a call the statement does not begin with, which runs for
+    /// every row that reaches it, and a catalog statement written
+    /// behind the data statements of a body rather than in front of
+    /// them, where taking it out would run it before the statements it
+    /// was written after.
     fn refuse_catalog_in_a_call(&self) -> Result<()> {
         if !self.at_catalog_stmt() && !self.next_hands_to_catalog() {
             return Ok(());
@@ -1593,7 +1745,7 @@ impl Parser<'_> {
             self.source,
             self.here(),
             format_args!(
-                "a call body runs once for every row that reaches it and a catalog statement makes or unmakes a thing once, so it is written beside the call rather than inside it"
+                "a call body runs once for every row that reaches it and a catalog statement makes or unmakes a thing once, so it is written beside the call, or at the front of the body of a call the statement begins with"
             ),
         ))
     }
@@ -1661,7 +1813,7 @@ impl Parser<'_> {
             self.pos += 1;
         }
         let init = if self.at(&TokenKind::LBrace) {
-            BindingInit::Query(Box::new(self.parse_call_block()?))
+            BindingInit::Query(Box::new(self.parse_call_block(false)?.0))
         } else if kind == BindingKind::Graph {
             BindingInit::Expr(Expr::GraphRef(self.parse_graph_ref()?))
         } else {
@@ -1730,6 +1882,24 @@ impl Parser<'_> {
         let mut statements = Vec::new();
         loop {
             let (simple, ending) = self.parse_simple()?;
+            // The body of a call the statement began with, which goes
+            // in this chain in front of what was written after the
+            // call. Where the call was the whole statement what is left
+            // of it is empty, and the last statement of the body is the
+            // one this chain ends with.
+            let (simple, ending) = match self.hoisted.take() {
+                None => (simple, ending),
+                Some((mut body, theirs)) => {
+                    let mine = simple.clauses.is_empty() && simple.result.is_none();
+                    let last = if mine {
+                        body.pop().expect("a call block holds a statement")
+                    } else {
+                        simple
+                    };
+                    statements.append(&mut body);
+                    (last, if mine { theirs } else { ending })
+                }
+            };
             statements.push(simple);
             if self.at_kw("NEXT") && ending == Ending::Finish {
                 return Err(ZuError::gql_in(
@@ -1862,8 +2032,19 @@ impl Parser<'_> {
                 // the inline call, and a name is the table function,
                 // there being nothing else a call can start with.
                 if self.at(&TokenKind::LBrace) || self.at(&TokenKind::LParen) {
+                    // The word was the first token of the statement, so
+                    // the body runs for the one row a statement starts
+                    // from and a catalog statement may open it (GP18).
+                    let head = self.pos == 1;
                     let scope = self.parse_variable_scope()?;
-                    let body = self.parse_call_block()?;
+                    let (body, ending) = self.parse_call_block(head)?;
+                    let Some(body) = (if head {
+                        self.hoist_a_leading_call(&scope, body, ending)
+                    } else {
+                        Some(body)
+                    }) else {
+                        continue;
+                    };
                     clauses.push(Clause::CallInline {
                         scope,
                         body: Box::new(body),
@@ -5811,19 +5992,61 @@ mod tests {
         );
     }
 
-    /// A catalog statement inside a call body is refused with the
-    /// reason, since a call body runs once per row.
+    /// GP18. A call body is a procedure body too, so a catalog
+    /// statement may open one, and where the call is the front of the
+    /// statement it is taken out and run in front of what is left.
     #[test]
-    fn a_catalog_statement_is_not_written_inside_a_call_body() {
+    fn a_catalog_statement_at_the_front_of_a_call_body_is_lifted_out_of_it() {
+        assert_eq!(
+            block_parts(
+                "CALL {\n  CREATE PROPERTY GRAPH mixed ANY\n  NEXT\n  \
+                 MATCH (p:Person)\n  RETURN COUNT(*) AS n\n}\nRETURN n AS n"
+            ),
+            vec![
+                "CREATE PROPERTY GRAPH mixed ANY",
+                "CALL {\n  MATCH (p:Person)\n  RETURN COUNT(*) AS n\n}\nRETURN n AS n",
+            ],
+        );
+        assert_eq!(
+            block_parts(
+                "CALL () { CREATE GRAPH a ANY NEXT DROP GRAPH b NEXT MATCH (p) RETURN p AS p } \
+                 RETURN p AS p NEXT DROP GRAPH a"
+            ),
+            vec![
+                "CREATE GRAPH a ANY",
+                "DROP GRAPH b",
+                "CALL () { MATCH (p) RETURN p AS p } RETURN p AS p",
+                "DROP GRAPH a",
+            ],
+        );
+    }
+
+    /// A catalog statement is refused where taking it out of the body
+    /// would change what it means: in a call the statement does not
+    /// begin with, which runs for every row that reaches it, and behind
+    /// the data statements of a body rather than in front of them.
+    #[test]
+    fn a_catalog_statement_is_not_written_deeper_inside_a_call_body() {
         for source in [
-            "CALL () { CREATE GRAPH g ANY }",
+            "MATCH (p:Person) CALL (p) { CREATE GRAPH g ANY NEXT INSERT (:Person) } RETURN p AS p",
+            "CALL { INSERT (:Person) NEXT DROP GRAPH g }",
             "MATCH (p:Person) CALL (p) { INSERT (:Person) NEXT DROP GRAPH g } RETURN p AS p",
         ] {
             assert!(
-                catalog_err(source).contains("written beside the call rather than inside it"),
+                catalog_err(source).contains("written beside the call"),
                 "{source}"
             );
         }
+    }
+
+    /// A body answers rows and a catalog statement answers none, so a
+    /// body that is only a catalog statement is refused.
+    #[test]
+    fn a_call_body_that_is_only_a_catalog_statement_is_refused() {
+        assert!(
+            catalog_err("CALL () { CREATE GRAPH g ANY }").contains("hands over to a statement"),
+            "the refusal says what is missing behind it"
+        );
     }
 
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes

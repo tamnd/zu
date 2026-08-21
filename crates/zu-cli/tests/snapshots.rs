@@ -410,22 +410,40 @@ fn decimals(text: &str) -> String {
         while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
-        if bytes.get(i) != Some(&b'.') || !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
-            out.push_str(&text[start..i]);
-            continue;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        // A point and its digits, an exponent, or both. Either one on
+        // its own makes the run a measurement rather than a count,
+        // which matters because the writer behind the JSON output
+        // drops the point entirely once a number is small enough: a
+        // parse that took nine hundredths of a millisecond prints as
+        // 9e-5 and the digits in front of the e are all there is of it.
+        let mut measured = false;
+        if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            measured = true;
             i += 1;
-        }
-        if bytes.get(i) == Some(&b'e') {
-            i += 1;
-            if matches!(bytes.get(i), Some(b'-' | b'+')) {
-                i += 1;
-            }
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
+        }
+        if bytes.get(i) == Some(&b'e') {
+            let mut at = i + 1;
+            if matches!(bytes.get(at), Some(b'-' | b'+')) {
+                at += 1;
+            }
+            let digits = at;
+            while at < bytes.len() && bytes[at].is_ascii_digit() {
+                at += 1;
+            }
+            // An exponent is digits and then something that is not a
+            // letter or a digit. A revision hash reads as a number and
+            // an e and more of itself, and it is not a measurement.
+            if at > digits && !bytes.get(at).is_some_and(u8::is_ascii_alphanumeric) {
+                measured = true;
+                i = at;
+            }
+        }
+        if !measured {
+            out.push_str(&text[start..i]);
+            continue;
         }
         out.push_str("<n>");
     }
@@ -453,4 +471,30 @@ fn snapshot(name: &str, actual: &str) {
          it.\n\n--- committed\n{committed}\n--- printed\n{actual}",
         path.display()
     );
+}
+
+/// The scrubber is what makes these snapshots hold on a machine of a
+/// different speed, so what it does and does not take out is worth a
+/// test of its own. The exponent cases are the ones that took a build
+/// down: a fast enough parse prints with no decimal point in it at all.
+#[test]
+fn a_measurement_is_scrubbed_and_a_count_is_not() {
+    for (text, want) in [
+        (
+            "copied 4 edges, 4 nodes, 1 groups",
+            "copied 4 edges, 4 nodes, 1 groups",
+        ),
+        ("2359296 bytes on disk", "2359296 bytes on disk"),
+        ("total 0.0123s", "total <n>s"),
+        ("\"parse_secs\":9e-5", "\"parse_secs\":<n>"),
+        ("\"parse_secs\":9.5e-5", "\"parse_secs\":<n>"),
+        ("\"edges_per_sec\":1.2e+7", "\"edges_per_sec\":<n>"),
+        (
+            "2 M edges/s and 4e2f1a is a revision",
+            "2 M edges/s and 4e2f1a is a revision",
+        ),
+        ("version 1e", "version 1e"),
+    ] {
+        assert_eq!(decimals(text), want, "scrubbing {text}");
+    }
 }

@@ -2598,6 +2598,34 @@
       "doc": "Writes the next field of this row.\n\nA field of the wrong type, or one past the end of the row, is\nrecorded and the rest of the row is written nowhere. Nothing\nhere returns a result, because a row implementation pushing its\nfields in order has nothing useful to do with one and the\nappender is where the error belongs."
     },
     {
+      "id": "zu::bytes",
+      "kind": "module",
+      "name": "bytes",
+      "source": "zu_common::bytes",
+      "doc": "Byte strings, GV35: how one is written down and how one is read\nback.\n\nA byte string is a sequence of octets, and there is no encoding to\nguess at: the value is the bytes. What there is, is a spelling, and\nISO 21.3 gives it as `X'00AB'`, two hexits to a byte. Writing and\nreading that spelling is the whole of this module, and it is here\nrather than beside the lexer because the same spelling comes back\nout of a result column, so a value that went in as `X'00ab'` and\ncame back as `X'00AB'` is the same value and reads as one."
+    },
+    {
+      "id": "zu::bytes::from_hexits",
+      "kind": "function",
+      "name": "from_hexits",
+      "signature": "fn from_hexits(text: &str) -> Option<Vec<u8>>",
+      "doc": "The bytes a run of hexits names, `None` for anything that is not a\nrun of hexits or names half a byte.\n\nSpace is allowed anywhere and dropped, which is what the standard's\nproduction allows and what lets a long literal be written in groups."
+    },
+    {
+      "id": "zu::bytes::hexits",
+      "kind": "function",
+      "name": "hexits",
+      "signature": "fn hexits(bytes: &[u8]) -> String",
+      "doc": "The hexits of a byte string, upper case, no quotes and no `X`.\n\nUpper case because ISO writes the literal that way, and a reader\ncomparing two of these is comparing text: one case is one answer."
+    },
+    {
+      "id": "zu::bytes::literal",
+      "kind": "function",
+      "name": "literal",
+      "signature": "fn literal(bytes: &[u8]) -> String",
+      "doc": "The literal a byte string is written as, quotes and `X` and all."
+    },
+    {
       "id": "zu::catalog_stmt",
       "kind": "module",
       "name": "catalog_stmt",
@@ -4371,6 +4399,14 @@
       "signature": "Bool(bool)"
     },
     {
+      "id": "zu::query::Value::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::query::Value",
+      "signature": "Bytes(Vec<u8>)",
+      "doc": "GV35, a byte string: a sequence of octets and not of characters.\n`X'0041'` is one byte string of two bytes and never the letter\nA, which is the whole reason it is an arm here rather than a\n`Str` holding the same bytes."
+    },
+    {
       "id": "zu::query::Value::Chain",
       "kind": "variant",
       "name": "Chain",
@@ -4643,6 +4679,14 @@
       "doc": "One bit per row, least significant bit first, the same packing\nas [`Validity`]."
     },
     {
+      "id": "zu::query::column::ColumnData::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Bytes(StrColumn)",
+      "doc": "GV35, a byte string column. The same two buffers a string\ncolumn keeps, over bytes that are not text, which is why the\narm is its own and not a flag on the one above."
+    },
+    {
       "id": "zu::query::column::ColumnData::Complex",
       "kind": "variant",
       "name": "Complex",
@@ -4723,6 +4767,14 @@
       "name": "Bool",
       "of": "zu::query::column::ColumnType",
       "signature": "Bool"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Bytes",
+      "doc": "GV35, a byte string. It rides the same offsets and bytes a\nstring column does and is not one: the bytes are octets and\nneed not be text at all, so a reader that took this for a\nstring would be handed something it cannot decode."
     },
     {
       "id": "zu::query::column::ColumnType::Date",

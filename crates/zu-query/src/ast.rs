@@ -1655,6 +1655,12 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Str(String),
+    /// GL08, GV35. A byte string, the bytes an `X'00AB'` names. It is
+    /// its own arm and not a string holding the same bytes, because a
+    /// byte string is a sequence of octets and a character string is a
+    /// sequence of characters, and the two are measured, compared and
+    /// trimmed by different units.
+    Bytes(Vec<u8>),
     /// A temporal value written with its type, as in `DATE '2024-01-15'`.
     /// The text is read at parse time, so the plan carries the instant
     /// and never the spelling.

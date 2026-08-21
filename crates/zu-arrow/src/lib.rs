@@ -45,9 +45,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, LargeStringArray, NullArray, StringArray, Time64NanosecondArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array,
+    Int64Array, IntervalMonthDayNanoArray, LargeBinaryArray, LargeStringArray, NullArray,
+    StringArray, Time64NanosecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
@@ -517,6 +517,10 @@ pub fn data_type(name: &str, ty: &ColumnType) -> Result<DataType, Error> {
         ColumnType::Int => DataType::Int64,
         ColumnType::Float => DataType::Float64,
         ColumnType::Str => DataType::Utf8,
+        // Arrow's binary type, which is the string layout over bytes
+        // that are not text, the same relation the two column types
+        // have here.
+        ColumnType::Bytes => DataType::Binary,
         ColumnType::Date => DataType::Date32,
         ColumnType::LocalTime => DataType::Time64(TimeUnit::Nanosecond),
         ColumnType::LocalDatetime => DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -588,6 +592,18 @@ fn column<T: Tables + ?Sized>(
             // 32 bit offset stops addressing the bytes. Arrow's own
             // answer is the wider type and every reader has it.
             Offsets::I64(offsets) => Arc::new(LargeStringArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Buffer::from_vec(held.bytes),
+                valid,
+            )?),
+        },
+        ColumnData::Bytes(held) => match held.offsets {
+            Offsets::I32(offsets) => Arc::new(BinaryArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Buffer::from_vec(held.bytes),
+                valid,
+            )?),
+            Offsets::I64(offsets) => Arc::new(LargeBinaryArray::try_new(
                 OffsetBuffer::new(ScalarBuffer::from(offsets)),
                 Buffer::from_vec(held.bytes),
                 valid,

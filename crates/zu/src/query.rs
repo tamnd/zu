@@ -607,6 +607,14 @@ fn column_value(
             })?;
             Ok(Value::Str(text))
         }
+        // A byte string is the same blob read without the decode: the
+        // octets are the value, so there is nothing to check them
+        // against and a column of them can hold anything.
+        LogicalType::Bytes { .. } => {
+            let mut bytes = Vec::new();
+            reader.read_str(db, col, row, &mut bytes)?;
+            Ok(Value::Bytes(bytes))
+        }
         // A stored list comes back as the list value the rest of the
         // engine already has, element by element through the same
         // reading a scalar column of that type gets, so `b.xs` and a

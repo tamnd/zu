@@ -8,6 +8,10 @@
 //!
 //! Published on crates.io as `zudb` (the name `zu` is taken).
 
+/// How a byte string is written down and read back, GV35: the `X'00AB'`
+/// spelling a query writes one with and a result column hands one back
+/// as.
+pub use zu_common::bytes;
 pub use zu_common::gqlstatus;
 pub use zu_common::{
     C_ABI_VERSION, DiagnosticRecord, DurationKind, Epoch, FloatBits, GqlStatus, IntBits, Interrupt,

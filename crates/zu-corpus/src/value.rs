@@ -143,7 +143,7 @@ pub enum Form {
 /// the corpus is a contract for languages where they are not: a
 /// TypeScript client returns `number` for one and `bigint` for the
 /// other, and a case that did not say which meant nothing to it.
-const TYPES: [(&str, Form); 23] = [
+const TYPES: [(&str, Form); 24] = [
     ("NULL", Form::Exact),
     ("BOOL", Form::Exact),
     ("INT8", Form::Exact),
@@ -157,6 +157,11 @@ const TYPES: [(&str, Form); 23] = [
     ("FLOAT32", Form::Text),
     ("FLOAT64", Form::Text),
     ("STRING", Form::Exact),
+    // A byte string is written in quotes because its hexits are digits
+    // as often as not: a bare 0041 is a number with a leading zero in
+    // one reader and the string it looks like in another, and neither
+    // of them is the two octets the case meant.
+    ("BYTES", Form::Text),
     ("DATE", Form::Text),
     ("LOCALTIME", Form::Text),
     ("ZONEDTIME", Form::Text),
@@ -177,7 +182,7 @@ const TYPES: [(&str, Form); 23] = [
 /// The types the encoding reserves a name for and the engine has no
 /// runtime value for yet, kept apart from an outright typo so that the
 /// error says which of the two it is.
-const RESERVED: [&str; 2] = ["DECIMAL", "BYTES"];
+const RESERVED: [&str; 1] = ["DECIMAL"];
 
 pub fn form(ty: &str) -> Option<Form> {
     TYPES.iter().find(|(name, _)| *name == ty).map(|(_, f)| *f)
@@ -404,6 +409,10 @@ fn scalar(ty: &str, text: &str) -> Option<Value> {
             _ => None,
         },
         "STRING" => Some(Value::Str(text.to_string())),
+        // The hexits and nothing else: the X and the quotes belong to
+        // the statement that writes a literal, and what a case spells
+        // here is the value, which is the octets.
+        "BYTES" => zu_common::bytes::from_hexits(text).map(Value::Bytes),
         "INT8" => text.parse::<i8>().ok().map(|n| Value::Int(n.into())),
         "INT16" => text.parse::<i16>().ok().map(|n| Value::Int(n.into())),
         "INT32" => text.parse::<i32>().ok().map(|n| Value::Int(n.into())),
@@ -478,6 +487,7 @@ fn plain(value: &Value) -> String {
         Value::Int(n) => format!("INT64 \"{n}\""),
         Value::Float(f) => format!("FLOAT64 \"{}\"", show_float(*f)),
         Value::Str(s) => format!("STRING {s:?}"),
+        Value::Bytes(b) => format!("BYTES \"{}\"", zu_common::bytes::hexits(b)),
         Value::Temporal(t) => format!("{} \"{t}\"", type_name(&t.logical_type())),
         Value::List(items) => {
             let items: Vec<String> = items.iter().map(plain).collect();

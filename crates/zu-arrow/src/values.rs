@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, StructArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array,
+    Int64Array, IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, StructArray,
     Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -74,6 +74,15 @@ pub fn build<T: Tables + ?Sized>(
                     _ => None,
                 })
                 .collect::<StringArray>(),
+        ),
+        ColumnType::Bytes => Arc::new(
+            values
+                .iter()
+                .map(|value| match value {
+                    Value::Bytes(b) => Some(b.as_slice()),
+                    _ => None,
+                })
+                .collect::<BinaryArray>(),
         ),
         ColumnType::Date => Arc::new(
             temporals(values)

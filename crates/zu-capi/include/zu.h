@@ -52,14 +52,14 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.13 and another
+ * system tests when it has to compile one way against 0.14 and another
  * against what comes next. The two numbers are counts and not decimals,
- * so 0.13 is the revision after 0.12 and a caller comparing them
+ * so 0.14 is the revision after 0.13 and a caller comparing them
  * compares each on its own. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.13"
+#define ZU_ABI_VERSION "0.14"
 
 #ifdef __cplusplus
 extern "C" {
@@ -154,6 +154,10 @@ typedef enum zu_status {
    whole of what a binding can say about the cell. */
 #define ZU_TYPE_GRAPH 11
 #define ZU_TYPE_BINDING_TABLE 12
+/* GV35, a byte string. It reads through zu_value_bytes and not through
+   zu_value_str: the octets need not be text, and a host that took them
+   for a string would decode them. */
+#define ZU_TYPE_BYTES 13
 
 /* Which temporal a temporal cell is, from zu_value_temporal. The unit
  * follows the kind: days for a date, months for a year-month duration,
@@ -586,6 +590,12 @@ zu_status zu_value_bool(const zu_value *v, int32_t *out);
 zu_status zu_value_i64(const zu_value *v, int64_t *out);
 zu_status zu_value_f64(const zu_value *v, double *out);
 zu_status zu_value_str(const zu_value *v, const char **out, size_t *len);
+/* A byte string on the same terms as zu_value_str: pointing into the
+ * result's bytes, not copied, not NUL-terminated, and len may not be
+ * NULL. A separate accessor because the two hold different types and
+ * one answering both would let a host read octets as text without ever
+ * asking whether they were. */
+zu_status zu_value_bytes(const zu_value *v, const uint8_t **out, size_t *len);
 /* kind and count are required; offset may be NULL for a host with no
  * zoned type, and is minutes east of UTC, 0 for the five kinds that
  * carry none. */

@@ -943,3 +943,126 @@ cases:
       - values:
           - type: NULL
           - type: NULL
+
+  - name: a-byte-string-literal
+    doc: A byte string is written as an X and the octets in hexits, and it is a value of its own and not the characters those octets happen to encode, so a client that hands back the letter A for X'0041' has decoded something the statement never asked it to decode.
+    query: RETURN X'00AB00' AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BYTES
+            value: "00AB00"
+
+  - name: an-empty-byte-string
+    doc: A byte string of no octets is a value the way the empty string is one, so a client answering null for it has answered a different question.
+    query: RETURN X'' AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BYTES
+            value: ""
+
+  - name: either-case-of-hexit-writes-the-same-octets
+    doc: The hexits above nine are letters and both cases of them spell the same octet, so a client that keeps the source text rather than the value gives back two different answers for one value.
+    query: RETURN X'00ab' AS lower, X'00AB' AS upper
+    columns:
+      - lower
+      - upper
+    rows:
+      - values:
+          - type: BYTES
+            value: "00AB"
+          - type: BYTES
+            value: "00AB"
+
+  - name: a-byte-string-is-not-the-string-it-encodes
+    doc: The octets of X'0041' are those of a NUL and the letter A in every encoding anyone uses, and the two values are still not equal, because a byte string is a sequence of octets and a character string is a sequence of characters and no comparison between them is defined.
+    query: RETURN X'0041' = 'A' AS same
+    columns:
+      - same
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: byte-strings-order-by-their-octets
+    doc: Octets are all a byte string has to order by, there being no collation over bytes that are not text, and a shorter one that is a prefix of a longer one comes first the way a shorter string does.
+    query: RETURN X'00AA' < X'00AB' AS lt, X'00' < X'0000' AS prefix
+    columns:
+      - lt
+      - prefix
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+          - type: BOOL
+            value: true
+
+  - name: the-octets-of-a-byte-string-are-counted
+    doc: OCTET_LENGTH is the one length question a byte string answers, and it answers it without decoding anything first, the octets being the value.
+    query: RETURN OCTET_LENGTH(X'00AB00') AS n, OCTET_LENGTH(X'') AS empty
+    columns:
+      - n
+      - empty
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "0"
+
+  - name: a-byte-string-trimmed-at-both-ends
+    doc: The trim family takes a byte string as readily as a string and trims octets rather than characters, which is the whole of GF07.
+    query: RETURN OCTET_LENGTH(TRIM(BOTH X'00' FROM X'00AB00')) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: each-end-of-a-byte-string-trims-on-its-own
+    doc: LEADING and TRAILING name one end each over octets the way they name one end each over characters, and the answer is a byte string and not a count.
+    query: RETURN TRIM(LEADING X'00' FROM X'00AB00') AS front, TRIM(TRAILING X'00' FROM X'00AB00') AS back
+    columns:
+      - front
+      - back
+    rows:
+      - values:
+          - type: BYTES
+            value: "AB00"
+          - type: BYTES
+            value: "00AB"
+
+  - name: a-set-of-octets-is-trimmed-by-the-three-that-take-one
+    doc: BTRIM, LTRIM and RTRIM take as many octets as they are given and stop at the first octet the set does not hold, which is what they do with characters.
+    query: RETURN BTRIM(X'0011AB1100', X'0011') AS b, LTRIM(X'0011AB1100', X'0011') AS l, RTRIM(X'0011AB1100', X'0011') AS r
+    columns:
+      - b
+      - l
+      - r
+    rows:
+      - values:
+          - type: BYTES
+            value: "AB"
+          - type: BYTES
+            value: "AB1100"
+          - type: BYTES
+            value: "0011AB"
+
+  - name: the-octet-nobody-wrote-is-nought
+    doc: A trim with no octet written trims X'00' and not a space, a space being a character and a byte string having none, and X'00' being the octet a short byte string is padded out with.
+    query: RETURN TRIM(X'0000AB0000') AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: BYTES
+            value: "AB"
+
+  - name: trimming-more-than-one-octet-is-a-condition
+    doc: TRIM trims one octet and says so, the way it trims one character and says so, and a longer one raises the trim error the standard names rather than being read as the set the other three take.
+    query: RETURN TRIM(BOTH X'0011' FROM X'00AB') AS t
+    raises: "22027"

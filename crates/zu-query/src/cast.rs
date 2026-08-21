@@ -90,12 +90,12 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         // value of `NULL` and the top of this function has already
         // answered it, and no value at all has type `NOTHING`.
         LogicalType::Null | LogicalType::Nothing => Err(forbidden(&v, ty.base())),
-        // GV35 to GV38. There is no byte string value in this executor
-        // yet and no syntax to write one with, and a cast that picked an
-        // encoding for a character string on the user's behalf would be
-        // a wrong answer rather than a missing one, so the whole column
-        // refuses until the value exists.
-        LogicalType::Bytes { .. } => Err(forbidden(&v, ty.base())),
+        // GV35 to GV38. A byte string casts to a byte string and
+        // nothing else casts to one: a cast that picked an encoding for
+        // a character string on the user's behalf would be a wrong
+        // answer rather than a missing one, and picking one is the whole
+        // of what such a cast would have to do.
+        LogicalType::Bytes { min, max, .. } => to_bytes(v, *min, *max),
         // `base()` above has already removed the wrapper, and matching
         // on it here rather than on a catch-all is what makes a new
         // member of the lattice a compile error in this function.
@@ -205,6 +205,7 @@ pub(crate) fn value_type(v: &Value) -> String {
         Value::Int(_) => "INT64".into(),
         Value::Float(_) => "FLOAT64".into(),
         Value::Str(_) => "STRING".into(),
+        Value::Bytes(_) => "BYTES".into(),
         Value::Node { .. } => "NODE".into(),
         Value::Rel { .. } => "EDGE".into(),
         Value::List(_) => "LIST".into(),
@@ -686,6 +687,39 @@ fn to_str(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
     Ok(Value::Str(s))
 }
 
+/// GV35 to GV38, a cast to a byte string, which only a byte string
+/// takes.
+///
+/// The two lengths are counted in octets and behave the way the two
+/// lengths of a character string do: too long is `22001`, and too short
+/// is padded, with `X'00'` here rather than a space, since a byte string
+/// has no space to pad with and `X'00'` is the octet ISO fixes a short
+/// one out with.
+fn to_bytes(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
+    let mut bytes = match &v {
+        Value::Bytes(bytes) => bytes.clone(),
+        other => return Err(forbidden_named(other, "BYTES")),
+    };
+    if let Some(max) = max
+        && bytes.len() > max as usize
+    {
+        return Err(ZuError::gql(
+            codes::C22001,
+            format!(
+                "{} is {} octets and the target holds {max}",
+                zu_common::bytes::literal(&bytes),
+                bytes.len()
+            ),
+        ));
+    }
+    if let Some(min) = min
+        && bytes.len() < min as usize
+    {
+        bytes.resize(min as usize, 0);
+    }
+    Ok(Value::Bytes(bytes))
+}
+
 /// The canonical spelling of a width, for messages.
 fn name(signed: bool, bits: IntBits) -> String {
     format!("{}INT{}", if signed { "" } else { "U" }, bits.bits())
@@ -889,6 +923,10 @@ mod tests {
             "22G03 22G03 22018 22018 22018 22018 . 22G03 . 22007 22007 . . 22G0H 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22018",
         ),
         (
+            "bytes",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . 22G03 22G03",
+        ),
+        (
             "list",
             "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V . 22G03 . . 22G03 22G03",
         ),
@@ -962,6 +1000,7 @@ mod tests {
             Value::Str("1".into()),
             Value::Str("true".into()),
             Value::Str("2024-01-15".into()),
+            Value::Bytes(vec![0x00, 0xAB]),
             Value::List(vec![Value::Int(1)]),
             Value::record(vec![("a".into(), Value::Int(1))]),
             Value::Node {
@@ -1106,6 +1145,7 @@ mod tests {
             Value::Chain(_) => "chain",
             Value::Graph(_) => "graph",
             Value::BindingTable(_) => "binding table",
+            Value::Bytes(_) => "bytes",
         }
     }
 

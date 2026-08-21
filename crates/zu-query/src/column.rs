@@ -69,6 +69,11 @@ pub enum ColumnType {
     Int,
     Float,
     Str,
+    /// GV35, a byte string. It rides the same offsets and bytes a
+    /// string column does and is not one: the bytes are octets and
+    /// need not be text at all, so a reader that took this for a
+    /// string would be handed something it cannot decode.
+    Bytes,
     /// Days since 1970-01-01.
     Date,
     /// Nanoseconds since midnight.
@@ -112,6 +117,7 @@ impl ColumnType {
             ColumnType::Int => "integers".into(),
             ColumnType::Float => "floats".into(),
             ColumnType::Str => "strings".into(),
+            ColumnType::Bytes => "byte strings".into(),
             ColumnType::Date => "dates".into(),
             ColumnType::LocalTime => "times".into(),
             ColumnType::ZonedTime { .. } => "times with an offset".into(),
@@ -159,6 +165,7 @@ impl ColumnType {
             Value::Int(_) => ColumnType::Int,
             Value::Float(_) => ColumnType::Float,
             Value::Str(_) => ColumnType::Str,
+            Value::Bytes(_) => ColumnType::Bytes,
             Value::Node { .. } => ColumnType::Node,
             Value::Rel { .. } => ColumnType::Rel,
             Value::Path(_) | Value::Chain(_) => ColumnType::Path,
@@ -397,6 +404,10 @@ pub enum ColumnData<'a> {
     Int(Vec<i64>),
     Float(Vec<f64>),
     Str(StrColumn),
+    /// GV35, a byte string column. The same two buffers a string
+    /// column keeps, over bytes that are not text, which is why the
+    /// arm is its own and not a flag on the one above.
+    Bytes(StrColumn),
     /// Days, for [`ColumnType::Date`].
     Days(Vec<i32>),
     /// Nanoseconds, for every time, datetime and day-time duration.
@@ -586,7 +597,18 @@ enum Fill<'a> {
     Bool(Vec<u8>),
     Int(Vec<i64>),
     Float(Vec<f64>),
-    Str { bytes: Vec<u8>, offsets: Vec<i64> },
+    Str {
+        bytes: Vec<u8>,
+        offsets: Vec<i64>,
+    },
+    /// The same two buffers a string column fills, over octets. It is a
+    /// second arm rather than a flag on the first because what it
+    /// finishes as is a different column type, and one arm answering
+    /// two of them would have to be told which.
+    Bytes {
+        bytes: Vec<u8>,
+        offsets: Vec<i64>,
+    },
     Days(Vec<i32>),
     Nanos(Vec<i64>),
     Months(Vec<i64>),
@@ -600,6 +622,14 @@ impl<'a> Fill<'a> {
             ColumnType::Bool => Fill::Bool(vec![0; rows.div_ceil(8)]),
             ColumnType::Int => Fill::Int(Vec::with_capacity(rows)),
             ColumnType::Float => Fill::Float(Vec::with_capacity(rows)),
+            ColumnType::Bytes => Fill::Bytes {
+                offsets: {
+                    let mut offsets = Vec::with_capacity(rows + 1);
+                    offsets.push(0);
+                    offsets
+                },
+                bytes: Vec::new(),
+            },
             ColumnType::Str => Fill::Str {
                 // One offset more than there are rows: the last one
                 // closes the last string.
@@ -681,6 +711,17 @@ impl<'a> Fill<'a> {
                     false
                 }
             },
+            Fill::Bytes { bytes, offsets } => match value {
+                Value::Bytes(b) => {
+                    bytes.extend_from_slice(b);
+                    offsets.push(bytes.len() as i64);
+                    true
+                }
+                _ => {
+                    offsets.push(bytes.len() as i64);
+                    false
+                }
+            },
             Fill::Days(values) => match value {
                 Value::Temporal(Temporal::Date(days)) => {
                     values.push(*days);
@@ -742,6 +783,15 @@ impl<'a> Fill<'a> {
                     Offsets::I64(offsets)
                 };
                 ColumnData::Str(StrColumn { bytes, offsets })
+            }
+            Fill::Bytes { bytes, offsets } => {
+                debug_assert_eq!(offsets.len(), rows + 1);
+                let offsets = if bytes.len() <= i32::MAX as usize {
+                    Offsets::I32(offsets.into_iter().map(|off| off as i32).collect())
+                } else {
+                    Offsets::I64(offsets)
+                };
+                ColumnData::Bytes(StrColumn { bytes, offsets })
             }
         }
     }

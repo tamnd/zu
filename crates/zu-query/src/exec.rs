@@ -107,6 +107,11 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    /// GV35, a byte string: a sequence of octets and not of characters.
+    /// `X'0041'` is one byte string of two bytes and never the letter
+    /// A, which is the whole reason it is an arm here rather than a
+    /// `Str` holding the same bytes.
+    Bytes(Vec<u8>),
     Node {
         table: u32,
         offset: u64,
@@ -1422,26 +1427,31 @@ fn rank(v: &Value) -> u8 {
         Value::Bool(_) => 1,
         Value::Int(_) | Value::Float(_) => 2,
         Value::Str(_) => 3,
+        // A byte string sorts beside the character strings and after
+        // them. The two are not comparable values, so where one goes
+        // relative to the other is a choice, and next to the type it
+        // is most often mistaken for is where a reader will look.
+        Value::Bytes(_) => 4,
         // A temporal value sorts after the strings and before the
         // references, and two of different kinds sort by kind, because
         // a date and a duration have no order between them and the
         // total order still owes an answer.
-        Value::Temporal(_) => 4,
-        Value::Node { .. } => 5,
-        Value::Rel { .. } => 6,
-        Value::List(_) | Value::Chain(_) => 7,
+        Value::Temporal(_) => 5,
+        Value::Node { .. } => 6,
+        Value::Rel { .. } => 7,
+        Value::List(_) | Value::Chain(_) => 8,
         // A record sorts after every list, and two records sort by
         // their fields, name first and then value.
-        Value::Record(_) => 8,
+        Value::Record(_) => 9,
         // A path sorts after every record, and two paths sort by their
         // elements, which is the list order over the same sequence.
-        Value::Path(_) => 9,
+        Value::Path(_) => 10,
         // GV60 and GV61 sort last, after everything the language can
         // write down. They are handles rather than data, so where they
         // go is a choice with nothing to recommend one place over
         // another, and the end is the place that moves no other type.
-        Value::Graph(_) => 10,
-        Value::BindingTable(_) => 11,
+        Value::Graph(_) => 11,
+        Value::BindingTable(_) => 12,
     }
 }
 
@@ -1465,6 +1475,11 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
         (Value::Float(a), Value::Int(b)) => float_order(*a, *b as f64),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Str(a), Value::Str(b)) => a.cmp(b),
+        // Two byte strings order by their octets, which is the only
+        // order they have: there is no collation over bytes that are
+        // not text, and a shorter one that is a prefix of a longer one
+        // comes first, the way a shorter string does.
+        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
         (Value::Temporal(a), Value::Temporal(b)) => temporal_key(a).cmp(&temporal_key(b)),
         (
             Value::Node {
@@ -5856,6 +5871,13 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
         (Value::Float(x), Value::Int(y)) => Some(*x == (*y as f64)),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Str(x), Value::Str(y)) => Some(x == y),
+        // Two byte strings are equal when they hold the same octets in
+        // the same order. Nothing is padded away first: IA016 leaves
+        // an engine free to call two byte strings differing only in
+        // trailing X'00' equal, and zu does not, because a value whose
+        // last byte is nought is a different value from one without it
+        // and a query that meant to ignore it can trim.
+        (Value::Bytes(x), Value::Bytes(y)) => Some(x == y),
         // Two temporal values are equal when they are the same kind
         // and the same count. A zoned value carries UTC, so two
         // spellings of one instant are equal and the offset each was
@@ -6480,6 +6502,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Int(i) => Value::Int(*i),
             Literal::Float(f) => Value::Float(*f),
             Literal::Str(s) => Value::Str(s.clone()),
+            Literal::Bytes(b) => Value::Bytes(b.clone()),
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),

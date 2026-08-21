@@ -2121,7 +2121,10 @@ impl Parser<'_> {
     fn parse_simple(&mut self) -> Result<(Simple, Ending)> {
         let mut clauses = Vec::new();
         loop {
-            if self.at_kw("MATCH") || self.at_kw("OPTIONAL") {
+            // An OPTIONAL takes a match or a call, so the word alone
+            // does not say which clause this is: the token behind it
+            // does, and a call is read where a call is read.
+            if self.at_kw("MATCH") || (self.at_kw("OPTIONAL") && !self.kw_at(1, "CALL")) {
                 let optional = self.eat_kw("OPTIONAL");
                 // GQ21. An OPTIONAL takes either one match statement or
                 // a braced block of them. The block is one operand, so
@@ -2194,7 +2197,14 @@ impl Parser<'_> {
                     targets.push(self.parse_delete_target()?);
                 }
                 clauses.push(Clause::Delete { targets, detach });
-            } else if self.eat_kw("CALL") {
+            } else if self.at_kw("CALL") || self.at_kw("OPTIONAL") {
+                // GP03. The word in front says the row is kept where
+                // the block answers nothing, which is a thing only the
+                // inline call does: a table function answers what it
+                // answers and there is no row of the statement for it
+                // to keep.
+                let optional = self.eat_kw("OPTIONAL");
+                self.expect_kw("CALL")?;
                 // Which of the two calls this is, read off the one
                 // token after the word. A block or a scope clause is
                 // the inline call, and a name is the table function,
@@ -2203,6 +2213,10 @@ impl Parser<'_> {
                     // The word was the first token of the statement, so
                     // the body runs for the one row a statement starts
                     // from and a catalog statement may open it (GP18).
+                    // An OPTIONAL is never that, the word being a token
+                    // of its own in front: what a hoisted body answers
+                    // is the statement's own rows, and there would be
+                    // no row left over to keep.
                     let head = self.pos == 1;
                     let scope = self.parse_variable_scope()?;
                     let (body, ending) = self.parse_call_block(head)?;
@@ -2214,10 +2228,21 @@ impl Parser<'_> {
                         continue;
                     };
                     clauses.push(Clause::CallInline {
+                        optional,
                         scope,
                         body: Box::new(body),
                     });
                     continue;
+                }
+                if optional {
+                    return Err(ZuError::gql_in(
+                        codes::C42001,
+                        self.source,
+                        self.here(),
+                        format_args!(
+                            "OPTIONAL says the row is kept where what follows answers nothing, and a procedure named in the catalog answers a table of its own rather than more of the row: write the call without the word, or write the body out as a block"
+                        ),
+                    ));
                 }
                 // `AT` names the schema the reference is resolved in,
                 // which is what a call written without a path in its
@@ -7406,7 +7431,7 @@ mod tests {
             ),
         ] {
             let q = parsed(source);
-            let Clause::CallInline { scope, body } = &q.clauses()[1] else {
+            let Clause::CallInline { scope, body, .. } = &q.clauses()[1] else {
                 panic!("an inline CALL in {source}");
             };
             assert_eq!(*scope, want, "{source}");
@@ -7438,6 +7463,52 @@ mod tests {
             panic!("an inline CALL");
         };
         assert!(body.result().is_none());
+    }
+
+    /// GP03. The word in front of a call says the row is kept where the
+    /// block answers nothing, and the same word in front of a match is
+    /// a different clause, so what tells the two apart is the token
+    /// behind the word and nothing else.
+    #[test]
+    fn an_optional_call_is_a_call_and_not_a_match() {
+        for source in [
+            "MATCH (a) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS f } RETURN a",
+            "MATCH (a) OPTIONAL CALL { MATCH (b) RETURN b AS f } RETURN a",
+        ] {
+            let q = parsed(source);
+            let Clause::CallInline { optional, .. } = &q.clauses()[1] else {
+                panic!("an inline CALL in {source}");
+            };
+            assert!(*optional, "{source}");
+        }
+        let q = parsed("MATCH (a) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a");
+        assert!(
+            matches!(&q.clauses()[1], Clause::Match { optional: true, .. }),
+            "an OPTIONAL MATCH is still a match"
+        );
+        let q = parsed("MATCH (a) CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS f } RETURN a");
+        let Clause::CallInline { optional, .. } = &q.clauses()[1] else {
+            panic!("an inline CALL");
+        };
+        assert!(!optional, "a call written without the word");
+    }
+
+    /// A procedure named in the catalog answers a table of its own, so
+    /// there is no row of the statement for the word to keep and it is
+    /// refused where it is written rather than read and dropped.
+    #[test]
+    fn an_optional_call_of_a_named_procedure_is_refused() {
+        let err = parse("OPTIONAL CALL pagerank('knows') YIELD node").unwrap_err();
+        assert!(err.to_string().contains("OPTIONAL"), "{err}");
+    }
+
+    /// The word alone does not say which clause is coming, so a word
+    /// with neither behind it is the match it always was, and the
+    /// message says so rather than naming both.
+    #[test]
+    fn an_optional_that_begins_nothing_is_still_a_match() {
+        let err = parse("MATCH (a) OPTIONAL RETURN a").unwrap_err();
+        assert!(err.to_string().contains("MATCH"), "{err}");
     }
 
     #[test]

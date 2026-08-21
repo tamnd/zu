@@ -231,8 +231,17 @@ reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
    The word is a named call's too, and that reading is the one a name
    after CALL gets. Which of the two a call is is settled by the one
    token after the word: a brace or a parenthesis is the inline call,
-   and a name, a path or AT is the named one. *)
-call_clause     = "CALL" , ( inline_procedure_call | named_procedure_call ) ;
+   and a name, a path or AT is the named one.
+
+   OPTIONAL in front says the row survives the block answering nothing,
+   and every name the block lets out is null on that row, which is what
+   the same word says in front of a MATCH. It is written in front of an
+   inline call only: a named procedure answers a table of its own rather
+   than more of the row, so there is no row of the statement for the
+   word to keep. The word is a match's too, and the token behind it is
+   what says which clause is coming. *)
+call_clause     = [ "OPTIONAL" ] , "CALL" , inline_procedure_call
+                | "CALL" , named_procedure_call ;
 inline_procedure_call
                 = [ variable_scope ] , "{" , [ leading_catalog_part ] ,
                   [ at_schema_clause ] , [ use_clause ] ,
@@ -265,7 +274,12 @@ leading_catalog_part
    statement written behind such a call may only project what the call
    answered: one that reads the graph was written outside the call and
    against another graph, and it is refused rather than read against
-   the graph nobody wrote it for. *)
+   the graph nobody wrote it for.
+
+   A call written with OPTIONAL is never taken out of the statement it
+   begins, the word being a token in front of it: what a hoisted body
+   answers is the statement's own rows and there is no row left over
+   for the word to keep. *)
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
 
 (* GP04, ISO 13.1. The named procedure call. The name is a catalog

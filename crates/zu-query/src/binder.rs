@@ -3389,10 +3389,22 @@ impl Binder<'_> {
     /// through the projection and the new ones follow them.
     fn bind_call_inline(
         &mut self,
+        optional: bool,
         scope: &Option<Vec<String>>,
         body: &ast::Query,
     ) -> Result<BoundClause> {
         let simple = self.splicable(body)?;
+        // GP03. A block written with OPTIONAL matches whole or not at
+        // all, so what it is written out of is bound as one bracketed
+        // group, which is the same all-or-nothing an OPTIONAL MATCH is.
+        let held = match optional {
+            true => Some(self.optional_body(simple)?),
+            false => None,
+        };
+        let clauses: &[Clause] = match &held {
+            Some(clauses) => clauses,
+            None => &simple.clauses,
+        };
         let outer_scope = self.scope.clone();
         let outer_groups = std::mem::take(&mut self.groups);
         let outer_forked = std::mem::take(&mut self.forked);
@@ -3456,7 +3468,7 @@ impl Binder<'_> {
 
         let mut bound = Vec::new();
         let outcome = (|| -> Result<()> {
-            for clause in &simple.clauses {
+            for clause in clauses {
                 bound.push(self.bind_clause(clause)?);
                 bound.append(&mut self.pending);
             }
@@ -3474,10 +3486,13 @@ impl Binder<'_> {
             return Err(e);
         }
 
-        let escaping = match &simple.result {
+        let mut escaping = match &simple.result {
             Some(projection) => self.bind_call_result(projection, own)?,
             None => Vec::new(),
         };
+        if optional {
+            escaping = self.kept_with_nulls(&bound, escaping, own)?;
+        }
         self.scope = outer_scope;
         self.groups = outer_groups;
         self.forked = outer_forked;
@@ -3546,6 +3561,117 @@ impl Binder<'_> {
             }
         }
         Ok(simple)
+    }
+
+    /// The clauses an `OPTIONAL` block is bound out of, which is the
+    /// one it is written out of with the word passed down to it.
+    ///
+    /// What the word says is that the row survives the block answering
+    /// nothing, and the only thing that can answer nothing here is the
+    /// match, so binding it as an optional one is what the word means:
+    /// the pattern matches whole and the block runs on, or it does not
+    /// and every name it would have bound is null.
+    ///
+    /// A block written out of anything else is refused by name rather
+    /// than bound as though the word were not there. A second clause
+    /// behind the match reads names the match may not have bound, and
+    /// what it does with the nulls is a decision this owes the reader
+    /// rather than one to make quietly.
+    fn optional_body(&self, simple: &ast::Simple) -> Result<Vec<Clause>> {
+        let [
+            Clause::Match {
+                optional: false,
+                patterns,
+                alts,
+                distinct,
+                filter,
+            },
+        ] = simple.clauses.as_slice()
+        else {
+            return Err(not_yet(
+                "an OPTIONAL CALL over a block written out of anything but one MATCH, which is the clause the word has something to say about,",
+            ));
+        };
+        if !alts.is_empty() {
+            return Err(not_yet(
+                "an OPTIONAL CALL over a block whose match is written with alternatives,",
+            ));
+        }
+        Ok(vec![Clause::Match {
+            optional: true,
+            patterns: patterns.clone(),
+            alts: Vec::new(),
+            distinct: *distinct,
+            filter: filter.clone(),
+        }])
+    }
+
+    /// The items an `OPTIONAL` block lets out, each one null on a row
+    /// the block did not match.
+    ///
+    /// A name for a slot the block bound is null on such a row already,
+    /// the group having left it that way, so it goes out as it is and
+    /// the call still costs nothing. Anything else is a value the row
+    /// would carry as though the block had answered a row, which is
+    /// what `RETURN 1 AS n` would do and what a lowering to a bare
+    /// optional match gets wrong, so it is asked for under whether the
+    /// block matched and null where it did not.
+    ///
+    /// What says the block matched is a slot the block bound itself,
+    /// and a pattern written out of nothing but names the row already
+    /// carried has none: there the two cases are the same row and are
+    /// refused rather than told apart wrongly.
+    fn kept_with_nulls(
+        &self,
+        bound: &[BoundClause],
+        escaping: Vec<(String, BoundExpr, Type)>,
+        own: usize,
+    ) -> Result<Vec<(String, BoundExpr, Type)>> {
+        if escaping
+            .iter()
+            .all(|(_, e, _)| matches!(e, BoundExpr::Var(slot) if *slot >= own))
+        {
+            return Ok(escaping);
+        }
+        let Some(BoundClause::Match { patterns, .. }) = bound.first() else {
+            unreachable!("an optional block is bound out of its match")
+        };
+        let matched = patterns
+            .iter()
+            .flat_map(|path| {
+                std::iter::once(path.start.slot).chain(
+                    path.steps
+                        .iter()
+                        .flat_map(|(rel, node)| [rel.slot, node.slot]),
+                )
+            })
+            .find(|slot| *slot >= own);
+        let Some(matched) = matched else {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "the block of an OPTIONAL CALL binds nothing of its own, so nothing on the row says whether it matched and what it lets out cannot be made null: name an element of the pattern, or take the OPTIONAL off".to_string(),
+            ));
+        };
+        Ok(escaping
+            .into_iter()
+            .map(|(name, expr, ty)| {
+                if matches!(&expr, BoundExpr::Var(slot) if *slot >= own) {
+                    return (name, expr, ty);
+                }
+                let expr = BoundExpr::Case {
+                    subject: None,
+                    branches: vec![(
+                        BoundExpr::IsNull {
+                            expr: Box::new(BoundExpr::Var(matched)),
+                            negated: true,
+                        },
+                        expr,
+                    )],
+                    otherwise: None,
+                };
+                (name, expr, ty)
+            })
+            .collect())
     }
 
     /// The items a block's `RETURN` lets out, bound in the block's own
@@ -3837,7 +3963,11 @@ impl Binder<'_> {
                 let at = at.clone().or_else(|| self.at.clone());
                 self.bind_table_call(at.as_deref(), proc, args, yields)
             }
-            Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
+            Clause::CallInline {
+                optional,
+                scope,
+                body,
+            } => self.bind_call_inline(*optional, scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
             // predicate is queued as exactly this. Binding it to that

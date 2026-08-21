@@ -629,7 +629,14 @@ pub enum Clause {
     /// reader wrote (GP03). An empty list is a block that reads nothing
     /// of the row, which is a whole statement standing on its own, and
     /// it is written `CALL () { ... }`.
+    ///
+    /// `optional` is the `OPTIONAL` in front of the word (GP03). A block
+    /// written with it keeps the row when it answers no rows at all, and
+    /// every name it lets out is null on that row, which is what the
+    /// same word says in front of a `MATCH`. A block that answers rows
+    /// is the call it always was.
     CallInline {
+        optional: bool,
         scope: Option<Vec<String>>,
         body: Box<Query>,
     },

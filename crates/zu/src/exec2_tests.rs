@@ -686,6 +686,13 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.age AS age, count(*) AS n",
         "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
          RETURN a.id AS a, b.id AS b LIMIT 4",
+        // GP03. An OPTIONAL CALL over a block that lets out an element
+        // it bound is the group above with a block around it: the name
+        // is the slot the group left null, so there is nothing left of
+        // the block after the binder and the executor sees the same
+        // plan it sees for the match.
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS node } \
+         RETURN a.id AS a, node.id AS b",
         // EXISTS blocks, which are the same bracket asked a yes or no
         // question: the outer row comes out once on a match for a semi
         // bracket and once on a miss for an anti one, and the block's
@@ -1250,6 +1257,21 @@ fn fallback_queries() -> &'static [&'static str] {
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
+        // GP03. An OPTIONAL CALL that lets out anything but an element
+        // it bound. The value has to be asked for under whether the
+        // block matched, or the row the block matched nothing for would
+        // carry it as though it had, and a case expression is not one
+        // this executor has a kernel for yet, so the statement goes
+        // back whole. The last of them is the same thing under a set
+        // function, where the null decides the count.
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b.id AS bid } \
+         RETURN a.id AS a, bid AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN 1 AS one } \
+         RETURN a.id AS a, one AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) WHERE b.age > 90 \
+         RETURN b.id AS bid } RETURN a.id AS a, bid AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b.id AS bid } \
+         RETURN count(bid) AS n",
         // A trim set that is a column is a different set a row, and
         // the kernel prepares one set for the chunk.
         "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",

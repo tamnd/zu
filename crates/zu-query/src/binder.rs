@@ -2212,6 +2212,20 @@ enum Projected {
     Answer,
 }
 
+/// The schema an `AT` clause names, written as a catalog path (GP16).
+///
+/// `CURRENT_SCHEMA` and `HOME_SCHEMA` both answer the root, because
+/// nothing moves a session out of it: the schema a session opens in is
+/// the schema it works in for as long as it lives, so the two words
+/// name the same directory and always will until a statement that
+/// changes the working schema exists.
+fn at_path(at: &Option<ast::SchemaRef>) -> Option<&str> {
+    match at.as_ref()? {
+        ast::SchemaRef::Current | ast::SchemaRef::Home => Some(procedures::ROOT),
+        ast::SchemaRef::Path(path) => Some(path),
+    }
+}
+
 /// Binds a parsed query against a schema.
 ///
 /// A composite is bound operand by operand, left to right. Each gets a
@@ -2220,6 +2234,7 @@ enum Projected {
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
+    let at = at_path(&query.at_schema);
     let mut params = Vec::new();
     // The binding variable definition block at the head of the
     // statement (GP17), bound before anything that could read one of
@@ -2231,11 +2246,12 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
     bind_bindings(
         &query.bindings,
         schema,
+        at,
         &mut params,
         &mut defined,
         &mut visible,
     )?;
-    let mut bound = bind_body(&query.body, schema, &mut params, &[], &visible)?;
+    let mut bound = bind_body(&query.body, schema, at, &mut params, &[], &visible)?;
     // Every definition written inside the statement as well, which is
     // one written at the head of a block. They are worked out where
     // these are, before the first row, because a definition cannot
@@ -2319,6 +2335,7 @@ fn graph_of_ref(schema: &Schema, reference: &GraphRef) -> Result<GraphHandle> {
 fn bind_bindings(
     defs: &[ast::BindingDef],
     schema: &Schema,
+    at: Option<&str>,
     params: &mut Vec<String>,
     out: &mut Vec<BoundBinding>,
     visible: &mut Vec<Visible>,
@@ -2337,9 +2354,13 @@ fn bind_bindings(
         // A block of its own, since a query may carry one, and it is
         // bound here so that its names are in reach inside that query
         // and out of reach after it.
+        // A definition holding a query of its own may say which schema
+        // that query resolves in, and one that does not resolves where
+        // the statement around it does.
+        let at = at_path(&query.at_schema).or(at);
         let mut inner = visible.clone();
-        bind_bindings(&query.bindings, schema, params, out, &mut inner)?;
-        let mut bound = bind_body(&query.body, schema, params, &[], &inner)?;
+        bind_bindings(&query.bindings, schema, at, params, out, &mut inner)?;
+        let mut bound = bind_body(&query.body, schema, at, params, &[], &inner)?;
         // A block written inside the definition defines names of its
         // own, and they are worked out where every definition is. They
         // land in front of this one because their positions were made
@@ -2437,6 +2458,7 @@ struct Visible {
 /// out and one place for that to be wrong.
 fn returning(expr: ast::Expr, name: &str) -> ast::Query {
     ast::Query {
+        at_schema: None,
         use_graph: None,
         bindings: Vec::new(),
         body: ast::Composite::Linear(ast::Linear {
@@ -2481,16 +2503,17 @@ fn gather_bindings(query: &mut BoundQuery, out: &mut Vec<BoundBinding>) {
 fn bind_body(
     body: &ast::Composite,
     schema: &Schema,
+    at: Option<&str>,
     params: &mut Vec<String>,
     outer: &[String],
     visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut operands = Vec::new();
     collect_operands(body, &mut operands);
-    let mut bound = bind_linear(operands[0].0, schema, params, outer, visible)?;
+    let mut bound = bind_linear(operands[0].0, schema, at, params, outer, visible)?;
     for (linear, how) in &operands[1..] {
         let how = how.expect("only the leftmost operand has no conjunction");
-        let right = bind_linear(linear, schema, params, outer, visible)?;
+        let right = bind_linear(linear, schema, at, params, outer, visible)?;
         // A statement that writes is taken apart at its write and run
         // in parts, and a part is one pipeline. An operand of a
         // composite is a second one, so the two cannot be the same
@@ -2870,12 +2893,14 @@ fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundE
 fn bind_linear(
     linear: &ast::Linear,
     schema: &Schema,
+    at: Option<&str>,
     params: &mut Vec<String>,
     outer: &[String],
     visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
+        at: at.map(str::to_string),
         variables: Vec::new(),
         scope: HashMap::new(),
         params: std::mem::take(params),
@@ -2946,6 +2971,11 @@ fn bind_linear(
 
 struct Binder<'a> {
     schema: &'a Schema,
+    /// The schema the `AT` clause of the query named, which is where a
+    /// procedure name written without a path in it is looked up
+    /// (GP16). `None` is a query with no `AT`, and a name in one is
+    /// looked up in the root.
+    at: Option<String>,
     variables: Vec<VarDef>,
     /// Name to slot for everything visible right now. `WITH` replaces
     /// it wholesale; slots stay in `variables` either way.
@@ -3361,9 +3391,14 @@ impl Binder<'_> {
         let defined = self.visible.len();
         let mut theirs = Vec::new();
         let mut params = std::mem::take(&mut self.params);
+        // A spliced block resolves names where the statement around it
+        // does, which is what `splicable` says by refusing an `AT` of
+        // its own.
+        let at = self.at.clone();
         let block = bind_bindings(
             &body.bindings,
             self.schema,
+            at.as_deref(),
             &mut params,
             &mut theirs,
             &mut self.visible,
@@ -3431,6 +3466,12 @@ impl Binder<'_> {
     /// those is a block that needs a plan of its own, which is the next
     /// piece of this work rather than a thing to get half right here.
     fn splicable<'q>(&self, body: &'q ast::Query) -> Result<&'q ast::Simple> {
+        if body.at_schema.is_some() {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "the block of a CALL cannot name a schema of its own: a spliced block resolves names where the statement around it does, so take the AT out of it, or write the block as the one the statement begins with".to_string(),
+            ));
+        }
         if body.use_graph.is_some() {
             return Err(invalid(
                 "the block of a CALL cannot name a graph of its own yet: take the USE out of it, or write the block as a statement of its own".into(),
@@ -3750,7 +3791,12 @@ impl Binder<'_> {
                 proc,
                 args,
                 yields,
-            } => self.bind_table_call(at.as_deref(), proc, args, yields),
+            } => {
+                // The schema the call names itself, or failing that
+                // the one the query names (GP16).
+                let at = at.clone().or_else(|| self.at.clone());
+                self.bind_table_call(at.as_deref(), proc, args, yields)
+            }
             Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
@@ -6352,7 +6398,17 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer, &self.visible)?;
+        let at = at_path(&query.at_schema)
+            .map(str::to_string)
+            .or_else(|| self.at.clone());
+        let mut bound = bind_body(
+            &query.body,
+            self.schema,
+            at.as_deref(),
+            &mut params,
+            &outer,
+            &self.visible,
+        )?;
         self.params = params;
         // A name the query around this one already has is read out of
         // that row, so a pattern in here that writes the same name

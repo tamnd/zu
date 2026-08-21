@@ -210,6 +210,10 @@ pub struct PropertyDef {
 /// bolted onto a flat clause list that has no room for them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// GP16, the `AT` schema clause: the schema a name written without
+    /// a path in it is resolved in. `None` is a query with no `AT`,
+    /// which resolves in the schema the session is working in.
+    pub at_schema: Option<SchemaRef>,
     /// GQ01: the graph the statements below run against, written as a
     /// `USE` clause in front of them. `None` is a query with no `USE`,
     /// which runs against whatever graph the session is working in.
@@ -445,6 +449,26 @@ pub enum GraphRef {
     /// arrives. That is the whole of what makes a graph reference an
     /// expression rather than a word in the text.
     Param(String),
+}
+
+/// What an `AT` schema clause names (ISO 16.1, `at schema clause`),
+/// which is the schema a reference written without a path in it is
+/// resolved in.
+///
+/// A schema here is a directory of the catalog and not a graph type,
+/// so what the clause changes is where a name is looked up, not what
+/// the statement reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRef {
+    /// `AT CURRENT_SCHEMA`, the schema the session is resolving names
+    /// in already, which is what the clause names when it names no
+    /// path at all.
+    Current,
+    /// `AT HOME_SCHEMA`, the schema the session started in.
+    Home,
+    /// A schema by its path, `AT /app`, which is absolute, and the
+    /// root schema is written `/`.
+    Path(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

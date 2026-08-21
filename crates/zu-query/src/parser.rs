@@ -22,8 +22,8 @@ use crate::ast::{
     GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
     MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
     Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
-    Repeat, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn,
-    TrimSide, TxnStmt, UnaryOp, YieldItem,
+    Repeat, SchemaRef, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
+    TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -417,6 +417,53 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
 
+/// Every word that can stand where a query begins once the schema
+/// clause is read: the graph clause, the three that open a binding
+/// variable definition, and the clauses themselves.
+///
+/// One reader, [`Parser::at_path_segment`], and one job: telling the
+/// end of an `AT` path from the query behind it. The list being a
+/// little long is the price of the lexer knowing nothing about
+/// keywords, and a word missing from it costs a refusal rather than a
+/// wrong answer, since the path would then swallow the word and no
+/// schema of that name exists.
+const OPENS_A_CLAUSE: &[&str] = &[
+    "USE",
+    "VALUE",
+    "TABLE",
+    "BINDING",
+    "GRAPH",
+    "PROPERTY",
+    "MATCH",
+    "OPTIONAL",
+    "CALL",
+    "INSERT",
+    "MERGE",
+    "SET",
+    "REMOVE",
+    "DELETE",
+    "DETACH",
+    "NODETACH",
+    "UNWIND",
+    "FOR",
+    "FILTER",
+    "LET",
+    "WITH",
+    "ORDER",
+    "OFFSET",
+    "SKIP",
+    "LIMIT",
+    "FINISH",
+    "RETURN",
+    "NEXT",
+];
+
+fn opens_a_clause(word: &str) -> bool {
+    OPENS_A_CLAUSE
+        .iter()
+        .any(|kw| word.eq_ignore_ascii_case(kw))
+}
+
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +517,7 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         spans: Vec::new(),
         lifted: Vec::new(),
         hoisted: None,
+        hoisted_at: None,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -542,6 +590,9 @@ struct Parser<'a> {
     /// waiting for the chain they go in, and how the last of them
     /// ended. See `hoist_a_leading_call`.
     hoisted: Option<(Vec<Simple>, Ending)>,
+    /// The schema clause that body was written with, which belongs to
+    /// the query the statements go into.
+    hoisted_at: Option<SchemaRef>,
 }
 
 /// A catalog statement lifted out of a call body (GP18).
@@ -1711,16 +1762,24 @@ impl Parser<'_> {
             return Some(body);
         }
         let Query {
+            at_schema,
             use_graph,
             bindings,
             body,
         } = body;
         match body {
             Composite::Linear(linear) => {
+                // The schema clause of the body becomes the schema
+                // clause of the query the statements go into. There is
+                // nothing to lose there: a call the statement begins
+                // with is one whose word is the first token written, so
+                // no clause of the query in front of it wrote one.
+                self.hoisted_at = at_schema;
                 self.hoisted = Some((linear.statements, ending));
                 None
             }
             body => Some(Query {
+                at_schema,
                 use_graph,
                 bindings,
                 body,
@@ -1794,6 +1853,15 @@ impl Parser<'_> {
     /// second rule here.
     fn parse_binding_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
         let name = self.expect_name("a binding variable name")?;
+        // GP06, the typed definition. ISO writes the separator two
+        // ways, `::` and the word `TYPED`, and allows the type to be
+        // written with neither, so all three are read here and the
+        // equals is what says the type is over.
+        if self.at_double_colon() {
+            self.pos += 2;
+        } else {
+            self.eat_kw("TYPED");
+        }
         let ty = if self.at(&TokenKind::Eq) {
             None
         } else {
@@ -1837,9 +1905,15 @@ impl Parser<'_> {
     /// this is a fold rather than a precedence climb: each operand read
     /// joins onto everything read before it.
     fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
+        // ISO 9.2 writes the schema clause in front of the graph
+        // clause, and both in front of the definitions.
+        let at_schema = self.parse_at_schema()?;
         let use_graph = self.parse_use_graph()?;
         let bindings = self.parse_binding_block()?;
         let (linear, ending) = self.parse_linear()?;
+        // The schema clause of a body taken out of a call the statement
+        // begins with, which is this query's now.
+        let at_schema = at_schema.or_else(|| self.hoisted_at.take());
         let mut body = Composite::Linear(linear);
         let mut ending = ending;
         loop {
@@ -1868,6 +1942,7 @@ impl Parser<'_> {
         }
         Ok((
             Query {
+                at_schema,
                 use_graph,
                 bindings,
                 body,
@@ -2308,6 +2383,77 @@ impl Parser<'_> {
             ));
         }
         Ok(name)
+    }
+
+    /// An `AT` clause in front of a query, which says which schema a
+    /// name written without a path in it is resolved in (GP16, ISO
+    /// 16.1).
+    ///
+    /// The word also opens the schema of a named procedure call,
+    /// `CALL AT /algo pagerank(...)`, and the two never collide: this
+    /// one is read where a query begins and that one where a call
+    /// does, which is behind the `CALL`.
+    fn parse_at_schema(&mut self) -> Result<Option<SchemaRef>> {
+        if !self.eat_kw("AT") {
+            return Ok(None);
+        }
+        if self.eat_kw("CURRENT_SCHEMA") {
+            return Ok(Some(SchemaRef::Current));
+        }
+        if self.eat_kw("HOME_SCHEMA") {
+            return Ok(Some(SchemaRef::Home));
+        }
+        // `SCHEMA` before the path is the long spelling and says
+        // nothing the path does not.
+        self.eat_kw("SCHEMA");
+        Ok(Some(SchemaRef::Path(self.parse_head_schema_path()?)))
+    }
+
+    /// The path an `AT` clause at the head of a query names.
+    ///
+    /// Whitespace is nothing to the lexer, so `AT / MATCH (p)` and
+    /// `AT /MATCH (p)` are the same tokens and the path would swallow
+    /// the word the query begins with, which is the ambiguity
+    /// [`Self::parse_at_and_name`] meets at a call and settles by what
+    /// follows. Here the word itself settles it: a segment that opens
+    /// a clause was never a segment, so the path ends in front of it
+    /// and the root is what a clause word straight after the slash
+    /// leaves behind. A schema really called `MATCH` is still
+    /// reachable, written in quotes, since a quoted name is a name and
+    /// nothing else.
+    fn parse_head_schema_path(&mut self) -> Result<String> {
+        if !self.eat(&TokenKind::Slash) {
+            return Err(self.error("an absolute directory path"));
+        }
+        let mut path = String::new();
+        while self.at_path_segment(0) {
+            path.push('/');
+            path.push_str(&self.expect_name("a name in a path")?);
+            // A slash with no segment behind it ends the path and
+            // belongs to whatever follows, so it is taken only when
+            // one does.
+            if !self.at(&TokenKind::Slash) || !self.at_path_segment(1) {
+                break;
+            }
+            self.pos += 1;
+        }
+        Ok(if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        })
+    }
+
+    /// Whether the token this many ahead can be a segment of the path
+    /// above: a name that is not one of the words a clause begins
+    /// with. A quoted name is always one, which is how a schema named
+    /// after a keyword is written.
+    fn at_path_segment(&self, ahead: usize) -> bool {
+        match self.tokens.get(self.pos + ahead).map(|t| &t.kind) {
+            Some(TokenKind::QuotedIdent(_)) => true,
+            Some(TokenKind::Ident(word)) => !opens_a_clause(word),
+            _ => false,
+        }
     }
 
     /// A `USE` clause in front of a query, which says which graph the
@@ -5018,19 +5164,23 @@ impl Parser<'_> {
     /// have to be adjacent: `a : : INT` is not a field and reading it
     /// as one would let a typo through as a type.
     fn expect_double_colon(&mut self) -> Result<()> {
-        let adjacent = match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
+        if !self.at_double_colon() {
+            return Err(self.error("'::'"));
+        }
+        self.pos += 2;
+        Ok(())
+    }
+
+    /// Whether a `::` stands here, without taking it.
+    fn at_double_colon(&self) -> bool {
+        match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
             (Some(first), Some(second)) => {
                 first.kind == TokenKind::Colon
                     && second.kind == TokenKind::Colon
                     && first.start + 1 == second.start
             }
             _ => false,
-        };
-        if !adjacent {
-            return Err(self.error("'::'"));
         }
-        self.pos += 2;
-        Ok(())
     }
 
     /// One number inside a type's parentheses: a digit count, a scale
@@ -6047,6 +6197,73 @@ mod tests {
             catalog_err("CALL () { CREATE GRAPH g ANY }").contains("hands over to a statement"),
             "the refusal says what is missing behind it"
         );
+    }
+
+    /// GP06. ISO writes the separator between a binding variable and
+    /// its type two ways and lets the type be written with neither, so
+    /// all three spellings say the same thing here.
+    #[test]
+    fn a_binding_variable_takes_its_type_however_the_separator_is_written() {
+        for source in [
+            "VALUE t :: INT = 3 MATCH (p:Person) RETURN t AS t",
+            "VALUE t TYPED INT = 3 MATCH (p:Person) RETURN t AS t",
+            "VALUE t INT = 3 MATCH (p:Person) RETURN t AS t",
+        ] {
+            let def = &parsed(source).bindings[0];
+            assert_eq!(def.name, "t", "{source}");
+            assert!(def.ty.is_some(), "{source}");
+        }
+        // The equals is what says the type is over, so a definition
+        // written without one has no type rather than a missing one.
+        assert!(parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
+            .ty
+            .is_none());
+    }
+
+    /// GP16. The `AT` clause stands in front of the query, ahead of the
+    /// graph clause and the definitions, and names a schema three ways.
+    #[test]
+    fn an_at_clause_names_the_schema_a_query_resolves_in() {
+        for (source, want) in [
+            ("AT CURRENT_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Current),
+            ("AT HOME_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Home),
+            (
+                "AT /app MATCH (p) RETURN p AS p",
+                SchemaRef::Path("/app".into()),
+            ),
+            // `SCHEMA` in front of the path is the long spelling and
+            // says nothing the path does not.
+            (
+                "AT SCHEMA /app MATCH (p) RETURN p AS p",
+                SchemaRef::Path("/app".into()),
+            ),
+        ] {
+            assert_eq!(parsed(source).at_schema, Some(want), "{source}");
+        }
+        assert_eq!(parsed("MATCH (p) RETURN p AS p").at_schema, None);
+    }
+
+    /// The word opens the schema of a named procedure call as well, and
+    /// the two never collide: this one is read where a query begins and
+    /// that one behind the `CALL`.
+    #[test]
+    fn an_at_clause_and_the_schema_of_a_call_are_read_apart() {
+        let q = parsed("AT /app CALL AT / pagerank() YIELD rank RETURN rank AS rank");
+        assert_eq!(q.at_schema, Some(SchemaRef::Path("/app".into())));
+        let Some(Clause::Call { at, .. }) = linear_body(&q).statements[0].clauses.first() else {
+            panic!("the first clause is the call");
+        };
+        assert_eq!(at.as_deref(), Some("/"));
+    }
+
+    /// GP16 again. A call the statement begins with is taken out of the
+    /// call and put in the chain around it, so an `AT` written on the
+    /// body is the schema the query it lands in resolves in.
+    #[test]
+    fn an_at_clause_on_a_hoisted_call_body_becomes_the_querys_own() {
+        let q = parsed("CALL { AT /app MATCH (p:Person) RETURN COUNT(*) AS n } RETURN n AS n");
+        assert_eq!(q.at_schema, Some(SchemaRef::Path("/app".into())));
+        assert_eq!(linear_body(&q).statements.len(), 2);
     }
 
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes

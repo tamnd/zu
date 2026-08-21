@@ -20,9 +20,9 @@ description: Install the toolchain this job builds with, from the local rustup.
 
 inputs:
   toolchain:
-    description: The channel or the exact version, spelled the way rustup spells it. `cargo xtask pins` reads this key in the workflows, so a pinned version is written here and held to toolchains.toml.
+    description: The channel or the exact version, spelled the way rustup spells it. Left out, the job builds with the version rust-toolchain.toml pins, which is what a job that has no opinion wants. `cargo xtask pins` reads this key in the workflows, so a version written here is held to toolchains.toml.
     required: false
-    default: stable
+    default: ''
   components:
     description: Components to install alongside it, comma or space separated.
     required: false
@@ -42,6 +42,29 @@ runs:
         targets: ${{ inputs.targets }}
       run: |
         set -eu
+
+        # No toolchain named is the job saying it has no opinion, and
+        # the answer for a job with no opinion is the version the
+        # repository pins. Naming a channel here instead means every
+        # such job builds with whatever rustup resolves that morning,
+        # which is a compiler nobody in the tree chose: stable moved to
+        # 1.98 on 2026-08-18, 1.98 added a lint, and main went red on
+        # code nobody had touched (#489). Worse, it was silent while it
+        # worked, so the twenty-five jobs that took the default had been
+        # testing a different compiler than the one every developer and
+        # every release build uses.
+        #
+        # A job that does have an opinion still says so and still gets
+        # it. The pins check treats a channel written here as deliberate
+        # for exactly that reason.
+        if [ -z "$toolchain" ]; then
+          pin="${GITHUB_WORKSPACE:-.}/rust-toolchain.toml"
+          toolchain=$(sed -n 's/^ *channel *= *"\([^"]*\)".*/\1/p' "$pin" | head -1)
+          if [ -z "$toolchain" ]; then
+            echo "no channel in $pin and no toolchain asked for" >&2
+            exit 1
+          fi
+        fi
 
         # Every hosted image ships rustup, so this is for the job
         # containers: the manylinux rows of the libzu workflow build in
@@ -110,10 +133,11 @@ runs:
 
         # An environment variable rather than `rustup default`, because
         # this repository has a rust-toolchain.toml and that file wins
-        # over the default. It is the pin every developer and every
-        # release build gets, and it is right for them; a job that asked
-        # for stable or for a dated nightly asked on purpose, and would
-        # otherwise silently build with the pinned version instead.
+        # over the default. A job that asked for a channel or a dated
+        # nightly asked on purpose and has to get it; a job that asked
+        # for nothing is being handed back the version that same file
+        # names, so the two paths end at the same place and the variable
+        # is what makes the first one work.
         export RUSTUP_TOOLCHAIN="$toolchain"
         echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
 

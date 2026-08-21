@@ -32,6 +32,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # The two jobs above build with the pinned compiler, which is what
+  # makes them reproduce on a developer's machine. That leaves nobody
+  # looking at the next one, so this looks: same two commands on the
+  # newest stable, allowed to fail. What it costs is one runner; what it
+  # buys is that a new lint or a rustfmt change shows up as a yellow
+  # mark on the day it ships, rather than as a red main inside whichever
+  # pull request happens to bump the pin (#489).
+  next:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   api-model:
     runs-on: ubuntu-latest
     steps:

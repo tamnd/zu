@@ -1511,7 +1511,14 @@ pub unsafe extern "C" fn zu2_log_span(db: *const Zu2Db) -> u64 {
     }
 }
 
-/// Entries in use in the hash index.
+/// Slots in use in the hash index.
+///
+/// Slots and not keys. A full bucket displaces, and the displaced key
+/// lives on the chain under the slot that took its place, so this comes
+/// out below the number of keys written and a caller that prints it
+/// against a record count is printing something that reads as data loss
+/// (#486). `zu2_index_foreign` is the part of the gap that is
+/// displacement.
 ///
 /// # Safety
 /// `db` is live.
@@ -1519,6 +1526,23 @@ pub unsafe extern "C" fn zu2_log_span(db: *const Zu2Db) -> u64 {
 pub unsafe extern "C" fn zu2_index_occupancy(db: *const Zu2Db) -> u64 {
     match unsafe { handle(db) } {
         Some(handle) => handle.db.index_occupancy() as u64,
+        None => 0,
+    }
+}
+
+/// Slots naming a chain of more than one key.
+///
+/// Every lookup that reaches one of these buckets walks the chain under
+/// the slot whether its tag matched or not, so this is the crowding a
+/// read actually pays for. The load factor says how full the table is
+/// and this says what that cost.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_foreign(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.index_foreign() as u64,
         None => 0,
     }
 }

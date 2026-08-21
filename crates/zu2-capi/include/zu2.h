@@ -344,9 +344,18 @@ uint64_t zu2_log_bytes(const zu2_db *db);
 /* Addresses the log still spans, tail minus begin. */
 uint64_t zu2_log_span(const zu2_db *db);
 
-/* Entries in use in the hash index, for reporting the load factor a run
- * happened at. */
+/* Slots in use in the hash index, for reporting the load factor a run
+ * happened at. Slots and not keys: a full bucket displaces, and the
+ * displaced key lives on the chain under the slot that took its place,
+ * so this comes out below the number of keys written and printing it
+ * against a record count reads as data loss. */
 uint64_t zu2_index_occupancy(const zu2_db *db);
+
+/* Slots naming a chain of more than one key. Every lookup reaching one
+ * of these buckets walks the chain whether its tag matched or not, so
+ * this is the crowding a read pays for where the load factor is only
+ * how full the table is. */
+uint64_t zu2_index_foreign(const zu2_db *db);
 
 /* Buckets in the live hash table. Against zu2_index_occupancy this is
  * the load factor, which is what says whether a read walked a chain

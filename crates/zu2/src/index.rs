@@ -158,14 +158,36 @@ impl Table {
         self.buckets.len()
     }
 
-    /// How many entries are in use.
+    /// How many slots are in use.
+    ///
+    /// Slots and not keys. A full bucket displaces, and a displaced key
+    /// lives on the chain under the entry that took its slot, so one
+    /// slot in use can name several keys. Against the number of keys
+    /// written this reads as records having gone missing, and it is not
+    /// that (#486). [`Self::foreign`] is the count that says how much
+    /// of the difference is displacement.
     pub fn occupancy(&self) -> usize {
+        self.count(|entry| entry != EMPTY)
+    }
+
+    /// How many slots name a chain holding more than one key.
+    ///
+    /// This is the number a reader of a benchmark actually wants out of
+    /// the index: every lookup that reaches one of these buckets walks
+    /// the chain under it whether the tag matched or not, so it is the
+    /// crowding that is being paid for rather than the crowding the
+    /// load factor implies.
+    pub fn foreign(&self) -> usize {
+        self.count(is_foreign)
+    }
+
+    fn count(&self, wanted: impl Fn(u64) -> bool + Copy) -> usize {
         self.buckets
             .iter()
             .map(|b| {
                 b.slots
                     .iter()
-                    .filter(|s| s.load(Ordering::Relaxed) != EMPTY)
+                    .filter(|s| wanted(s.load(Ordering::Relaxed)))
                     .count()
             })
             .sum()
@@ -480,10 +502,16 @@ impl Index {
         epochs.drain();
     }
 
-    /// How many entries are in use, for tests and for reporting the
+    /// How many slots are in use, for tests and for reporting the
     /// load factor a benchmark ran at.
     pub fn occupancy(&self) -> usize {
         self.live().occupancy()
+    }
+
+    /// How many slots name a chain holding more than one key, which is
+    /// what displacement costs a reader.
+    pub fn foreign(&self) -> usize {
+        self.live().foreign()
     }
 
     /// The tag for a hash: 14 bits off the top, independent of the bits

@@ -491,18 +491,33 @@ impl Db {
         }
     }
 
-    /// Entries in use, for reporting the load factor a run happened at.
+    /// Slots in use, for reporting the load factor a run happened at.
+    ///
+    /// Slots and not keys, since a displaced key shares the slot of the
+    /// one that took its place. [`Db::index_foreign`] is how many slots
+    /// that is true of.
     ///
     /// Under an epoch because a doubling retires the table it grew out
-    /// of, and a caller counting entries is walking one.
+    /// of, and a caller counting slots is walking one.
     pub fn index_occupancy(&self) -> usize {
+        self.counted(|index| index.occupancy())
+    }
+
+    /// Slots naming a chain of more than one key, which is the crowding
+    /// a lookup pays for rather than the crowding the load factor
+    /// implies.
+    pub fn index_foreign(&self) -> usize {
+        self.counted(|index| index.foreign())
+    }
+
+    fn counted(&self, count: impl Fn(&Index) -> usize) -> usize {
         let Ok(session) = self.core.maintenance_session() else {
             return 0;
         };
         session.slot.protect();
-        let entries = self.core.index.occupancy();
+        let n = count(&self.core.index);
         session.slot.unprotect();
-        entries
+        n
     }
 
     /// Buckets in the index as it stands, which is the size it was
@@ -1564,6 +1579,50 @@ mod tests {
             }
         }
         found
+    }
+
+    /// #486. A slot in use is not a key, and the difference is the
+    /// keys a full bucket displaced onto the chain under a slot that
+    /// was already taken. Printed against a record count the occupancy
+    /// reads as records having gone missing, which is what this pins
+    /// apart: fewer slots than keys, foreign says how many slots carry
+    /// the rest, and every key is still there.
+    #[test]
+    fn a_crowded_bucket_holds_more_keys_than_it_has_slots_in_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(&dir.path().join("crowded.zu2"), one_bucket()).expect("create");
+        const KEYS: usize = 20;
+        {
+            let mut session = db.session();
+            for i in 0..KEYS {
+                session
+                    .upsert(format!("k{i}").as_bytes(), &[b'x'; 64])
+                    .expect("upsert");
+            }
+        }
+
+        // One bucket of eight, so twelve of the twenty had to displace.
+        assert_eq!(db.index_buckets(), 1);
+        assert_eq!(db.index_occupancy(), SLOTS);
+        assert!(
+            db.index_foreign() > 0,
+            "a bucket this crowded carries chains of more than one key"
+        );
+        assert!(db.index_foreign() <= db.index_occupancy());
+
+        // And the count that looked like loss was not: every key reads
+        // back its own value through the chain it was displaced onto.
+        let mut session = db.session();
+        for i in 0..KEYS {
+            let key = format!("k{i}");
+            let mut value = Vec::new();
+            assert!(
+                session.read(key.as_bytes(), &mut value).expect("read"),
+                "{key} is in a bucket with {} slots in use",
+                db.index_occupancy()
+            );
+            assert_eq!(value, [b'x'; 64]);
+        }
     }
 
     #[test]

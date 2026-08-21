@@ -868,9 +868,24 @@ impl ZuResult {
 /* ---- library ---- */
 
 /// Returns the library version as a static string; never freed.
+///
+/// It is the crate's own version rather than a string beside it. A
+/// version written twice is a version that goes stale on the half
+/// nobody builds against, and this is the half nobody builds against:
+/// Cargo reads the manifest, and a C host asking the artifact what it
+/// is would have been told the answer from whenever somebody last
+/// remembered.
 #[unsafe(no_mangle)]
 pub extern "C" fn zu_version() -> *const c_char {
-    const VERSION: &CStr = c"0.0.1";
+    // Built at compile time from the manifest, so a bump moves this
+    // with it. A NUL in a version is not a thing Cargo will accept, but
+    // the constructor still has to say what it does about one, and a
+    // const panic is a build that fails rather than a string that lies.
+    const VERSION: &CStr =
+        match CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) {
+            Ok(version) => version,
+            Err(_) => panic!("the crate version has a NUL in it"),
+        };
     VERSION.as_ptr()
 }
 

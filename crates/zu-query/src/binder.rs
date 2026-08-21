@@ -24,6 +24,7 @@ use crate::ast::{
     SetInto, SetItem, SortKey, TemporalFn, TrimSide, UnaryOp,
 };
 use crate::functions;
+use crate::procedures;
 use crate::refs::GraphHandle;
 
 fn invalid(detail: String) -> ZuError {
@@ -1677,22 +1678,6 @@ pub enum TableFunc {
 }
 
 impl TableFunc {
-    fn resolve(name: &str) -> Option<TableFunc> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "pagerank" => TableFunc::Pagerank,
-            "wcc" => TableFunc::Wcc,
-            "bfs" => TableFunc::Bfs,
-            "sssp" => TableFunc::Sssp,
-            "sssp_weighted" => TableFunc::SsspWeighted,
-            "cdlp" => TableFunc::Cdlp,
-            "lcc" => TableFunc::Lcc,
-            "triangle_count" => TableFunc::TriangleCount,
-            "betweenness" => TableFunc::Betweenness,
-            "louvain" => TableFunc::Louvain,
-            _ => return None,
-        })
-    }
-
     /// The engine-facing kernel name.
     pub fn name(self) -> &'static str {
         match self {
@@ -1706,23 +1691,6 @@ impl TableFunc {
             TableFunc::TriangleCount => "triangle_count",
             TableFunc::Betweenness => "betweenness",
             TableFunc::Louvain => "louvain",
-        }
-    }
-
-    /// The YIELD column after the leading `node`, with its type. The
-    /// distance column is an integer that comes back null for nodes
-    /// the source does not reach.
-    fn value_column(self) -> (&'static str, Type) {
-        match self {
-            TableFunc::Pagerank => ("rank", Type::Float),
-            TableFunc::Wcc => ("component", Type::Int),
-            TableFunc::Bfs => ("level", Type::Int),
-            TableFunc::Sssp | TableFunc::SsspWeighted => ("distance", Type::Int),
-            TableFunc::Cdlp => ("community", Type::Int),
-            TableFunc::Lcc => ("coefficient", Type::Float),
-            TableFunc::TriangleCount => ("triangles", Type::Int),
-            TableFunc::Betweenness => ("centrality", Type::Float),
-            TableFunc::Louvain => ("community", Type::Int),
         }
     }
 }
@@ -3639,7 +3607,12 @@ impl Binder<'_> {
                     ordinal,
                 })
             }
-            Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
+            Clause::Call {
+                at,
+                proc,
+                args,
+                yields,
+            } => self.bind_table_call(at.as_deref(), proc, args, yields),
             Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
@@ -3797,25 +3770,59 @@ impl Binder<'_> {
         })
     }
 
+    /// A named procedure call (ISO 13.1, feature GP04).
+    ///
+    /// The name is resolved against the catalog before anything else is
+    /// looked at, because what the call takes and what it yields are
+    /// the procedure's to say and there is nothing to check an argument
+    /// against until the procedure is known. Everything after the
+    /// lookup is read off the descriptor, so a procedure is a row in a
+    /// table rather than an arm in three matches, and the refusals are
+    /// built out of the same words the row holds.
     fn bind_table_call(
         &mut self,
-        name: &str,
+        at: Option<&str>,
+        reference: &ast::ProcRef,
         args: &[Expr],
         yields: &[(String, Option<String>)],
     ) -> Result<BoundClause> {
-        let func = TableFunc::resolve(name).ok_or_else(|| {
-            invalid(format!(
-                "unknown table function '{name}', the v0 functions are \
-                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, \
-                 triangle_count, betweenness, louvain"
-            ))
+        // Where the name is looked up: what the name itself says, then
+        // what the AT clause says, then the root. A name written out as
+        // a path is never one the AT clause could disagree with, since
+        // a path after a path reads as one longer path and the parser
+        // has already settled which of them it is.
+        let schema = reference
+            .schema
+            .as_deref()
+            .or(at)
+            .unwrap_or(procedures::ROOT);
+        let proc = procedures::resolve(schema, &reference.name).ok_or_else(|| {
+            // A procedure that is somewhere else is a different refusal
+            // from a procedure that is nowhere, because the caller
+            // spelled the name right and looked in the wrong place.
+            if procedures::resolve(procedures::ROOT, &reference.name).is_some() {
+                bad_reference(format!(
+                    "no procedure '{}' in the schema '{schema}', it is in the root schema",
+                    reference.name
+                ))
+            } else {
+                bad_reference(format!(
+                    "no procedure '{}' in the schema '{schema}', the ones there are {}",
+                    reference.name,
+                    match procedures::in_schema(schema).join(", ").as_str() {
+                        "" => "none".to_string(),
+                        list => list.to_string(),
+                    }
+                ))
+            }
         })?;
+        let func = proc.func;
         // The rel table must resolve at bind time, so the first
         // argument is a string literal, not an expression.
         let Some(Expr::Literal(Literal::Str(rel_name))) = args.first() else {
             return Err(invalid(format!(
                 "{}'s first argument must be a string naming a rel table",
-                func.name()
+                proc.name
             )));
         };
         let rel = self
@@ -3825,8 +3832,7 @@ impl Binder<'_> {
         if rel.from != rel.to {
             return Err(invalid(format!(
                 "{} needs a rel table over one node table, '{}' connects two",
-                func.name(),
-                rel.name
+                proc.name, rel.name
             )));
         }
         let (rel_id, table) = (rel.id, rel.from);
@@ -3836,86 +3842,42 @@ impl Binder<'_> {
             let (expr, ty) = self.bind_expr(arg, &mut ctx)?;
             bound_args.push((expr, ty));
         }
-        match func {
-            TableFunc::Bfs | TableFunc::Sssp => {
-                let name = func.name();
-                if bound_args.len() != 1 {
-                    return Err(invalid(format!(
-                        "{name} takes the rel table and a source node id"
-                    )));
+        let (least, most) = proc.arity();
+        if bound_args.len() < least || bound_args.len() > most {
+            return Err(invalid(format!("{} takes {}", proc.name, proc.takes())));
+        }
+        for (i, param) in proc.params.iter().enumerate() {
+            let Some((_, ty)) = bound_args.get(i) else {
+                break;
+            };
+            let fits = match param.ty {
+                procedures::ParamTy::Int => matches!(ty, Type::Int | Type::Any),
+                procedures::ParamTy::List => matches!(ty, Type::List(_) | Type::Any),
+                // A literal is checked on what was written and not on
+                // what it works out to, since what it names is settled
+                // while the statement is being bound.
+                procedures::ParamTy::StrLiteral => {
+                    matches!(args[i + 1], Expr::Literal(Literal::Str(_)))
                 }
-                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
-                    return Err(invalid(format!(
-                        "{name}'s source must be a node id, got {}",
-                        bound_args[0].1
-                    )));
-                }
+            };
+            if !fits && param.ty == procedures::ParamTy::StrLiteral {
+                return Err(invalid(format!(
+                    "{}'s {} must be {}",
+                    proc.name, param.noun, param.expect
+                )));
             }
-            TableFunc::SsspWeighted => {
-                // The weight column is named rather than assumed: a rel
-                // table can carry several numeric columns and which one
-                // is a distance is the caller's to say.
-                if bound_args.len() != 2 {
-                    return Err(invalid(
-                        "sssp_weighted takes the rel table, a source node id, and the name of \
-                         the weight column"
-                            .into(),
-                    ));
-                }
-                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
-                    return Err(invalid(format!(
-                        "sssp_weighted's source must be a node id, got {}",
-                        bound_args[0].1
-                    )));
-                }
-                if !matches!(args[2], Expr::Literal(Literal::Str(_))) {
-                    return Err(invalid(
-                        "sssp_weighted's weight column must be a string literal".into(),
-                    ));
-                }
-            }
-            TableFunc::Betweenness => {
-                // The sources are a list and not a single node,
-                // because the score a node gets is a sum over the
-                // sample and running the sample one source at a time
-                // would be one pass of the graph per source with the
-                // adding left to the caller.
-                if bound_args.len() != 1 {
-                    return Err(invalid(
-                        "betweenness takes the rel table and a list of source node ids".into(),
-                    ));
-                }
-                if !matches!(bound_args[0].1, Type::List(_) | Type::Any) {
-                    return Err(invalid(format!(
-                        "betweenness's sources must be a list of node ids, got {}",
-                        bound_args[0].1
-                    )));
-                }
-            }
-            TableFunc::Cdlp => {
-                // The round count is what makes label propagation
-                // reproducible, so it is spellable, and the default is
-                // the one Graphalytics fixed.
-                if bound_args.len() > 1 {
-                    return Err(invalid(
-                        "cdlp takes the rel table and an optional round count".into(),
-                    ));
-                }
-                if let Some((_, ty)) = bound_args.first()
-                    && !matches!(ty, Type::Int | Type::Any)
-                {
-                    return Err(invalid(format!(
-                        "cdlp's round count must be an integer, got {ty}"
-                    )));
-                }
-            }
-            _ => {
-                if !bound_args.is_empty() {
-                    return Err(invalid(format!("{} takes only the rel table", func.name())));
-                }
+            if !fits {
+                return Err(invalid(format!(
+                    "{}'s {} must be {}, got {ty}",
+                    proc.name, param.noun, param.expect
+                )));
             }
         }
-        let (value_name, value_ty) = func.value_column();
+        let (value_name, value_ty) = proc.column;
+        let value_ty = match value_ty {
+            procedures::ColTy::Int => Type::Int,
+            procedures::ColTy::Float => Type::Float,
+        };
         let expected = ["node", value_name];
         if yields.len() != expected.len()
             || yields
@@ -3925,7 +3887,7 @@ impl Binder<'_> {
         {
             return Err(invalid(format!(
                 "{} yields the columns node, {value_name}",
-                func.name()
+                proc.name
             )));
         }
         let mut slots = Vec::new();

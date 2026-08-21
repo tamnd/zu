@@ -10194,7 +10194,15 @@ mod tests {
             ),
             (
                 "CALL nonsense('KNOWS') YIELD node, rank RETURN rank",
-                "unknown table function",
+                "no procedure 'nonsense' in the schema '/'",
+            ),
+            (
+                "CALL AT /app pagerank('KNOWS') YIELD node, rank RETURN rank",
+                "it is in the root schema",
+            ),
+            (
+                "CALL /app/pagerank('KNOWS') YIELD node, rank RETURN rank",
+                "it is in the root schema",
             ),
             (
                 "CALL pagerank('IS_LOCATED_IN') YIELD node, rank RETURN rank",

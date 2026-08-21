@@ -162,13 +162,29 @@ reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
    the names the reader wrote (GP03), and an empty list is a block that
    reads nothing, which is a whole statement standing on its own.
 
-   The word is a table function's too, and that reading is the one a
-   name after CALL gets. Which of the two a call is is settled by the
-   one token after the word: a brace or a parenthesis is this, and a
-   name is the other. *)
-call_clause     = "CALL" , [ variable_scope ] , "{" ,
+   The word is a named call's too, and that reading is the one a name
+   after CALL gets. Which of the two a call is is settled by the one
+   token after the word: a brace or a parenthesis is the inline call,
+   and a name, a path or AT is the named one. *)
+call_clause     = "CALL" , ( inline_procedure_call | named_procedure_call ) ;
+inline_procedure_call
+                = [ variable_scope ] , "{" ,
                   [ use_clause ] , composite_query , "}" ;
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
+
+(* GP04, ISO 13.1. The named procedure call. The name is a catalog
+   object reference, so it is read the way a graph's name is: a bare
+   name, or a path saying which schema it is in. The AT clause says
+   that schema instead, and the two are never both written, since
+   whitespace is nothing to the lexer and a path after a path reads as
+   one longer path. What a procedure takes and what it yields are the
+   procedure's own, so the arguments and the YIELD columns are checked
+   against the catalog and not against this grammar. *)
+named_procedure_call
+                = [ "AT" , schema_path ] , procedure_ref , "(" ,
+                  [ expression , { "," , expression } ] , ")" ,
+                  yield_clause ;
+procedure_ref   = name | "/" , { name , "/" } , name ;
 
 match_clause    = ( "MATCH" , pattern , [ where_clause ]
                   | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]

@@ -13,22 +13,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The two jobs that read the source rather than run it, and the two
+  # that install no toolchain of their own. rust-toolchain.toml names
+  # the version and names rustfmt and clippy beside it, so cargo's
+  # first call here installs exactly that and these jobs say what a
+  # developer's own checkout says. The rust action would set
+  # RUSTUP_TOOLCHAIN, which wins over that file, and its default is the
+  # floating stable. That is what turned somebody else's release day
+  # into a red main: 1.98 added chunks_exact_to_as_chunks and failed
+  # five sites in zu-vector that nobody had touched, and the fix it
+  # asked for is a method that is not stable on the version this
+  # workspace builds with. What rustfmt and clippy say is part of the
+  # toolchain, so it moves when the pin moves and not before (#489).
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust
-        with:
-          components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

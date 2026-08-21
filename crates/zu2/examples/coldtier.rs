@@ -65,8 +65,13 @@ impl Rng {
     }
 }
 
-fn options(memory: usize) -> Options {
+fn options(memory: usize, cold: bool, target: u64) -> Options {
     Options {
+        cold_tier: cold,
+        // The tier gets the same storage budget as the log, so a row is
+        // the same database size either way and what is left to compare
+        // is the work and the time.
+        cold_target_percent: target as u32,
         durability: Durability::Async,
         index_buckets: (RECORDS as usize).next_power_of_two(),
         max_pages: 1 << 12,
@@ -85,6 +90,7 @@ fn options(memory: usize) -> Options {
 struct Row {
     appended: u64,
     copied: u64,
+    migrated: u64,
     passes: u64,
     updates: f64,
     compacting: f64,
@@ -94,10 +100,10 @@ struct Row {
 /// of the keys taking four fifths of them, each round followed by
 /// however many passes it takes to get back under `target` percent of
 /// the live set.
-fn run(hot: f64, target: u64, memory: usize) {
+fn run(hot: f64, target: u64, memory: usize, cold: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("cold.zu2");
-    let db = Db::create(&path, options(memory)).expect("create");
+    let db = Db::create(&path, options(memory, cold, target)).expect("create");
     let value = vec![b'x'; VALUE_BYTES];
     let live = RECORDS * record_bytes();
     let ceiling = live * target / 100;
@@ -113,7 +119,11 @@ fn run(hot: f64, target: u64, memory: usize) {
     let mut rng = Rng(0x2026_0821);
     let mut row = Row::default();
     for round in 0..ROUNDS {
-        let mark = (db.log_bytes(), db.compaction().copied.load(Relaxed));
+        let mark = (
+            db.log_bytes(),
+            db.compaction().copied.load(Relaxed),
+            db.compaction().migrated.load(Relaxed),
+        );
         let at = Instant::now();
         let mut session = db.session();
         for _ in 0..PER_ROUND {
@@ -131,7 +141,7 @@ fn run(hot: f64, target: u64, memory: usize) {
 
         let at = Instant::now();
         let mut passes = 0;
-        while db.log_span() > ceiling {
+        while db.log_span() + db.cold_span() > ceiling {
             let reclaimed = db.compact().expect("compact");
             passes += 1;
             if reclaimed == 0 {
@@ -145,6 +155,7 @@ fn run(hot: f64, target: u64, memory: usize) {
 
         if round >= ROUNDS / 2 {
             let copied = db.compaction().copied.load(Relaxed) - mark.1;
+            row.migrated += db.compaction().migrated.load(Relaxed) - mark.2;
             // The tail moved for two reasons and only one of them is the
             // workload, so the copies come out of the total rather than
             // being compared against it.
@@ -156,9 +167,15 @@ fn run(hot: f64, target: u64, memory: usize) {
         }
     }
 
+    // Laps counts copies and not migrations, because a lap is the cost
+    // that repeats. A record that moves to the tier is picked up once and
+    // then stops being read by the log's passes altogether, which is the
+    // whole of what the tier is for.
     let laps = row.copied as f64 / record_bytes() as f64 / RECORDS as f64;
+    let moved = row.copied + row.migrated;
     println!(
-        "{:>9}  {:>7}  {:>7}  {:>7}  {:>10.0}  {:>10.0}  {:>7.2}  {:>7.2}  {:>7.0}  {:>9.2}  {:>9.2}",
+        "{:>5}  {:>9}  {:>7}  {:>7}  {:>7}  {:>10.0}  {:>10.0}  {:>10.0}  {:>7.2}  {:>7.2}  {:>7.0}  {:>9.2}  {:>9.2}",
+        if cold { "on" } else { "off" },
         format!("{:.0}%", hot * 100.0),
         format!("{target}%"),
         if memory == usize::MAX {
@@ -169,9 +186,10 @@ fn run(hot: f64, target: u64, memory: usize) {
         row.passes,
         row.appended as f64 / (1 << 20) as f64,
         row.copied as f64 / (1 << 20) as f64,
-        row.copied as f64 / row.appended.max(1) as f64,
+        row.migrated as f64 / (1 << 20) as f64,
+        moved as f64 / row.appended.max(1) as f64,
         laps,
-        db.log_span() as f64 / live as f64 * 100.0,
+        (db.log_span() + db.cold_span()) as f64 / live as f64 * 100.0,
         row.updates,
         row.compacting,
     );
@@ -179,13 +197,15 @@ fn run(hot: f64, target: u64, memory: usize) {
 
 fn main() {
     println!(
-        "{:>9}  {:>7}  {:>7}  {:>7}  {:>10}  {:>10}  {:>7}  {:>7}  {:>7}  {:>9}  {:>9}",
+        "{:>5}  {:>9}  {:>7}  {:>7}  {:>7}  {:>10}  {:>10}  {:>10}  {:>7}  {:>7}  {:>7}  {:>9}  {:>9}",
+        "tier",
         "hot",
         "target",
         "memory",
         "passes",
         "wrote MiB",
         "copied MiB",
+        "moved MiB",
         "amp",
         "laps",
         "span %",
@@ -194,7 +214,9 @@ fn main() {
     );
     for hot in [1.0, 0.2, 0.01] {
         for target in [150, 200, 400] {
-            run(hot, target, usize::MAX);
+            for cold in [false, true] {
+                run(hot, target, usize::MAX, cold);
+            }
         }
     }
     // The live set is about 62 MiB, so four pages is a memory budget of
@@ -202,6 +224,8 @@ fn main() {
     // what it copies.
     println!();
     for hot in [1.0, 0.2, 0.01] {
-        run(hot, 200, 4);
+        for cold in [false, true] {
+            run(hot, 200, 4, cold);
+        }
     }
 }

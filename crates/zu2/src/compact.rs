@@ -85,7 +85,7 @@
 //! neither can see the other half done.
 
 use crate::addr::{Address, PAGE_SIZE, page_of, page_start};
-use crate::db::Session;
+use crate::db::{Carried, Placement, Session};
 use crate::error::Result;
 use crate::graph;
 use crate::graph::Direction;
@@ -100,6 +100,10 @@ pub struct Compacted {
     /// Bytes it wrote back at the tail, which is the write amplification
     /// compaction costs.
     pub copied: u64,
+    /// Bytes it moved to the cold tier, which is the other half of that
+    /// amplification and the half that is only paid once. See
+    /// [`crate::cold`].
+    pub migrated: u64,
     /// Records it read.
     pub records: u64,
     /// Records it found still live.
@@ -136,6 +140,16 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
         return Ok(done);
     }
     debug_assert_eq!(upto % PAGE_SIZE as u64, 0, "compact to a page boundary");
+
+    // A record still live in the oldest region went a whole lap of the
+    // log without anybody touching it, which is the definition of cold
+    // this engine uses, so the survivors of a pass go to the tier rather
+    // than to the tail. See [`crate::cold`].
+    // A file written before pad records existed is read under a rule
+    // that treats zeros as padding, and the tier's scan is not written
+    // for that rule. Such a file keeps the engine it had.
+    let cold =
+        session.core_ref().cold.is_some() && crate::cold::usable(session.core_ref().log.format());
 
     // The copies do not each wait for the device. One barrier at the end
     // covers all of them, and nothing below is allowed to move until it
@@ -191,15 +205,35 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
             done.records += 1;
             done.scanned += size as u64;
             let kept = match kind {
-                record::KIND_EDGE => keep_edge(session, &value),
-                _ => session.copy_forward(&key, &value, tombstone, kind, address, version),
+                record::KIND_EDGE => keep_edge(session, &value).map(|kept| {
+                    if kept {
+                        Placement::Hot
+                    } else {
+                        Placement::Dead
+                    }
+                }),
+                _ => session.copy_forward(
+                    &Carried {
+                        key: &key,
+                        value: &value,
+                        tombstone,
+                        kind,
+                        version,
+                    },
+                    address,
+                    cold,
+                ),
             };
             match kept {
-                Ok(true) => {
+                Ok(Placement::Hot) => {
                     done.live += 1;
                     done.copied += size as u64;
                 }
-                Ok(false) => {}
+                Ok(Placement::Cold) => {
+                    done.live += 1;
+                    done.migrated += size as u64;
+                }
+                Ok(Placement::Dead) => {}
                 Err(error) => {
                     outcome = Err(error);
                     break 'pages;
@@ -212,7 +246,11 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
     outcome?;
 
     // Everything live is at the tail and on the device before a single
-    // block of the region is released.
+    // block of the region is released. The tier goes first because a
+    // record that moved there is no longer anywhere else.
+    if let Some(tier) = &session.core_ref().cold {
+        tier.sync()?;
+    }
     let tail = session.core_ref().log.tail();
     session
         .core_ref()
@@ -220,6 +258,92 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
         .make_durable(tail, Durability::Durable)?;
     done.reclaimed = session.core_ref().log.reclaim_to(upto)?;
     Ok(done)
+}
+
+/// Compacts `[cold.begin(), upto)` of the cold tier, which must be a
+/// page boundary.
+///
+/// The same lookup-based rule as the log's pass, and it has to be: the
+/// index is what says whether a record is live and it does not care
+/// which tier the record is in. What is different is where the
+/// survivors go, which is straight back to the cold tail. A record that
+/// has already settled once and is still settled is not evidence that it
+/// is about to be written to.
+///
+/// Nothing in this tier is an edge record, because edges are not keyed
+/// and only a keyed record is ever moved here, so there is no adjacency
+/// question to ask.
+pub fn compact_cold(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
+    let mut done = Compacted::default();
+    let Some(tier) = &session.core_ref().cold else {
+        return Ok(done);
+    };
+    let begin = tier.begin();
+    if upto <= begin {
+        return Ok(done);
+    }
+    tier.sync()?;
+
+    // Read out first and place after, one record at a time, because the
+    // walk holds a page buffer that the placing would otherwise be
+    // borrowing the session through.
+    let mut batch = Vec::new();
+    let stopped = tier.walk(begin, upto, |header, address| {
+        // SAFETY: the walk hands over a whole record inside its own page
+        // buffer, and everything is copied out before it moves on.
+        unsafe {
+            batch.push((
+                address,
+                header.key().to_vec(),
+                header.value_unchecked().to_vec(),
+                header.tombstone(),
+                header.kind(),
+                header.version(),
+            ));
+        }
+        Ok(())
+    })?;
+    for (address, key, value, tombstone, kind, version) in batch {
+        let size = record::size_of(key.len(), value.len()) as u64;
+        done.records += 1;
+        done.scanned += size;
+        let carried = Carried {
+            key: &key,
+            value: &value,
+            tombstone,
+            kind,
+            version,
+        };
+        match session.copy_forward(&carried, address, true)? {
+            Placement::Cold => {
+                done.live += 1;
+                done.migrated += size;
+            }
+            Placement::Hot => {
+                done.live += 1;
+                done.copied += size;
+            }
+            Placement::Dead => {}
+        }
+    }
+
+    let tier = session.core_ref().cold.as_ref().expect("zu2 cold tier");
+    tier.sync()?;
+    done.reclaimed = tier.reclaim_to(stopped.min(upto))?;
+    Ok(done)
+}
+
+/// How far a cold pass should reach. A quarter of the span at a time,
+/// for the same reason the log's slice is a quarter: a whole pass would
+/// hold the maintenance lock for as long as the tier is big.
+pub fn cold_slice(session: &Session<'_>) -> Address {
+    let Some(tier) = &session.core_ref().cold else {
+        return 0;
+    };
+    let begin = tier.begin();
+    let quarter = begin + tier.span() / 4;
+    let page = page_start(page_of(quarter)).max(page_start(page_of(begin) + 1));
+    page.min(page_start(page_of(tier.tail())))
 }
 
 /// Decides an edge record and re-appends it when it still counts.

@@ -586,10 +586,9 @@ fn fill(db: &Db, tag: char, pages: usize) {
 }
 
 /// Adds every edge of a ring and then removes every one of them, or does
-/// neither, then compacts to a steady state and returns the span of the
-/// log that is left. The two answers should agree: a removed edge is
-/// gone, and gone means it costs nothing.
-fn churn_to_steady_span(edges: bool) -> u64 {
+/// neither, then compacts for `rounds` and returns what the database
+/// spans, both tiers together.
+fn churn_to_steady_span(edges: bool, rounds: usize) -> u64 {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::create(&dir.path().join("e.zu2"), wide()).expect("create");
     let nodes = 8000u32;
@@ -608,16 +607,16 @@ fn churn_to_steady_span(edges: bool) -> u64 {
         }
     }
     fill(&db, 'f', 3);
-    // Several passes, each with fresh records above it, because one pass
+    // Each round is a pass with fresh records above it, because one pass
     // reclaims a quarter of what it is allowed to read and the question
     // here is what the log settles at rather than what one pass does.
-    for _ in 0..4 {
+    for _ in 0..rounds {
         db.sync().expect("sync");
         db.compact().expect("compact");
         fill(&db, 'g', 1);
     }
     db.sync().expect("sync");
-    db.log_span()
+    db.log_span() + db.cold_span()
 }
 
 #[test]
@@ -625,16 +624,25 @@ fn a_removed_edge_stops_costing_once_it_is_compacted() {
     // #452. Compaction kept an edge remove whenever the edge was absent,
     // which for a removed edge is forever, so every pass matched it and
     // copied it forward again: 48 bytes a deleted edge, paid on every
-    // pass for the life of the database. The same workload with the
-    // edges taken out is the control, and the two spans should be the
-    // same log.
-    let with = churn_to_steady_span(true);
-    let without = churn_to_steady_span(false);
-    let leaked = with as i64 - without as i64;
+    // pass for the life of the database.
+    //
+    // What says whether that is happening is how the difference between
+    // the two workloads moves with the number of passes, not the
+    // difference itself. The difference itself is never zero: a database
+    // that wrote 768 KiB of edge records has a log 768 KiB longer at
+    // every point in its life, reclaim moves `begin` a whole page at a
+    // time, and once the survivors go to the cold tier the log settles at
+    // the mutable window rather than at the live set, so nothing ever
+    // rounds that shift away. A leak of 48 bytes a pass looks nothing
+    // like a shift: it grows every round, and doubling the rounds doubles
+    // it.
+    let short = churn_to_steady_span(true, 4) as i64 - churn_to_steady_span(false, 4) as i64;
+    let long = churn_to_steady_span(true, 8) as i64 - churn_to_steady_span(false, 8) as i64;
     assert!(
-        leaked.unsigned_abs() < 4 * RECORD,
-        "8000 added then removed edges left {leaked} bytes behind after compaction, \
-         {with} against {without} for the same workload with no edges in it"
+        (long - short).unsigned_abs() < 4 * RECORD,
+        "8000 added then removed edges cost {} bytes more over 8 passes than over 4, \
+         so compaction is still copying them forward",
+        long - short
     );
 }
 

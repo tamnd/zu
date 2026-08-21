@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
 use crate::checkpoint::{self, Checkpointed};
+use crate::cold::{self, Cold};
 use crate::epoch::Slotted;
 use crate::error::{Error, Result};
 use crate::graph::Graph;
@@ -125,6 +126,33 @@ pub struct Options {
     /// operator's to make rather than the library's. See
     /// [`Error::LogHole`](crate::Error::LogHole).
     pub salvage: bool,
+    /// Whether records that survive a compaction pass move to the cold
+    /// tier instead of being copied to the tail.
+    ///
+    /// On. A record that is still live in the oldest region of the log
+    /// went a whole lap without anybody touching it, and copying it to
+    /// the tail only puts it in the way of the next pass.
+    /// `examples/coldtier.rs` is what says how much that costs, and
+    /// [`crate::cold`] is what it does instead.
+    ///
+    /// Off is for measuring the difference, and for a host that would
+    /// rather have one file than two.
+    pub cold_tier: bool,
+    /// How many bytes of cold tier to keep per byte of live cold data,
+    /// as a percentage, which is [`Options::space_target_percent`] for
+    /// the other tier.
+    ///
+    /// The same as the log's, in the end. The argument for a looser
+    /// target was that cold data goes stale slowly and a pass over the
+    /// tier reads a file that is not in memory, so those passes should
+    /// be rare. The table in `examples/coldtier.rs` says the second half
+    /// of that is not true once the tier's appends are buffered: at 200
+    /// percent the tier moved a fifth of the bytes the log's own passes
+    /// moved and spent less time doing it than the run with no tier at
+    /// all. Space that buys nothing is space, so the tier keeps the
+    /// budget the log keeps and the option is here for a host that
+    /// wants to trade one for the other.
+    pub cold_target_percent: u32,
     /// Whether closing a database takes a checkpoint of it.
     ///
     /// On, because the alternative is that a reopen reads every record
@@ -152,10 +180,38 @@ impl Default for Options {
             compact_below: 128 << 20,
             provision_bytes: log::PROVISION_CHUNK,
             space_target_percent: 200,
+            cold_tier: true,
+            cold_target_percent: 200,
             salvage: false,
             checkpoint_on_close: true,
         }
     }
+}
+
+/// One record as a compaction pass carries it: what came out of the
+/// region it is reading, before anything has decided where it goes.
+///
+/// A struct rather than five arguments because the two passes carry the
+/// same five and the tier gave them a sixth.
+pub(crate) struct Carried<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub tombstone: bool,
+    pub kind: u32,
+    pub version: u64,
+}
+
+/// Where a compaction pass put a record it found still live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Nobody reaches it, so it was left where it was to be reclaimed.
+    Dead,
+    /// Copied to the tail of the log, which is what happens to a record
+    /// under a foreign index entry and to everything when there is no
+    /// cold tier.
+    Hot,
+    /// Moved to the cold tier. See [`crate::cold`].
+    Cold,
 }
 
 /// What compaction has done to a database since it was opened.
@@ -167,6 +223,8 @@ pub struct Compaction {
     pub scanned: AtomicU64,
     /// Bytes written back at the tail.
     pub copied: AtomicU64,
+    /// Bytes moved to the cold tier.
+    pub migrated: AtomicU64,
     /// Bytes the filesystem took back.
     pub reclaimed: AtomicU64,
 }
@@ -176,6 +234,7 @@ impl Compaction {
         self.passes.fetch_add(1, Ordering::Relaxed);
         self.scanned.fetch_add(pass.scanned, Ordering::Relaxed);
         self.copied.fetch_add(pass.copied, Ordering::Relaxed);
+        self.migrated.fetch_add(pass.migrated, Ordering::Relaxed);
         self.reclaimed.fetch_add(pass.reclaimed, Ordering::Relaxed);
     }
 }
@@ -201,11 +260,18 @@ pub struct Recovered {
     /// on every open that did not have to throw anything away. A
     /// salvaged database is a short database and this is how short.
     pub discarded: AtomicU64,
+    /// Cold records that had to go back to the hot log because the table
+    /// this reopen filled left them nowhere to sit. See
+    /// [`crate::recover`].
+    pub rehomed: AtomicU64,
 }
 
 /// Everything the sessions and the flusher share.
 pub struct Core {
     pub(crate) log: Log,
+    /// The cold tier, when the options asked for one. See
+    /// [`crate::cold`].
+    pub(crate) cold: Option<Cold>,
     pub(crate) index: Index,
     pub(crate) graph: Graph,
     version: AtomicU64,
@@ -214,6 +280,9 @@ pub struct Core {
     /// after every pass to the live set times the space target, so a
     /// database that stops being rewritten stops being compacted.
     compact_at: AtomicU64,
+    /// The cold span at which the next cold pass starts, the same
+    /// arrangement `compact_at` is for the log.
+    cold_at: AtomicU64,
     compaction: Compaction,
     pub(crate) recovered: Recovered,
     /// Held by the jobs that move the log or the index out from under a
@@ -300,6 +369,16 @@ impl Core {
     }
 
     /// The epoch table, which both planes reclaim through.
+    /// The floor a chain walk stops at for an address, which is the
+    /// begin of whichever tier the address is in.
+    #[inline]
+    pub(crate) fn floor_of(&self, address: Address) -> Address {
+        match &self.cold {
+            Some(cold) if cold::is_cold(address) => cold.begin(),
+            _ => self.log.begin(),
+        }
+    }
+
     pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
         &self.log.epochs
     }
@@ -316,7 +395,7 @@ impl Db {
     /// Creates a database, failing if the file is already there.
     pub fn create(path: &Path, options: Options) -> Result<Self> {
         let handle = file::create_new(path)?;
-        let core = Self::assemble(handle, path, options);
+        let core = Self::assemble(handle, path, options, true)?;
         // A file that never compacts never writes its marker word
         // otherwise, and a marker of zeros is how a file written before
         // pad records existed is recognised. Without this a brand new
@@ -329,7 +408,7 @@ impl Db {
     /// Opens a database and replays its log into the index.
     pub fn open(path: &Path, options: Options) -> Result<Self> {
         let handle = file::open_rw(path)?;
-        let core = Self::assemble(handle, path, options);
+        let core = Self::assemble(handle, path, options, false)?;
         // Before the replay, because it is what says where the replay
         // starts: a compacted file has a hole where its first pages were.
         let begin = core.log.read_begin()?;
@@ -360,8 +439,23 @@ impl Db {
         }
     }
 
-    fn assemble(handle: std::fs::File, path: &Path, options: Options) -> Arc<Core> {
-        Arc::new(Core {
+    fn assemble(
+        handle: std::fs::File,
+        path: &Path,
+        options: Options,
+        fresh: bool,
+    ) -> Result<Arc<Core>> {
+        let cold = if options.cold_tier {
+            Some(if fresh {
+                Cold::create(path)?
+            } else {
+                Cold::open(path)?
+            })
+        } else {
+            None
+        };
+        Ok(Arc::new(Core {
+            cold,
             log: Log::new(
                 handle,
                 path,
@@ -380,7 +474,12 @@ impl Db {
             recovered: Recovered::default(),
             maintenance: Mutex::new(()),
             warm_upto: AtomicU64::new(0),
-        })
+            // A page, never zero. The tier's threshold is raised by
+            // every pass that reads it, and the first one has nothing to
+            // go on, so the floor is the smallest span worth a pass
+            // rather than whatever floor the log was given.
+            cold_at: AtomicU64::new(options.compact_below.max(PAGE_SIZE as u64)),
+        }))
     }
 
     fn start(core: Arc<Core>, options: Options) -> Self {
@@ -441,6 +540,21 @@ impl Db {
         self.core.log.span()
     }
 
+    /// Addresses the cold tier still spans, or zero when there is none.
+    pub fn cold_span(&self) -> u64 {
+        self.core.cold.as_ref().map_or(0, Cold::span)
+    }
+
+    /// Bytes the cold file occupies on the device, holes excluded, and
+    /// zero when there is no tier. The tier's half of what
+    /// [`Db::disk_bytes`] reports together.
+    pub fn cold_disk_bytes(&self) -> Result<u64> {
+        match &self.core.cold {
+            Some(cold) => cold.disk_bytes(),
+            None => Ok(0),
+        }
+    }
+
     /// Log pages holding memory right now, each 4 MiB. The memory side
     /// of what [`Db::disk_bytes`] answers for the filesystem.
     pub fn resident_pages(&self) -> usize {
@@ -458,7 +572,11 @@ impl Db {
     /// megabyte more than it holds. The next commit provisions again.
     pub fn disk_bytes(&self) -> Result<u64> {
         self.core.log.trim_tail()?;
-        self.core.log.disk_bytes()
+        let mut bytes = self.core.log.disk_bytes()?;
+        if let Some(cold) = &self.core.cold {
+            bytes += cold.disk_bytes()?;
+        }
+        Ok(bytes)
     }
 
     /// Pushes everything appended so far to the device and waits for it.
@@ -468,6 +586,9 @@ impl Db {
     /// how a caller gets it there: a loader that is done, or anything
     /// about to measure what the database costs on disk.
     pub fn sync(&self) -> Result<()> {
+        if let Some(cold) = &self.core.cold {
+            cold.sync()?;
+        }
         let tail = self.core.log.tail();
         self.core.log.make_durable(tail, Durability::Durable)
     }
@@ -605,6 +726,22 @@ impl Db {
             }
             reclaimed += pass.reclaimed;
             if pass.scanned == 0 {
+                break;
+            }
+        }
+        // The tier only ever grows during the loop above, so the limit is
+        // taken after it: a record the hot pass just migrated has not
+        // been anywhere long enough to be worth reading again.
+        let limit = self
+            .core
+            .cold
+            .as_ref()
+            .map_or(0, |tier| page_start(page_of(tier.tail())));
+        drop(session);
+        loop {
+            let took = compact_cold_slice(&self.core, self.options, limit)?;
+            reclaimed += took;
+            if took == 0 {
                 return Ok(reclaimed);
             }
         }
@@ -818,11 +955,71 @@ fn compact_slice(core: &Core, options: Options) -> Result<()> {
             .fetch_max(core.log.span() + PAGE_SIZE as u64, Ordering::AcqRel);
         return Ok(());
     }
-    let live = (core.log.span() as u128 * pass.copied as u128 / pass.scanned as u128) as u64;
+    // Copied and migrated both, because both are records the pass found
+    // live. Counting only what went back to the tail would read a log
+    // whose survivors all went to the cold tier as empty, and empty says
+    // the target span is zero, which is a pass on every flush forever.
+    let survived = pass.copied + pass.migrated;
+    let live = (core.log.span() as u128 * survived as u128 / pass.scanned as u128) as u64;
     let target = live.saturating_mul(u64::from(options.space_target_percent)) / 100;
     core.compact_at
         .store(target.max(options.compact_below), Ordering::Release);
+    let limit = core
+        .cold
+        .as_ref()
+        .map_or(0, |tier| page_start(page_of(tier.tail())));
+    compact_cold_slice(core, options, limit)?;
     Ok(())
+}
+
+/// One pass over the cold tier plus the decision about when the next one
+/// runs, which is [`compact_slice`] against the tier's own span and its
+/// own target.
+///
+/// It runs after the hot pass and under the same maintenance lock,
+/// because a hot pass is the only thing that puts records in the tier and
+/// a tier that has just grown is the one worth measuring. Nothing here is
+/// on a timer: garbage appears down here only when a key that had settled
+/// is written again, so a tier that nobody rewrites raises its threshold
+/// once and is never read again.
+///
+/// `limit` is where the tier ended when the caller started, and no pass
+/// reads above it. A cold pass puts its survivors back at the cold tail,
+/// so without a stop line a tier that is all live would be read round and
+/// round forever, each pass finding the records the pass before it had
+/// just moved. That is not a theoretical loop: a database that loads a
+/// set of keys and never rewrites them hangs on the first foreground
+/// compaction. The threshold below is what makes the loop end early in
+/// the ordinary case, and this is what makes it end at all.
+fn compact_cold_slice(core: &Core, options: Options, limit: Address) -> Result<u64> {
+    let Some(tier) = &core.cold else {
+        return Ok(0);
+    };
+    if tier.span() < core.cold_at.load(Ordering::Acquire) {
+        return Ok(0);
+    }
+    let mut session = core.maintenance_session()?;
+    let upto = compact::cold_slice(&session).min(limit);
+    let pass = compact::compact_cold(&mut session, upto)?;
+    drop(session);
+    core.compaction.note(&pass);
+    if pass.scanned > 0 {
+        // The tier's begin moved, and a checkpoint names cold addresses
+        // that are now a hole. Same test, same tidying.
+        checkpoint::discard(core);
+    }
+    let tier = core.cold.as_ref().expect("zu2 cold tier");
+    if pass.scanned == 0 {
+        core.cold_at
+            .fetch_max(tier.span() + PAGE_SIZE as u64, Ordering::AcqRel);
+        return Ok(0);
+    }
+    let survived = pass.copied + pass.migrated;
+    let live = (tier.span() as u128 * survived as u128 / pass.scanned as u128) as u64;
+    let target = live.saturating_mul(u64::from(options.cold_target_percent)) / 100;
+    core.cold_at
+        .store(target.max(PAGE_SIZE as u64), Ordering::Release);
+    Ok(pass.reclaimed)
 }
 
 impl Drop for Db {
@@ -847,6 +1044,12 @@ impl Drop for Db {
         // report a size nobody wrote and hand the next run a scan over
         // blocks with nothing in them.
         let _ = self.core.log.trim_tail();
+        // The tier is write through, so this is an fsync and nothing
+        // else, but it is the fsync that makes a migrated record durable
+        // where it now lives rather than where it used to.
+        if let Some(tier) = &self.core.cold {
+            let _ = tier.sync();
+        }
     }
 }
 
@@ -907,6 +1110,16 @@ impl<'a> Session<'a> {
     /// The returned pointer is good until the next call on this session
     /// or the end of the epoch, whichever comes first.
     fn locate(&mut self, address: Address) -> Result<*const u8> {
+        if cold::is_cold(address) {
+            let Some(cold) = &self.core.cold else {
+                return Err(Error::Malformed {
+                    address,
+                    why: "a cold address in a database with no cold tier",
+                });
+            };
+            cold.load(address, &mut self.scratch)?;
+            return Ok(self.scratch.as_ptr().cast());
+        }
         let resident = self.core.log.resident(address);
         if !resident.is_null() {
             return Ok(resident);
@@ -948,8 +1161,11 @@ impl<'a> Session<'a> {
     fn chain_find(&mut self, entry: u64, key: &[u8]) -> Result<Option<Address>> {
         let mut address = index::address_of(entry);
         let foreign = index::is_foreign(entry);
-        let floor = self.core.log.begin();
-        while address >= floor && address != NULL {
+        // Per tier, because the two have floors of their own and a chain
+        // may cross from the log into the cold tier. It crosses at most
+        // once and never comes back, since a cold record has no
+        // `previous`, which is what makes this walk terminate.
+        while address != NULL && address >= self.core.floor_of(address) {
             let base = self.locate(address)?;
             // SAFETY: locate returns a whole record, 8 byte aligned,
             // valid until the next call, and nothing below moves on
@@ -1628,18 +1844,22 @@ impl<'a> Session<'a> {
     /// knowing anything about compaction.
     pub(crate) fn copy_forward(
         &mut self,
-        key: &[u8],
-        value: &[u8],
-        tombstone: bool,
-        kind: u32,
+        carried: &Carried<'_>,
         from: Address,
-        version: u64,
-    ) -> Result<bool> {
+        cold: bool,
+    ) -> Result<Placement> {
+        let Carried {
+            key,
+            value,
+            tombstone,
+            kind,
+            version,
+        } = *carried;
         let hash = index::hash(key);
         let tag = Index::tag(hash);
         self.slot.protect();
         let entered = self.bucket_of(hash);
-        let outcome = (|| -> Result<bool> {
+        let outcome = (|| -> Result<Placement> {
             let bucket = entered?;
             loop {
                 let mut found = None;
@@ -1657,22 +1877,40 @@ impl<'a> Session<'a> {
                     }
                 }
                 let Some((i, entry, address)) = found else {
-                    return Ok(false);
+                    return Ok(Placement::Dead);
                 };
                 if address != from {
                     // Somebody has written a newer version, so this one
                     // is a version and not the record.
-                    return Ok(false);
+                    return Ok(Placement::Dead);
                 }
-                let fresh = self.core.log.append(
-                    &self.slot,
-                    index::address_of(entry),
-                    version,
-                    key,
-                    value,
-                    tombstone,
-                    kind,
-                )?;
+                // A foreign entry keeps its chain, so its record stays
+                // in the log. The tier is only for an entry that answers
+                // for the key at its head and for nothing else, because
+                // a record written there has no `previous` to carry a
+                // chain in. See [`crate::cold`].
+                let tier = match &self.core.cold {
+                    Some(tier) if cold && !index::is_foreign(entry) => Some(tier),
+                    _ => None,
+                };
+                let (fresh, placed) = match tier {
+                    Some(tier) => (
+                        tier.append(version, key, value, tombstone, kind)?,
+                        Placement::Cold,
+                    ),
+                    None => (
+                        self.core.log.append(
+                            &self.slot,
+                            index::address_of(entry),
+                            version,
+                            key,
+                            value,
+                            tombstone,
+                            kind,
+                        )?,
+                        Placement::Hot,
+                    ),
+                };
                 if bucket.slots[i]
                     .compare_exchange(
                         entry,
@@ -1682,7 +1920,7 @@ impl<'a> Session<'a> {
                     )
                     .is_ok()
                 {
-                    return Ok(true);
+                    return Ok(placed);
                 }
             }
         })();
@@ -1706,6 +1944,13 @@ impl<'a> Session<'a> {
     /// the record has already gone read-only, or a flush has claimed
     /// the bytes.
     fn update_in_place(&mut self, address: Address, value: &[u8]) -> Option<Address> {
+        if cold::is_cold(address) {
+            // The tier is write through and has no mutable window, so
+            // there is nothing here to rewrite. An update to a key that
+            // had settled appends in the log, which is what takes it
+            // back out of the tier.
+            return None;
+        }
         if address < self.core.log.in_place_floor() {
             return None;
         }

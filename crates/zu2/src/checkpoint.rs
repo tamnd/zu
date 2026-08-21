@@ -62,11 +62,16 @@ const MAGIC: u64 = 0x7a75_3263_6b70_7431;
 
 /// The layout the reader was taught. A file stamped with anything else
 /// is not read, and a reopen that meets one falls back to the scan.
-const FORMAT: u32 = 1;
+/// Two: the header grew the cold tier's begin and tail. A checkpoint
+/// written before the tier existed says nothing about it, and a file
+/// with a tier restored from one would come back missing every key that
+/// had settled, so the older layout is refused rather than read with
+/// zeros for the fields it does not have.
+const FORMAT: u32 = 2;
 
-/// Magic, format, the two log addresses, the version counter, the shape
-/// of both planes.
-const HEADER: usize = 64;
+/// Magic, format, the two log addresses, the two cold addresses, the
+/// version counter, the shape of both planes.
+const HEADER: usize = 80;
 
 /// What a capture wrote, which is what a caller measuring one wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +193,16 @@ pub(crate) fn capture(core: &Core, boundary: Address) -> Result<(Vec<u8>, Checkp
     header[40..48].copy_from_slice(&(table.len() as u64).to_le_bytes());
     header[48..56].copy_from_slice(&(index.keys() as u64).to_le_bytes());
     header[56..60].copy_from_slice(&nodes.to_le_bytes());
+    // Zeros when there is no tier, which is a state the restore has to
+    // be able to tell from an empty one: a database that opens without a
+    // tier and one whose tier is empty read the same cold records, but
+    // only the second may adopt a checkpoint that names cold addresses.
+    let (cold_begin, cold_tail) = match &core.cold {
+        Some(tier) => (tier.begin(), tier.tail()),
+        None => (0, 0),
+    };
+    header[64..72].copy_from_slice(&cold_begin.to_le_bytes());
+    header[72..80].copy_from_slice(&cold_tail.to_le_bytes());
 
     let crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
@@ -229,6 +244,9 @@ pub(crate) struct Restored {
     /// The version counter the capture ran at, which the replay raises
     /// further as it reads records above the boundary.
     pub version: u64,
+    /// Where the cold tier ended at the capture, which is where the
+    /// replay reads it from. Everything below is in the restored planes.
+    pub cold_tail: Address,
 }
 
 /// Reads the checkpoint beside the log and installs it, or answers
@@ -256,6 +274,19 @@ pub(crate) fn restore(core: &Core, len: u64) -> Result<Option<Restored>> {
     // one whose tail did not survive, which the capture's own sync makes
     // impossible unless the file has been replaced under us.
     if read.begin != core.log.begin() || read.boundary > len || read.format != core.log.format() {
+        return Ok(None);
+    }
+    // The same argument for the second file. A cold pass since the
+    // capture moved the tier's begin and punched below it, and an entry
+    // naming a cold address down there names a hole. A checkpoint from a
+    // run with no tier beside a database that has one, or the other way
+    // round, is refused for the plainer reason that the addresses in it
+    // do not mean what this database would read them as.
+    let cold_matches = match &core.cold {
+        Some(tier) => read.cold_tail != 0 && read.cold_begin == tier.begin(),
+        None => read.cold_tail == 0,
+    };
+    if !cold_matches {
         return Ok(None);
     }
     // Nothing above this point has touched either plane, which is the
@@ -323,6 +354,7 @@ pub(crate) fn restore(core: &Core, len: u64) -> Result<Option<Restored>> {
     Ok(Some(Restored {
         boundary: read.boundary,
         version: read.version,
+        cold_tail: read.cold_tail,
     }))
 }
 
@@ -336,6 +368,8 @@ struct Read {
     buckets: usize,
     keys: usize,
     nodes: u32,
+    cold_begin: Address,
+    cold_tail: Address,
 }
 
 fn word(bytes: &[u8], at: usize) -> u64 {
@@ -374,6 +408,8 @@ fn parse(bytes: &[u8]) -> Option<Read> {
         buckets: word(bytes, 40) as usize,
         keys: word(bytes, 48) as usize,
         nodes: half(bytes, 56),
+        cold_begin: word(bytes, 64),
+        cold_tail: word(bytes, 72),
     };
     let mut at = HEADER;
     for _ in 0..read.buckets {

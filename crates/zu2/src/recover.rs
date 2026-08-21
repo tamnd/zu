@@ -52,6 +52,7 @@
 use std::collections::BTreeSet;
 
 use crate::addr::{Address, FIRST, NULL, PAGE_SIZE, page_of, page_start};
+use crate::cold;
 use crate::db::{Core, restore_pages, restore_pages_from};
 use crate::error::{Error, Result};
 use crate::graph;
@@ -122,7 +123,14 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
             .discarded
             .store(len - stopped, std::sync::atomic::Ordering::Relaxed);
     }
-    core.index.presize(records.div_ceil(4));
+    // The tier's records are keys too, and a table sized without them is
+    // a table the scan has to displace into. Counting means reading the
+    // cold file twice on this path, which is the same bargain the log
+    // makes above and for the same reason: a table of the wrong size
+    // costs every lookup for the life of the database.
+    let cold_records = cold_count(core)?;
+    core.index
+        .presize((records + cold_records as usize).div_ceil(4));
 
     let mut rewritten = Rewritten::new();
     let mut repairs = Repairs::new();
@@ -159,9 +167,14 @@ pub fn replay(core: &Core, salvage: bool) -> Result<()> {
     })?;
     core.log.resume_at(end);
     core.set_version(version);
-    core.recovered
-        .records
-        .store(records as u64, std::sync::atomic::Ordering::Relaxed);
+    // After the log and not before it, so that a key with a record in
+    // both tiers is decided by the version rule with both records in
+    // hand, and so that rehoming has a log to append to. See [`cold`].
+    let cold_read = cold_scan(core, None, &mut rewritten, &mut repairs, &mut scratch)?;
+    core.recovered.records.store(
+        records as u64 + cold_read,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     core.recovered
         .pages
         .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -262,9 +275,19 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     }
     core.log.resume_at(end);
     core.set_version(version);
+    // Only what the tier grew by since the checkpoint was taken. The
+    // planes the checkpoint restored already name every cold record
+    // that existed at the boundary.
+    let cold_read = cold_scan(
+        core,
+        Some(restored.cold_tail),
+        &mut rewritten,
+        &mut repairs,
+        &mut scratch,
+    )?;
     core.recovered
         .records
-        .store(records, std::sync::atomic::Ordering::Relaxed);
+        .store(records + cold_read, std::sync::atomic::Ordering::Relaxed);
     core.recovered
         .pages
         .store(rewritten.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -279,6 +302,173 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     core.log.sync_file()?;
     journal::clear(core);
     Ok(true)
+}
+
+/// Reads the cold tier back into the index.
+///
+/// `from` is where to start: `None` for a full scan of the file, and the
+/// checkpoint's cold tail when there is one, since everything below that
+/// is already in the planes the checkpoint restored.
+///
+/// A cold record has no `previous` and is the whole of what its entry
+/// answers for, so this is [`install`] without the relinking, and it can
+/// only put a record under an entry whose foreign bit is clear (#466).
+/// Whether it can is not something the tier decides: the table this
+/// reopen is filling may be a different size from the one the record was
+/// migrated under, and then the bucket the key lands in can be full, or
+/// can already be somebody else's chain. There is nowhere down here to
+/// put such a record, so it goes back to the hot log, which is the one
+/// place a record with a chain pointer belongs. Rare by construction and
+/// bounded by the bucket, but not impossible, and losing the key is not
+/// an option.
+fn cold_scan(
+    core: &Core,
+    from: Option<Address>,
+    rewritten: &mut Rewritten,
+    repairs: &mut Repairs,
+    scratch: &mut Vec<u64>,
+) -> Result<u64> {
+    let Some(tier) = &core.cold else {
+        return Ok(0);
+    };
+    let end = tier.end()?;
+    let from = from.unwrap_or_else(|| tier.begin()).max(tier.begin());
+    if from >= end {
+        // Nothing to read, but the tail still has to be where the run
+        // before this one left it. A tier reopened at its begin reports
+        // an empty span and calls every address it holds outside itself.
+        tier.resume_at(from.min(end.max(tier.begin())));
+        return Ok(0);
+    }
+    // Before the walk, because a chain the walk follows can point at a
+    // record the walk has already installed, and the tier will not read
+    // an address above its own tail.
+    tier.resume_at(end);
+
+    let mut rehome = Vec::new();
+    let mut records = 0u64;
+    let mut version = core.version();
+    let stopped = tier.walk(from, end, |header, address| {
+        records += 1;
+        version = version.max(header.version());
+        if !install_cold(core, header, address, scratch) {
+            // SAFETY: the walk hands over a whole record in its page
+            // buffer, and it is copied out before the walk moves on.
+            unsafe {
+                rehome.push((
+                    header.key().to_vec(),
+                    header.value_unchecked().to_vec(),
+                    header.tombstone(),
+                    header.kind(),
+                    header.version(),
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    tier.resume_at(stopped);
+    core.set_version(version);
+
+    if rehome.is_empty() {
+        return Ok(records);
+    }
+    // Recovery is alone with the database, so every slot is free and a
+    // reserved one is the right one: this is maintenance and not a host
+    // session. See [`crate::epoch`].
+    let slot = crate::epoch::Slotted::reserved(&core.log.epochs).expect("zu2 recovery slot");
+    for (key, value, tombstone, kind, version) in rehome {
+        let at = core
+            .log
+            .append(&slot, NULL, version, &key, &value, tombstone, kind)?;
+        let base = core.log.resident(at);
+        debug_assert!(!base.is_null(), "a record just appended is resident");
+        // SAFETY: the address came back from the append that wrote the
+        // record, and the page it went in is resident.
+        let header = unsafe { RecordRef::new(base) };
+        install(core, header, at, rewritten, repairs, scratch);
+        core.recovered
+            .rehomed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(records)
+}
+
+/// Records the cold tier holds, read before anything is built out of
+/// them so that the table can be sized against the whole key set.
+fn cold_count(core: &Core) -> Result<u64> {
+    let Some(tier) = &core.cold else {
+        return Ok(0);
+    };
+    let end = tier.end()?;
+    let begin = tier.begin();
+    if begin >= end {
+        return Ok(0);
+    }
+    let mut records = 0u64;
+    tier.walk(begin, end, |_, _| {
+        records += 1;
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+/// One cold record into the index. Answers false when there is no entry
+/// this record can go under, and then the caller moves it to the hot log.
+fn install_cold(
+    core: &Core,
+    header: RecordRef<'_>,
+    address: Address,
+    scratch: &mut Vec<u64>,
+) -> bool {
+    let key = header.key();
+    let hash = index::hash(key);
+    let tag = Index::tag(hash);
+    let bucket = core.index.live().bucket(hash);
+    let mut empty = None;
+    for i in 0..SLOTS {
+        let entry = bucket.slots[i].load(std::sync::atomic::Ordering::Relaxed);
+        if entry == EMPTY {
+            if empty.is_none() {
+                empty = Some(i);
+            }
+            continue;
+        }
+        if index::tag_of(entry) != tag && !index::is_foreign(entry) {
+            continue;
+        }
+        let Some(installed) = chain_version(core, entry, key, scratch) else {
+            continue;
+        };
+        if header.version() < installed {
+            // The hot log holds something newer for this key, which is
+            // the ordinary case for a key that was written again after
+            // it settled. The cold record is garbage waiting for a pass.
+            return true;
+        }
+        if index::is_foreign(entry) {
+            // Putting a record with no chain pointer at the head of a
+            // chain would cut off every key behind it.
+            return false;
+        }
+        bucket.slots[i].store(
+            index::entry(tag, address, false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return true;
+    }
+    core.index.note_key();
+    match empty {
+        Some(i) => {
+            bucket.slots[i].store(
+                index::entry(tag, address, false),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            true
+        }
+        // A full bucket means taking an entry over, which means carrying
+        // what it held, which is the one thing a cold record cannot do.
+        None => false,
+    }
 }
 
 /// Whether every record in a page of the log parses and holds its
@@ -634,9 +824,16 @@ fn relink(
 fn chain_version(core: &Core, entry: u64, key: &[u8], scratch: &mut Vec<u64>) -> Option<u64> {
     let mut address = index::address_of(entry);
     let foreign = index::is_foreign(entry);
-    let floor = core.log.begin();
-    while address >= floor && address != crate::addr::NULL {
-        let mut base = core.log.resident(address);
+    while address != crate::addr::NULL && address >= core.floor_of(address) {
+        let mut base = if cold::is_cold(address) {
+            // A hot record may point into the tier, so a chain the scan
+            // is reading can cross once and has to be followed across.
+            // See [`crate::cold`].
+            core.cold.as_ref()?.load(address, scratch).ok()?;
+            scratch.as_ptr().cast()
+        } else {
+            core.log.resident(address)
+        };
         if base.is_null() {
             core.log.load(address, scratch).ok()?;
             base = scratch.as_ptr().cast();

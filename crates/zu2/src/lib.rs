@@ -41,6 +41,7 @@
 
 pub mod addr;
 pub mod checkpoint;
+pub mod cold;
 pub mod compact;
 pub mod db;
 pub mod epoch;

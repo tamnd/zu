@@ -460,8 +460,10 @@ pub fn read_range(
     let lo_entry = first.saturating_sub(1);
     let span = read_payload_span(db, meta, 4 + lo_entry * 4, 4 + (last + 1) * 4)?;
     let ends: Vec<usize> = span
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b) as usize)
         .collect();
     let ent = |chunk: usize| ends[chunk - lo_entry];
     let body_start = if first == 0 { 0 } else { ent(first - 1) };
@@ -562,16 +564,20 @@ pub fn locate(
     } else {
         let span = read_payload_span(db, meta, fence_off + first * 8, fence_off + last * 8)?;
         let fences: Vec<u64> = span
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
             .collect();
         first + fences.partition_point(|&f| f < value)
     };
     let lo_entry = target.saturating_sub(1);
     let span = read_payload_span(db, meta, 4 + lo_entry * 4, 4 + (target + 1) * 4)?;
     let ends: Vec<usize> = span
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b) as usize)
         .collect();
     let body_start = if target == 0 { 0 } else { ends[0] };
     let body_end = *ends.last().unwrap();
@@ -618,13 +624,17 @@ pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Chun
     let chunks = meta.chunk_count();
     let span = read_payload_span(db, meta, 4, 4 + chunks * 4)?;
     let ends = span
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     let span = read_payload_span(db, meta, 4 + chunks * 4, 4 + chunks * 12)?;
     let fences = span
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
         .collect();
     Ok(ChunkDirectory { ends, fences })
 }

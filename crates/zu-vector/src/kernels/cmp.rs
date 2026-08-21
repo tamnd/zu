@@ -73,13 +73,15 @@ fn pack_stage(stage: &[u8], out: &mut Bitmap) {
     let words = out.words_mut();
     for (wi, group) in stage.chunks(64).enumerate() {
         let mut w = 0u64;
-        let mut octets = group.chunks_exact(8);
-        for (k, bytes) in octets.by_ref().enumerate() {
-            let v = u64::from_le_bytes(bytes.try_into().expect("octet"));
-            w |= pack8(v) << (8 * k);
+        // Eights as arrays rather than as slices, so the octet is the
+        // type `from_le_bytes` wants and the fallible conversion that
+        // could never fail goes away with it.
+        let (octets, tail) = group.as_chunks::<8>();
+        for (k, bytes) in octets.iter().enumerate() {
+            w |= pack8(u64::from_le_bytes(*bytes)) << (8 * k);
         }
         let base = group.len() / 8 * 8;
-        for (b, &s) in octets.remainder().iter().enumerate() {
+        for (b, &s) in tail.iter().enumerate() {
             w |= u64::from(s) << (base + b);
         }
         words[wi] = w;

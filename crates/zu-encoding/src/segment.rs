@@ -324,8 +324,10 @@ fn decode_plain(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<(
         .ok_or_else(|| corrupt("truncated body"))?;
     out.reserve(count);
     out.extend(
-        body.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap())),
+        body.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c)),
     );
     Ok(())
 }

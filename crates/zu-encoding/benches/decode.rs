@@ -201,7 +201,7 @@ fn main() {
         })
         .unwrap_or_else(|| {
             let mut text = Vec::new();
-            for pair in data.chunks_exact(2).take(4 << 20) {
+            for pair in data.as_chunks::<2>().0.iter().take(4 << 20) {
                 text.extend_from_slice(format!("{}\t{}\n", pair[0], pair[1]).as_bytes());
             }
             println!("fsst data: synthetic edge-list text, {} bytes", text.len());

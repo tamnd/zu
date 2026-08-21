@@ -616,12 +616,12 @@ impl GroupTable {
 /// "ab\0" cannot land on the same value.
 fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = b.len() as u64;
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        h = hash64(h ^ u64::from_le_bytes(c.try_into().expect("eight bytes")));
+    let (octets, rest) = b.as_chunks::<8>();
+    for c in octets {
+        h = hash64(h ^ u64::from_le_bytes(*c));
     }
     let mut tail = 0u64;
-    for (i, &c) in chunks.remainder().iter().enumerate() {
+    for (i, &c) in rest.iter().enumerate() {
         tail |= u64::from(c) << (i * 8);
     }
     hash64(h ^ tail)

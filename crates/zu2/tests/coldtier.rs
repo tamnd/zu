@@ -297,3 +297,129 @@ fn without_the_tier_nothing_migrates() {
         );
     }
 }
+
+/// Readers walking the tier while a pass reclaims the front of it.
+///
+/// A pass copies what is still live above the region it is about to
+/// release and then moves `begin` past the region, and a reader that
+/// resolved an address just before that has an address that is about to
+/// be a hole. The floor test in the chain walk is not enough on its own,
+/// because it reads `begin` and then reads the record, and the pass can
+/// land between the two. What closes it is waiting for the sessions that
+/// were already inside an operation to leave before `begin` moves, and
+/// this is the test that they are waited for.
+///
+/// Timing, so it is written to make the window as wide as it can: as
+/// many readers as the session table allows, all of them over the cold
+/// key set, and passes back to back for the whole of it.
+#[test]
+fn a_cold_pass_does_not_reclaim_under_a_reader() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(
+        Db::create(
+            &dir.path().join("z.zu2"),
+            Options {
+                sessions: 32,
+                ..options()
+            },
+        )
+        .expect("create"),
+    );
+    let records = lapped(&db, 3000);
+    assert!(db.cold_span() > 0, "nothing went cold, so this proves nothing");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..8u32)
+        .map(|which| {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut s = db.session();
+                let mut rounds = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for i in 0..records {
+                        let i = (i + which) % records;
+                        assert_eq!(
+                            read(&mut s, &key(i)).as_deref(),
+                            Some(value(i, 0).as_slice()),
+                            "key {i} came back wrong under a pass"
+                        );
+                    }
+                    rounds += 1;
+                }
+                rounds
+            })
+        })
+        .collect();
+
+    // Enough churn between the passes to keep giving them something to
+    // do, since a pass over a tier nothing has been added to is a pass
+    // that returns immediately and never touches begin.
+    {
+        let mut s = db.session();
+        for round in 0..20u32 {
+            for i in 0..1000u32 {
+                s.upsert(&churn(i), &value(i, round)).expect("upsert");
+            }
+            s.set_durability(Durability::Durable);
+            s.upsert(&churn(0), &value(0, round)).expect("flush");
+            s.set_durability(Durability::Async);
+            db.compact().expect("compact");
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        let rounds = reader.join().expect("reader");
+        assert!(rounds > 0, "a reader did not finish a single round");
+    }
+}
+
+/// A doubling that runs after a cold pass has taken space back.
+///
+/// The split reads the log to find out which side of the new table each
+/// key belongs on, and the address it starts that read from can name a
+/// region a pass has already reclaimed. Which floor it tests against is
+/// the whole of it: a cold address is numerically above every hot one,
+/// so the hot log's floor drops nothing, and the split walks into a hole
+/// and fails the whole operation with `outside the cold tier`. #535.
+///
+/// The shape is a load big enough that the table doubles several times
+/// after the tier has a floor above zero, which is what the scaling
+/// example was doing when it found this.
+#[test]
+fn a_doubling_after_a_cold_pass_does_not_read_reclaimed_space() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("z.zu2"),
+        Options {
+            // Small enough that the load below doubles it several times,
+            // which is the only way into the split path.
+            index_buckets: 1 << 8,
+            ..options()
+        },
+    )
+    .expect("create");
+    let records = lapped(&db, 3000);
+    assert!(db.cold_span() > 0, "nothing migrated");
+
+    let mut s = db.session();
+    for round in 1..8u32 {
+        for i in 0..records {
+            // Rewriting the cold set is what puts a reclaimed address
+            // under a live entry, and the fresh keys are what make the
+            // table double while those entries are in it.
+            s.upsert(&key(i), &value(i, round)).expect("upsert");
+            s.upsert(&key(records + round * records + i), &value(i, round))
+                .expect("upsert");
+        }
+        drop(s);
+        db.compact().expect("compact");
+        s = db.session();
+    }
+    for i in 0..records {
+        assert!(read(&mut s, &key(i)).is_some(), "cold key {i} is gone");
+    }
+}

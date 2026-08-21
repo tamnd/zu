@@ -1577,7 +1577,6 @@ impl<'a> Session<'a> {
     /// disagreed.
     fn split_bucket(&mut self, migration: &Migration, source: usize) -> Result<()> {
         let old = migration.old().at(source);
-        let floor = self.core.log.begin();
         let mut entries = Vec::with_capacity(SLOTS);
         // Key to the record for it this bucket is going to name.
         let mut keys: HashMap<Vec<u8>, Placed> = HashMap::new();
@@ -1595,11 +1594,16 @@ impl<'a> Session<'a> {
                 continue;
             }
             let address = index::address_of(entry);
-            if address < floor {
+            if address < self.core.floor_of(address) {
                 // Compaction has passed this entry by, so a lookup
                 // reaching it stops at the floor and reads nothing. It
                 // is already invisible and carrying it over would only
                 // take a slot in the new table.
+                //
+                // The floor is the one belonging to the address's own
+                // tier and not the hot log's, because a cold address is
+                // numerically above every hot one and testing it
+                // against the hot floor drops nothing at all. #535.
                 continue;
             }
             entries.push(entry);
@@ -1612,7 +1616,7 @@ impl<'a> Session<'a> {
             }
             chain.clear();
             let mut at = address;
-            while at >= floor && at != NULL {
+            while at != NULL && at >= self.core.floor_of(at) {
                 if chain.len() == SPLIT_WALK_LIMIT {
                     // A chain long enough to cost more than the split is
                     // worth. What has been read so far cannot be used,

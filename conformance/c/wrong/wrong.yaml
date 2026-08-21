@@ -82,6 +82,50 @@ cases:
           - type: NODE
             value: "thing#1"
 
+  - name: wrong-arrow-type
+    doc: A case whose rows are right and whose export is not, which is the failure the `arrow:` key exists to catch, and the one a report has to name the column and both format strings for.
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+    arrow:
+      - name: n
+        format: g
+
+  - name: wrong-arrow-field-name
+    doc: The same thing one level down, so that the two runners are compared on how they point at a field inside a column rather than only on a column.
+    query: RETURN [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+    arrow:
+      - name: n
+        format: "+l"
+        children:
+          - name: element
+            format: l
+
+  - name: an-export-that-was-not-refused
+    doc: A case saying Arrow has no type for the result, against a result Arrow exports. A runner that read a refusal as permission to skip the check would call this a pass.
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+    arrow: refused
+
   - name: ahead-of-the-engine
     doc: A statement this engine does not implement, which is the third outcome and neither of the other two.
     query: MERGE (n:person)

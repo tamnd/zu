@@ -13,15 +13,18 @@
 //! client repository consumes (ADR 0005). The cases live here because
 //! they gate engine releases; `tamnd/zu-kit` holds the other runners.
 //!
-//! Five pieces, one per module. [`yaml`] reads the subset of YAML the
+//! Six pieces, one per module. [`yaml`] reads the subset of YAML the
 //! files are written in. [`value`] is the `{type, value}` encoding a
 //! case writes values in, whose entire job is to survive nine readers
 //! in seven languages without any of them rounding anything. [`case`]
 //! is what a case is. [`load`] is the data a suite puts in through its
 //! client's bulk load path before its cases read it back, which is the
-//! half of the question an expression cannot ask. [`runner`] runs them
-//! against this engine.
+//! half of the question an expression cannot ask. [`arrow`] is what a
+//! result looks like on the way out through the export, which is the
+//! half a row cannot ask either. [`runner`] runs them against this
+//! engine.
 
+pub mod arrow;
 pub mod case;
 pub mod load;
 pub mod runner;

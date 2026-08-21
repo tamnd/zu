@@ -1402,8 +1402,8 @@ pub fn decode_free_list(bytes: &[u8], block_count: u64) -> Result<Vec<BlockPtr>>
         )));
     }
     let mut ptrs = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        let ptr = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in bytes.as_chunks::<8>().0 {
+        let ptr = u64::from_le_bytes(*chunk);
         if ptr == NULL_BLOCK || ptr > block_count {
             return Err(corrupt(format!(
                 "block {ptr} out of range 1..={block_count}"

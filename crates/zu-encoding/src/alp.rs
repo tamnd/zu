@@ -209,8 +209,8 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<f64>) -> Result<()>
             return Err(e);
         }
     }
-    for (&pos, chunk) in positions.iter().zip(patterns_bytes.chunks_exact(8)) {
-        out[base + pos as usize] = f64::from_bits(u64::from_le_bytes(chunk.try_into().unwrap()));
+    for (&pos, chunk) in positions.iter().zip(patterns_bytes.as_chunks::<8>().0) {
+        out[base + pos as usize] = f64::from_bits(u64::from_le_bytes(*chunk));
     }
     Ok(())
 }

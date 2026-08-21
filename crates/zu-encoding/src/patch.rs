@@ -138,8 +138,8 @@ pub(crate) fn decode_chunks(
         // `take`; hostile ones are ignored here and cannot index out of
         // bounds because popcount bounded exc_count above.
         let mut next = 0usize;
-        for (word_idx, word_bytes) in bitmap.chunks_exact(8).enumerate() {
-            let mut word = u64::from_le_bytes(word_bytes.try_into().unwrap());
+        for (word_idx, word_bytes) in bitmap.as_chunks::<8>().0.iter().enumerate() {
+            let mut word = u64::from_le_bytes(*word_bytes);
             while word != 0 {
                 let i = word_idx * 64 + word.trailing_zeros() as usize;
                 if i < take {

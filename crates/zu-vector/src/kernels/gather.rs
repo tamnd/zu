@@ -17,15 +17,18 @@ use crate::vector::{ValueVector, VecEncoding};
 /// bounded by group size, not vector size.
 pub fn gather_u64(src: &[u64], idx: &[u32], out: &mut [u64]) {
     debug_assert_eq!(idx.len(), out.len());
-    let mut chunks = idx.chunks_exact(4);
-    let mut outs = out.chunks_exact_mut(4);
-    for (i4, o4) in chunks.by_ref().zip(outs.by_ref()) {
+    // Fours as arrays rather than as slices, which is the same unroll
+    // with the length in the type, so the four stores need no bounds
+    // check to prove.
+    let (fours, tail) = idx.as_chunks::<4>();
+    let (outs, out_tail) = out.as_chunks_mut::<4>();
+    for (i4, o4) in fours.iter().zip(outs) {
         o4[0] = src[i4[0] as usize];
         o4[1] = src[i4[1] as usize];
         o4[2] = src[i4[2] as usize];
         o4[3] = src[i4[3] as usize];
     }
-    for (o, &i) in outs.into_remainder().iter_mut().zip(chunks.remainder()) {
+    for (o, &i) in out_tail.iter_mut().zip(tail) {
         *o = src[i as usize];
     }
 }

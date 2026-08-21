@@ -1,6 +1,6 @@
 schema = 1
 doc = "The words of zuQL, grouped by what they are, for the three things that colour them."
-audited = "2026-08-20"
+audited = "2026-08-21"
 
 # One list of words, three consumers. The shell scans a statement as it
 # is typed and colours the words it recognises, the tree-sitter grammar
@@ -89,13 +89,13 @@ words = ["INSERT", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "CALL"]
 
 [[group]]
 kind = "keyword"
-doc = "The transaction statements, which the parser reads and the session runs, since a transaction outlives the statement that opened it."
-words = ["START", "COMMIT", "ROLLBACK"]
+doc = "The transaction statements, which the parser reads and the session runs, since a transaction outlives the statement that opened it. TRANSACTION is the noun START takes and takes alone, and the access mode behind it is READ ONLY or READ WRITE, ISO 13.3. The three mode words are contextual the way the interval fields are: nothing but a START puts them where they mean anything, so READ is an ordinary variable name everywhere else and RETURN read is a variable read."
+words = ["START", "TRANSACTION", "COMMIT", "ROLLBACK", "READ", "ONLY", "WRITE"]
 
 [[group]]
 kind = "keyword"
-doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word."
-words = ["MERGE", "SESSION"]
+doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word. ON is here because a MERGE is the only place it stands, in the ON CREATE SET and ON MATCH SET that say which of the two the MERGE did, and a word only a refused statement can hold is refused along with it."
+words = ["MERGE", "SESSION", "ON"]
 
 [[group]]
 kind = "keyword"

@@ -55,7 +55,100 @@ todo = "warn"
 lto = "thin"
 strip = true
 
-# Benches keep symbols so check_asm.sh and profilers can find the
-# kernel anchors; codegen is otherwise identical to release.
+# What a release ships, which is not what a developer builds.
+#
+# The CLI carries arrow and parquet and libzu does not, and on darwin
+# that is 5.12 MiB of a 13.03 MiB binary: 13.03 with the feature and
+# 7.91 without it. Those crates are generic enough that thin LTO leaves
+# most of the duplicate instantiations in place, and the three targets
+# that are not darwin were over the 15 MiB ceiling because of it (#492).
+# A fat link takes the pair to 11.62 MiB with no feature removed.
+#
+# It costs link time, which is why it is a profile of its own rather
+# than a change to release. `cargo build`, `cargo test` and every bench
+# keep the thin link they have, and only scripts/libzu-build.sh asks for
+# this one. profile.bench inherits release for the same reason:
+# check_asm.sh and the perf gates are read on the codegen a developer
+# gets, not on a link nobody runs twice. How much it costs is a number
+# the libzu matrix prints per target on every push, which is a better
+# record of it than anything a laptop measures: the two builds here came
+# out 5:03 and 15:41 in the wrong order, on a machine that throttles.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+
+# And the same crates asked to be small rather than fast, which is
+# another 1.19 MiB on top of the fat link, 11.62 to 10.43. Nothing zu
+# wrote is in this list: the engine, the encodings and the kernels stay
+# at opt-level 3, and what changes is the parquet reader and writer,
+# which is a decoder in front of a file rather than anything on the
+# query path.
+#
+# The cost was not settled here and this laptop cannot settle it. Six
+# interleaved warm runs of `zu copy` over a 4 M edge parquet file
+# measure a median of 6.6 M edges a second against 6.3, which is inside
+# the spread of the runs either side of it. The number belongs on
+# server1/2/3, and if it turns out to be real the answer is to drop this
+# block and find the megabyte somewhere else, because size is a ceiling
+# and throughput is the product.
+#
+# The list is written out rather than globbed so that an arrow crate
+# arriving in a version bump shows up as the binary growing, which is a
+# question somebody answers, rather than as a decoder quietly changing
+# speed, which is not.
+[profile.dist.package.parquet]
+opt-level = "s"
+
+[profile.dist.package.thrift]
+opt-level = "s"
+
+[profile.dist.package.zstd]
+opt-level = "s"
+
+[profile.dist.package.zstd-safe]
+opt-level = "s"
+
+[profile.dist.package.zstd-sys]
+opt-level = "s"
+
+[profile.dist.package.snap]
+opt-level = "s"
+
+[profile.dist.package.arrow]
+opt-level = "s"
+
+[profile.dist.package.arrow-arith]
+opt-level = "s"
+
+[profile.dist.package.arrow-array]
+opt-level = "s"
+
+[profile.dist.package.arrow-buffer]
+opt-level = "s"
+
+[profile.dist.package.arrow-cast]
+opt-level = "s"
+
+[profile.dist.package.arrow-data]
+opt-level = "s"
+
+[profile.dist.package.arrow-ipc]
+opt-level = "s"
+
+[profile.dist.package.arrow-ord]
+opt-level = "s"
+
+[profile.dist.package.arrow-row]
+opt-level = "s"
+
+[profile.dist.package.arrow-schema]
+opt-level = "s"
+
+[profile.dist.package.arrow-select]
+opt-level = "s"
+
+[profile.dist.package.arrow-string]
+opt-level = "s"
+
 [profile.bench]
 strip = "none"

@@ -18,7 +18,7 @@ set -eu
 
 target="${1:?usage: libzu-build.sh <target> <smoke>}"
 smoke="${2:?usage: libzu-build.sh <target> <smoke>}"
-out="target/$target/release"
+out="target/$target/dist"
 stage="dist/libzu-$target"
 
 # The CLI with parquet in it, because dx/12 section 6 promises that what
@@ -27,7 +27,12 @@ stage="dist/libzu-$target"
 # the CLI's feature and not the library's: the C ABI loads columns a
 # caller already has in memory, so an Arrow reader behind it would be
 # weight every embedder pays and nobody calls.
-cargo build --release --target "$target" -p zu-capi -p zu-cli --features zu-cli/arrow
+#
+# The `dist` profile rather than `release`, which is the same codegen
+# with a fat link on the end of it. That link is what keeps the CLI
+# under the ceiling below, and it is worth ten minutes here and nothing
+# at all to a developer, who never asks for this profile (#492).
+cargo build --profile dist --target "$target" -p zu-capi -p zu-cli --features zu-cli/arrow
 
 # The dx/14 section 4 ceilings, from the same table as the matrix. Size
 # is a real adoption factor for serverless and mobile targets and it
@@ -51,7 +56,7 @@ cargo run -q -p xtask -- platforms --measure "$out" --target "$target"
 # build here: everything downstream would carry on and fail at the far
 # end of it, where the message is a page of undefined references to
 # pthread_create rather than the one sentence that explains them.
-syslibs="$(cargo rustc -q --color never --release --target "$target" -p zu-capi \
+syslibs="$(cargo rustc -q --color never --profile dist --target "$target" -p zu-capi \
     --crate-type staticlib -- --print native-static-libs 2>&1 |
     sed -n 's/^note: native-static-libs: //p' | tail -1)"
 if [ -z "$syslibs" ]; then

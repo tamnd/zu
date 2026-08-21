@@ -28,8 +28,33 @@
 //! A displaced key costs a log dereference per lookup, so a table that
 //! is four times too small turns a point read into four random reads
 //! and the whole argument for the design goes with it. The table
-//! doubles rather than letting that happen, at half full, which is
-//! before displacement starts rather than after.
+//! doubles rather than letting that happen, at half full.
+//!
+//! Half full is not where displacement starts. There is no load above
+//! zero where it has not started, because half full is a statement
+//! about the table and overflowing is a property of one bucket, and
+//! keys per bucket is Poisson rather than uniform. What the threshold
+//! buys is a rate. A hundred thousand keys, with the bucket count
+//! forced so the load is the only thing moving:
+//!
+//! ```text
+//!   buckets   keys/bucket   slots in use   displaced
+//!      8192          3.05          99793         207
+//!     16384          3.05          99793         207
+//!     32768          3.05          99793         207
+//!     65536          1.53          99999           1
+//!    131072          0.76         100000           0
+//! ```
+//!
+//! 32768 is where the policy settles for that many keys, and the mean
+//! bucket there holds 3 of its 8 while the tail of the distribution is
+//! already past 8 for a couple of hundred of them. So two keys in a
+//! thousand are displaced at the threshold, which is one lookup in five
+//! hundred paying one extra dereference, and nothing like the four
+//! random reads the paragraph above is guarding against. The rate is
+//! what the threshold is chosen for, and `displacement_at_the_growth_
+//! threshold_stays_rare` holds it to that number so a change to the
+//! bucket width or the threshold has to restate it (#487).
 //!
 //! Doubling is FASTER's split, and the shape here is the same: a bucket
 //! `b` of the old table feeds exactly two buckets of the new one, `b`
@@ -74,8 +99,10 @@ const ADDRESS_MASK: u64 = (1 << 48) - 1;
 /// The entry an empty slot holds.
 pub const EMPTY: u64 = 0;
 
-/// Keys per slot at which the table doubles. Half full, so the split
-/// happens before a bucket has to displace anything rather than after.
+/// Keys per slot at which the table doubles. Half full, which is where
+/// displacement is rare rather than where it has not started: about two
+/// keys in a thousand are on a chain at that load. The module header
+/// has the measurements.
 const GROW_AT_PERCENT: usize = 50;
 
 #[inline]
@@ -617,6 +644,43 @@ mod tests {
             assert_eq!(seen[0], before);
             assert_eq!(seen[1], before + old.len());
         }
+    }
+
+    /// #487. Half full is not where displacement starts. There is no
+    /// load above zero where it has not started, because the threshold
+    /// is a statement about the table and overflowing is a property of
+    /// one bucket, and keys per bucket is Poisson rather than uniform.
+    /// What the threshold buys is a rate, so the rate is what this
+    /// holds: a change to the bucket width or to the threshold has to
+    /// restate the number rather than move it quietly.
+    ///
+    /// The count is the keys past the eighth of their bucket, which is
+    /// exactly the keys that go on a chain, so this is the displaced
+    /// number without a log to build. It comes out at 205 of 100000,
+    /// against the 207 a hundred thousand go-ycsb records displaced on
+    /// a real load at the same bucket count, which is the agreement
+    /// worth having: the rate is a property of the distribution and
+    /// not of the keys.
+    #[test]
+    fn displacement_at_the_growth_threshold_stays_rare() {
+        const KEYS: usize = 100_000;
+        let table = Table::new(1 << 15);
+        let mut per_bucket = vec![0usize; table.len()];
+        for i in 0..KEYS {
+            let key = format!("user{i}");
+            per_bucket[hash(key.as_bytes()) as usize & table.mask] += 1;
+        }
+        let displaced: usize = per_bucket.iter().map(|k| k.saturating_sub(SLOTS)).sum();
+        let load = KEYS as f64 / (table.len() * SLOTS) as f64;
+        assert!(
+            (0.35..0.40).contains(&load),
+            "the table this sizes to is the one the policy settles on, load {load}"
+        );
+        let per_thousand = displaced as f64 * 1000.0 / KEYS as f64;
+        assert!(
+            (1.0..4.0).contains(&per_thousand),
+            "{displaced} of {KEYS} keys displaced, {per_thousand} in a thousand"
+        );
     }
 
     #[test]

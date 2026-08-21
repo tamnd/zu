@@ -1118,6 +1118,17 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) RETURN count(p.born) AS n",
         "MATCH (p:person) WHERE p.born < DATE '1970-01-01' RETURN p.born AS born ORDER BY born \
          LIMIT 3",
+        // Two durations of one kind, which add and subtract the way the
+        // counts under them do. The answer is a duration rather than a
+        // number, so what these check is that the kind rides out of the
+        // kernel as well as into it: the projection has to name one and
+        // the grouping has to key off one.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.shift + DURATION 'PT1H' AS s \
+         ORDER BY id",
+        "MATCH (p:person) WHERE p.shift - DURATION 'PT1H' = DURATION 'PT2H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 30 RETURN p.shift + p.shift AS s, count(p) AS n ORDER BY s",
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, \
+         p.shift + DURATION 'PT1H' - DURATION 'PT30M' AS s ORDER BY id",
     ]
 }
 
@@ -1134,6 +1145,20 @@ fn fallback_queries() -> &'static [&'static str] {
         "MATCH (p:person) RETURN min(p.born) AS d",
         "MATCH (p:person) RETURN max(p.born) AS d",
         "MATCH (p:person) RETURN min(p.shift) AS d",
+        // An instant shifted by a length of time. The kernel adds two
+        // words and a date plus a duration is not that: a month has to
+        // land on a day the month has, a day-time duration has to keep
+        // the time of day it made, and the end of the calendar has to
+        // be an error rather than a wrap. All three are conditions the
+        // arithmetic kernel has no op for, so the shape declines.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.born + DURATION 'P1D' AS d \
+         ORDER BY id",
+        // A duration scaled by a number. The kernel would multiply the
+        // words happily and the result is a duration, but the operands
+        // are a duration and a number, and a register pair that does
+        // not agree on a lane declines rather than guessing which one
+        // the answer takes.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.shift * 2 AS d ORDER BY id",
         // ORDER BY over something the projection does not return has
         // no output column to read, so it stays with the old engine.
         "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",

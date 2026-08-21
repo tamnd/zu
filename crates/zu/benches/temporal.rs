@@ -14,11 +14,12 @@
 //! The table is two million people with a `born` date strided over
 //! forty years, a `shift` day-time duration taking one of seven values,
 //! and an `age` column that is the same filter written over a number.
-//! Five queries run over it: a bound on the date, a selective bound on
+//! Six queries run over it: a bound on the date, a selective bound on
 //! the same column, an equality on the duration, a grouping keyed by
-//! the duration, and the integer bound, which is what the date bound is
-//! measured against, since the two do the same work and the difference
-//! between them is whatever the lane costs.
+//! the duration, an equality on a duration a length of time was added
+//! to, and the integer bound, which is what the date bound is measured
+//! against, since the two do the same work and the difference between
+//! them is whatever the lane costs.
 //!
 //! Each one runs twice, once through the pipeline and once with
 //! ZU_EXEC2=0, which is where all of them ran before this change.
@@ -161,7 +162,7 @@ fn main() {
         .filter(|&i| shift_of(i) == 3_600_000_000_000)
         .count() as i64;
 
-    let cases: [(&str, &str, i64, bool); 5] = [
+    let cases: [(&str, &str, i64, bool); 6] = [
         (
             "date bound",
             "MATCH (p:person) WHERE p.born < DATE '1990-01-01' RETURN count(p) AS n",
@@ -191,6 +192,18 @@ fn main() {
             "MATCH (p:person) RETURN p.shift AS s, count(p) AS n ORDER BY s",
             NODES as i64,
             true,
+        ),
+        // A length of time added to a stored one, which selects the
+        // rows the equality above selects and does one addition per row
+        // more than it does. Two durations of a kind are two counts of
+        // the same unit, so the sum is the integer sum and the pair
+        // reads as the cost of the arithmetic rather than of the lane.
+        (
+            "duration arithmetic",
+            "MATCH (p:person) WHERE p.shift + DURATION 'PT1H' = DURATION 'PT2H' \
+             RETURN count(p) AS n",
+            one_shift,
+            false,
         ),
     ];
 

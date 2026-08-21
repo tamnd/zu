@@ -14,7 +14,7 @@
 # table. An image tagged `latest` is a build whose compiler changes on
 # somebody else's schedule, which is a broken release on a day nothing
 # was released.
-ARG rust=1.97.1
+ARG rust=1.98.0
 ARG alpine=3.22
 
 FROM rust:${rust}-alpine AS build

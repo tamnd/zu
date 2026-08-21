@@ -3,7 +3,7 @@
 > **zu** (図, *zu*), "diagram, figure, drawing." A graph you can hold.
 > Repo: `tamnd/zu` · binary: `zu` · published crates: `zudb`, `zudb-*` (crate name `zu` is taken on crates.io)
 
-**Status**: Specification v0.1 (2026-08-06). Ready-to-implement. **License**: Apache-2.0. **Language**: Rust (edition 2024, MSRV 1.97).
+**Status**: Specification v0.1 (2026-08-06). Ready-to-implement. **License**: Apache-2.0. **Language**: Rust (edition 2024, MSRV 1.98).
 
 ## 1. One-paragraph pitch
 

@@ -63,7 +63,7 @@ pub enum Holds {
 pub enum Match {
     /// The value is the version, character for character. This is what
     /// a toolchain file or a workflow says, because those name a
-    /// release to install and installing "the newest 1.97" is a range.
+    /// release to install and installing "the newest 1.98" is a range.
     Exact,
     /// The value names the series the version is in, which is what a
     /// cargo requirement of `59` is against `59.2.0`. A requirement is

@@ -193,7 +193,70 @@ pub struct Query {
     /// `USE` clause in front of them. `None` is a query with no `USE`,
     /// which runs against whatever graph the session is working in.
     pub use_graph: Option<GraphRef>,
+    /// GP17, the binding variable definition block: the names the
+    /// statements below may read that no row carries. Empty for every
+    /// query written without one, which is most of them.
+    pub bindings: Vec<BindingDef>,
     pub body: Composite,
+}
+
+/// What a binding variable definition defines (ISO 13.3), which
+/// decides what the name may stand for and where it may be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// `VALUE v = ...`, GP05 through GP07. A value of any type a
+    /// column can hold, which is every type except the two below.
+    Value,
+    /// `BINDING TABLE t = ...`, GP08 through GP10. The rows of a
+    /// result, held once and read by whatever runs over them.
+    Table,
+    /// `GRAPH g = ...`, GP11 through GP13. A reference to a graph,
+    /// which is what a `USE` names and what a graph valued expression
+    /// answers.
+    Graph,
+}
+
+impl BindingKind {
+    /// How the kind reads in a diagnostic, which is how it is written.
+    pub fn word(self) -> &'static str {
+        match self {
+            BindingKind::Value => "VALUE",
+            BindingKind::Table => "BINDING TABLE",
+            BindingKind::Graph => "GRAPH",
+        }
+    }
+}
+
+/// One binding variable definition (ISO 13.3, GP05 through GP13 and
+/// GP17): a name, what kind of thing it stands for, and what it is.
+///
+/// A definition is worked out once, where it is written, and not once
+/// for each place the name is read. That is the difference between
+/// this and a `LET`, and it is why the initializer may be a whole
+/// query without the query becoming a correlated subquery: there is no
+/// row here for it to be correlated to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingDef {
+    pub kind: BindingKind,
+    pub name: String,
+    /// The type written between the name and the `=`, `None` when the
+    /// definition leaves the type to whatever it initializes with.
+    pub ty: Option<LogicalType>,
+    pub init: BindingInit,
+}
+
+/// What a binding variable is initialized with, which is either an
+/// expression or a query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingInit {
+    /// `= 1 + 1`, `= $t`, `= HOME_PROPERTY_GRAPH`. An expression, which
+    /// covers the reference forms of all three kinds since a graph
+    /// reference and a binding table reference are both expressions.
+    Expr(Expr),
+    /// `= { MATCH (p:Person) RETURN p.name AS name }`. A query, which
+    /// answers one value for a `VALUE` and its whole result for a
+    /// `BINDING TABLE`.
+    Query(Box<Query>),
 }
 
 impl Query {

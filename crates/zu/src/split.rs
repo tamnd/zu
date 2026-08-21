@@ -634,6 +634,14 @@ fn compile(
         // inside one, so it reads nothing from a query around it and
         // nothing around it asks whether it answered a row.
         captures: Vec::new(),
+        // The statement's binding variables, carried for the same
+        // reason its value query expressions are: a part reads the same
+        // parameter positions the whole statement does, so each part
+        // fills them before it runs. That works out a definition once
+        // per part rather than once per statement, which is why a
+        // definition that writes is refused: re-reading a graph twice
+        // answers the same thing and writing to it twice does not.
+        bindings: query.bindings.clone(),
         exists: false,
     };
     let leaf = match base {

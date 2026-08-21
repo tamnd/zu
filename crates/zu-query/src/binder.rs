@@ -1004,6 +1004,19 @@ pub struct BoundQuery {
     /// from the rows around it answers the same value for all of them
     /// and is worked out once.
     pub captures: Vec<Capture>,
+    /// GP05 through GP13 and GP17. The binding variables defined at
+    /// the head of this statement and at the head of every block in
+    /// it, in the order they were written, which is the order they are
+    /// worked out in.
+    ///
+    /// They gather onto the outermost query rather than staying where
+    /// they were written because that is where they are run: a
+    /// definition is worked out once, before the first row of anything
+    /// exists, and a nested one is no different since a definition may
+    /// not read a row. Where it was written decides who may read the
+    /// name, and the binder has already settled that by the time this
+    /// list is made.
+    pub bindings: Vec<BoundBinding>,
     /// True when what is written around this query asks only whether it
     /// answered a row, which is what `EXISTS { ... }` says (ISO 19.4).
     ///
@@ -1032,6 +1045,52 @@ pub struct Capture {
     pub slot: usize,
     /// The parameter position this query reads that value at.
     pub param: usize,
+}
+
+/// One binding variable definition, bound (ISO 13.3).
+///
+/// It is a query and a parameter position, and that pairing is the
+/// whole implementation. The query is what the definition says, bound
+/// on its own with no row in scope, and the position is where its
+/// answer is put before the statement runs, so every reader of the
+/// name reads a parameter and nothing below the binder has to know
+/// that a binding variable is a different thing from a value the
+/// caller passed in. That is also what makes "worked out once" true
+/// rather than aspirational: there is one place the value is written
+/// and it is written before the first row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundBinding {
+    /// The name as written, for the message and the EXPLAIN line.
+    pub name: String,
+    /// Which of the three kinds it is, which decides how the query's
+    /// answer is read and what type the answer has to be.
+    pub kind: ast::BindingKind,
+    /// The parameter position the value is written into.
+    pub param: usize,
+    /// The type the definition was written with, if it was written with
+    /// one. It is checked against the answer rather than used to shape
+    /// it, because a definition already has a shape: whatever the query
+    /// answered. A declared type that the answer does not have is a
+    /// statement about the graph that turned out to be wrong, and
+    /// saying so where the definition was made is worth more than
+    /// letting a reader further in find a value of the wrong kind.
+    pub ty: Option<LogicalType>,
+    /// What the definition says, as a query. An initializer that was
+    /// written as an expression is the query that returns it, because
+    /// one shape here is one path through the executor.
+    pub query: BoundQuery,
+}
+
+/// The parameter name a binding variable is given, which is its own
+/// name behind a nul byte and a mark saying which of the two kinds of
+/// engine filled position this is.
+///
+/// The name is in it so that a diagnostic and an EXPLAIN line can say
+/// which variable a position stands for, and the mark is in it so that
+/// a capture of a row variable called `g` and a binding variable
+/// called `g` cannot land on one position.
+fn binding_param(name: &str) -> String {
+    format!("\0b:{name}")
 }
 
 /// The parameter name a capture is given, which is the variable's own
@@ -2147,12 +2206,163 @@ enum Projected {
 /// across and each operand's names are appended to it.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
     let mut params = Vec::new();
-    let mut bound = bind_body(&query.body, schema, &mut params, &[])?;
+    // The binding variable definition block at the head of the
+    // statement (GP17), bound before anything that could read one of
+    // the names. A definition may read the definitions in front of it
+    // and nothing else, so binding them in written order is all the
+    // scoping this level needs.
+    let mut defined = Vec::new();
+    let mut visible = Vec::new();
+    bind_bindings(
+        &query.bindings,
+        schema,
+        &mut params,
+        &mut defined,
+        &mut visible,
+    )?;
+    let mut bound = bind_body(&query.body, schema, &mut params, &[], &visible)?;
+    // Every definition written inside the statement as well, which is
+    // one written at the head of a block. They are worked out where
+    // these are, before the first row, because a definition cannot
+    // read a row wherever it stands.
+    gather_bindings(&mut bound, &mut defined);
+    defined.sort_by_key(|b| b.param);
+    bound.bindings = defined;
     // The parameter list is the statement's, so every operand's plan
     // reads the same positions the caller filled in.
     let all = params.clone();
     spread_params(&mut bound, &all);
     Ok(bound)
+}
+
+/// Binds one binding variable definition block, appending a parameter
+/// position and a definition for each name it defines.
+///
+/// The order is the point. A definition is bound against the
+/// parameters that already exist, so it may read the names in front of
+/// it and cannot read itself or the ones behind it, and its own
+/// position is made only once it is bound. Nothing else is in scope:
+/// the query a definition holds is bound with no outer names at all,
+/// which is what says a definition may not read a row and is what lets
+/// every one of them be worked out before the first row exists.
+fn bind_bindings(
+    defs: &[ast::BindingDef],
+    schema: &Schema,
+    params: &mut Vec<String>,
+    out: &mut Vec<BoundBinding>,
+    visible: &mut Vec<(String, usize)>,
+) -> Result<()> {
+    for def in defs {
+        if visible.iter().any(|(name, _)| *name == def.name) {
+            return Err(bad_reference(format!(
+                "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
+                def.name
+            )));
+        }
+        let query = match &def.init {
+            ast::BindingInit::Query(query) => (**query).clone(),
+            ast::BindingInit::Expr(expr) => returning(expr.clone(), &def.name),
+        };
+        // A block of its own, since a query may carry one, and it is
+        // bound here so that its names are in reach inside that query
+        // and out of reach after it.
+        let mut inner = visible.clone();
+        bind_bindings(&query.bindings, schema, params, out, &mut inner)?;
+        let mut bound = bind_body(&query.body, schema, params, &[], &inner)?;
+        // A block written inside the definition defines names of its
+        // own, and they are worked out where every definition is. They
+        // land in front of this one because their positions were made
+        // while this one was being bound.
+        gather_bindings(&mut bound, out);
+        // A definition says what a name stands for, and a statement
+        // that is taken apart at its write runs in parts, each of
+        // which fills the parameter positions it reads. So a
+        // definition that wrote would write once per part, which is
+        // the sort of thing that is right until the day the statement
+        // grows a second part. Reading a graph twice answers the same
+        // thing; writing to it twice does not.
+        if bound.clauses.iter().any(writes) {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "the definition of '{}' writes to the graph, and a binding variable is worked out where nothing else has run yet: write the statement on its own",
+                    def.name
+                ),
+            ));
+        }
+        for scalar in &bound.scalars {
+            if !scalar.captures.is_empty() {
+                return Err(bad_reference(format!(
+                    "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
+                    def.name
+                )));
+            }
+        }
+        if def.kind != ast::BindingKind::Table && bound.columns.len() != 1 {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{} '{}' stands for one value, so what defines it has to answer one column and this one answers {}",
+                    def.kind.word(),
+                    def.name,
+                    bound.columns.len()
+                ),
+            ));
+        }
+        let param = params.len();
+        params.push(binding_param(&def.name));
+        visible.push((def.name.clone(), param));
+        out.push(BoundBinding {
+            name: def.name.clone(),
+            kind: def.kind,
+            param,
+            ty: def.ty.clone(),
+            query: bound,
+        });
+    }
+    Ok(())
+}
+
+/// The query `RETURN expr AS name`, which is what an initializer
+/// written as an expression means.
+///
+/// One shape reaches the executor rather than two: a definition is a
+/// query whatever it was written as, so there is one way to work one
+/// out and one place for that to be wrong.
+fn returning(expr: ast::Expr, name: &str) -> ast::Query {
+    ast::Query {
+        use_graph: None,
+        bindings: Vec::new(),
+        body: ast::Composite::Linear(ast::Linear {
+            statements: vec![ast::Simple {
+                clauses: Vec::new(),
+                result: Some(ast::Projection {
+                    distinct: false,
+                    star: false,
+                    items: vec![ast::ProjectionItem {
+                        expr,
+                        alias: Some(name.to_string()),
+                    }],
+                    group_by: Vec::new(),
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                }),
+            }],
+        }),
+    }
+}
+
+/// Takes the definitions written inside `query` and puts them in
+/// `out`, which is where they are run from.
+fn gather_bindings(query: &mut BoundQuery, out: &mut Vec<BoundBinding>) {
+    out.append(&mut query.bindings);
+    for joined in &mut query.conjoined {
+        gather_bindings(&mut joined.query, out);
+    }
+    for scalar in &mut query.scalars {
+        gather_bindings(scalar, out);
+    }
 }
 
 /// Binds the operands of a composite query against one parameter list.
@@ -2167,13 +2377,14 @@ fn bind_body(
     schema: &Schema,
     params: &mut Vec<String>,
     outer: &[String],
+    visible: &[(String, usize)],
 ) -> Result<BoundQuery> {
     let mut operands = Vec::new();
     collect_operands(body, &mut operands);
-    let mut bound = bind_linear(operands[0].0, schema, params, outer)?;
+    let mut bound = bind_linear(operands[0].0, schema, params, outer, visible)?;
     for (linear, how) in &operands[1..] {
         let how = how.expect("only the leftmost operand has no conjunction");
-        let right = bind_linear(linear, schema, params, outer)?;
+        let right = bind_linear(linear, schema, params, outer, visible)?;
         // A statement that writes is taken apart at its write and run
         // in parts, and a part is one pipeline. An operand of a
         // composite is a second one, so the two cannot be the same
@@ -2213,6 +2424,9 @@ fn spread_params(query: &mut BoundQuery, all: &[String]) {
     }
     for scalar in &mut query.scalars {
         spread_params(scalar, all);
+    }
+    for binding in &mut query.bindings {
+        spread_params(&mut binding.query, all);
     }
 }
 
@@ -2552,6 +2766,7 @@ fn bind_linear(
     schema: &Schema,
     params: &mut Vec<String>,
     outer: &[String],
+    visible: &[(String, usize)],
 ) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
@@ -2568,6 +2783,8 @@ fn bind_linear(
         groups: HashMap::new(),
         forked: BTreeSet::new(),
         hidden: Vec::new(),
+        bindings: Vec::new(),
+        visible: visible.to_vec(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -2616,6 +2833,7 @@ fn bind_linear(
         conjoined: Vec::new(),
         scalars: binder.scalars,
         captures: binder.captures,
+        bindings: binder.bindings,
         exists: false,
     })
 }
@@ -2672,6 +2890,18 @@ struct Binder<'a> {
     /// because a binding nothing reads is a binding nothing can tell
     /// apart from any other.
     forked: BTreeSet<String>,
+    /// The binding variables defined at the head of a block in this
+    /// statement (GP17), which gather onto the whole query and are
+    /// worked out before it runs.
+    bindings: Vec<BoundBinding>,
+    /// The binding variables a reference here may resolve to, by name
+    /// and by the parameter position their value is written into.
+    ///
+    /// It is a list rather than a map because a block puts names on
+    /// the end of it and takes them off again when the block closes,
+    /// which is the whole of the lexical scoping: what a definition
+    /// can be read from is where it stands in this list.
+    visible: Vec<(String, usize)>,
     /// The names an enclosing `CALL` scope clause took out of reach,
     /// and the slots they are in.
     ///
@@ -3017,6 +3247,31 @@ impl Binder<'_> {
         // `RETURN *` stands for and what tells a returned name from a
         // name the row already carried.
         let own = self.variables.len();
+        // The block's own binding variable definitions (GP17), which
+        // are in reach inside it and gone after it. They are worked out
+        // where every definition is, before the first row, so what the
+        // block keeps of one is the parameter position its value went
+        // into.
+        let defined = self.visible.len();
+        let mut theirs = Vec::new();
+        let mut params = std::mem::take(&mut self.params);
+        let block = bind_bindings(
+            &body.bindings,
+            self.schema,
+            &mut params,
+            &mut theirs,
+            &mut self.visible,
+        );
+        self.params = params;
+        if let Err(e) = block {
+            self.scope = outer_scope;
+            self.groups = outer_groups;
+            self.forked = outer_forked;
+            self.hidden.truncate(put_away);
+            self.visible.truncate(defined);
+            return Err(e);
+        }
+        self.bindings.append(&mut theirs);
 
         let mut bound = Vec::new();
         let outcome = (|| -> Result<()> {
@@ -3034,6 +3289,7 @@ impl Binder<'_> {
             self.groups = outer_groups;
             self.forked = outer_forked;
             self.hidden.truncate(put_away);
+            self.visible.truncate(defined);
             return Err(e);
         }
 
@@ -3045,6 +3301,7 @@ impl Binder<'_> {
         self.groups = outer_groups;
         self.forked = outer_forked;
         self.hidden.truncate(put_away);
+        self.visible.truncate(defined);
         if let Some(clause) = self.wider(escaping)? {
             bound.push(clause);
         }
@@ -5441,6 +5698,14 @@ impl Binder<'_> {
                 if self.forked.contains(name) {
                     return Err(out_of_reach(name));
                 }
+                // A binding variable (GP05 through GP13). It is worked
+                // out once, before the first row, so what stands here
+                // is the parameter its value was written into and the
+                // reader costs a parameter read however many rows
+                // there are.
+                if let Some((_, param)) = self.visible.iter().rev().find(|(n, _)| n == name) {
+                    return Ok((BoundExpr::Param(*param), Type::Any));
+                }
                 // A name the query around this one defined, which this
                 // query may read: it makes the value query expression
                 // correlated, and a correlated one is answered per row
@@ -5972,7 +6237,7 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
+        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer, &self.visible)?;
         self.params = params;
         // A name the query around this one already has is read out of
         // that row, so a pattern in here that writes the same name
@@ -7976,5 +8241,62 @@ mod tests {
         assert!(e.contains("'a' is already defined"), "got: {e}");
         let e = bind_err("MATCH (a:Person) LET n = count(*) RETURN n AS v");
         assert!(e.contains("cannot be an aggregate"), "got: {e}");
+    }
+
+    /// What a binding variable compiles to is a parameter position, so
+    /// a name read anywhere in the statement is a parameter read and
+    /// the definition is nowhere in the plan. That is the whole of the
+    /// implementation and it is worth saying in a test, because it is
+    /// what makes "worked out once" a fact about the shape rather than
+    /// a promise about the executor.
+    #[test]
+    fn a_binding_variable_compiles_to_a_parameter_position() {
+        let q = bound("VALUE cut = 30 MATCH (p:Person) WHERE p.age > cut RETURN cut AS a");
+        assert_eq!(q.bindings.len(), 1);
+        let cut = &q.bindings[0];
+        assert_eq!(cut.name, "cut");
+        assert_eq!(q.params[cut.param], binding_param("cut"));
+        let BoundClause::Project { items, .. } = q.clauses.last().expect("a projection") else {
+            panic!("a projection");
+        };
+        assert_eq!(items[0].expr, BoundExpr::Param(cut.param));
+    }
+
+    /// The definitions gather onto the outermost query in the order
+    /// they are worked out, and a definition written inside another one
+    /// lands in front of it, because it has to be worked out before the
+    /// one that reads it can be.
+    #[test]
+    fn the_definitions_come_out_in_the_order_they_are_worked_out() {
+        let q = bound(
+            "VALUE a = 1 VALUE b = { VALUE inner = 2 RETURN inner + a AS v } RETURN a + b AS x",
+        );
+        assert_eq!(
+            q.bindings
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "inner", "b"]
+        );
+        assert!(
+            q.bindings.windows(2).all(|w| w[0].param < w[1].param),
+            "the positions run the way the list does"
+        );
+    }
+
+    /// A definition is not a source of rows and cannot read one, so a
+    /// pattern is not a way to smuggle a row into a place where none
+    /// has been matched yet, and the refusals say which name it was.
+    #[test]
+    fn a_definition_reads_no_row_and_writes_nothing() {
+        let e = bind_err("VALUE v = { INSERT (:Person) RETURN 1 AS a } RETURN v AS x");
+        assert!(e.contains("writes to the graph"), "got: {e}");
+        let e =
+            bind_err("MATCH (p:Person) CALL (p) { VALUE v = p.age RETURN v AS a } RETURN p AS x");
+        assert!(e.contains("'p'"), "got: {e}");
+        let e = bind_err("VALUE v = 1 VALUE v = 2 RETURN v AS x");
+        assert!(e.contains("defined twice"), "got: {e}");
+        let e = bind_err("VALUE v = { MATCH (p:Person) RETURN p.a AS a, p.b AS b } RETURN v AS x");
+        assert!(e.contains("one column"), "got: {e}");
     }
 }

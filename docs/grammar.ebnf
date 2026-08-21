@@ -7,7 +7,8 @@
    spec change to docs/07 first. *)
 
 statement       = query | catalog_statement ;
-query           = [ use_clause ] , composite_query , [ ";" ] ;
+query           = [ use_clause ] , { binding_variable_definition } ,
+                  composite_query , [ ";" ] ;
 
 (* GQ02 to GQ07, ISO 12.1. A composite query meets two result tables.
    Every conjunction is at one level and the fold is to the left, so
@@ -45,6 +46,32 @@ use_clause      = "USE" , graph_ref ;
 graph_ref       = "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
                   | "HOME_PROPERTY_GRAPH" | "HOME_GRAPH"
                   | [ [ "PROPERTY" ] , "GRAPH" ] , ( graph_name | parameter ) ;
+
+(* GP05 to GP13 and GP17, ISO 13.3. The binding variable definition
+   block: names the statements below it may read that no row carries.
+   A definition stands for a value, a binding table or a graph, and
+   what defines it is either an expression or a whole query in braces.
+   Each one is worked out once, before the first row, and in the order
+   written, so a definition may read the ones in front of it and not
+   itself. It may not read a row, because there is none yet, and it may
+   not write, because a statement taken apart at its write runs in
+   parts and a definition is worked out once per part. A definition
+   whose kind is not BINDING TABLE has to answer one column, and one
+   whose kind is VALUE has to answer something that is not a table or a
+   graph. The block a CALL body carries is its own: the names go out of
+   scope with the block. *)
+binding_variable_definition
+                = value_variable_definition | table_variable_definition
+                | graph_variable_definition ;
+value_variable_definition
+                = "VALUE" , name , [ value_type ] , "=" ,
+                  ( [ "VALUE" ] , "{" , query , "}" | expression ) ;
+table_variable_definition
+                = [ "BINDING" ] , "TABLE" , name , [ value_type ] , "=" ,
+                  ( "{" , query , "}" | expression ) ;
+graph_variable_definition
+                = [ "PROPERTY" ] , "GRAPH" , name , [ value_type ] , "=" ,
+                  ( "{" , query , "}" | graph_ref ) ;
 
 (* Catalog statements (docs/07 §9). They change what the file declares
    and answer no rows, so they are told apart from a query by their

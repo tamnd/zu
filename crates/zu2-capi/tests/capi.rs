@@ -174,6 +174,119 @@ fn empty_is_a_value_and_not_an_error() {
     close(db, &[s]);
 }
 
+/// A batch crosses once and comes back with every record in it. The
+/// count matters as much as the records: a host that got fewer than it
+/// sent has to know where to start again.
+#[test]
+fn a_batch_writes_every_pair_and_says_how_many() {
+    let (_dir, db) = open("batch.zu2");
+    let s = session_on(db);
+    const N: usize = 64;
+    let keys: Vec<String> = (0..N).map(|i| format!("user{i}")).collect();
+    let values: Vec<String> = (0..N).map(|i| format!("value{i}")).collect();
+    let pairs: Vec<zu2::Zu2Pair> = keys
+        .iter()
+        .zip(&values)
+        .map(|(k, v)| zu2::Zu2Pair {
+            key: k.as_ptr(),
+            key_len: k.len(),
+            value: v.as_ptr(),
+            value_len: v.len(),
+        })
+        .collect();
+    let mut written = 0usize;
+    let status = unsafe { zu2::zu2_upsert_many(s, pairs.as_ptr(), pairs.len(), &mut written) };
+    assert_eq!(status, Zu2Status::Ok);
+    assert_eq!(written, N);
+    for (key, value) in keys.iter().zip(&values) {
+        assert_eq!(read(s, key.as_bytes()), Some(value.as_bytes().to_vec()));
+    }
+
+    // An empty batch is a call with nothing to do, not a mistake, which
+    // is what a host that loops over a partly filled buffer sends on
+    // the last turn.
+    written = 7;
+    assert_eq!(
+        unsafe { zu2::zu2_upsert_many(s, ptr::null(), 0, &mut written) },
+        Zu2Status::Ok
+    );
+    assert_eq!(written, 0);
+    close(db, &[s]);
+}
+
+/// The same divergence the options struct can have, on the struct a
+/// batch is made of: a host reads the header's layout and the library
+/// reads its own, and neither fails to compile when they disagree.
+#[test]
+fn the_header_and_the_pair_struct_declare_the_same_fields() {
+    const FIELDS: &[&str] = &["key", "key_len", "value", "value_len"];
+    let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/zu2.h"))
+        .expect("the header ships with the crate");
+    let body = header
+        .split_once("typedef struct zu2_pair {")
+        .expect("the header declares zu2_pair")
+        .1
+        .split_once("} zu2_pair;")
+        .expect("the declaration is closed")
+        .0;
+    let found: Vec<&str> = body
+        .split(';')
+        .filter_map(|line| line.split_whitespace().last())
+        .map(|name| name.trim_start_matches('*'))
+        .collect();
+    assert_eq!(found, FIELDS);
+    // Four pointer sized fields, no padding on any target that has a
+    // pointer the width of its size_t, which is every one this builds
+    // for.
+    assert_eq!(
+        std::mem::size_of::<zu2::Zu2Pair>(),
+        4 * std::mem::size_of::<usize>()
+    );
+}
+
+/// A bad pointer anywhere in a batch is caught before the first record
+/// is written, so the load a host has to unpick is the one it sent and
+/// not a prefix of it.
+#[test]
+fn a_batch_with_a_bad_entry_writes_nothing() {
+    let (_dir, db) = open("batch-misuse.zu2");
+    let s = session_on(db);
+    let good = zu2::Zu2Pair {
+        key: b"first".as_ptr(),
+        key_len: 5,
+        value: b"v".as_ptr(),
+        value_len: 1,
+    };
+    // NULL with a length is the one shape bytes() refuses: NULL with
+    // zero is an empty value and a host sends it all the time.
+    let bad = zu2::Zu2Pair {
+        key: ptr::null(),
+        key_len: 4,
+        value: b"v".as_ptr(),
+        value_len: 1,
+    };
+    let pairs = [good, bad];
+    let mut written = 9usize;
+    assert_eq!(
+        unsafe { zu2::zu2_upsert_many(s, pairs.as_ptr(), pairs.len(), &mut written) },
+        Zu2Status::Misuse
+    );
+    assert_eq!(written, 0);
+    assert_eq!(read(s, b"first"), None, "the good entry went in with it");
+
+    // And a NULL array with a count is misuse rather than a walk off
+    // the front of nothing.
+    assert_eq!(
+        unsafe { zu2::zu2_upsert_many(s, ptr::null(), 3, &mut written) },
+        Zu2Status::Misuse
+    );
+    assert_eq!(
+        unsafe { zu2::zu2_upsert_many(ptr::null_mut(), pairs.as_ptr(), 1, ptr::null_mut()) },
+        Zu2Status::Misuse
+    );
+    close(db, &[s]);
+}
+
 /// The contract is that the value buffer is good until the next call,
 /// and this is the test that would catch it being good for less: the
 /// second read has to have replaced the first one's bytes rather than

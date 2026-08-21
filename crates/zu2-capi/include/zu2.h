@@ -226,6 +226,31 @@ zu2_status zu2_set_durability(zu2_session *s, zu2_durability d);
 zu2_status zu2_upsert(zu2_session *s, const uint8_t *key, size_t key_len,
                       const uint8_t *value, size_t value_len);
 
+/* One key and one value, so a batch is one array rather than four.
+ * NULL is allowed where the length beside it is zero. */
+typedef struct zu2_pair {
+  const uint8_t *key;
+  size_t key_len;
+  const uint8_t *value;
+  size_t value_len;
+} zu2_pair;
+
+/* Writes every pair, waiting for durability once for the batch rather
+ * than once per pair.
+ *
+ * A loader that calls zu2_upsert in a loop pays a foreign call per
+ * record, and on a durable session a device write per record for a
+ * guarantee it did not ask for. One call and one wait leave the batch
+ * exactly as durable as its last record would have been on its own.
+ *
+ * *written is how many went in, and on ZU2_ERROR that is where it
+ * stopped: everything before it is in the log and durable to the
+ * session's setting, so a retry starts from there. A ZU2_MISUSE writes
+ * zero and changes nothing, because the pointers are all checked before
+ * the first record is. written may be NULL. */
+zu2_status zu2_upsert_many(zu2_session *s, const zu2_pair *pairs,
+                           size_t count, size_t *written);
+
 /* Reads the newest value for key. *found says whether there was one.
  * The buffer is the session's and is valid until the next call on it. */
 zu2_status zu2_read(zu2_session *s, const uint8_t *key, size_t key_len,

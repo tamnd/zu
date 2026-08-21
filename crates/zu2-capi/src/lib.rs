@@ -656,6 +656,86 @@ pub unsafe extern "C" fn zu2_upsert(
     }
 }
 
+/// One key and one value, in the layout the header declares, so a
+/// batch is one array rather than four.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Zu2Pair {
+    /// The key, or NULL when `key_len` is zero.
+    pub key: *const u8,
+    /// How many bytes of it.
+    pub key_len: usize,
+    /// The value, or NULL when `value_len` is zero.
+    pub value: *const u8,
+    /// How many bytes of it.
+    pub value_len: usize,
+}
+
+/// Writes every pair, waiting for durability once for the batch.
+///
+/// This is here for the crossing as much as for the wait. A host that
+/// loads a million records one `zu2_upsert` at a time pays a foreign
+/// call per record, and in cgo that is not free; a durable session pays
+/// a device write per record on top, for a guarantee a loader did not
+/// ask for. One call and one wait leave the batch exactly as durable as
+/// its last record would have been alone.
+///
+/// `written` says how many went in, and on an error that is where it
+/// stopped, so a caller can retry from there rather than from the
+/// start. Everything before it is in the log and is durable to the
+/// session's setting. A misuse writes zero and does nothing at all.
+///
+/// # Safety
+/// `s` is live, `pairs` covers `count` entries, each entry's pointers
+/// cover their stated lengths, and `written` is writable or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_upsert_many(
+    s: *mut Zu2Session,
+    pairs: *const Zu2Pair,
+    count: usize,
+    written: *mut usize,
+) -> Zu2Status {
+    if !written.is_null() {
+        unsafe { written.write(0) };
+    }
+    let Some(s) = (unsafe { session(s) }) else {
+        return Zu2Status::Misuse;
+    };
+    if pairs.is_null() && count != 0 {
+        return Zu2Status::Misuse;
+    }
+    // SAFETY: the caller's contract. An empty batch reads no entries.
+    let raw = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(pairs, count) }
+    };
+    // Every pointer is checked before any record is written, so a batch
+    // with a bad entry in the middle of it is a misuse that changed
+    // nothing rather than a half applied load.
+    let mut batch = Vec::with_capacity(raw.len());
+    for pair in raw {
+        let (Some(key), Some(value)) = (unsafe { bytes(pair.key, pair.key_len) }, unsafe {
+            bytes(pair.value, pair.value_len)
+        }) else {
+            return Zu2Status::Misuse;
+        };
+        batch.push((key, value));
+    }
+    let Some(call) = s.enter() else {
+        return Zu2Status::MisuseConcurrent;
+    };
+    let state = &mut *call.state;
+    let (done, outcome) = state.session.upsert_many(&batch);
+    if !written.is_null() {
+        unsafe { written.write(done) };
+    }
+    match note(&mut state.error, outcome) {
+        Ok(()) => Zu2Status::Ok,
+        Err(status) => status,
+    }
+}
+
 /// Reads the newest value for `key`.
 ///
 /// # Safety

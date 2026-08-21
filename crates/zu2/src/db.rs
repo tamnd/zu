@@ -1125,6 +1125,45 @@ impl<'a> Session<'a> {
         self.write(key, value, false, record::KIND_VALUE)
     }
 
+    /// Writes every pair, waiting for durability once at the end
+    /// rather than once per pair.
+    ///
+    /// The wait is the cost of a durable write here, not the write: an
+    /// append is a memcpy into a mapped page, and the device is what
+    /// takes the microseconds. A loader that calls
+    /// [`upsert`](Self::upsert) in a loop pays that wait per record for
+    /// a guarantee it did not ask for, since what it wants is the batch
+    /// on disk, not each record on disk before the next one starts.
+    /// Waiting once gives the batch exactly what its last record would
+    /// have had alone. What it gives up is per-record acknowledgement
+    /// inside the batch, and a caller who wanted that would not have
+    /// handed over a batch.
+    ///
+    /// Returns how many pairs were written, which on an error is where
+    /// it stopped. That prefix is in the log and is as durable as this
+    /// session asks for, error or not, so a caller can retry from the
+    /// count rather than from the start.
+    pub fn upsert_many(&mut self, pairs: &[(&[u8], &[u8])]) -> (usize, Result<()>) {
+        let mut end = None;
+        for (i, &(key, value)) in pairs.iter().enumerate() {
+            let hash = index::hash(key);
+            let tag = Index::tag(hash);
+            self.slot.protect();
+            let outcome = self.bucket_of(hash).and_then(|bucket| {
+                self.install(bucket, tag, key, value, false, record::KIND_VALUE)
+            });
+            self.slot.unprotect();
+            match outcome {
+                // An update that happened inside a record already in the
+                // log adds nothing to wait for, so it leaves the address
+                // where the last append put it.
+                Ok(next) => end = next.or(end),
+                Err(error) => return (i, self.finish(end).and(Err(error))),
+            }
+        }
+        (pairs.len(), self.finish(end))
+    }
+
     /// Removes `key`. Returns whether it was there.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let hash = index::hash(key);
@@ -1579,6 +1618,61 @@ mod tests {
             }
         }
         found
+    }
+
+    /// Z14. A batch waits once for all of it, where the loop that
+    /// writes the same records waits once each.
+    ///
+    /// Commits and not syncs, because commits is what the caller does
+    /// and syncs is what the device sees, and between the two sits the
+    /// background flusher: it can take a record to the device before
+    /// the thread that wrote it asks, so the device count is a number
+    /// this test does not own. Syncs still gets an inequality, since
+    /// the point of waiting once is that the device is touched once.
+    #[test]
+    fn a_batch_waits_for_the_device_once() {
+        const N: usize = 64;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = Options {
+            durability: Durability::Durable,
+            ..Options::default()
+        };
+        let db = Db::create(&dir.path().join("batch.zu2"), options).expect("create");
+        let mut session = db.session();
+        for i in 0..N {
+            session
+                .upsert(format!("one{i}").as_bytes(), b"v")
+                .expect("upsert");
+        }
+        let (loop_commits, loop_syncs) = (db.commits(), db.syncs());
+        assert_eq!(loop_commits, N as u64, "one wait per record");
+        // A single writer appends the next record only after the last
+        // one is durable, so no device write covers two of them and
+        // there are at least as many writes as records.
+        assert!(
+            loop_syncs >= N as u64,
+            "{loop_syncs} device writes for {N} records written one at a time"
+        );
+
+        let keys: Vec<String> = (0..N).map(|i| format!("many{i}")).collect();
+        let pairs: Vec<(&[u8], &[u8])> = keys.iter().map(|k| (k.as_bytes(), &b"v"[..])).collect();
+        let (written, outcome) = session.upsert_many(&pairs);
+        outcome.expect("batch");
+        assert_eq!(written, N);
+        assert_eq!(db.commits() - loop_commits, 1, "the batch waits once");
+        let batch_syncs = db.syncs() - loop_syncs;
+        assert!(
+            batch_syncs * 4 <= loop_syncs,
+            "{batch_syncs} device writes for a batch of {N} against {loop_syncs} for the loop"
+        );
+
+        let mut value = Vec::new();
+        for key in &keys {
+            assert!(
+                session.read(key.as_bytes(), &mut value).expect("read"),
+                "{key} went in with the batch"
+            );
+        }
     }
 
     /// #486. A slot in use is not a key, and the difference is the

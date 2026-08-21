@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: arrow
 doc: The other way a result leaves the database. A client that reads rows one at a time and a client that hands a million of them to a dataframe are the same client, and only the first of those paths is covered by a case that asserts values. Every case here asserts both: the rows, as every other suite does, and the schema the export gives for them, written in the C Data Interface's own format strings because that is the one spelling every language sees the same. The fixture is three people and two edges between them, which is enough for a node, an edge and a path to have somewhere to come from.
 

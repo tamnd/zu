@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: result
 doc: The shape of an answer rather than the values in it: which columns come back, what they are called, in what order they stand, and how many rows there are. A client that decodes values perfectly can still hand back the wrong result if it sorts the columns, drops a repeated name, or counts a paged result before the page was taken, and none of that shows up in a suite that checks one value at a time. Every multi-row case here is ordered by something, because a result whose order the statement does not fix is not a thing a case can assert.
 

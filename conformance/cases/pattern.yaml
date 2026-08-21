@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: pattern
 doc: What a pattern selects, which is the half of a statement that reads the graph rather than the values in it. The fixture is four people and three edges, one of which runs from a node to itself, and every case here is a question about which of those a pattern reaches: whether a label selects, whether an arrow has a direction, whether a name written twice means one element or two, and how many rows a walk of two edges is. The counts are small enough to check by reading the pairs at the top of this file, which is the point of them.
 

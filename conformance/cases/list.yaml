@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: list
 doc: The one composite type in the v0 core, and the only place a value can hold other values. A client decoding a list has to have decoded every type inside it, so a list case is a test of the whole decoder rather than one branch of it, and the nesting is where a client written against a flat wire format runs out of room.
 

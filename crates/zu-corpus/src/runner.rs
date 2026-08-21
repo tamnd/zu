@@ -7,6 +7,16 @@
 //! one would be a failure that moves when the file is reordered, which
 //! is the worst kind to be handed.
 //!
+//! A case may run its statements on more than one connection, which is
+//! how a case about a transaction is written: the connection that
+//! opened it is not the one that can say what is visible from outside
+//! it. Connections are made as they are first named, by duplicating the
+//! case's own, so they share a write side and see each other's commits
+//! exactly as two connections from one database do. Statements still
+//! run one at a time in the order they were written, because a corpus
+//! that needed threads to say what it means would be a corpus no client
+//! could run the same way twice.
+//!
 //! An outcome is one of three things and not two. Passed and failed
 //! are obvious. Unsupported is the third, and it exists because the
 //! corpus is versioned with the engine and shipped to nine clients
@@ -19,12 +29,13 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use zu::query::Value;
 use zu::session::Session;
 
 use crate::arrow::Export;
-use crate::case::{Case, Expect, Suite};
+use crate::case::{Case, Expect, MAIN, Suite};
 use crate::value::{Cell, Tables, from_engine, same, show};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,13 +156,18 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
         return ran(Outcome::Failed, format!("the suite's load: {e}"));
     }
     drop(file);
-    let mut session = match Session::open(&path) {
+    let session = match Session::open(&path) {
         Ok(session) => session,
         Err(e) => return ran(Outcome::Failed, format!("opening {}: {e}", path.display())),
     };
+    let mut open: Vec<(String, Session)> = vec![(MAIN.to_string(), session)];
 
-    for (i, statement) in case.setup.iter().enumerate() {
-        if let Err(e) = session.run(statement, &[]) {
+    for (i, step) in case.setup.iter().enumerate() {
+        let session = match connection(&mut open, &step.on) {
+            Ok(session) => session,
+            Err(detail) => return ran(Outcome::Failed, detail),
+        };
+        if let Err(e) = session.run(&step.query, &[]) {
             // A setup that fails is not a result about the statement
             // under test, so it is never a pass and never a quiet skip.
             return match unsupported(&e) {
@@ -160,6 +176,10 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
             };
         }
     }
+    let session = match connection(&mut open, &case.on) {
+        Ok(session) => session,
+        Err(detail) => return ran(Outcome::Failed, detail),
+    };
 
     // The engine takes the values by value and the case owns them, so
     // this is where they are copied. It is a copy per case rather than
@@ -208,6 +228,33 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
                 },
             }
         }
+    }
+}
+
+/// The connection a case named, made if this is the first mention of
+/// it, or what stopped it being made.
+///
+/// A new one is a duplicate of the case's own rather than a second
+/// open of the file, which is what a pool does and what the ABI's
+/// `zu_conn_duplicate` is: the two share the write side, so each sees
+/// what the other has committed. Opening the path twice would be two
+/// databases that happen to be the same file, which is a different
+/// thing and not what a case about a transaction means.
+fn connection<'a>(
+    open: &'a mut Vec<(String, Session)>,
+    name: &str,
+) -> Result<&'a mut Session, String> {
+    if let Some(i) = open.iter().position(|(had, _)| had == name) {
+        return Ok(&mut open[i].1);
+    }
+    let handle = Arc::clone(open[0].1.handle());
+    match Session::attached(handle) {
+        Ok(session) => {
+            open.push((name.to_string(), session));
+            let last = open.len() - 1;
+            Ok(&mut open[last].1)
+        }
+        Err(e) => Err(format!("connecting as {name:?}: {e}")),
     }
 }
 
@@ -378,7 +425,7 @@ mod tests {
     use super::*;
     use crate::case::Suite;
 
-    const HEAD: &str = "schema: 3\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
+    const HEAD: &str = "schema: 4\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
 
     fn run_cases(cases: &str) -> Report {
         let suite = Suite::parse(&format!("{HEAD}{cases}")).expect("the fixture parses");

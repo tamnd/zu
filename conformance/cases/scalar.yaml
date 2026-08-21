@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: scalar
 doc: The values that cross a language boundary badly. Every case here is one a client has got wrong somewhere, which is why the corpus starts with them rather than with the ones that work everywhere.
 

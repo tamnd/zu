@@ -797,7 +797,7 @@ pub fn queries(cases: &Path, out: &Path) -> Result<(usize, usize), String> {
             // it is as much a case for the grammar as the one under
             // test, and the suites that write a graph write it there.
             for (n, setup) in case.setup.iter().enumerate() {
-                write_query(&out.join(format!("{stem}--setup-{n}.gql")), setup)?;
+                write_query(&out.join(format!("{stem}--setup-{n}.gql")), &setup.query)?;
                 taken += 1;
             }
         }

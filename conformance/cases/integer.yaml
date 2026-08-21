@@ -1,4 +1,4 @@
-schema: 3
+schema: 4
 suite: integer
 doc: The integer tower, width by width. GQL has ten integer types and most host languages have four, so every case here is a place a client has to decide what to give back, and the ones at the edges are the places where deciding badly still looks right. The declared type is the contract even where a value fits something narrower, because a client with an int8 has somewhere to put INT8 and something to get wrong.
 

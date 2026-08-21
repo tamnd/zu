@@ -32,6 +32,99 @@ use zu_common::{DurationKind, LogicalType, Temporal};
 
 use crate::yaml::Node;
 
+/// A value as a case spells it.
+///
+/// This is not [`Value`] and cannot be, for one reason: a node value
+/// in the engine is a table id and a row offset, and the id is a number
+/// the file decided. A case is read by nine clients against a database
+/// each of them built, so what a case can assert is the table's name,
+/// and the name is not in the value. Everything else a case can write
+/// is a `Value` already and rides here as one.
+///
+/// A comparison therefore happens in this type and not in the engine's:
+/// what came back is turned into a case's spelling with [`from_engine`]
+/// and the two are compared as equals. That is what the C runner does
+/// as well, for the same reason and with the same shape, so the two
+/// agree by construction rather than by review.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cell {
+    /// Everything the engine spells and a case spells the same way.
+    Plain(Value),
+    /// A node, as the table it is a row of and the offset of that row.
+    Node { table: String, offset: u64 },
+    /// An edge, as its table and the two rows it runs between.
+    Edge { table: String, src: u64, dst: u64 },
+    /// Nodes and edges alternating, beginning and ending with a node,
+    /// so there are always an odd number of them.
+    Path(Vec<Cell>),
+    /// A list, which is here rather than in `Plain` because a list may
+    /// hold a node and a `Value::List` cannot hold one that is named.
+    List(Vec<Cell>),
+}
+
+impl Cell {
+    /// The engine value this spells, or nothing when it spells one the
+    /// engine has no parameter and no column for.
+    ///
+    /// A parameter and a load column are values going in rather than
+    /// coming back, and nothing puts a node in either: a node is a row
+    /// that exists, so naming one in a parameter would be naming a row
+    /// the case has not written yet.
+    pub fn plain(&self) -> Option<Value> {
+        match self {
+            Cell::Plain(value) => Some(value.clone()),
+            Cell::List(items) => items
+                .iter()
+                .map(Cell::plain)
+                .collect::<Option<Vec<Value>>>()
+                .map(Value::List),
+            Cell::Node { .. } | Cell::Edge { .. } | Cell::Path(_) => None,
+        }
+    }
+}
+
+/// What turning an engine value into a case's spelling needs from the
+/// database that value came out of, which is one thing: the name of a
+/// table id.
+///
+/// A trait rather than the catalog itself so that this file keeps
+/// knowing about the encoding and nothing about storage, and so that a
+/// test here can answer for a table without opening a database.
+pub trait Tables {
+    fn name(&self, table: u32) -> Option<&str>;
+}
+
+/// What came back, in the spelling a case is written in.
+///
+/// A table with no name is spelled `#7` after its id, which is what a
+/// node column of an Arrow export is named when there is no catalog to
+/// ask. It cannot happen here, since the catalog is right there, and it
+/// is a spelling rather than a panic because a corpus runner reporting
+/// "the case wants person#1 and this is #7" is more use to whoever has
+/// to fix it than one that died.
+pub fn from_engine(value: &Value, tables: &dyn Tables) -> Cell {
+    let named = |table: u32| match tables.name(table) {
+        Some(name) => name.to_string(),
+        None => format!("#{table}"),
+    };
+    match value {
+        Value::Node { table, offset } => Cell::Node {
+            table: named(*table),
+            offset: *offset,
+        },
+        Value::Rel {
+            table, src, dst, ..
+        } => Cell::Edge {
+            table: named(*table),
+            src: *src,
+            dst: *dst,
+        },
+        Value::Path(items) => Cell::Path(items.iter().map(|v| from_engine(v, tables)).collect()),
+        Value::List(items) => Cell::List(items.iter().map(|v| from_engine(v, tables)).collect()),
+        other => Cell::Plain(other.clone()),
+    }
+}
+
 /// Whether a type's payload is written as a quoted string, and why the
 /// answer is not "whatever the writer felt like".
 ///
@@ -50,7 +143,7 @@ pub enum Form {
 /// the corpus is a contract for languages where they are not: a
 /// TypeScript client returns `number` for one and `bigint` for the
 /// other, and a case that did not say which meant nothing to it.
-const TYPES: [(&str, Form); 20] = [
+const TYPES: [(&str, Form); 23] = [
     ("NULL", Form::Exact),
     ("BOOL", Form::Exact),
     ("INT8", Form::Exact),
@@ -71,12 +164,20 @@ const TYPES: [(&str, Form); 20] = [
     ("ZONEDDATETIME", Form::Text),
     ("DURATION", Form::Text),
     ("LIST", Form::Exact),
+    // A node and an edge are written in quotes because what a case
+    // spells is a name and two numbers with punctuation between them,
+    // which is text in every reader and a number in none.
+    ("NODE", Form::Text),
+    ("EDGE", Form::Text),
+    // A path is a sequence, like a list, because that is what it is:
+    // the nodes and edges of a walk, in the order they were walked.
+    ("PATH", Form::Exact),
 ];
 
 /// The types the encoding reserves a name for and the engine has no
 /// runtime value for yet, kept apart from an outright typo so that the
 /// error says which of the two it is.
-const RESERVED: [&str; 5] = ["DECIMAL", "BYTES", "NODE", "EDGE", "PATH"];
+const RESERVED: [&str; 2] = ["DECIMAL", "BYTES"];
 
 pub fn form(ty: &str) -> Option<Form> {
     TYPES.iter().find(|(name, _)| *name == ty).map(|(_, f)| *f)
@@ -93,7 +194,7 @@ fn unknown(ty: &str) -> String {
 
 /// The value a `{type, value}` mapping describes, or what is wrong
 /// with it.
-pub fn decode(node: &Node) -> Result<Value, String> {
+pub fn decode(node: &Node) -> Result<Cell, String> {
     if node.map().is_none() {
         return Err(format!(
             "line {}: a value is a mapping of `type` and `value`, and this is {}",
@@ -112,7 +213,7 @@ pub fn decode(node: &Node) -> Result<Value, String> {
 /// belongs to the case rather than to the encoding. The keys are the
 /// caller's to check, since only the caller knows which others it
 /// allows.
-pub fn typed(node: &Node) -> Result<Value, String> {
+pub fn typed(node: &Node) -> Result<Cell, String> {
     let line = node.line();
     let at = |msg: String| format!("line {line}: {msg}");
     let ty = node
@@ -131,7 +232,7 @@ pub fn typed(node: &Node) -> Result<Value, String> {
 
     if ty == "NULL" {
         return match node.get("value") {
-            None => Ok(Value::Null),
+            None => Ok(Cell::Plain(Value::Null)),
             Some(_) => Err(at("NULL carries no `value`".to_string())),
         };
     }
@@ -147,26 +248,26 @@ pub fn typed(node: &Node) -> Result<Value, String> {
 /// load names it once at the top and every value under it is a bare
 /// payload, which is the same encoding with the type factored out, so
 /// it is the same function reading it.
-pub fn payload(ty: &str, value: &Node) -> Result<Value, String> {
+pub fn payload(ty: &str, value: &Node) -> Result<Cell, String> {
     let Some(form) = form(ty) else {
         return Err(format!("line {}: {}", value.line(), unknown(ty)));
     };
 
-    if ty == "LIST" {
+    if ty == "LIST" || ty == "PATH" {
         // The empty list is a value worth a case and needs a spelling,
         // which is a `value:` with nothing under it.
         let items = value.seq_or_empty().ok_or_else(|| {
             format!(
-                "line {}: a LIST holds a sequence of values, and this is {}",
+                "line {}: a {ty} holds a sequence of values, and this is {}",
                 value.line(),
                 value.kind()
             )
         })?;
-        return items
-            .iter()
-            .map(decode)
-            .collect::<Result<_, _>>()
-            .map(Value::List);
+        let items: Vec<Cell> = items.iter().map(decode).collect::<Result<_, _>>()?;
+        return match ty {
+            "LIST" => Ok(Cell::List(items)),
+            _ => walk(items, value.line()),
+        };
     }
 
     let (text, quoted) = value.scalar().ok_or_else(|| {
@@ -181,6 +282,16 @@ pub fn payload(ty: &str, value: &Node) -> Result<Value, String> {
     // case where a silent misread would survive review.
     let line = value.line();
     match (form, quoted) {
+        // A node and an edge are quoted for a different reason from the
+        // numbers, so they are told a different reason. Both reasons
+        // are the same rule: a payload is quoted where a bare one would
+        // read as something else in some reader of this file.
+        (Form::Text, false) if ty == "NODE" || ty == "EDGE" => {
+            return Err(format!(
+                "line {line}: {ty} is written in quotes, because {text} is a name and two numbers \
+                 and no reader has a scalar for that"
+            ));
+        }
         (Form::Text, false) => {
             return Err(format!(
                 "line {line}: {ty} is written in quotes, because a bare {text} is a number and \
@@ -195,7 +306,91 @@ pub fn payload(ty: &str, value: &Node) -> Result<Value, String> {
         }
         _ => {}
     }
-    scalar(ty, text).ok_or_else(|| format!("line {line}: {text:?} is not a {ty}"))
+    match ty {
+        "NODE" => node_at(text),
+        "EDGE" => edge_at(text),
+        _ => scalar(ty, text).map(Cell::Plain),
+    }
+    .ok_or_else(|| format!("line {line}: {text:?} is not a {ty}"))
+}
+
+/// The nodes and edges of a walk, or what is wrong with the sequence
+/// somebody wrote.
+///
+/// A path alternates and ends at both ends with a node, so a sequence
+/// that does not is a case that could never pass. Refusing it here
+/// rather than at the comparison is the difference between a message
+/// naming the line and a report saying the row differs.
+fn walk(items: Vec<Cell>, line: usize) -> Result<Cell, String> {
+    if items.len().is_multiple_of(2) {
+        return Err(format!(
+            "line {line}: a PATH is a node, then an edge and a node for each hop, so it holds an \
+             odd number of values and this holds {}",
+            items.len()
+        ));
+    }
+    for (i, item) in items.iter().enumerate() {
+        let want_node = i % 2 == 0;
+        let ok = match item {
+            Cell::Node { .. } => want_node,
+            Cell::Edge { .. } => !want_node,
+            _ => false,
+        };
+        if !ok {
+            return Err(format!(
+                "line {line}: a PATH alternates, so value {} is {} where it should be {}",
+                i + 1,
+                match item {
+                    Cell::Node { .. } => "a NODE",
+                    Cell::Edge { .. } => "an EDGE",
+                    _ => "neither a NODE nor an EDGE",
+                },
+                match want_node {
+                    true => "a NODE",
+                    false => "an EDGE",
+                }
+            ));
+        }
+    }
+    Ok(Cell::Path(items))
+}
+
+/// A node, written as its table and the offset of its row: `person#1`.
+///
+/// The table's name rather than its id, because the id is a number the
+/// file decided and every client builds its own file. Split from the
+/// right, so that a table whose name holds a `#` is still readable.
+fn node_at(text: &str) -> Option<Cell> {
+    let (table, offset) = text.rsplit_once('#')?;
+    match table.is_empty() {
+        true => None,
+        false => Some(Cell::Node {
+            table: table.to_string(),
+            offset: offset.parse().ok()?,
+        }),
+    }
+}
+
+/// An edge, written as its table and the rows it runs between:
+/// `knows#0->1`.
+///
+/// What is not written is which edge of that pair it is. A pair may run
+/// more than once and the engine tells the copies apart by the row
+/// their properties sit in, which is their place in the load order, and
+/// that is a number the loader chose rather than one the case did. A
+/// case that has to tell two parallel edges apart asserts a property of
+/// them instead.
+fn edge_at(text: &str) -> Option<Cell> {
+    let (table, ends) = text.rsplit_once('#')?;
+    let (src, dst) = ends.split_once("->")?;
+    match table.is_empty() {
+        true => None,
+        false => Some(Cell::Edge {
+            table: table.to_string(),
+            src: src.parse().ok()?,
+            dst: dst.parse().ok()?,
+        }),
+    }
 }
 
 /// The value a scalar payload spells, or `None` if it does not spell
@@ -258,7 +453,25 @@ fn float(text: &str) -> Option<f64> {
 
 /// How a value reads in a failure report, in the encoding's own
 /// spelling so that it can be pasted into a case.
-pub fn show(value: &Value) -> String {
+pub fn show(cell: &Cell) -> String {
+    match cell {
+        Cell::Plain(value) => plain(value),
+        Cell::Node { table, offset } => format!("NODE \"{table}#{offset}\""),
+        Cell::Edge { table, src, dst } => format!("EDGE \"{table}#{src}->{dst}\""),
+        Cell::Path(items) => {
+            let items: Vec<String> = items.iter().map(show).collect();
+            format!("PATH [{}]", items.join(", "))
+        }
+        Cell::List(items) => {
+            let items: Vec<String> = items.iter().map(show).collect();
+            format!("LIST [{}]", items.join(", "))
+        }
+    }
+}
+
+/// The same for the values that ride in a [`Cell::Plain`], which is
+/// every one the engine and a case spell alike.
+fn plain(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => format!("BOOL {b}"),
@@ -267,13 +480,13 @@ pub fn show(value: &Value) -> String {
         Value::Str(s) => format!("STRING {s:?}"),
         Value::Temporal(t) => format!("{} \"{t}\"", type_name(&t.logical_type())),
         Value::List(items) => {
-            let items: Vec<String> = items.iter().map(show).collect();
+            let items: Vec<String> = items.iter().map(plain).collect();
             format!("LIST [{}]", items.join(", "))
         }
         Value::Record(fields) => {
             let fields: Vec<String> = fields
                 .iter()
-                .map(|(name, v)| format!("{name}: {}", show(v)))
+                .map(|(name, v)| format!("{name}: {}", plain(v)))
                 .collect();
             format!("RECORD {{{}}}", fields.join(", "))
         }
@@ -320,18 +533,30 @@ fn type_name(ty: &LogicalType) -> &'static str {
 /// on x86-64 and clear on aarch64, and neither of those is the constant
 /// a case that writes `NaN` decodes to. The sign and the payload of a
 /// NaN are the hardware's business, so every NaN is the same NaN here.
-pub fn same(a: &Value, b: &Value) -> bool {
+pub fn same(a: &Cell, b: &Cell) -> bool {
+    match (a, b) {
+        (Cell::Plain(x), Cell::Plain(y)) => alike(x, y),
+        (Cell::List(x), Cell::List(y)) | (Cell::Path(x), Cell::Path(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b))
+        }
+        _ => a == b,
+    }
+}
+
+/// The same for two engine values, which is where the float rule lives
+/// because the engine's value is where a float is.
+fn alike(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan() => true,
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::List(x), Value::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b))
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| alike(a, b))
         }
         (Value::Record(x), Value::Record(y)) => {
             x.len() == y.len()
                 && x.iter()
                     .zip(y)
-                    .all(|((xn, xv), (yn, yv))| xn == yn && same(xv, yv))
+                    .all(|((xn, xv), (yn, yv))| xn == yn && alike(xv, yv))
         }
         _ => a == b,
     }
@@ -342,12 +567,24 @@ mod tests {
     use super::*;
     use crate::yaml;
 
-    fn read(text: &str) -> Result<Value, String> {
+    fn read(text: &str) -> Result<Cell, String> {
         decode(&yaml::parse(text).expect("the fixture parses"))
     }
 
-    fn ok(text: &str) -> Value {
+    fn cell(text: &str) -> Cell {
         read(text).unwrap_or_else(|e| panic!("{text:?} should decode: {e}"))
+    }
+
+    /// The engine value a case spells, for the assertions about the
+    /// types the engine and a case spell alike, which is most of them.
+    fn ok(text: &str) -> Value {
+        let cell = cell(text);
+        cell.plain().unwrap_or_else(|| {
+            panic!(
+                "{text:?} decodes to {}, which is not a plain value",
+                show(&cell)
+            )
+        })
     }
 
     #[test]
@@ -417,20 +654,20 @@ mod tests {
         );
         // A negative zero is a different value from a zero, and saying
         // so is why `same` compares bits.
-        let minus = ok("type: FLOAT64\nvalue: \"-0.0\"\n");
-        assert!(!same(&minus, &Value::Float(0.0)));
-        assert!(same(&minus, &Value::Float(-0.0)));
+        let minus = cell("type: FLOAT64\nvalue: \"-0.0\"\n");
+        assert!(!same(&minus, &Cell::Plain(Value::Float(0.0))));
+        assert!(same(&minus, &Cell::Plain(Value::Float(-0.0))));
     }
 
     #[test]
     fn a_nan_matches_a_nan_whatever_the_hardware_put_in_its_sign_and_payload() {
-        let want = ok("type: FLOAT64\nvalue: \"NaN\"\n");
+        let want = cell("type: FLOAT64\nvalue: \"NaN\"\n");
         let negative = Value::Float(f64::from_bits(f64::NAN.to_bits() | 1 << 63));
         let payload = Value::Float(f64::from_bits(f64::NAN.to_bits() | 7));
-        assert!(same(&want, &Value::Float(f64::NAN)));
-        assert!(same(&want, &negative));
-        assert!(same(&want, &payload));
-        assert!(!same(&want, &Value::Float(0.0)));
+        assert!(same(&want, &Cell::Plain(Value::Float(f64::NAN))));
+        assert!(same(&want, &Cell::Plain(negative)));
+        assert!(same(&want, &Cell::Plain(payload)));
+        assert!(!same(&want, &Cell::Plain(Value::Float(0.0))));
     }
 
     #[test]
@@ -440,8 +677,8 @@ mod tests {
             Value::Float(0.1f32 as f64)
         );
         assert!(!same(
-            &ok("type: FLOAT32\nvalue: \"0.1\"\n"),
-            &Value::Float(0.1)
+            &Cell::Plain(ok("type: FLOAT32\nvalue: \"0.1\"\n")),
+            &Cell::Plain(Value::Float(0.1))
         ));
     }
 
@@ -507,18 +744,155 @@ mod tests {
         }
     }
 
+    /// A stub catalog, which is what the trait is for: the encoding
+    /// can be tested without a database and the runner is the only
+    /// place a real catalog reaches.
+    struct Tiny;
+
+    impl Tables for Tiny {
+        fn name(&self, table: u32) -> Option<&str> {
+            match table {
+                0 => Some("person"),
+                1 => Some("knows"),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are() {
+        assert_eq!(
+            cell("type: NODE\nvalue: \"person#1\"\n"),
+            Cell::Node {
+                table: "person".into(),
+                offset: 1
+            }
+        );
+        assert_eq!(
+            cell("type: EDGE\nvalue: \"knows#0->1\"\n"),
+            Cell::Edge {
+                table: "knows".into(),
+                src: 0,
+                dst: 1
+            }
+        );
+        // The table's name is what a case can assert, so a case that
+        // wrote the id instead is a case about this file rather than
+        // about the engine, and there is nothing here to catch it. What
+        // is caught is the spelling: no table, no offset, or an offset
+        // that is not a number.
+        for text in [
+            "type: NODE\nvalue: \"person\"\n",
+            "type: NODE\nvalue: \"#1\"\n",
+            "type: NODE\nvalue: \"person#-1\"\n",
+            "type: EDGE\nvalue: \"knows#0\"\n",
+            "type: EDGE\nvalue: \"knows#0->\"\n",
+        ] {
+            let err = read(text).expect_err(&format!("{text:?} is refused"));
+            assert!(err.contains("is not a"), "{text:?} gave {err:?}");
+        }
+        // Bare rather than quoted, which is the rule the whole encoding
+        // exists for, told with the reason that applies to these two.
+        let err = read("type: NODE\nvalue: person#1\n").expect_err("refused");
+        assert!(err.contains("no reader has a scalar for that"), "{err}");
+    }
+
+    #[test]
+    fn a_path_is_a_walk_and_a_sequence_that_is_not_one_is_refused() {
+        let hop = "type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n  - type: EDGE\n    value: \"knows#0->1\"\n  - type: NODE\n    value: \"person#1\"\n";
+        let Cell::Path(items) = cell(hop) else {
+            panic!("a path");
+        };
+        assert_eq!(items.len(), 3);
+        // A path of one node is the shortest there is, and it is a
+        // path: a walk starts somewhere.
+        assert_eq!(
+            cell("type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n"),
+            Cell::Path(vec![Cell::Node {
+                table: "person".into(),
+                offset: 0
+            }])
+        );
+        let even = "type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n  - type: EDGE\n    value: \"knows#0->1\"\n";
+        let err = read(even).expect_err("refused");
+        assert!(err.contains("odd number of values"), "{err}");
+        let wrong = "type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n  - type: NODE\n    value: \"person#1\"\n  - type: NODE\n    value: \"person#2\"\n";
+        let err = read(wrong).expect_err("refused");
+        assert!(err.contains("value 2 is a NODE"), "{err}");
+    }
+
+    #[test]
+    fn what_came_back_is_turned_into_the_spelling_a_case_is_written_in() {
+        let path = Value::Path(vec![
+            Value::Node {
+                table: 0,
+                offset: 0,
+            },
+            Value::Rel {
+                table: 1,
+                src: 0,
+                dst: 1,
+                ord: 3,
+            },
+            Value::Node {
+                table: 0,
+                offset: 1,
+            },
+        ]);
+        let hop = "type: PATH\nvalue:\n  - type: NODE\n    value: \"person#0\"\n  - type: EDGE\n    value: \"knows#0->1\"\n  - type: NODE\n    value: \"person#1\"\n";
+        // The ordinal is not spelled and so is not compared: a case
+        // that had to tell two parallel edges apart would be asserting
+        // the order they were loaded in.
+        assert!(same(&cell(hop), &from_engine(&path, &Tiny)));
+        assert_eq!(
+            show(&from_engine(&path, &Tiny)),
+            "PATH [NODE \"person#0\", EDGE \"knows#0->1\", NODE \"person#1\"]"
+        );
+        // A table the catalog does not name is spelled after its id
+        // rather than reported as a name, which is a report somebody
+        // can act on and not a comparison that quietly passed.
+        assert_eq!(
+            show(&from_engine(
+                &Value::Node {
+                    table: 7,
+                    offset: 2
+                },
+                &Tiny
+            )),
+            "NODE \"#7#2\""
+        );
+    }
+
     #[test]
     fn what_a_report_prints_is_what_a_case_would_be_written_as() {
-        assert_eq!(show(&Value::Int(7)), "INT64 \"7\"");
-        assert_eq!(show(&Value::Float(1.0)), "FLOAT64 \"1.0\"");
-        assert_eq!(show(&Value::Float(f64::NAN)), "FLOAT64 \"NaN\"");
-        assert_eq!(show(&Value::Null), "NULL");
+        assert_eq!(show(&Cell::Plain(Value::Int(7))), "INT64 \"7\"");
+        assert_eq!(show(&Cell::Plain(Value::Float(1.0))), "FLOAT64 \"1.0\"");
         assert_eq!(
-            show(&Value::List(vec![
-                Value::Bool(true),
-                Value::Str("a".into())
+            show(&Cell::Plain(Value::Float(f64::NAN))),
+            "FLOAT64 \"NaN\""
+        );
+        assert_eq!(show(&Cell::Plain(Value::Null)), "NULL");
+        assert_eq!(
+            show(&Cell::List(vec![
+                Cell::Plain(Value::Bool(true)),
+                Cell::Plain(Value::Str("a".into()))
             ])),
             "LIST [BOOL true, STRING \"a\"]"
+        );
+        assert_eq!(
+            show(&Cell::Node {
+                table: "person".into(),
+                offset: 1
+            }),
+            "NODE \"person#1\""
+        );
+        assert_eq!(
+            show(&Cell::Edge {
+                table: "knows".into(),
+                src: 0,
+                dst: 1
+            }),
+            "EDGE \"knows#0->1\""
         );
     }
 }

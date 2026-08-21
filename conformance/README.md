@@ -148,7 +148,7 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 | `order` | The order values sort in, including across types, which no host comparator gets right by accident. |
 | `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
 | `stored` | Values put in through a client's own loader and read back out through a query, so the value crosses the boundary twice and by two different mechanisms. |
-| `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, and a row that points at itself. |
+| `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, a row that points at itself, and the nodes, edges and paths themselves as values. |
 | `param` | Values handed to a statement rather than written in it, which is the client's own encoder rather than its decoder: every type through a binding, the positions a statement takes one in, and the rules about names. |
 | `pattern` | What a pattern selects: labels and inline properties, direction, an undirected walk, a quantified one, a subquery that only asks whether something exists, and the rows an optional match keeps. |
 | `result` | The shape of an answer rather than the values in it: what a column is named, how many rows come back, what paging and DISTINCT do to them, and where a grouping puts its boundary. |
@@ -184,9 +184,15 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `NULL` carries no `value`. `LIST` carries a sequence of `{type, value}` pairs, and an empty list is written as `value:` with nothing under it.
 
-`DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
+`NODE`, `EDGE`, and `PATH` are the values a graph has and a table does not, and they are written as names rather than as the numbers the engine holds. A node is `"person#1"`, which is the table it is a row of and which row of it. An edge is `"knows#0->1"`, which is its table and the two rows it runs between. Both are quoted, for the same reason the numbers are and a different one: a name and two numbers with punctuation between them is text in every reader and a number in none. A `PATH` is a sequence, like a `LIST`, and holds a node, then an edge and a node for each hop, so it always holds an odd number of values and a case that writes an even number is refused with its line.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1475 values counting the ones inside lists, and both print them the same way.
+The name and not the id, because the id is a number the file decided and every one of the nine clients builds its own file. The runner asks the connection what a table id is called and compares names, which is what makes a case portable. What an edge does not carry is which of two parallel edges it is: a pair may run more than once and the engine tells the copies apart by the row their properties sit in, which is their place in the load order rather than anything the case chose, so a case that has to tell two of them apart asserts a property of them instead.
+
+None of the three can be a parameter or a load column. A parameter and a column are values going in, and a node is a row that exists, so naming one on the way in would be naming a row the case has not written yet.
+
+`DECIMAL` and `BYTES` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
+
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1751 values counting the ones inside lists and paths, and both print them the same way.
 
 ## What the Rust runner does not check
 

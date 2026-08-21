@@ -24,7 +24,7 @@ use zu::query::Value;
 use zu::session::Session;
 
 use crate::case::{Case, Expect, Suite};
-use crate::value::{same, show};
+use crate::value::{Cell, Tables, from_engine, same, show};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -173,10 +173,29 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
             ran(Outcome::Unsupported, e.to_string())
         }
         (Expect::Rows { .. }, Err(e)) => ran(Outcome::Failed, e.to_string()),
-        (Expect::Rows { columns, rows }, Ok(got)) => match compare(columns, rows, &got) {
-            None => ran(Outcome::Passed, String::new()),
-            Some(detail) => ran(Outcome::Failed, detail),
-        },
+        (Expect::Rows { columns, rows }, Ok(got)) => {
+            // The catalog after the statement rather than before it,
+            // because a statement may have made the table the rows it
+            // returns are rows of.
+            let tables = Named(session.catalog());
+            match compare(columns, rows, &got, &tables) {
+                None => ran(Outcome::Passed, String::new()),
+                Some(detail) => ran(Outcome::Failed, detail),
+            }
+        }
+    }
+}
+
+/// The names of the tables the case ran against, which is what turns a
+/// node value into the spelling a case is written in.
+struct Named<'a>(&'a zu::zu1::catalog::Catalog);
+
+impl Tables for Named<'_> {
+    fn name(&self, table: u32) -> Option<&str> {
+        self.0
+            .node_by_id(table)
+            .map(|t| t.name.as_str())
+            .or_else(|| self.0.rel_by_id(table).map(|t| t.name.as_str()))
     }
 }
 
@@ -201,8 +220,9 @@ fn unsupported(e: &zu::ZuError) -> bool {
 /// prints a hundred rows is one nobody reads to the end.
 fn compare(
     columns: &[String],
-    rows: &[Vec<Value>],
+    rows: &[Vec<Cell>],
     got: &zu::query::QueryResult,
+    tables: &dyn Tables,
 ) -> Option<String> {
     if columns != got.columns.as_slice() {
         return Some(format!(
@@ -212,12 +232,13 @@ fn compare(
     }
     for (i, (want, found)) in rows.iter().zip(&got.rows).enumerate() {
         for (j, (want, found)) in want.iter().zip(found).enumerate() {
-            if !same(want, found) {
+            let found = from_engine(found, tables);
+            if !same(want, &found) {
                 return Some(format!(
                     "row {} column {} is {} where the case wants {}",
                     i + 1,
                     columns.get(j).map_or("?", String::as_str),
-                    show(found),
+                    show(&found),
                     show(want)
                 ));
             }

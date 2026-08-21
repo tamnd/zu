@@ -31,9 +31,9 @@
  * in is refused by the ABI and reported in the ABI's words, because the
  * two runners refuse it in different places: the Rust one knows the
  * line the column was written on and the loader knows the column. And a
- * cell holding a node, a rel, a path or a record is named rather than
- * printed, since the encoding reserves those names and a cv has no arm
- * for one. Neither can happen in a case that passes.
+ * cell holding a record is named rather than printed, since the
+ * encoding has no spelling for one and a cv has no arm for one.
+ * Neither can happen in a case that passes.
  *
  * An outcome is one of three things. Passed and failed are obvious.
  * Unsupported is a statement the engine refuses with a GQLSTATUS in
@@ -67,6 +67,11 @@ typedef struct run {
     int strict;
     int quiet;
     cv_arena *arena;
+    /* The connection the case is running on, which is here because
+     * turning a node into a value the case can be compared against
+     * needs the name of its table and the connection is what knows
+     * one. NULL outside a case. */
+    zu_conn *conn;
     unsigned long cases;
     unsigned long passed;
     unsigned long failed;
@@ -157,12 +162,39 @@ static void *slots(run *r, size_t n, size_t size) {
 
 static const char *type_name(int32_t type) {
     switch (type) {
-    case ZU_TYPE_NODE: return "NODE";
-    case ZU_TYPE_REL: return "REL";
-    case ZU_TYPE_PATH: return "PATH";
     case ZU_TYPE_RECORD: return "RECORD";
     default: return "value of a type this header does not name";
     }
+}
+
+/* What a table id is called, copied into the arena.
+ *
+ * Copied rather than borrowed because the connection keeps one name at
+ * a time and the next call replaces it, so a path of four nodes that
+ * held the pointer would be four pointers at one name.
+ *
+ * A table the catalog does not name is spelled `#7` after its id, which
+ * is what the reference runner does and for the reason it gives: a
+ * report saying "the case wants person#1 and this is #7" is more use to
+ * whoever has to fix it than a runner that stopped. */
+static int table_name(run *r, uint32_t table, zy_str *out) {
+    size_t len = 0;
+    const char *name = zu_conn_table_name(r->conn, table, &len);
+    char spelled[16];
+    char *copy;
+    if (name == NULL) {
+        len = (size_t)snprintf(spelled, sizeof spelled, "#%lu", (unsigned long)table);
+        name = spelled;
+    }
+    copy = (char *)cv_alloc(r->arena, len + 1);
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    out->ptr = copy;
+    out->len = len;
+    return 0;
 }
 
 /* One cell of a result as the value the encoding compares, so that what
@@ -175,10 +207,14 @@ static const char *type_name(int32_t type) {
  * therefore the one place this has to allocate, and it allocates in the
  * arena so that its items die with the case the decoded ones do.
  *
- * A node, a rel, a path or a record is a failure naming what came back.
- * The encoding reserves those names and no case can write one, so a
- * cell holding one is a case whose statement returns something the
- * corpus has no way to assert. */
+ * A node, an edge and a path carry the name of their table rather than
+ * its id, because the id is a number the file decided and every client
+ * builds its own file, so the name is what a case can assert and the
+ * connection is what is asked for it.
+ *
+ * A record is a failure naming what came back. The encoding has no
+ * spelling for one, so a cell holding one is a case whose statement
+ * returns something the corpus has no way to assert. */
 static int engine_value(run *r, const zu_value *v, const char *where, cv *out, char *detail,
                         size_t len) {
     int32_t type = zu_value_type(v);
@@ -240,6 +276,36 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
         out->as.temporal.offset = offset;
         return 0;
     }
+    case ZU_TYPE_NODE: {
+        uint32_t table = 0;
+        uint64_t offset = 0;
+        if (zu_value_node(v, &table, &offset) != ZU_OK) {
+            return say(detail, len, "%s says it is a NODE and does not read as one", where);
+        }
+        if (table_name(r, table, &out->as.node.table) != 0) {
+            return say(detail, len, "%s is a node with no memory to name its table", where);
+        }
+        out->kind = CV_NODE;
+        out->as.node.offset = offset;
+        return 0;
+    }
+    case ZU_TYPE_REL: {
+        uint32_t table = 0;
+        uint64_t src = 0, dst = 0;
+        if (zu_value_rel(v, &table, &src, &dst) != ZU_OK) {
+            return say(detail, len, "%s says it is an EDGE and does not read as one", where);
+        }
+        if (table_name(r, table, &out->as.edge.table) != 0) {
+            return say(detail, len, "%s is an edge with no memory to name its table", where);
+        }
+        out->kind = CV_EDGE;
+        out->as.edge.src = src;
+        out->as.edge.dst = dst;
+        return 0;
+    }
+    /* A path walks with the accessors a list walks with, which is why
+     * it is read here rather than in a case of its own. */
+    case ZU_TYPE_PATH:
     case ZU_TYPE_LIST: {
         uint64_t count = zu_value_len(v), i;
         cv *items = (cv *)slots(r, (size_t)count, sizeof(cv));
@@ -257,7 +323,7 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
                 return -1;
             }
         }
-        out->kind = CV_LIST;
+        out->kind = type == ZU_TYPE_PATH ? CV_PATH : CV_LIST;
         out->as.list.items = items;
         out->as.list.count = (size_t)count;
         return 0;
@@ -912,7 +978,9 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
         return;
     }
 
+    r->conn = conn;
     out = answer(r, conn, node, detail, sizeof detail);
+    r->conn = NULL;
     zu_conn_close(conn);
     report(r, suite, name->text.ptr, node->line, out, detail);
     cv_arena_reset(r->arena);

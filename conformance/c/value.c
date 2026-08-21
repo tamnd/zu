@@ -825,19 +825,26 @@ typedef struct cv_type {
  * corpus is a contract for languages where they are not: a TypeScript
  * client returns `number` for one and `bigint` for the other, and a case
  * that did not say which meant nothing to it. */
-static const cv_type TYPES[20] = {
+static const cv_type TYPES[23] = {
     {"NULL", CV_EXACT},          {"BOOL", CV_EXACT},          {"INT8", CV_EXACT},
     {"INT16", CV_EXACT},         {"INT32", CV_EXACT},         {"INT64", CV_TEXT},
     {"UINT8", CV_EXACT},         {"UINT16", CV_EXACT},        {"UINT32", CV_EXACT},
     {"UINT64", CV_TEXT},         {"FLOAT32", CV_TEXT},        {"FLOAT64", CV_TEXT},
     {"STRING", CV_EXACT},        {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
     {"ZONEDTIME", CV_TEXT},      {"LOCALDATETIME", CV_TEXT},  {"ZONEDDATETIME", CV_TEXT},
-    {"DURATION", CV_TEXT},       {"LIST", CV_EXACT}};
+    {"DURATION", CV_TEXT},       {"LIST", CV_EXACT},
+    /* A node and an edge are written in quotes because what a case
+     * spells is a name and two numbers with punctuation between them,
+     * which is text in every reader and a number in none. */
+    {"NODE", CV_TEXT},           {"EDGE", CV_TEXT},
+    /* A path is a sequence, like a list, because that is what it is:
+     * the nodes and edges of a walk, in the order they were walked. */
+    {"PATH", CV_EXACT}};
 
 /* The types the encoding reserves a name for and the engine has no
  * runtime value for yet, kept apart from an outright typo so that the
  * error says which of the two it is. */
-static const char *const RESERVED[5] = {"DECIMAL", "BYTES", "NODE", "EDGE", "PATH"};
+static const char *const RESERVED[2] = {"DECIMAL", "BYTES"};
 
 static const cv_type *type_of(const char *ty) {
     size_t i;
@@ -961,6 +968,133 @@ static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
     return 0;
 }
 
+/* ---- nodes, edges and paths ---- */
+
+/* The last byte in the text equal to c, which is what splitting from
+ * the right is: a table whose name holds a `#` is still readable. */
+static const char *last_byte(zy_str t, char c) {
+    size_t i = t.len;
+    while (i > 0) {
+        i--;
+        if (t.ptr[i] == c) {
+            return t.ptr + i;
+        }
+    }
+    return NULL;
+}
+
+/* The first `->` in the text, which is where an edge's two ends part. */
+static const char *arrow(zy_str t) {
+    size_t i;
+    for (i = 0; i + 1 < t.len; i++) {
+        if (t.ptr[i] == '-' && t.ptr[i + 1] == '>') {
+            return t.ptr + i;
+        }
+    }
+    return NULL;
+}
+
+/* A row offset, which is a count and so has no sign. It is read into
+ * an int64_t because that is what the parser here has, and a corpus
+ * whose offsets reached the top half of a uint64_t would be a corpus
+ * with more rows than there are atoms to store them in. */
+static int offset_of(zy_str t, uint64_t *out) {
+    int64_t n;
+    if (parse_int(t, 0, INT64_MAX, &n) != 0) {
+        return -1;
+    }
+    *out = (uint64_t)n;
+    return 0;
+}
+
+/* A node, written as its table and the offset of its row: `person#1`.
+ *
+ * The table's name rather than its id, because the id is a number the
+ * file decided and every client builds its own file. */
+static int node_at(cv_arena *a, zy_str text, cv *out) {
+    const char *hash = last_byte(text, '#');
+    zy_str table, rest;
+    if (hash == NULL) {
+        return -1;
+    }
+    table.ptr = text.ptr;
+    table.len = (size_t)(hash - text.ptr);
+    rest.ptr = hash + 1;
+    rest.len = text.len - table.len - 1;
+    if (table.len == 0 || offset_of(rest, &out->as.node.offset) != 0) {
+        return -1;
+    }
+    out->kind = CV_NODE;
+    out->as.node.table = arena_str(a, table.ptr, table.len);
+    return out->as.node.table.ptr == NULL ? -2 : 0;
+}
+
+/* An edge, written as its table and the rows it runs between:
+ * `knows#0->1`.
+ *
+ * What is not written is which edge of that pair it is. A pair may run
+ * more than once and the engine tells the copies apart by the row their
+ * properties sit in, which is their place in the load order, and that
+ * is a number the loader chose rather than one the case did. A case
+ * that has to tell two parallel edges apart asserts a property of them
+ * instead. */
+static int edge_at(cv_arena *a, zy_str text, cv *out) {
+    const char *hash = last_byte(text, '#');
+    const char *at;
+    zy_str table, ends, src, dst;
+    if (hash == NULL) {
+        return -1;
+    }
+    table.ptr = text.ptr;
+    table.len = (size_t)(hash - text.ptr);
+    ends.ptr = hash + 1;
+    ends.len = text.len - table.len - 1;
+    at = arrow(ends);
+    if (table.len == 0 || at == NULL) {
+        return -1;
+    }
+    src.ptr = ends.ptr;
+    src.len = (size_t)(at - ends.ptr);
+    dst.ptr = at + 2;
+    dst.len = ends.len - src.len - 2;
+    if (offset_of(src, &out->as.edge.src) != 0 || offset_of(dst, &out->as.edge.dst) != 0) {
+        return -1;
+    }
+    out->kind = CV_EDGE;
+    out->as.edge.table = arena_str(a, table.ptr, table.len);
+    return out->as.edge.table.ptr == NULL ? -2 : 0;
+}
+
+/* Whether the decoded sequence is a walk, which is what a PATH is.
+ *
+ * A path alternates and ends at both ends with a node, so a sequence
+ * that does not is a case that could never pass. Refusing it here
+ * rather than at the comparison is the difference between a message
+ * naming the line and a report saying the row differs. */
+static int walk(const cv *items, size_t count, size_t line, char *err, size_t err_len) {
+    size_t i;
+    if (count % 2 == 0) {
+        return fail(err, err_len, line,
+                    "a PATH is a node, then an edge and a node for each hop, so it holds an odd "
+                    "number of values and this holds %lu",
+                    (unsigned long)count);
+    }
+    for (i = 0; i < count; i++) {
+        int want_node = i % 2 == 0;
+        cv_kind kind = items[i].kind;
+        const char *found = kind == CV_NODE ? "a NODE"
+                            : kind == CV_EDGE ? "an EDGE"
+                                              : "neither a NODE nor an EDGE";
+        if (kind == (want_node ? CV_NODE : CV_EDGE)) {
+            continue;
+        }
+        return fail(err, err_len, line,
+                    "a PATH alternates, so value %lu is %s where it should be %s",
+                    (unsigned long)(i + 1), found, want_node ? "a NODE" : "an EDGE");
+    }
+    return 0;
+}
+
 int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char *err,
                size_t err_len) {
     const cv_type *type = type_of(ty);
@@ -970,14 +1104,14 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
     if (type == NULL) {
         return unknown(err, err_len, line, ty);
     }
-    if (strcmp(ty, "LIST") == 0) {
+    if (strcmp(ty, "LIST") == 0 || strcmp(ty, "PATH") == 0) {
         const zy_node *items;
         size_t count, i;
         cv *cells;
         /* The empty list is a value worth a case and needs a spelling,
          * which is a `value:` with nothing under it. */
         if (zy_seq_or_empty(value, &items, &count) != 0) {
-            return fail(err, err_len, line, "a LIST holds a sequence of values, and this is %s",
+            return fail(err, err_len, line, "a %s holds a sequence of values, and this is %s", ty,
                         zy_kind_name(value));
         }
         cells = count == 0 ? NULL : (cv *)cv_alloc(a, count * sizeof *cells);
@@ -989,7 +1123,10 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
                 return -1;
             }
         }
-        out->kind = CV_LIST;
+        if (strcmp(ty, "PATH") == 0 && walk(cells, count, line, err, err_len) != 0) {
+            return -1;
+        }
+        out->kind = strcmp(ty, "LIST") == 0 ? CV_LIST : CV_PATH;
         out->as.list.items = cells;
         out->as.list.count = count;
         return 0;
@@ -1002,6 +1139,17 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
     /* The one rule the whole encoding exists for, checked before the
      * text is looked at, because a value that parses is exactly the case
      * where a silent misread would survive review. */
+    if (type->form == CV_TEXT && !value->quoted &&
+        (strcmp(ty, "NODE") == 0 || strcmp(ty, "EDGE") == 0)) {
+        /* A node and an edge are quoted for a different reason from the
+         * numbers, so they are told a different reason. Both reasons
+         * are the same rule: a payload is quoted where a bare one would
+         * read as something else in some reader of this file. */
+        return fail(err, err_len, line,
+                    "%s is written in quotes, because %s is a name and two numbers and no reader "
+                    "has a scalar for that",
+                    ty, text.ptr);
+    }
     if (type->form == CV_TEXT && !value->quoted) {
         return fail(err, err_len, line,
                     "%s is written in quotes, because a bare %s is a number and some reader of "
@@ -1013,7 +1161,9 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
                     "%s is written without quotes, so that a reader cannot take it for a string",
                     ty);
     }
-    switch (scalar(a, ty, text, out)) {
+    switch (strcmp(ty, "NODE") == 0   ? node_at(a, text, out)
+            : strcmp(ty, "EDGE") == 0 ? edge_at(a, text, out)
+                                      : scalar(a, ty, text, out)) {
     case 0:
         return 0;
     case -2:
@@ -1256,8 +1406,18 @@ static void emit_value(cv_out *o, const cv *v) {
         }
         emit(o, "\"");
         return;
+    case CV_NODE:
+        emit(o, "NODE \"");
+        emit(o, "%s", v->as.node.table.ptr);
+        emit(o, "#%" PRIu64 "\"", v->as.node.offset);
+        return;
+    case CV_EDGE:
+        emit(o, "EDGE \"");
+        emit(o, "%s", v->as.edge.table.ptr);
+        emit(o, "#%" PRIu64 "->%" PRIu64 "\"", v->as.edge.src, v->as.edge.dst);
+        return;
     default:
-        emit(o, "LIST [");
+        emit(o, "%s [", v->kind == CV_PATH ? "PATH" : "LIST");
         for (i = 0; i < v->as.list.count; i++) {
             if (i > 0) {
                 emit(o, ", ");
@@ -1286,6 +1446,12 @@ size_t cv_show(const cv *v, char *buf, size_t len) {
 
 /* ---- comparing ---- */
 
+/* Two strings, which is a length and a memcmp because a corpus string
+ * may hold a NUL of its own. */
+static int same_str(zy_str a, zy_str b) {
+    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
+}
+
 static uint64_t bits(double f) {
     uint64_t out;
     memcpy(&out, &f, sizeof out);
@@ -1313,12 +1479,16 @@ int cv_same(const cv *a, const cv *b) {
         }
         return bits(a->as.real) == bits(b->as.real);
     case CV_STR:
-        return a->as.str.len == b->as.str.len &&
-               memcmp(a->as.str.ptr, b->as.str.ptr, a->as.str.len) == 0;
+        return same_str(a->as.str, b->as.str);
     case CV_TEMPORAL:
         return a->as.temporal.unit == b->as.temporal.unit &&
                a->as.temporal.count == b->as.temporal.count &&
                a->as.temporal.offset == b->as.temporal.offset;
+    case CV_NODE:
+        return a->as.node.offset == b->as.node.offset && same_str(a->as.node.table, b->as.node.table);
+    case CV_EDGE:
+        return a->as.edge.src == b->as.edge.src && a->as.edge.dst == b->as.edge.dst &&
+               same_str(a->as.edge.table, b->as.edge.table);
     default:
         if (a->as.list.count != b->as.list.count) {
             return 0;

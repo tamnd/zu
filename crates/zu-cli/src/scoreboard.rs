@@ -110,11 +110,11 @@ impl Tally {
     }
 }
 
-fn u(v: Option<&Json>) -> u64 {
+pub(crate) fn u(v: Option<&Json>) -> u64 {
     v.and_then(Json::as_u64).unwrap_or(0)
 }
 
-fn s(v: Option<&Json>) -> String {
+pub(crate) fn s(v: Option<&Json>) -> String {
     v.and_then(Json::as_str).unwrap_or("unknown").to_string()
 }
 
@@ -321,7 +321,7 @@ fn render_tally(t: &Tally) -> String {
     out
 }
 
-fn push_str_field(out: &mut String, key: &str, value: &str, comma: bool) {
+pub(crate) fn push_str_field(out: &mut String, key: &str, value: &str, comma: bool) {
     out.push_str(&format!("  \"{key}\": \""));
     for c in value.chars() {
         match c {
@@ -523,7 +523,7 @@ fn render_scoreboard(tallies: &[Tally]) -> String {
 
     out.push_str("## What the numbers do not say\n\n");
     out.push_str("A skip is not a pass. It means the engine declared it cannot hold the fixture the case needs, so the case never ran, and for zu almost every one of those is a limit of the loader rather than of the evaluator. The declaration behind those skips is in `conformance.toml` at the root of this repository, with a reason on every line.\n\n");
-    out.push_str("The performance rows are pass and fail on a correctness check, not a speed comparison. Latency, throughput and footprint are measured per case by the harness and reported there. Nothing in this table is a timing.\n\n");
+    out.push_str("The performance rows are pass and fail on a correctness check, not a speed comparison. Nothing in this table is a timing. What each of those cases cost, in latency, in ingest rate, in memory held and in bytes left on disk, is in `docs/gql-performance.md`, generated the same way from the same runs.\n\n");
     out.push_str("An engine missing from the table is missing because nobody has taken a tally for it on a machine this repository can point at, not because it was tried and refused. Drop a `docs/conformance/<engine>.json` in and it appears in the next regeneration.\n");
     out
 }

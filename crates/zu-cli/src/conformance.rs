@@ -804,6 +804,15 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
             None => crate::usage_error("conformance"),
         },
         Some("--scoreboard") if args.len() > 1 => crate::scoreboard::scoreboard_command(&args[1..]),
+        // The other half of the same report. A tally is counts and a
+        // measurement set is timings, and they are separate files
+        // because one of them is the same number tomorrow and one of
+        // them is not.
+        Some("--measured") => match args.get(1) {
+            Some(path) => crate::matrix::measured_command(path),
+            None => crate::usage_error("conformance"),
+        },
+        Some("--matrix") if args.len() > 1 => crate::matrix::matrix_command(&args[1..]),
         Some("--regressed") => match (args.get(1), args.get(2)) {
             (Some(report), Some(baseline)) => {
                 crate::scoreboard::regressed_command(report, baseline)

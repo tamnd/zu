@@ -50,6 +50,6 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 
 A skip is not a pass. It means the engine declared it cannot hold the fixture the case needs, so the case never ran, and for zu almost every one of those is a limit of the loader rather than of the evaluator. The declaration behind those skips is in `conformance.toml` at the root of this repository, with a reason on every line.
 
-The performance rows are pass and fail on a correctness check, not a speed comparison. Latency, throughput and footprint are measured per case by the harness and reported there. Nothing in this table is a timing.
+The performance rows are pass and fail on a correctness check, not a speed comparison. Nothing in this table is a timing. What each of those cases cost, in latency, in ingest rate, in memory held and in bytes left on disk, is in `docs/gql-performance.md`, generated the same way from the same runs.
 
 An engine missing from the table is missing because nobody has taken a tally for it on a machine this repository can point at, not because it was tried and refused. Drop a `docs/conformance/<engine>.json` in and it appears in the next regeneration.

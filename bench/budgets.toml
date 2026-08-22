@@ -2025,6 +2025,37 @@ vec_math_real_grows_s = 0.2
 # observed run on the loaded vCPU hosts. Raise floors, never lower them.
 vec_math_pair_grows_s = 0.2
 
+# G9 (zu#124). The fault bit per morsel pattern, priced (plan/07
+# section 1.1). The four floors above say the kernels are fast; these
+# two say the conditions are why, and they are ratios rather than rates
+# because what they gate is a shape and a shape reads the same on a
+# quiet machine and a swamped one.
+#
+# The first is what the guard costs, as the same allocation and the
+# same wrapping addition with no condition behind them over the answer
+# the kernel gives with one. The fold reads both operands where the
+# loop reads both and writes one, so about twice the traffic and about
+# twice the time is the honest price of the pattern on the very
+# cheapest operation there is, and every operation dearer than an
+# integer add pays less of it. Measured on the local M series over
+# three interleaved passes at load 11: 1.93, 1.97, 2.11. The ceiling is
+# 3, which is not where the measurements are but is well under where a
+# check standing in the loop lands: this gate read 6.97 before the
+# arithmetic kernel settled its operation outside its loop, and that is
+# the number it exists to catch.
+vec_guard_x = 3.0
+
+# The second is what the walk costs, as the fold that clears a chunk
+# over the walk behind it, both measured on the same operands and the
+# same kernel with only the magnitude of the numbers differing. A
+# kernel that checked every row where it computed it would read near 1
+# here, since the wide operands differ from the ordinary ones only in
+# whether the fold can rule them out. Measured on the same three
+# passes: 12.50, 11.18, 12.61. The floor is 4, far under the
+# measurements and far above where the pattern gone reads. Raise this
+# floor, never lower it.
+vec_condition_walk_x = 4.0
+
 # A count of characters over a 2048-row flat string vector, the string
 # library's first kernel. Nothing here can raise, so the loop is a fold
 # over the bytes of each row with no check ahead of it, and the same

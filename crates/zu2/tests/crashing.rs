@@ -127,9 +127,9 @@ fn writes_until_it_is_killed() {
 
 /// Runs a child, kills it, and gives back every write the parent saw
 /// acknowledged in the order it saw them, along with the path it was
-/// killed on. `mode` is the environment variable that picks which child
-/// this is, or nothing for the plain one.
-fn kill_a_writer(dir: &std::path::Path, mode: Option<&str>) -> (std::path::PathBuf, Vec<u64>) {
+/// killed on. `modes` are the environment variables that pick which
+/// child this is, and none of them is the plain one.
+fn kill_a_writer(dir: &std::path::Path, modes: &[&str]) -> (std::path::PathBuf, Vec<u64>) {
     let path = dir.join("c.zu2");
     let mut command = Command::new(std::env::current_exe().expect("current exe"));
     command
@@ -137,7 +137,7 @@ fn kill_a_writer(dir: &std::path::Path, mode: Option<&str>) -> (std::path::PathB
         .env("ZU2_CRASH_CHILD", &path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(mode) = mode {
+    for mode in modes {
         command.env(mode, "1");
     }
     let mut child = command.spawn().expect("spawn");
@@ -240,7 +240,7 @@ fn a_durable_write_survives_a_kill() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, acknowledged) = kill_a_writer(dir.path(), None);
+    let (path, acknowledged) = kill_a_writer(dir.path(), &[]);
     let acknowledged = last_per_key(acknowledged, KEYS);
 
     let db = Db::open(&path, options(false)).expect("reopen");
@@ -271,7 +271,7 @@ fn an_ordered_database_survives_a_kill() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, acknowledged) = kill_a_writer(dir.path(), Some("ZU2_CRASH_ORDERED"));
+    let (path, acknowledged) = kill_a_writer(dir.path(), &["ZU2_CRASH_ORDERED"]);
     let acknowledged = last_per_key(acknowledged, KEYS);
 
     let db = Db::open(&path, options(true)).expect("reopen");
@@ -324,7 +324,7 @@ fn a_transaction_is_all_of_it_or_none_of_it_after_a_kill() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, acknowledged) = kill_a_writer(dir.path(), Some("ZU2_CRASH_TXN"));
+    let (path, acknowledged) = kill_a_writer(dir.path(), &["ZU2_CRASH_TXN"]);
     let acknowledged = last_per_key(acknowledged, GROUPS);
 
     let db = Db::open(&path, options(false)).expect("reopen");
@@ -357,5 +357,62 @@ fn a_transaction_is_all_of_it_or_none_of_it_after_a_kill() {
                 "transaction {t} committed and group {g} came back holding {got}"
             );
         }
+    }
+}
+
+/// The same transaction child with the key order kept as well, read back
+/// through a scan.
+///
+/// A scan answers from the skip list beside the hash index and a read
+/// answers from the index, so a recovery that dropped a provisional
+/// record from one and not the other passes the test above and gives a
+/// torn group back here. The two structures are filled by different code
+/// on the way in and rebuilt by different code on the way back, and the
+/// only thing that says they agree about a group the process died inside
+/// is asking both.
+#[test]
+fn a_transaction_is_all_of_it_or_none_of_it_in_the_key_order_too() {
+    if std::env::var_os("ZU2_CRASH_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, acknowledged) = kill_a_writer(dir.path(), &["ZU2_CRASH_TXN", "ZU2_CRASH_ORDERED"]);
+    let acknowledged = last_per_key(acknowledged, GROUPS);
+
+    let db = Db::open(&path, options(true)).expect("reopen");
+    let mut session = db.session();
+    let mut seen = Vec::new();
+    session
+        .scan(&member(0, 0), (GROUPS * GROUP) as usize * 2, |k, v| {
+            seen.push((k.to_vec(), round(v)))
+        })
+        .expect("scan");
+    // Every key of every acknowledged group, in key order, since the
+    // groups are laid out contiguously and the child writes them in
+    // order. Groups past the ones acknowledged are allowed to be there.
+    let wanted = acknowledged.len() * GROUP as usize;
+    assert!(
+        seen.len() >= wanted,
+        "the scan gave back {} keys and {wanted} of them were in acknowledged groups",
+        seen.len()
+    );
+    for (t, group) in acknowledged.iter().zip(seen.chunks(GROUP as usize)) {
+        let g = t % GROUPS;
+        let round = group[0].1;
+        for (j, (got_key, got)) in group.iter().enumerate() {
+            assert_eq!(
+                got_key.as_slice(),
+                member(g, j as u64).as_slice(),
+                "the scan is out of order or skipped a key after the kill"
+            );
+            assert_eq!(
+                *got, round,
+                "group {g} came back torn in the key order: key 0 holds {round} and key {j} holds {got}"
+            );
+        }
+        assert!(
+            round >= *t && round % GROUPS == g,
+            "transaction {t} committed and the key order gave back {round} for group {g}"
+        );
     }
 }

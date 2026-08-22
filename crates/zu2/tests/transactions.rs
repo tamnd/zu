@@ -272,3 +272,90 @@ fn an_empty_group_writes_nothing() {
     t.commit().expect("commit");
     assert_eq!(db.log_bytes(), before);
 }
+
+/// The same group against a database that keeps the key order as well.
+///
+/// A scan reads the skip list beside the hash index rather than the
+/// index, so everything above is answered by one structure and a scan is
+/// answered by the other. A commit that reached one and not the other
+/// would pass every test in this file and give back a key a read says is
+/// not there.
+#[test]
+fn a_group_lands_in_the_key_order_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("t.zu2"),
+        Options {
+            ordered: true,
+            ..options()
+        },
+    )
+    .expect("create");
+    let mut s = db.session();
+    s.upsert(b"a", b"one").expect("upsert");
+    s.upsert(b"c", b"three").expect("upsert");
+
+    // Dropped, so neither structure should have heard of it.
+    {
+        let mut t = s.transaction();
+        t.upsert(b"b", b"never").expect("stage");
+        t.delete(b"a").expect("stage");
+    }
+    let mut seen = Vec::new();
+    s.scan(b"a", 16, |k, v| seen.push((k.to_vec(), v.to_vec())))
+        .expect("scan");
+    assert_eq!(
+        seen,
+        vec![
+            (b"a".to_vec(), b"one".to_vec()),
+            (b"c".to_vec(), b"three".to_vec())
+        ],
+        "a dropped group changed the key order"
+    );
+
+    // Committed, so both should.
+    let mut t = s.transaction();
+    t.upsert(b"b", b"two").expect("stage");
+    t.upsert(b"d", b"four").expect("stage");
+    t.delete(b"a").expect("stage");
+    t.commit().expect("commit");
+
+    seen.clear();
+    s.scan(b"a", 16, |k, v| seen.push((k.to_vec(), v.to_vec())))
+        .expect("scan");
+    assert_eq!(
+        seen,
+        vec![
+            (b"b".to_vec(), b"two".to_vec()),
+            (b"c".to_vec(), b"three".to_vec()),
+            (b"d".to_vec(), b"four".to_vec())
+        ],
+        "the key order and the index disagree about the group"
+    );
+
+    // And after a reopen, where the key order is rebuilt from the log
+    // rather than carried across in memory.
+    drop(s);
+    drop(db);
+    let db = Db::open(
+        &dir.path().join("t.zu2"),
+        Options {
+            ordered: true,
+            ..options()
+        },
+    )
+    .expect("reopen");
+    let mut s = db.session();
+    seen.clear();
+    s.scan(b"a", 16, |k, v| seen.push((k.to_vec(), v.to_vec())))
+        .expect("scan");
+    assert_eq!(
+        seen,
+        vec![
+            (b"b".to_vec(), b"two".to_vec()),
+            (b"c".to_vec(), b"three".to_vec()),
+            (b"d".to_vec(), b"four".to_vec())
+        ],
+        "the reopen rebuilt a different key order than the writer saw"
+    );
+}

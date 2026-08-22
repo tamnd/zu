@@ -79,7 +79,14 @@ fn every_set_is_readable_and_names_an_engine() {
             text.contains(&format!("\"engine\": \"{stem}\"")),
             "{p:?} is named after {stem} and does not declare that engine"
         );
-        for field in ["version", "taken", "host", "round_trip_ns", "cases", "loads"] {
+        for field in [
+            "version",
+            "taken",
+            "host",
+            "round_trip_ns",
+            "cases",
+            "loads",
+        ] {
             assert!(
                 text.contains(&format!("\"{field}\"")),
                 "{p:?} has no {field}"
@@ -95,10 +102,7 @@ fn every_column_carries_a_timed_case_and_a_load() {
     // slow rather than one that was never measured.
     for p in sets() {
         let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
-        assert!(
-            text.contains("\"p50_ns\""),
-            "{p:?} has no timed case in it"
-        );
+        assert!(text.contains("\"p50_ns\""), "{p:?} has no timed case in it");
         assert!(
             text.contains("\"engine_wall_ns\""),
             "{p:?} has no ingest in it"

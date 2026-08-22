@@ -164,10 +164,7 @@ fn distil(report: &Json) -> Result<Measured, String> {
                     store_bytes: u(l.get("disk").and_then(|d| d.get("bytes_after"))),
                     graph_bytes: u(l.get("graph_bytes")),
                     bits_per_edge_milli: milli(l.get("bits_per_edge")),
-                    density_ok: l
-                        .get("density_ok")
-                        .and_then(Json::as_bool)
-                        .unwrap_or(false),
+                    density_ok: l.get("density_ok").and_then(Json::as_bool).unwrap_or(false),
                     density_note: text(l.get("density_note")),
                 });
             }
@@ -274,10 +271,7 @@ fn load_measured(text_in: &str) -> Result<Measured, String> {
                 store_bytes: u(l.get("store_bytes")),
                 graph_bytes: u(l.get("graph_bytes")),
                 bits_per_edge_milli: u(l.get("bits_per_edge_milli")),
-                density_ok: l
-                    .get("density_ok")
-                    .and_then(Json::as_bool)
-                    .unwrap_or(false),
+                density_ok: l.get("density_ok").and_then(Json::as_bool).unwrap_or(false),
                 density_note: text(l.get("density_note")),
             });
         }
@@ -569,7 +563,11 @@ fn latency(out: &mut String, engines: &[&Measured], subject: &Measured) {
         let mine = c.outcome == "pass";
         let (target, gain, verdict) = if !mine {
             nocmp += 1;
-            ("n/a".to_string(), "n/a".to_string(), subject.engine.clone() + " did not pass")
+            (
+                "n/a".to_string(),
+                "n/a".to_string(),
+                subject.engine.clone() + " did not pass",
+            )
         } else if best == 0 {
             nocmp += 1;
             (
@@ -888,7 +886,10 @@ mod tests {
         let m = sample();
         assert_eq!(m.loads.len(), 1);
         assert_eq!(m.loads[0].nodes, 100_000);
-        assert_eq!(per_sec(m.loads[0].nodes, m.loads[0].engine_wall_ns), "1 281 467");
+        assert_eq!(
+            per_sec(m.loads[0].nodes, m.loads[0].engine_wall_ns),
+            "1 281 467"
+        );
     }
 
     #[test]

@@ -395,6 +395,25 @@ zu2_status zu2_compact(zu2_db *db, uint64_t *reclaimed);
  * still counts them. This is the honest storage number. */
 zu2_status zu2_disk_bytes(zu2_db *db, uint64_t *bytes);
 
+/* The cold tier's half of what zu2_disk_bytes reports, holes excluded,
+ * and zero on a db with no tier. Against zu2_disk_bytes this is the
+ * migrated share, which belongs beside any number measured with the
+ * tier on: the share a run settles at varies from 2 to 35 percent
+ * across otherwise identical runs, and two runs that settled
+ * differently are two different storage layouts. */
+zu2_status zu2_cold_disk_bytes(zu2_db *db, uint64_t *bytes);
+
+/* Addresses the cold tier still spans, and zero when there is no tier.
+ * What it holds rather than what it costs the device, so this stays put
+ * where the disk number falls when a cold pass punches a hole. */
+uint64_t zu2_cold_span(const zu2_db *db);
+
+/* Bytes compaction has moved to the cold tier since the db was opened.
+ * Not what is down there now: a cold pass can take back everything it
+ * was given, so a run that migrated a great deal can end with a small
+ * span. */
+uint64_t zu2_migrated(const zu2_db *db);
+
 /* Addresses the log has spent, which is what the file would cost had
  * nothing ever been compacted away. */
 uint64_t zu2_log_bytes(const zu2_db *db);

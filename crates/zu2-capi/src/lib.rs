@@ -1686,6 +1686,80 @@ pub unsafe extern "C" fn zu2_disk_bytes(db: *mut Zu2Db, bytes: *mut u64) -> Zu2S
     }
 }
 
+/// The cold tier's half of what [`zu2_disk_bytes`] reports, holes
+/// excluded, and zero on a database with no tier.
+///
+/// Against `zu2_disk_bytes` this is the migrated share, which is the
+/// number a benchmark row needs beside it whenever the tier is on. The
+/// share a run settles at varies from 2 to 35 percent across otherwise
+/// identical runs depending on how much of the background schedule the
+/// run overlapped, and a latency compared across two runs that settled
+/// differently is comparing two different storage layouts. See #600.
+///
+/// # Safety
+/// `db` is live and `bytes` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_cold_disk_bytes(db: *mut Zu2Db, bytes: *mut u64) -> Zu2Status {
+    if !bytes.is_null() {
+        unsafe { bytes.write(0) };
+    }
+    let Some(handle) = (unsafe { handle(db) }) else {
+        return Zu2Status::Misuse;
+    };
+    if bytes.is_null() {
+        return Zu2Status::Misuse;
+    }
+    let Some(call) = handle.enter() else {
+        return Zu2Status::MisuseConcurrent;
+    };
+    let outcome = call.db.cold_disk_bytes();
+    match note(call.error, outcome) {
+        Ok(size) => {
+            unsafe { bytes.write(size) };
+            Zu2Status::Ok
+        }
+        Err(status) => status,
+    }
+}
+
+/// Addresses the cold tier still spans, and zero when there is no tier.
+///
+/// The tier's own version of `zu2_log_span`: what it holds rather than
+/// what it costs the device, so this stays put where the disk number
+/// falls when a cold pass punches a hole.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_cold_span(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.cold_span(),
+        None => 0,
+    }
+}
+
+/// Bytes compaction has moved to the cold tier since the database was
+/// opened.
+///
+/// Not what is down there now: a cold pass can take back everything it
+/// was given, so a run that migrated a great deal can end with a small
+/// span. This is the work rather than the residue, which is what says
+/// whether a run reached the tier at all.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_migrated(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle
+            .db
+            .compaction()
+            .migrated
+            .load(std::sync::atomic::Ordering::Relaxed),
+        None => 0,
+    }
+}
+
 /// Addresses the log has spent.
 ///
 /// # Safety

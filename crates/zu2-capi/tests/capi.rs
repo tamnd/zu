@@ -833,6 +833,104 @@ fn the_database_reports_its_size() {
     close(db, &[s]);
 }
 
+/// Opens a database small enough that a pass has to move records to
+/// the cold tier, which is what the tier metrics have to be measured
+/// against. The default `open` turns compaction off, so nothing would
+/// ever migrate under it.
+fn open_migrating(name: &str) -> (tempfile::TempDir, *mut Zu2Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.index_buckets = 1 << 12;
+    options.max_pages = 8;
+    options.compact_below = 1 << 20;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    (dir, db)
+}
+
+/// The tier's share of the storage number, which is what #600 wants
+/// beside any row measured with the tier on: two runs that settled at
+/// different shares are two different layouts and their latencies do
+/// not compare.
+#[test]
+fn the_database_reports_what_settled_into_the_cold_tier() {
+    let (_dir, db) = open_migrating("tier.zu2");
+    let s = session_on(db);
+    // Written once and never again, so a pass finds them live and has
+    // to carry them down rather than dropping them as dead.
+    for i in 0..100_000u32 {
+        upsert(s, format!("key{i:07}").as_bytes(), &[b'x'; 400]);
+    }
+    assert_eq!(unsafe { zu2::zu2_sync(db) }, Zu2Status::Ok);
+    let mut reclaimed = 0u64;
+    assert_eq!(
+        unsafe { zu2::zu2_compact(db, &mut reclaimed) },
+        Zu2Status::Ok
+    );
+
+    assert!(
+        unsafe { zu2::zu2_migrated(db) } > 0,
+        "nothing ever reached the tier, so there is nothing to report"
+    );
+    assert!(unsafe { zu2::zu2_cold_span(db) } > 0);
+    let mut cold = 0u64;
+    assert_eq!(
+        unsafe { zu2::zu2_cold_disk_bytes(db, &mut cold) },
+        Zu2Status::Ok
+    );
+    let mut total = 0u64;
+    assert_eq!(
+        unsafe { zu2::zu2_disk_bytes(db, &mut total) },
+        Zu2Status::Ok
+    );
+    assert!(cold > 0, "the tier holds records and occupies nothing");
+    assert!(
+        cold <= total,
+        "the tier is part of the total, {cold} of {total}"
+    );
+
+    // And the records are readable from wherever the pass left them,
+    // because a share reported over data that was lost is worse than
+    // no share at all.
+    assert_eq!(read(s, b"key0000042").as_deref(), Some(&[b'x'; 400][..]));
+    close(db, &[s]);
+}
+
+/// A database with no tier answers rather than failing, so a caller
+/// can print the column unconditionally.
+#[test]
+fn a_database_with_nothing_cold_reports_zero() {
+    let (_dir, db) = open("nocold.zu2");
+    let s = session_on(db);
+    upsert(s, b"k", b"v");
+    let mut cold = u64::MAX;
+    assert_eq!(
+        unsafe { zu2::zu2_cold_disk_bytes(db, &mut cold) },
+        Zu2Status::Ok
+    );
+    assert_eq!(cold, 0);
+    assert_eq!(unsafe { zu2::zu2_cold_span(db) }, 0);
+    assert_eq!(unsafe { zu2::zu2_migrated(db) }, 0);
+    close(db, &[s]);
+}
+
 #[test]
 fn durability_is_settable_per_session() {
     let (_dir, db) = open("durable.zu2");
@@ -942,6 +1040,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
         ("uint32_t", "fixed_index"),
         ("uint32_t", "salvage"),
         ("uint32_t", "ordered"),
+        ("uint32_t", "no_promote_reads"),
     ];
     let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/zu2.h"))
         .expect("the header ships with the crate");
@@ -1017,6 +1116,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "fixed_index" => std::mem::offset_of!(Zu2Options, fixed_index),
             "salvage" => std::mem::offset_of!(Zu2Options, salvage),
             "ordered" => std::mem::offset_of!(Zu2Options, ordered),
+            "no_promote_reads" => std::mem::offset_of!(Zu2Options, no_promote_reads),
             other => panic!("{other} is in the header and this test does not know it"),
         };
         assert_eq!(

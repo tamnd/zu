@@ -169,13 +169,12 @@ fn manifest(version: &str, entries: &[Entry]) -> String {
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
+    use crate::scratch::Scratch;
 
-    /// A directory of cases, written where the test can pack it.
-    fn corpus(name: &str, suites: &[(&str, usize)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zu-pack-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+    /// A directory of cases, written where the test can pack it and
+    /// removed when the test is done with it.
+    fn corpus(name: &str, suites: &[(&str, usize)]) -> Scratch {
+        let dir = Scratch::new(&format!("pack-{name}"));
         for (suite, cases) in suites {
             let mut text = format!(
                 "schema: {}\nsuite: {suite}\ndoc: A suite the packing test wrote, which exists so \
@@ -253,7 +252,12 @@ mod tests {
     #[test]
     fn a_readme_travels_with_the_cases() {
         let dir = corpus("readme", &[("alpha", 1)]);
-        let readme = dir.join("../zu-pack-readme.md");
+        // Beside the cases and not among them, which is where a real
+        // one is: the readme is named on the command line and the cases
+        // are found by walking, so one written into the directory being
+        // packed would be a file the walk had to know to skip.
+        let beside = Scratch::new("pack-readme");
+        let readme = beside.join("README.md");
         std::fs::write(&readme, "what this is\n").expect("writes");
         let packed = pack(&dir, Some(&readme), "0.1.0").expect("packs");
         let files = entries(&packed.tar);

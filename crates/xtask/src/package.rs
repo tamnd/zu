@@ -665,6 +665,7 @@ mod tests {
     use super::*;
 
     use crate::platforms;
+    use crate::scratch::Scratch;
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -679,11 +680,8 @@ mod tests {
     }
 
     /// A scratch tree, so a test can stage into something.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zu-package-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("package-{name}"))
     }
 
     #[test]
@@ -1068,7 +1066,6 @@ mod tests {
             assert_eq!(mode("lib/libzu.dylib"), 0o755);
             assert_eq!(mode("include/zu.h"), 0o644);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1085,6 +1082,5 @@ mod tests {
             .stage(&root(), &built, &dir.join("prefix"))
             .expect_err("no static archive");
         assert!(error.contains("libzu.a"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

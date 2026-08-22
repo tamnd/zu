@@ -18,10 +18,11 @@
 //! Run: cargo bench -p xtask --bench pins
 
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use xtask::pins::Table;
+use xtask::scratch::Scratch;
 
 fn main() {
     println!("{:>9}  {:>9}  {:>9}", "rows", "parse ms", "us/row");
@@ -70,7 +71,6 @@ fn main() {
             );
         }
         per_site = Some((sites, us));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Cargo runs a bench from the package directory, so the tree is two
@@ -111,9 +111,8 @@ fn table(rows: usize) -> String {
 
 /// The tree that table holds: one file per site, each a few dozen lines
 /// the way a real manifest is, and one workflow for the backward pass.
-fn tree(sites: usize) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zu-pins-bench-{}-{sites}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn tree(sites: usize) -> Scratch {
+    let dir = Scratch::new(&format!("pins-bench-{sites}"));
     std::fs::create_dir_all(dir.join(".github/workflows")).expect("the scratch dir is writable");
     std::fs::write(
         dir.join(".github/workflows/ci.yml"),

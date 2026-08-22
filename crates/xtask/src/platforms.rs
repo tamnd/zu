@@ -537,6 +537,8 @@ fn rows(text: &str) -> Result<Vec<Row>, String> {
 mod tests {
     use super::*;
 
+    use crate::scratch::Scratch;
+
     const TABLE: &str = concat!(
         "schema = 2\n",
         "doc = \"The platforms zu builds for.\"\n",
@@ -677,9 +679,7 @@ mod tests {
 
     #[test]
     fn what_a_build_produced_is_weighed_against_its_ceiling() {
-        let dir = std::env::temp_dir().join(format!("zu-platforms-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+        let dir = Scratch::new("platforms");
         std::fs::write(dir.join("libzu.so"), vec![0u8; 3 << 20]).expect("writes");
         std::fs::write(dir.join("zu"), vec![0u8; 5 << 20]).expect("writes");
         let weights = table()
@@ -690,32 +690,25 @@ mod tests {
         assert_eq!(weights[0].cap, 14 << 20);
         assert!(!weights[0].over());
         assert!(weights[0].to_string().contains("21%"), "{}", weights[0]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_artifact_over_its_ceiling_says_so() {
-        let dir = std::env::temp_dir().join(format!("zu-platforms-over-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+        let dir = Scratch::new("platforms-over");
         std::fs::write(dir.join("libzu.so"), vec![0u8; 15 << 20]).expect("writes");
         let weights = table()
             .weigh("x86_64-unknown-linux-gnu", &dir)
             .expect("weighs");
         assert!(weights[0].over(), "{:?}", weights[0]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_artifact_the_build_did_not_produce_is_an_error_and_not_a_zero() {
-        let dir = std::env::temp_dir().join(format!("zu-platforms-none-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+        let dir = Scratch::new("platforms-none");
         let error = table()
             .weigh("x86_64-unknown-linux-gnu", &dir)
             .expect_err("nothing was built");
         assert!(error.contains("libzu.so"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -816,9 +809,7 @@ mod tests {
         // And the weight it is measured against is the one for the
         // platform it was built for, so the same file passes on one and
         // fails on the other.
-        let dir = std::env::temp_dir().join(format!("zu-platforms-one-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+        let dir = Scratch::new("platforms-one");
         std::fs::write(dir.join("libzu.so"), vec![0u8; 16 << 20]).expect("writes");
         std::fs::write(dir.join("libzu.dylib"), vec![0u8; 16 << 20]).expect("writes");
         let linux = table
@@ -829,7 +820,6 @@ mod tests {
         assert_eq!(darwin.len(), 1, "{darwin:?}");
         assert!(linux[0].over(), "{:?}", linux[0]);
         assert!(!darwin[0].over(), "{:?}", darwin[0]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

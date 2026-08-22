@@ -109,6 +109,15 @@ pub struct Zu2Options {
     /// to be on for the whole life of the data and not just the run
     /// that scans, because the plane is built as keys arrive.
     pub ordered: u32,
+    /// Nonzero stops a point read of a cold record putting it back in
+    /// the log. On by default, the way `Options::promote_reads` is: a
+    /// record goes to the cold tier for having survived a lap of the
+    /// log unwritten, which says nothing about how often it is read, and
+    /// without promotion a hot record that was quiet for one lap reads
+    /// from the device for the life of the data. Off is for measuring
+    /// what promotion is worth, and `zu2_promoted` is how much of it
+    /// happened.
+    pub no_promote_reads: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -375,6 +384,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.ordered != 0 {
         options.ordered = true;
+    }
+    if given.no_promote_reads != 0 {
+        options.promote_reads = false;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,
@@ -1834,6 +1846,21 @@ pub unsafe extern "C" fn zu2_index_resizing(db: *const Zu2Db) -> u32 {
 pub unsafe extern "C" fn zu2_resident_pages(db: *const Zu2Db) -> u64 {
     match unsafe { handle(db) } {
         Some(handle) => handle.db.resident_pages() as u64,
+        None => 0,
+    }
+}
+
+/// Records a read moved out of the cold tier and back into the log.
+///
+/// The cost side of `promote_reads`: it says how much writing the reads
+/// did. See the option's own documentation.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_promoted(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.promoted(),
         None => 0,
     }
 }

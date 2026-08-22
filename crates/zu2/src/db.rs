@@ -1103,8 +1103,6 @@ impl Db {
         n
     }
 
-    /// Buckets in the index as it stands, which is the size it was
-    /// opened with doubled once per [`Db::index_grows`].
     /// What the scan plane is holding, in bytes, or nothing when the
     /// database has no scan plane. This is memory and not disk: the
     /// plane is rebuilt from the log rather than written to it.
@@ -1118,6 +1116,8 @@ impl Db {
         self.core.ordered.as_ref().map(crate::scan::Ordered::keys)
     }
 
+    /// Buckets in the index as it stands, which is the size it was
+    /// opened with doubled once per [`Db::index_grows`].
     pub fn index_buckets(&self) -> usize {
         let Ok(session) = self.core.maintenance_session() else {
             return 0;

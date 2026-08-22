@@ -177,6 +177,14 @@ typedef struct zu2_options {
    * the whole life of the data and not just the run that scans,
    * because the plane is built as the keys arrive. */
   uint32_t ordered;
+  /* Nonzero stops a point read of a cold record putting it back in the
+   * log. On by default: a record reaches the cold tier for having
+   * survived a lap of the log unwritten, which says nothing about how
+   * often it is read, and without promotion a record that was quiet for
+   * one lap reads from the device for the life of the data. Off is for
+   * measuring what promotion is worth, and zu2_promoted() says how much
+   * of it happened. */
+  uint32_t no_promote_reads;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -436,6 +444,10 @@ uint32_t zu2_index_resizing(const zu2_db *db);
  * the space column: zu2_disk_bytes says what the filesystem holds and
  * this says what the process does. */
 uint64_t zu2_resident_pages(const zu2_db *db);
+
+/* Records a read moved out of the cold tier and back into the log,
+ * which is the cost side of promote_reads. */
+uint64_t zu2_promoted(const zu2_db *db);
 
 /* Bytes a salvaged open threw away, and zero on an open that had nothing
  * to throw away. A salvaged database is a short database and this is how

@@ -3,13 +3,13 @@
 //! This exists because the milestone's latency claim cannot be measured
 //! through go-ycsb and it took a while to see why. The YCSB client and
 //! the cgo crossing cost about 390 ns an operation before any engine is
-//! reached, and every engine pays it. A zu2 read is around 34 ns and a
-//! sqlite read around 2500, so the true ratio is about 73x, but what
-//! YCSB reports is (390 + 34) against (390 + 2500), which is 6.8x. The
-//! floor does not cancel. It compresses every ratio toward 1, and it
-//! compresses hardest exactly when the engine is fastest, so the better
-//! zu2 gets the more the harness understates it. No amount of re-running
-//! fixes that. The measurement has to move below the client.
+//! reached, and every engine pays it. A zu2 read is a few hundred
+//! nanoseconds and a sqlite read a few thousand, so the harness compares
+//! (390 + ours) against (390 + theirs) and the floor does not cancel. It
+//! compresses every ratio toward 1, and it compresses hardest exactly
+//! when the engine is fastest, so the better zu2 gets the more the
+//! harness understates it. No amount of re-running fixes that. The
+//! measurement has to move below the client.
 //!
 //! So: one process, both engines, the same histogram, the same clock,
 //! the same calibration, the same keys in the same order. The only
@@ -19,18 +19,35 @@
 //!
 //! sqlite is given its fastest configuration rather than its default
 //! one, because a comparison against a rival's slow mode is not worth
-//! printing. WAL, synchronous off, a page cache, and an 8 GiB mmap over
-//! the file on top of it, with a prepared statement reused for the life
-//! of each thread and the blob copied into a buffer that is reused too.
-//! The mapping is the part that matters for a read: it is file backed
-//! and shared between connections, so the whole database is reachable
-//! without a copy into any one thread's cache. If sqlite loses here it
-//! is not because it was holding a hand behind its back.
+//! printing, and getting that right took two corrections that each moved
+//! sqlite by a large factor.
 //!
-//! Each engine is measured twice, in the order zu2, sqlite, sqlite, zu2.
-//! If a host drifts under the run, or if one engine leaves the machine
-//! in a state that helps or hurts the next, the two passes for an engine
-//! disagree and the table says so instead of hiding it in an average.
+//! WAL, synchronous off, a page cache, an 8 GiB mmap over the file,
+//! `WITHOUT ROWID` so a lookup is one B-tree descent rather than two, a
+//! prepared statement reused for the life of each thread, and the blob
+//! copied into a buffer that is reused too.
+//!
+//! Then `SQLITE_CONFIG_MEMSTATUS` off. sqlite's default allocator takes
+//! one process wide mutex per malloc to maintain a byte counter, so at
+//! eight threads every read serialises on it and sqlite gets slower with
+//! more threads rather than faster. Turning it off moved sqlite from
+//! 83000 reads a second to 635000 at eight threads on an M4, which is
+//! 7.6x, and without it this table would have been reporting a lock
+//! artefact as though it were a lookup cost.
+//!
+//! Then a second sqlite row, `sqlite+txn`, which holds one read
+//! transaction open per thread instead of letting every read be its own
+//! implicit one. That is what sqlite's own documentation recommends for
+//! many small reads and it is the closer analogue of a zu2 session,
+//! which holds an epoch for its lifetime. It is worth another 2.1x at
+//! eight threads. Both rows are printed and the ratio worth quoting is
+//! against the better of them.
+//!
+//! Each engine is measured twice, zu2, sqlite, sqlite+txn, sqlite+txn,
+//! sqlite, zu2. If a host drifts under the run, or if one engine leaves
+//! the machine in a state that helps or hurts the next, the two passes
+//! for an engine disagree and the table says so instead of hiding it in
+//! an average.
 //!
 //! usage: readlatency [records] [ops] [threads]
 
@@ -164,10 +181,35 @@ where
     (merged, (each * threads as u64) as f64 / took)
 }
 
+/// Turn off sqlite's memory statistics before anything opens a
+/// connection.
+///
+/// This is the difference between sqlite scaling and sqlite not scaling,
+/// and it is not obvious. sqlite's default allocator takes a single
+/// process wide mutex on every malloc and free so it can keep a running
+/// total for `sqlite3_memory_used`. A point read does several
+/// allocations, so at n threads every read serialises n ways on one lock
+/// that exists only to maintain a counter nobody in this benchmark
+/// reads. Measured at eight threads it costs sqlite most of its
+/// throughput, and without this the table would be reporting a lock
+/// contention artefact as if it were a lookup cost.
+///
+/// `SQLITE_CONFIG_MEMSTATUS` has to be set before `sqlite3_initialize`,
+/// and rusqlite may already have run it, so shut the library down first.
+/// Nothing is open at this point.
+fn sqlite_drop_memstatus() {
+    // SQLITE_CONFIG_MEMSTATUS is 9. rusqlite's ffi does not name it.
+    const SQLITE_CONFIG_MEMSTATUS: i32 = 9;
+    unsafe {
+        rusqlite::ffi::sqlite3_shutdown();
+        let rc = rusqlite::ffi::sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0);
+        rusqlite::ffi::sqlite3_initialize();
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "sqlite3_config memstatus");
+    }
+}
+
 fn open_sqlite(path: &Path) -> rusqlite::Connection {
     let c = rusqlite::Connection::open(path).expect("sqlite open");
-    // sqlite's fastest honest read configuration.
-    //
     // The cache is per connection, which is per thread here, and that is
     // the detail that matters. It was a gigabyte and at eight threads
     // that is eight gigabytes of page cache on a box with four free.
@@ -196,6 +238,8 @@ fn main() {
     let records: u64 = a.next().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
     let ops: u64 = a.next().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
     let threads: usize = a.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+
+    sqlite_drop_memstatus();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let zu_path = dir.path().join("readlatency.zu2");
@@ -275,12 +319,12 @@ fn main() {
         );
     }
     println!(
-        "# sqlite: WAL, synchronous off, 64 MiB page cache a connection, 8 GiB mmap, WITHOUT ROWID, prepared statement reused"
+        "# sqlite: WAL, synchronous off, 64 MiB page cache a connection, 8 GiB mmap, WITHOUT ROWID, prepared statement reused, memstatus off"
     );
     println!(
         "# ns/op is the mean including thread joins; p50 is the median of the sampled reads. They are not the same measurement."
     );
-    println!("pass  engine   ops/s        ns/op   p50   p95    p99   p999");
+    println!("pass  engine      ops/s        ns/op   p50   p95    p99   p999");
 
     let zu2_reader = |_t: usize| {
         let mut s = db.session();
@@ -294,45 +338,76 @@ fn main() {
             }
         }
     };
-    let sq_reader = |_t: usize| {
-        let c = open_sqlite(&sq_path);
-        let mut out = Vec::with_capacity(VALUE);
-        move |k: &str| {
-            // The statement is prepared once per read rather than once
-            // per thread only because rusqlite ties a Statement's
-            // lifetime to its Connection and both live in this closure.
-            // sqlite caches prepared statements internally, which is
-            // what `prepare_cached` uses, so this is a hash lookup and
-            // not a parse.
-            let mut stmt = c
-                .prepare_cached("SELECT field0 FROM usertable WHERE ycsb_key = ?1")
-                .expect("prepare");
-            stmt.query_row([k], |r| {
-                let b = r.get_ref(0)?.as_blob().expect("blob");
-                out.clear();
-                out.extend_from_slice(b);
-                Ok(out.len())
-            })
-            .unwrap_or(0)
+    // sqlite twice, because at more than one thread the two shapes are
+    // an order of magnitude apart and publishing only the slower one
+    // would be a comparison against a rival's bad day.
+    //
+    // `sqlite` gives every read its own implicit transaction, which is
+    // what a YCSB style client does. `sqlite+txn` holds one read
+    // transaction open per thread for the life of the pass, which is
+    // what sqlite's documentation recommends for many small reads and
+    // is the closer analogue of a zu2 session holding an epoch. At one
+    // thread it is worth about 1.4x and at eight about 2.1x, so it is
+    // not a rounding difference and printing only the first would be
+    // quoting a rival's slower shape.
+    // Borrowed once, because the closure below is called twice and a
+    // `move` closure that captured the `PathBuf` itself would be
+    // callable only once. A `&Path` is Copy and can be handed to both.
+    let sq_ref: &Path = &sq_path;
+    let sq_reader_at = |held: bool| {
+        move |_t: usize| {
+            let c = open_sqlite(sq_ref);
+            if held {
+                c.execute_batch("BEGIN").expect("begin");
+            }
+            let mut out = Vec::with_capacity(VALUE);
+            move |k: &str| {
+                // The statement is prepared once per read rather than
+                // once per thread only because rusqlite ties a
+                // Statement's lifetime to its Connection and both live
+                // in this closure. sqlite caches prepared statements
+                // internally, which is what `prepare_cached` uses, so
+                // this is a hash lookup and not a parse.
+                let mut stmt = c
+                    .prepare_cached("SELECT field0 FROM usertable WHERE ycsb_key = ?1")
+                    .expect("prepare");
+                stmt.query_row([k], |r| {
+                    let b = r.get_ref(0)?.as_blob().expect("blob");
+                    out.clear();
+                    out.extend_from_slice(b);
+                    Ok(out.len())
+                })
+                .unwrap_or(0)
+            }
         }
     };
+    let sq_reader = sq_reader_at(false);
+    let sq_txn_reader = sq_reader_at(true);
 
     // A warm pass over each engine that is not printed, so neither one
     // pays the other's first touch faults.
     pass(threads, ops / 8, records, overhead, zu2_reader);
     pass(threads, ops / 8, records, overhead, sq_reader);
 
-    // zu2, sqlite, sqlite, zu2. See the header comment: the outer pair
-    // and the inner pair bracket each other, so drift shows up as the
-    // two rows for one engine disagreeing.
-    for (n, engine) in [(1, "zu2"), (1, "sqlite"), (2, "sqlite"), (2, "zu2")] {
-        let (h, rate) = if engine == "zu2" {
-            pass(threads, ops, records, overhead, zu2_reader)
-        } else {
-            pass(threads, ops, records, overhead, sq_reader)
+    // zu2, sqlite, sqlite, zu2, with the held transaction shape sitting
+    // inside that. See the header comment: the outer pair and the inner
+    // pair bracket each other, so drift shows up as the two rows for one
+    // engine disagreeing.
+    for (n, engine) in [
+        (1, "zu2"),
+        (1, "sqlite"),
+        (1, "sqlite+txn"),
+        (2, "sqlite+txn"),
+        (2, "sqlite"),
+        (2, "zu2"),
+    ] {
+        let (h, rate) = match engine {
+            "zu2" => pass(threads, ops, records, overhead, zu2_reader),
+            "sqlite" => pass(threads, ops, records, overhead, sq_reader),
+            _ => pass(threads, ops, records, overhead, sq_txn_reader),
         };
         println!(
-            "{n:4}  {engine:7}  {rate:9.0}  {:6.0}  {:4}  {:4}  {:5}  {:5}",
+            "{n:4}  {engine:10}  {rate:9.0}  {:6.0}  {:4}  {:4}  {:5}  {:5}",
             1e9 / rate * threads as f64,
             h.quantile(0.50),
             h.quantile(0.95),

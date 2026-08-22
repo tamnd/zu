@@ -565,9 +565,25 @@ impl Writer {
                 _ => None,
             })
             .collect();
+        // And the edges it is adding, for the other half of the same
+        // question: a row is only removable once nothing is left
+        // pointing at it, and an edge written beside the delete points
+        // at it as surely as one that was already there.
+        let born: Vec<(u32, u64, u64)> = changes
+            .iter()
+            .filter_map(|change| match *change {
+                Deferred::Edge(rel, src, dst, _) => Some((rel, src, dst)),
+                _ => None,
+            })
+            .collect();
         // The words this commit has left on rows so far, by table and
         // offset, for the same reason.
         let mut staged: IdMap<(u32, u64), u64> = IdMap::default();
+        // The rows this commit has put on the end of each table so far,
+        // for the same reason again: `INSERT (m:Post), (p)-[:LIKES]->(m)`
+        // is a row and then an edge onto it, and the edge is asked about
+        // while the row it names is still only in here.
+        let mut appending: IdMap<u32, u64> = IdMap::default();
         let mut taken = Vec::with_capacity(changes.len());
         for change in changes {
             match change {
@@ -587,19 +603,19 @@ impl Writer {
                     taken.extend(run.map(|row| Deferred::Cell((rel, row, col, value.clone()))));
                 }
                 Deferred::Edge(rel, src, dst, ref cols) => {
-                    if !self.edge_patchable(db, rel, src, dst, cols)? {
+                    if !self.edge_patchable(db, rel, src, dst, cols, &appending)? {
                         return Ok(None);
                     }
                     taken.push(change);
                 }
                 Deferred::Gone(table, offset) => {
-                    if !self.removable(db, table, offset, &dying)? {
+                    if !self.removable(db, table, offset, &dying, &born, &appending)? {
                         return Ok(None);
                     }
                     taken.push(change);
                 }
-                Deferred::DeadRel(rel, src, dst) => {
-                    if !self.edge_removable(db, rel, src, dst)? {
+                Deferred::DeadRel(rel, ..) => {
+                    if !self.edge_removable(db, rel)? {
                         return Ok(None);
                     }
                     taken.push(change);
@@ -608,6 +624,7 @@ impl Writer {
                     if !self.appendable(db, table, rows)? {
                         return Ok(None);
                     }
+                    *appending.entry(table).or_default() += rows.len() as u64;
                     taken.push(change);
                 }
                 Deferred::Labels(table, row, add, remove) => {
@@ -685,6 +702,15 @@ impl Writer {
     /// table that stores properties refuses the second copy at write
     /// time anyway; this is what keeps the other kind honest.
     ///
+    /// Either end may be a row the CSR was never built over, one an
+    /// earlier commit of this run appended or one this same commit is
+    /// appending, which is what `appending` counts. The CSR holds no
+    /// list for such a row and the readers are told how far past it the
+    /// two node tables now run, so they answer for one out of the patch
+    /// alone. Past that the id is not a row of anything and the edge
+    /// folds. The probe below is only for an end the file has a row
+    /// for, because an end it does not cannot be in a list it wrote.
+    ///
     /// Every column the table stores has to be given a value of its own
     /// kind, because that row is served out of the patch and there is
     /// no column underneath it to fall back on. That is also what the
@@ -697,6 +723,7 @@ impl Writer {
         src: u64,
         dst: u64,
         cols: &[(u32, Cell)],
+        appending: &IdMap<u32, u64>,
     ) -> Result<bool> {
         if self
             .patches
@@ -707,14 +734,29 @@ impl Writer {
             return Ok(false);
         }
         self.load_reader(db, rel)?;
+        if self.catalog.is_none() {
+            self.catalog = Some(Catalog::load(db)?);
+        }
         let Some(reader) = self.readers.get(&rel) else {
             return Ok(false);
         };
-        let directory = reader.directory();
-        if src >= directory.from_count || dst >= directory.to_count {
+        let (from_count, to_count) = {
+            let directory = reader.directory();
+            (directory.from_count, directory.to_count)
+        };
+        let catalog = self.catalog.as_ref().expect("loaded with the reader");
+        let Some(table) = catalog.rel_by_id(rel) else {
+            return Ok(false);
+        };
+        let (from, to) = (table.from, table.to);
+        let [from_grown, to_grown] = self.patches.grown(catalog, rel);
+        let room = |count: u64, grown: u64, end: u32| {
+            count + grown + appending.get(&end).copied().unwrap_or(0)
+        };
+        if src >= room(from_count, from_grown, from) || dst >= room(to_count, to_grown, to) {
             return Ok(false);
         }
-        if reader.has_edge(db, src, dst)? {
+        if src < from_count && reader.has_edge(db, src, dst)? {
             return Ok(false);
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(rel) {
@@ -735,28 +777,22 @@ impl Writer {
     /// Whether a reader can be shown this edge as gone without the CSR
     /// being rebuilt without it.
     ///
-    /// The pair has to be one this run of deferred commits did not add.
-    /// An added edge is in the patch's lists and in the rows it
-    /// appended under the ordinal it took, and taking it out again
-    /// would leave a hole in the ordinals every read of an edge
-    /// property counts on being dense. A pair that arrives and goes
-    /// inside one run is rare enough to fold.
-    ///
-    /// Nothing else is asked. The pair names whatever copies of it the
+    /// Nothing is asked but that the table is one a reader can be
+    /// handed a patch over. The pair names whatever copies of it the
     /// file holds and no more, so a delete of an edge that is not there
     /// takes nothing away, and the property columns underneath are left
     /// exactly as they were: the ordinals of the edges that stay do not
     /// move, because nothing has been rebuilt around the ones that
     /// went.
-    fn edge_removable(&mut self, db: &mut Zu1File, rel: u32, src: u64, dst: u64) -> Result<bool> {
-        if self
-            .patches
-            .edges
-            .get(&rel)
-            .is_some_and(|p| p.holds(src, dst))
-        {
-            return Ok(false);
-        }
+    ///
+    /// A pair this run of deferred commits added is taken out of the
+    /// patch's lists rather than laid over them as gone, which is what
+    /// leaves an unfolded write and the delete that follows it costing
+    /// nothing between them. The ordinal it took stays spent and the
+    /// row of properties it wrote stays where it was, unreachable, so
+    /// the run of ordinals nothing has rebuilt is left as dense as it
+    /// was.
+    fn edge_removable(&mut self, db: &mut Zu1File, rel: u32) -> Result<bool> {
         self.load_reader(db, rel)?;
         Ok(self.readers.contains_key(&rel))
     }
@@ -881,19 +917,27 @@ impl Writer {
     /// what a `DETACH DELETE` is: the edges and then the row, in one
     /// transaction.
     ///
-    /// The edges are read off the file rather than through the patch,
-    /// which is why what the patch holds is passed in beside them: the
-    /// readers here are the file's and the patch is the writer's. An
-    /// edge this run of deferred commits added is not accounted for by
-    /// anything, and it turns the whole table away, because a delete on
-    /// a table something has just been linked into is rare enough to
-    /// fold.
+    /// The readers here are the file's, so the file's list and the
+    /// patch's are asked separately and between them are the whole list
+    /// a fold would have found on the row. The pairs an earlier commit
+    /// of this run took away are in the patch, the ones this commit is
+    /// taking away are in `dying`, and the ones it is adding are in
+    /// `born`, which has to be accounted for as well: an edge written
+    /// and a row deleted in one transaction is still an edge that would
+    /// run to nothing.
+    ///
+    /// The row may be one the patch appended rather than one the file
+    /// holds, which is what `appending` bounds along with the rows this
+    /// same commit has put on the end so far. The file holds no list for
+    /// such a row, so only the patch is asked about it.
     fn removable(
         &mut self,
         db: &mut Zu1File,
         table: u32,
         offset: u64,
         dying: &[(u32, u64, u64)],
+        born: &[(u32, u64, u64)],
+        appending: &IdMap<u32, u64>,
     ) -> Result<bool> {
         if self.catalog.is_none() {
             self.catalog = Some(Catalog::load(db)?);
@@ -902,7 +946,11 @@ impl Writer {
         let Some(node) = catalog.node_by_id(table) else {
             return Ok(false);
         };
-        if offset >= node.node_count {
+        let held = offset < node.node_count;
+        let room = node.node_count
+            + self.patches.added_rows(table)
+            + appending.get(&table).copied().unwrap_or(0);
+        if offset >= room {
             return Ok(false);
         }
         let rels: Vec<(u32, bool, bool)> = catalog
@@ -913,20 +961,23 @@ impl Writer {
             .collect();
         let mut list = Vec::new();
         for (rel, out, back) in rels {
-            if self
-                .patches
-                .edges
-                .get(&rel)
-                .is_some_and(|patch| patch.adds() > 0)
-            {
-                return Ok(false);
-            }
             self.load_reader(db, rel)?;
             let Some(reader) = self.readers.get(&rel) else {
                 return Ok(false);
             };
             for (dir, walk) in [(Direction::Fwd, out), (Direction::Bwd, back)] {
                 if !walk {
+                    continue;
+                }
+                let patched = self.patches.edges.get(&rel).is_some_and(|patch| {
+                    patch
+                        .adds_on(offset, dir)
+                        .any(|other| !self.gone(rel, offset, other, dir, dying))
+                });
+                if patched || self.arriving(rel, offset, dir, born, dying) {
+                    return Ok(false);
+                }
+                if !held {
                     continue;
                 }
                 list.clear();
@@ -940,6 +991,27 @@ impl Writer {
             }
         }
         Ok(true)
+    }
+
+    /// Whether this same commit is putting an edge on `node`'s list in
+    /// `dir` and leaving it there. An insert and a delete of one pair
+    /// inside one transaction cancel, so what is asked of each is
+    /// whether `dying` covers it.
+    fn arriving(
+        &self,
+        rel: u32,
+        node: u64,
+        dir: Direction,
+        born: &[(u32, u64, u64)],
+        dying: &[(u32, u64, u64)],
+    ) -> bool {
+        born.iter().any(|&(r, src, dst)| {
+            let (end, other) = match dir {
+                Direction::Fwd => (src, dst),
+                Direction::Bwd => (dst, src),
+            };
+            r == rel && end == node && !self.gone(rel, node, other, dir, dying)
+        })
     }
 
     /// Whether the edges between `node` and `other` are already going
@@ -2306,11 +2378,13 @@ mod tests {
         assert_eq!(ages(&mut session), want);
     }
 
-    /// An edge onto a row the patch is carrying folds. The CSR was
-    /// built over the rows the file held, so a list for the new row is
-    /// one the adjacency reader has nowhere to put.
+    /// An edge onto a row the patch is carrying is patched too. The CSR
+    /// was built over the rows the file held and has nowhere to put a
+    /// list for the new row, so the reader is told how far past the CSR
+    /// the table now runs and answers for that row out of the patch,
+    /// where its only edges are.
     #[test]
-    fn an_edge_onto_a_row_the_patch_is_carrying_folds() {
+    fn an_edge_onto_a_row_the_patch_is_carrying_is_patched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("insert-then-link.zu1");
         seeded_loner(&path);
@@ -2328,7 +2402,7 @@ mod tests {
                 &[],
             )
             .expect("link ada to eva");
-        assert!(session.epoch() > before, "the edge did not fold");
+        assert_eq!(session.epoch(), before, "the edge folded");
 
         let hops = session
             .run(
@@ -2339,6 +2413,212 @@ mod tests {
             .expect("walk to eva");
         assert_eq!(hops.rows.len(), 1);
         assert_eq!(string(&hops.rows[0], 0), "ada");
+
+        // Forward off the new row, which is the direction the CSR has no
+        // offset for at all, and the degree that goes with it.
+        let back = session
+            .run(
+                "MATCH (q:person)<-[:knows]-(p:person) WHERE q.name = 'eva' \
+                 RETURN p.name AS name",
+                &[],
+            )
+            .expect("walk back from eva");
+        assert_eq!(back.rows.len(), 1);
+        assert_eq!(string(&back.rows[0], 0), "ada");
+
+        // And it survives the fold, laid out where a rebuild puts it.
+        let long = "z".repeat(DEFERRED_BYTES + 1);
+        session
+            .run(
+                &format!("MATCH (p:person) WHERE p.name = 'ada' SET p.name = '{long}'"),
+                &[],
+            )
+            .expect("a change that folds");
+        let after = session
+            .run(
+                "MATCH (p)-[:knows]->(q:person) WHERE q.name = 'eva' \
+                 RETURN q.age AS age",
+                &[],
+            )
+            .expect("walk to eva after the fold");
+        assert_eq!(after.rows.len(), 1);
+    }
+
+    /// One statement that writes a row and an edge onto it is patched
+    /// whole. The edge is decided about while the row it names is only
+    /// in the changes beside it, not in the file and not in the patch,
+    /// so what says the row is there is the count this commit is
+    /// carrying.
+    #[test]
+    fn a_row_and_an_edge_onto_it_in_one_statement_are_patched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("insert-both.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // A first deferred write, so the run is up and the epoch the
+        // assert below reads is a settled one.
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        session
+            .run(
+                "MATCH (a:person) WHERE a.name = 'ada' \
+                 INSERT (e:person {age: 60, name: 'eva'}), (a)-[:knows]->(e)",
+                &[],
+            )
+            .expect("insert eva and the edge onto her");
+        assert_eq!(session.epoch(), before, "the statement folded");
+
+        let hops = session
+            .run(
+                "MATCH (p:person)-[:knows]->(q:person) WHERE q.name = 'eva' \
+                 RETURN p.name AS name",
+                &[],
+            )
+            .expect("walk to eva");
+        assert_eq!(hops.rows.len(), 1);
+        assert_eq!(string(&hops.rows[0], 0), "ada");
+    }
+
+    /// An edge this run of deferred commits added is taken away without
+    /// a fold, and so is the row it ran onto. That is the whole of the
+    /// shape a benchmark harness writes in, a scratch row created,
+    /// written over and taken away again, and none of the four
+    /// statements folds.
+    ///
+    /// The edge comes back out of the patch's lists rather than being
+    /// laid over them as gone, and the row it ran onto is one the patch
+    /// appended, so what says either is gone is the patch alone. The
+    /// fold at the end is what says the two paths agree.
+    #[test]
+    fn a_bracket_of_a_row_an_edge_and_both_away_never_folds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bracket.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        for round in 0..3 {
+            session
+                .run("INSERT (p:person {age: 60, name: 'eva'})", &[])
+                .expect("the scratch row");
+            session
+                .run(
+                    "MATCH (a:person), (e:person) WHERE a.name = 'ada' AND e.name = 'eva' \
+                     INSERT (a)-[:knows]->(e)",
+                    &[],
+                )
+                .expect("the edge onto it");
+            let seen = session
+                .run(
+                    "MATCH (a:person)-[:knows]->(q:person) WHERE q.name = 'eva' \
+                     RETURN count(a) AS n",
+                    &[],
+                )
+                .expect("count the edge");
+            assert_eq!(seen.rows[0][0], Value::Int(1), "round {round}");
+            session
+                .run("MATCH (e:person) WHERE e.name = 'eva' DETACH DELETE e", &[])
+                .expect("take both away");
+            assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay", "zoe"]);
+            assert_eq!(session.epoch(), before, "round {round} folded");
+        }
+
+        // ada is where she started, with the one edge the file gave her
+        // and nothing the bracket left behind, and the fold agrees.
+        let count = |session: &mut Session| {
+            session
+                .run(
+                    "MATCH (a:person)-[:knows]->(b:person) WHERE a.name = 'ada' \
+                     RETURN count(b) AS n",
+                    &[],
+                )
+                .expect("count ada's edges")
+                .rows[0][0]
+                .clone()
+        };
+        assert_eq!(count(&mut session), Value::Int(1));
+        session.file_mut().expect("fold");
+        assert_eq!(count(&mut session), Value::Int(1));
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay", "zoe"]);
+    }
+
+    /// A row the patch appended and an edge onto it in one transaction,
+    /// and the delete of the row in another, with the edge left for the
+    /// delete to find. A `DETACH DELETE` stages the edge and the row
+    /// together, so this is the same question asked of a patch the
+    /// commit before left behind rather than of the commit's own
+    /// changes.
+    #[test]
+    fn a_patched_row_with_a_patched_edge_on_it_is_deleted_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("patched-detach.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        session
+            .run(
+                "MATCH (a:person) WHERE a.name = 'ada' \
+                 INSERT (e:person {age: 60, name: 'eva'}), (a)-[:knows]->(e)",
+                &[],
+            )
+            .expect("the row and the edge");
+        session
+            .run("MATCH (e:person) WHERE e.name = 'eva' DETACH DELETE e", &[])
+            .expect("take both away");
+        assert_eq!(session.epoch(), before, "the bracket folded");
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay", "zoe"]);
+    }
+
+    /// A row the patch appended that still has an edge on it folds
+    /// rather than being carried away, the same as one the file holds.
+    /// An edge in the file names its ends by offset, so a row that goes
+    /// with one still on it is an edge running to nothing.
+    #[test]
+    fn a_patched_row_with_an_edge_left_on_it_folds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("patched-dangling.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let (person, _) = person_and_knows(&session);
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        session
+            .run(
+                "MATCH (a:person) WHERE a.name = 'ada' \
+                 INSERT (e:person {age: 60, name: 'eva'}), (a)-[:knows]->(e)",
+                &[],
+            )
+            .expect("the row and the edge");
+        let before = session.epoch();
+
+        // Straight at the write side, because a `DELETE` statement is
+        // refused a row that still has an edge and a `DETACH DELETE`
+        // takes the edge with it, so neither reaches the question.
+        session
+            .write(|txn| {
+                txn.delete(person, 5);
+                Ok(())
+            })
+            .expect("delete the row on its own");
+        assert!(
+            session.epoch() > before,
+            "a row with an edge still on it did not fold"
+        );
     }
 
     /// A row holding nothing in a column that cannot hold nothing

@@ -49,7 +49,7 @@ use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::{GROUP_ROWS, Result, ZuError};
+use zu_common::{GROUP_ROWS, IdMap, Result, ZuError};
 
 use crate::catalog::{Catalog, ElementKind, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
@@ -64,8 +64,10 @@ use crate::segment::{SegmentMeta, probe, read_range, read_segment_pooled, write_
 // FullZip, so version 6 files must fail as unsupported here rather than
 // misread downstream. Version 6 had added the has_keys byte and the
 // primary-key index segments to the header, version 5 the SegmentMeta
-// zone map, version 4 the per-chunk fence array.
-const DIRECTORY_VERSION: u16 = 9;
+// zone map, version 4 the per-chunk fence array. Version 10 is the
+// start word every segment meta now carries, which says where in its
+// first block the payload begins.
+const DIRECTORY_VERSION: u16 = 10;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -1048,6 +1050,8 @@ pub(crate) fn free_directory_keeping_edges(db: &mut Zu1File, root: BlockPtr) -> 
     free_directory_parts(db, root, false, true)
 }
 
+use crate::props::Sweep;
+
 fn free_directory_parts(
     db: &mut Zu1File,
     root: BlockPtr,
@@ -1058,29 +1062,22 @@ fn free_directory_parts(
     if props && directory.props != NULL_BLOCK {
         crate::props::free_props(db, directory.props)?;
     }
+    // The adjacency of one rel table packs into shared blocks, so what
+    // goes back is the blocks nothing kept is left in. The key index
+    // packs with it and goes whole either way.
+    let mut going = Sweep::default();
     if let Some(keys) = &directory.keys {
-        for seg in [&keys.keys, &keys.rows] {
-            for &ptr in &seg.blocks {
-                db.free_block(ptr)?;
-            }
-        }
+        going.drop_all([&keys.keys, &keys.rows].into_iter());
     }
     for group in &directory.groups {
-        let segs = match neighbors {
-            true => vec![&group.fwd.offsets, &group.bwd.offsets],
-            false => vec![
-                &group.fwd.offsets,
-                &group.fwd.neighbors,
-                &group.bwd.offsets,
-                &group.bwd.neighbors,
-            ],
-        };
-        for seg in segs {
-            for &ptr in &seg.blocks {
-                db.free_block(ptr)?;
-            }
+        going.drop_all([&group.fwd.offsets, &group.bwd.offsets].into_iter());
+        let lists = [&group.fwd.neighbors, &group.bwd.neighbors].into_iter();
+        match neighbors {
+            true => going.keep_all(lists),
+            false => going.drop_all(lists),
         }
     }
+    going.sweep(db)?;
     for ptr in meta::chain_blocks(db, root)? {
         db.free_block(ptr)?;
     }
@@ -1323,6 +1320,24 @@ fn bulk_load_inner(
     key_by_row: Option<&[u64]>,
     undirected: bool,
 ) -> Result<Directory> {
+    // One rel table is one packing scope. Its offsets, neighbor lists
+    // and key index are freed together by `free_directory_parts`, so
+    // they are the segments allowed to share blocks with each other,
+    // and a second load of the same table starts a block of its own.
+    let held = db.pack_open();
+    let loaded = bulk_load_body(db, ends, rel_table, edges, key_by_row, undirected);
+    db.pack_close(held);
+    loaded
+}
+
+fn bulk_load_body(
+    db: &mut Zu1File,
+    ends: Ends<'_>,
+    rel_table: &str,
+    edges: &[(u32, u32)],
+    key_by_row: Option<&[u64]>,
+    undirected: bool,
+) -> Result<Directory> {
     let ((from_table, from_count), (to_table, to_count)) = (ends.from, ends.to);
     if let Some(keys) = key_by_row
         && keys.len() as u64 != from_count
@@ -1524,9 +1539,10 @@ fn copy_directory(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
     if directory.props != NULL_BLOCK {
         directory.props = crate::props::copy_props(db, directory.props)?;
     }
+    let done = &mut IdMap::default();
     if let Some(keys) = &mut directory.keys {
         for seg in [&mut keys.keys, &mut keys.rows] {
-            seg.blocks = copy_blocks(db, &seg.blocks)?;
+            seg.blocks = copy_blocks(db, done, &seg.blocks)?;
         }
     }
     for group in &mut directory.groups {
@@ -1536,7 +1552,7 @@ fn copy_directory(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
             &mut group.bwd.offsets,
             &mut group.bwd.neighbors,
         ] {
-            seg.blocks = copy_blocks(db, &seg.blocks)?;
+            seg.blocks = copy_blocks(db, done, &seg.blocks)?;
         }
     }
     meta::write_chain(db, &directory.encode())
@@ -1554,12 +1570,26 @@ fn copy_chain(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
 /// Copies a segment's blocks into fresh ones, answering where they
 /// landed. A block is read and written whole: what a segment block
 /// holds is the encoder's business and none of this function's.
-pub(crate) fn copy_blocks(db: &mut Zu1File, blocks: &[BlockPtr]) -> Result<Vec<BlockPtr>> {
+///
+/// `done` remembers the blocks this copy has already made, because a
+/// block holds several packed payloads and every one of them names it.
+/// Copying it once per payload would be correct and would also make
+/// the copy several times the size of what it copied.
+pub(crate) fn copy_blocks(
+    db: &mut Zu1File,
+    done: &mut IdMap<BlockPtr, BlockPtr>,
+    blocks: &[BlockPtr],
+) -> Result<Vec<BlockPtr>> {
     let mut out = Vec::with_capacity(blocks.len());
     for &ptr in blocks {
+        if let Some(&copy) = done.get(&ptr) {
+            out.push(copy);
+            continue;
+        }
         let data = db.read_block(ptr)?;
         let copy = db.allocate_block();
         db.write_block(copy, &data)?;
+        done.insert(ptr, copy);
         out.push(copy);
     }
     Ok(out)

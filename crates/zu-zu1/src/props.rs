@@ -28,11 +28,11 @@
 //! could be null costs anything to read now.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use zu_common::{
-    DurationKind, FloatBits, IntBits, LogicalType, PhysicalType, Result, ZuError, int_key,
+    DurationKind, FloatBits, IdMap, IntBits, LogicalType, PhysicalType, Result, ZuError, int_key,
 };
 
 use crate::catalog::{Catalog, TableIndex};
@@ -57,7 +57,7 @@ use crate::txn::Cell;
 /// not wrong, it is just narrow. Version 5 adds the label bitset, the
 /// second thing after validity that is about the rows rather than about
 /// what a column holds.
-const PROPS_VERSION: u16 = 5;
+const PROPS_VERSION: u16 = 6;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -621,6 +621,16 @@ fn float_key(bits: u64) -> i64 {
     }
 }
 
+/// One segment meta out of a directory of `version`. Payloads could
+/// not be packed beside each other before version 6, so a meta written
+/// then has no start word and reads with the older header length.
+fn seg(bytes: &[u8], pos: usize, version: u16) -> Result<(SegmentMeta, usize)> {
+    match version >= 6 {
+        true => SegmentMeta::decode(bytes, pos),
+        false => SegmentMeta::decode_unpacked(bytes, pos),
+    }
+}
+
 /// Whether a directory written under `version` was allowed to carry
 /// this type code. Version 1 wrote two codes and version 2 wrote every
 /// code but the list one, so a file claiming an older version and
@@ -751,7 +761,7 @@ impl PropsDirectory {
                 None => return Err(corrupt("truncated column type".into())),
             };
             pos += 1;
-            let (meta, next) = SegmentMeta::decode(bytes, pos)?;
+            let (meta, next) = seg(bytes, pos, version)?;
             pos = next;
             // A directory older than version 4 has no flag byte and no
             // null, which is the same column read either way.
@@ -762,7 +772,7 @@ impl PropsDirectory {
                         None
                     }
                     Some(1) => {
-                        let (meta, next) = SegmentMeta::decode(bytes, pos + 1)?;
+                        let (meta, next) = seg(bytes, pos + 1, version)?;
                         pos = next;
                         Some(meta)
                     }
@@ -790,7 +800,7 @@ impl PropsDirectory {
                     None
                 }
                 Some(1) => {
-                    let (meta, next) = SegmentMeta::decode(bytes, pos + 1)?;
+                    let (meta, next) = seg(bytes, pos + 1, version)?;
                     pos = next;
                     Some(meta)
                 }
@@ -818,13 +828,14 @@ impl PropsDirectory {
 /// pointers in the same order.
 pub(crate) fn copy_props(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
     let mut directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
+    let done = &mut IdMap::default();
     if let Some(labels) = &mut directory.labels {
-        labels.blocks = crate::graph::copy_blocks(db, &labels.blocks)?;
+        labels.blocks = crate::graph::copy_blocks(db, done, &labels.blocks)?;
     }
     for col in &mut directory.columns {
-        col.meta.blocks = crate::graph::copy_blocks(db, &col.meta.blocks)?;
+        col.meta.blocks = crate::graph::copy_blocks(db, done, &col.meta.blocks)?;
         if let Some(validity) = &mut col.validity {
-            validity.blocks = crate::graph::copy_blocks(db, &validity.blocks)?;
+            validity.blocks = crate::graph::copy_blocks(db, done, &validity.blocks)?;
         }
     }
     meta::write_chain(db, &directory.encode())
@@ -864,26 +875,56 @@ fn free_props_parts(
     keep_cols: &[bool],
 ) -> Result<()> {
     let directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
+    // A block holds several of this directory's payloads, so the
+    // question is not which segments are going but which blocks are
+    // left with nothing in them. A block a kept column still sits in
+    // stays, holding whatever the dropped ones left behind, until the
+    // fold that rewrites that column too lets it go.
+    let mut going = Sweep::default();
     if labels {
-        for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
-            db.free_block(ptr)?;
-        }
+        going.drop_all(directory.labels.iter());
+    } else {
+        going.keep_all(directory.labels.iter());
     }
     for (ci, col) in directory.columns.iter().enumerate() {
-        if keep_cols.get(ci) == Some(&true) {
-            continue;
-        }
-        for &ptr in &col.meta.blocks {
-            db.free_block(ptr)?;
-        }
-        for &ptr in col.validity.iter().flat_map(|m| &m.blocks) {
-            db.free_block(ptr)?;
+        let segs = [Some(&col.meta), col.validity.as_ref()];
+        match keep_cols.get(ci) == Some(&true) {
+            true => going.keep_all(segs.into_iter().flatten()),
+            false => going.drop_all(segs.into_iter().flatten()),
         }
     }
+    going.sweep(db)?;
     for ptr in meta::chain_blocks(db, root)? {
         db.free_block(ptr)?;
     }
     Ok(())
+}
+
+/// The blocks a free is about to hand back, less the ones something it
+/// is keeping still reads. Payloads share blocks, so freeing a
+/// segment's block list one segment at a time would hand the same block
+/// back twice and would hand back a block a kept segment is still in.
+#[derive(Default)]
+pub(crate) struct Sweep {
+    dropped: BTreeSet<BlockPtr>,
+    kept: BTreeSet<BlockPtr>,
+}
+
+impl Sweep {
+    pub(crate) fn drop_all<'m>(&mut self, segs: impl Iterator<Item = &'m SegmentMeta>) {
+        self.dropped.extend(segs.flat_map(|m| &m.blocks).copied());
+    }
+
+    pub(crate) fn keep_all<'m>(&mut self, segs: impl Iterator<Item = &'m SegmentMeta>) {
+        self.kept.extend(segs.flat_map(|m| &m.blocks).copied());
+    }
+
+    pub(crate) fn sweep(self, db: &mut Zu1File) -> Result<()> {
+        for ptr in self.dropped.difference(&self.kept) {
+            db.free_block(*ptr)?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether a mask says every one of `rows` rows holds a value. The
@@ -1072,6 +1113,21 @@ fn check_columns(rows: u64, columns: &[PropInput]) -> Result<()> {
 /// it is decides only where the root gets written down, which is the
 /// caller's to do.
 fn write_props(
+    db: &mut Zu1File,
+    rows: u64,
+    columns: &[PropInput],
+    labels: Option<SegmentMeta>,
+) -> Result<(BlockPtr, PropsDirectory, BTreeMap<String, stats::ColStats>)> {
+    // One directory is one packing scope, because one directory is what
+    // a free takes away: the columns written here are freed together, so
+    // they may share blocks with each other and with nothing else.
+    let held = db.pack_open();
+    let written = write_columns(db, rows, columns, labels);
+    db.pack_close(held);
+    written
+}
+
+fn write_columns(
     db: &mut Zu1File,
     rows: u64,
     columns: &[PropInput],
@@ -1315,9 +1371,19 @@ pub fn store_labels<S: AsRef<str>>(
     let mut directory = match index.get(table_id) {
         Some(root) => {
             let directory = load_props_at(db, root)?;
-            for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
-                db.free_block(ptr)?;
+            // The bitset is going and the columns are staying, and the
+            // two of them share blocks, so what goes back is only what
+            // no column is left in.
+            let mut going = Sweep::default();
+            going.drop_all(directory.labels.iter());
+            for col in &directory.columns {
+                going.keep_all(
+                    [Some(&col.meta), col.validity.as_ref()]
+                        .into_iter()
+                        .flatten(),
+                );
             }
+            going.sweep(db)?;
             crate::graph::free_chain(db, root)?;
             index.remove(table_id);
             directory
@@ -3296,6 +3362,78 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_column_keeps_the_block_the_dropped_one_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("p.zu1")).unwrap();
+        let kept: Vec<u64> = (0..40u64).map(|i| i * 3).collect();
+        let gone: Vec<u64> = (0..40u64).map(|i| i * 5 + 1).collect();
+        let inputs = [
+            PropInput::dense("kept", PropValues::Int(&kept)),
+            PropInput::dense("gone", PropValues::Int(&gone)),
+        ];
+        let (root, directory, _) = write_props(&mut db, 40, &inputs, None).unwrap();
+        let shared = directory.columns[0].meta.blocks[0];
+        assert_eq!(
+            directory.columns[1].meta.blocks[0], shared,
+            "two tiny columns of one directory land in one block"
+        );
+
+        // The fold that rewrote the second column and carried the first
+        // one across. The block under both of them is still read, so it
+        // is not handed back however the second one goes.
+        free_props_reusing(&mut db, root, false, &[true]).unwrap();
+        db.checkpoint().unwrap();
+        for _ in 0..8 {
+            assert_ne!(
+                db.allocate_block(),
+                shared,
+                "the block a kept column sits in was handed back"
+            );
+        }
+        let mut out = Vec::new();
+        crate::segment::read_segment(&mut db, &directory.columns[0].meta, &mut out).unwrap();
+        assert_eq!(out, kept, "and it still reads what it held");
+    }
+
+    #[test]
+    fn a_version_5_directory_still_reads_its_columns() {
+        // Version 5 is the last one written before payloads could share
+        // a block, so its metas carry no start word and its columns each
+        // begin where their first block does. A store written then has
+        // to keep reading, values and all, not just decode.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("p.zu1")).unwrap();
+        let values: Vec<u64> = (0..500u64).map(|i| i * 17 + 3).collect();
+        let meta = crate::segment::write_segment(&mut db, &values).unwrap();
+        assert_eq!(meta.start, 0, "nothing is packed outside a scope");
+
+        let mut old = Vec::new();
+        old.extend_from_slice(&5u16.to_le_bytes());
+        old.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        old.extend_from_slice(&1u32.to_le_bytes());
+        old.extend_from_slice(&2u16.to_le_bytes());
+        old.extend_from_slice(b"id");
+        old.extend_from_slice(
+            &type_bytes(&LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None,
+            })
+            .unwrap(),
+        );
+        meta.encode_unpacked(&mut old);
+        old.push(0);
+        old.push(0);
+
+        let decoded = PropsDirectory::decode(&old).unwrap();
+        assert_eq!(decoded.columns.len(), 1);
+        assert_eq!(decoded.columns[0].meta.start, 0);
+        let mut out = Vec::new();
+        crate::segment::read_segment(&mut db, &decoded.columns[0].meta, &mut out).unwrap();
+        assert_eq!(out, values);
+    }
+
+    #[test]
     fn a_version_1_directory_still_reads() {
         // Written by hand in the old layout: one string column and one
         // integer column, type codes 0 and 1, which is every type
@@ -3309,6 +3447,7 @@ mod tests {
             crc: 0,
             structural: crate::segment::Structural::MiniBlock,
             sorted: false,
+            start: 0,
             blocks: vec![7],
         };
         let mut old = Vec::new();
@@ -3319,7 +3458,7 @@ mod tests {
             old.extend_from_slice(&(name.len() as u16).to_le_bytes());
             old.extend_from_slice(name.as_bytes());
             old.push(code);
-            meta.encode(&mut old);
+            meta.encode_unpacked(&mut old);
         }
         let dir = PropsDirectory::decode(&old).unwrap();
         assert_eq!(
@@ -3358,7 +3497,7 @@ mod tests {
     /// the last column's type byte without hardcoding a size.
     fn meta_len(meta: &SegmentMeta) -> usize {
         let mut out = Vec::new();
-        meta.encode(&mut out);
+        meta.encode_unpacked(&mut out);
         out.len()
     }
 
@@ -3526,6 +3665,7 @@ mod tests {
             crc: 0,
             structural: crate::segment::Structural::MiniBlock,
             sorted: false,
+            start: 0,
             blocks: vec![7],
         };
         let mut old = Vec::new();
@@ -3536,7 +3676,7 @@ mod tests {
         old.extend_from_slice(b"x");
         old.push(LIST_CODE);
         old.push(1);
-        meta.encode(&mut old);
+        meta.encode_unpacked(&mut old);
         assert!(PropsDirectory::decode(&old).is_err());
         old[0] = 3;
         let dir = PropsDirectory::decode(&old).unwrap();

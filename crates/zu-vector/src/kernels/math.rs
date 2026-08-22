@@ -1429,7 +1429,11 @@ mod tests {
             // which is the shape a pinned argument arrives in.
             let c = ValueVector::constant(&mut arena, PhysType::Float64, 0.5f64, 3);
             let out = unary(&mut arena, op, &c, None).unwrap();
-            assert_eq!(out.values::<f64>()[2], real(op, 0.5), "{op:?} on a constant");
+            assert_eq!(
+                out.values::<f64>()[2],
+                real(op, 0.5),
+                "{op:?} on a constant"
+            );
         }
     }
 }

@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+The following XML document is a "digital artifact" contains an XML element 
+(implementationDependent) that identifies every aspect of ISO/IEC 39075 that is specified to be 
+"implementation-dependent".  
+An XML DTD is provided that may be used to validate the XML document itself. 
+
+The code consistes of 2 characters followed by a three digit number.
+The first letter of implementation-dependent codes is always U. 
+This distinguishes it from the codes used for optional features and implementation-defined 
+features.
+The second letter of implementation-dependent codes have the following meanings:
+    A Actions
+    D Defaults
+    L Limits
+    S Sequencing
+    V Values/Constants
+    W Ways and means
+
+-->
+
+
+
+<!DOCTYPE implementationDependent [
+  
+<!-- The implementationDependent element defines the implementation-dependent features of 
+a standard (part). -->
+<!ELEMENT implementationDependent (unDef*)>
+
+<!-- An unDef element defines a specific implementation-dependent feature. -->
+<!ELEMENT unDef (code, description)>
+
+<!-- A code element specifies the unique code for an implementation-dependent feature. -->
+<!ELEMENT code (#PCDATA)>
+
+<!-- A description element provides a textual specification of the implementation-dependent feature.
+-->
+<!ELEMENT description (#PCDATA)>
+
+]>
+
+<implementationDependent>
+   <unDef>
+      <code>UA001</code>
+      <description>The interaction between multiple GQL-environments within the constraints of GQL-transaction semantics.</description>
+   </unDef>
+   <unDef>
+      <code>UA002</code>
+      <description>Whether or not diagnostic information pertaining to more than one condition is made available.</description>
+   </unDef>
+   <unDef>
+      <code>UA004</code>
+      <description>Whether or not that exception condition is actually raised when the evaluation of an inessential part of an expression or search condition would cause an exception to be raised.</description>
+   </unDef>
+   <unDef>
+      <code>UA005</code>
+      <description>Which path bindings are retained in an any paths search if the number of candidates exceeds the required number.</description>
+   </unDef>
+   <unDef>
+      <code>UA006</code>
+      <description>Which additional path bindings are actually probed to establish whether they might also raise an exception when the GQL-implementation has terminated the evaluation of a selective path pattern.</description>
+   </unDef>
+   <unDef>
+      <code>UA007</code>
+      <description>Whether or not a rollback is forced when a GQL-transaction becomes blocked, cannot complete without causing semantic inconsistency, or the resources required to continue its execution become unavailable.</description>
+   </unDef>
+   <unDef>
+      <code>US001</code>
+      <description>The sequence of records in an unordered binding table.</description>
+   </unDef>
+   <unDef>
+      <code>US005</code>
+      <description>The order of path bindings that have the same number of edges.</description>
+   </unDef>
+   <unDef>
+      <code>US006</code>
+      <description>The relative ordering of peers in a sort.</description>
+   </unDef>
+   <unDef>
+      <code>US007</code>
+      <description>The relative ordering of items in a sort whose comparison is Unknown.</description>
+   </unDef>
+   <unDef>
+      <code>US008</code>
+      <description>The actual order of expression evaluation.</description>
+   </unDef>
+   <unDef>
+      <code>US009</code>
+      <description>The point in time at which the request timestamp is set.</description>
+   </unDef>
+   <unDef>
+      <code>UV001</code>
+      <description>The value of an object identifier.</description>
+   </unDef>
+   <unDef>
+      <code>UV003</code>
+      <description>The ‹value expression› whose evaluation raises the exception condition: “data exception — invalid value type (22G12)”.</description>
+   </unDef>
+   <unDef>
+      <code>UV004</code>
+      <description>The value value returned by an evaluation of the ELEMENT_ID function.</description>
+   </unDef>
+   <unDef>
+      <code>UV005</code>
+      <description>The physical representation of an instance of a data type.</description>
+   </unDef>
+   <unDef>
+      <code>UV007</code>
+      <description>The declared type of a site that contains an intermediate result.</description>
+   </unDef>
+   <unDef>
+      <code>UV009</code>
+      <description>Which arbitrary value is chosen when multiple assignments to a graph element property are specified.</description>
+   </unDef>
+   <unDef>
+      <code>UV014</code>
+      <description>The start datetime used for converting intervals to scalars for subtraction purposes.</description>
+   </unDef>
+   <unDef>
+      <code>UW001</code>
+      <description>The mechanism for determining which exception condition is to be returned as the primary GQL-status object of an execution outcome from a set of raised exception conditions.</description>
+   </unDef>
+</implementationDependent>

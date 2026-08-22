@@ -26,6 +26,7 @@ mod corpus;
 mod format;
 mod help;
 mod highlight;
+mod impdef;
 mod keys;
 mod line;
 mod lsp;

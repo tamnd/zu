@@ -74,6 +74,13 @@ doc = "The language's own shapes: how it iterates, how it releases a resource, h
 name = "conditions"
 weight = 10
 doc = "Every failure carries the standard's condition code, the place, and the doc URL, checked by a test rather than promised in a page."
+# Held on statement failures, which is as far as the engine goes today.
+# A failure that happens before a statement or beside one, a database
+# that will not open and an appender aimed at a table nothing declares
+# among them, carries a message and no code, no standard text and no doc
+# URL. That is tamnd/zu#614, and it caps this item for every row here
+# rather than for one of them, so it is written down at the item instead
+# of being scored against a single client.
 
 [[item]]
 name = "misuse"
@@ -159,7 +166,7 @@ package = "zu"
 registry = "vcpkg and Conan"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = ["quickstart"]
+holds = ["quickstart", "conditions"]
 doc = "The developer kit for the ABI itself: examples, the header-only C++ wrapper, the packaging and the sanitizer suites. It owes no api-map, because the C names are zu.h and zu.h is generated in the engine."
 
 [[client]]

@@ -257,7 +257,7 @@ fn main() {
     // holds its whole log in the process by default (#636) and sqlite
     // keeps a bounded cache per connection on top of its file, so the
     // rough floor is one database per engine plus the caches.
-    let footprint = records * (VALUE as u64 + 64) * 2 + (threads as u64 * 64 << 20);
+    let footprint = records * (VALUE as u64 + 64) * 2 + ((threads as u64 * 64) << 20);
     println!(
         "# this run wants about {} MiB of memory; on a host with less than that the rows below \
          are measuring the swap",

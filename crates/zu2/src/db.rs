@@ -1193,6 +1193,26 @@ impl Db {
         self.counted(|index| index.occupancy())
     }
 
+    /// Distinct keys the index has installed, which is the count a
+    /// loader means by rows.
+    ///
+    /// Not [`Db::index_occupancy`], which counts slots and undercounts
+    /// keys by however many were displaced into somebody else's chain: a
+    /// load of 100000 reported 99793 slots and every one of the 207 was
+    /// there (#486). This one goes up once per key that was not already
+    /// present, wherever it ends up living, so a load of n distinct keys
+    /// answers n and a harness can check that the rows it was told about
+    /// arrived. Deletes do not take it back down, so it is a count of
+    /// keys installed rather than keys held, which is what a load phase
+    /// wants and not what a run with deletes in it would.
+    ///
+    /// A checkpoint carries it, so a reopen answers what the run before
+    /// it had rather than starting from what the replay happened to
+    /// touch. See [`crate::index::Index::adopt_keys`].
+    pub fn index_keys(&self) -> usize {
+        self.counted(|index| index.keys())
+    }
+
     /// Slots naming a chain of more than one key, which is the crowding
     /// a lookup pays for rather than the crowding the load factor
     /// implies.

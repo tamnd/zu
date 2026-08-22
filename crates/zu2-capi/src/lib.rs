@@ -1840,6 +1840,27 @@ pub unsafe extern "C" fn zu2_index_occupancy(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// Distinct keys the index has installed, which is what a loader means
+/// by rows.
+///
+/// The count a harness needs and `zu2_index_occupancy` cannot give it:
+/// occupancy is slots, and a displaced key lives on somebody else's
+/// chain rather than in a slot of its own, so a load of 100000 reports
+/// 99793 there with nothing missing (#486). This goes up once per key
+/// that was not already present, so a load of n distinct keys answers n
+/// and a client that reported n inserts can be checked against what
+/// arrived. Deletes do not take it back down.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_keys(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.index_keys() as u64,
+        None => 0,
+    }
+}
+
 /// Slots naming a chain of more than one key.
 ///
 /// Every lookup that reaches one of these buckets walks the chain under

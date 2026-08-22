@@ -428,6 +428,14 @@ uint64_t zu2_log_span(const zu2_db *db);
  * against a record count reads as data loss. */
 uint64_t zu2_index_occupancy(const zu2_db *db);
 
+/* Distinct keys the index has installed, which is what a loader means
+ * by rows and what zu2_index_occupancy cannot say. It goes up once per
+ * key that was not already present, wherever that key ends up living,
+ * so a load of n distinct keys answers n and a client that reported n
+ * inserts can be checked against what arrived. Deletes do not take it
+ * back down. */
+uint64_t zu2_index_keys(const zu2_db *db);
+
 /* Slots naming a chain of more than one key. Every lookup reaching one
  * of these buckets walks the chain whether its tag matched or not, so
  * this is the crowding a read pays for where the load factor is only

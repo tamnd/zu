@@ -833,6 +833,71 @@ fn the_database_reports_its_size() {
     close(db, &[s]);
 }
 
+/// A table too small for the keys that go into it, pinned so it cannot
+/// grow out of the problem, which is how displacement is made to happen
+/// on purpose: 64 buckets are 512 slots and the test writes twice that
+/// many keys.
+fn open_crowded(name: &str) -> (tempfile::TempDir, *mut Zu2Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.compact_below = u64::MAX;
+    options.index_buckets = 64;
+    options.fixed_index = 1;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    (dir, db)
+}
+
+/// The count a benchmark harness needs, and the reason it cannot use
+/// the occupancy line for it. A load reports how many inserts returned
+/// without an error, which is not the same as how many rows arrived,
+/// and the only engine side answer to that has been a slot count that
+/// is legitimately lower than the key count. This is the key count.
+#[test]
+fn the_database_counts_the_keys_it_holds_and_not_the_slots() {
+    let (_dir, db) = open_crowded("keys.zu2");
+    let s = session_on(db);
+    for i in 0..1000u32 {
+        upsert(s, format!("key{i:06}").as_bytes(), &[b'x'; 32]);
+    }
+    let keys = unsafe { zu2::zu2_index_keys(db) };
+    let slots = unsafe { zu2::zu2_index_occupancy(db) };
+    assert_eq!(keys, 1000, "a thousand distinct keys went in");
+    assert!(
+        slots < keys,
+        "the table has 512 slots and took 1000 keys, so it must have displaced some, \
+         and a test where it did not is not testing the difference: slots {slots}, keys {keys}"
+    );
+    // A key written twice is one key. A harness checking a load against
+    // a record count would otherwise be told the loader wrote more rows
+    // than it has, which is the same failure as being told fewer.
+    upsert(s, b"key000042", &[b'y'; 32]);
+    assert_eq!(
+        unsafe { zu2::zu2_index_keys(db) },
+        1000,
+        "an update counted as a new key"
+    );
+    assert_eq!(read(s, b"key000042").as_deref(), Some(&[b'y'; 32][..]));
+    close(db, &[s]);
+}
+
 /// Opens a database small enough that a pass has to move records to
 /// the cold tier, which is what the tier metrics have to be measured
 /// against. The default `open` turns compaction off, so nothing would

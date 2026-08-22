@@ -4,6 +4,8 @@ ISO/IEC 39075:2024 Clause 24.5.2 asks a conforming implementation to state its a
 
 The first list is implementation-defined: an answer that must be the same every time and must be published, which is what this file does. The second is implementation-dependent: an answer the standard asks neither to be stable nor to be published. zu publishes those too, as behaviour observed today and not as a promise, because a reader who knows what an engine does can write a query that does not depend on it.
 
+<!-- terms: allow vertex -->
+
 ## Implementation-defined (117 items)
 
 ### IA001

@@ -527,13 +527,22 @@ impl Vocabulary {
             // `DATE` is a variable far more often than it is a type,
             // and a page that painted every one of them as a type
             // would be wrong more often than it was right.
+            //
+            // Three groups rather than two, because the three things
+            // that introduce a type are not one kind of thing. AS and
+            // TYPED are keywords and `::` is the operator that means
+            // the same, and a capture carries one scope, so the two
+            // spellings need a group each. Written as one alternation
+            // it painted `::` keyword.control.gql, which the corpus
+            // check caught: a theme would have coloured the separator
+            // as a control word.
             (
                 "type".into(),
                 obj(&[
                     (
                         "match",
                         str(&format!(
-                            "(?i)(\\bAS\\b|\\bTYPED\\b|::)\\s*({})\\b",
+                            "(?i)(?:(\\bAS\\b|\\bTYPED\\b)|(::))\\s*({})\\b",
                             self.words(Kind::Type).join("|")
                         )),
                     ),
@@ -541,7 +550,8 @@ impl Vocabulary {
                         "captures",
                         Json::Obj(vec![
                             ("1".into(), obj(&[("name", str(Kind::Keyword.scope()))])),
-                            ("2".into(), obj(&[("name", str(Kind::Type.scope()))])),
+                            ("2".into(), obj(&[("name", str("keyword.operator.gql"))])),
+                            ("3".into(), obj(&[("name", str(Kind::Type.scope()))])),
                         ]),
                     ),
                 ]),

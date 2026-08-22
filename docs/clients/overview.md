@@ -4,7 +4,7 @@
 
 The clients of this engine, who maintains each one, and what its tier promises.
 
-Every client is a repository of its own, with a person who answers for it and a tier that says what it promises. The tier is the same one the engine's README publishes, because a client cannot be tier 1 on one page and tier 2 on another. Audited 2026-08-19.
+Every client is a repository of its own, with a person who answers for it and a tier that says what it promises. The tier is the same one the engine's README publishes, because a client cannot be tier 1 on one page and tier 2 on another. Audited 2026-08-22.
 
 | Client | Language | Package | Registry | Maintainer | Tier |
 |---|---|---|---|---|---|
@@ -51,7 +51,7 @@ The practice score, today, out of what the client's tier asks for. What is missi
 |---|---|---|---|---|
 | [zu-python](https://github.com/tamnd/zu-python) | 1 | 90 | 90 | `api-map`, `perf` |
 | [zu-node](https://github.com/tamnd/zu-node) | 1 | 90 | 90 | `api-map`, `perf` |
-| [zu-go](https://github.com/tamnd/zu-go) | 1 | 35 | 90 | `reference`, `idiom`, `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-go](https://github.com/tamnd/zu-go) | 1 | 70 | 90 | `leaks`, `install`, `api-map`, `perf` |
 | [zu-java](https://github.com/tamnd/zu-java) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
 | [zu-c](https://github.com/tamnd/zu-c) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability` |
 | [zu-dotnet](https://github.com/tamnd/zu-dotnet) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |

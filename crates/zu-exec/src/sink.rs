@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::ast::{BinaryOp, SortKey};
 use zu_query::exec::{OrdValue, QueryResult, Value};
@@ -20,10 +21,6 @@ use crate::group::{GroupTable, KeyBatch, PartKind};
 
 /// Rows per DISTINCT probe vector, the pipeline's vector width.
 const VECTOR: usize = 2048;
-
-fn invalid(detail: String) -> ZuError {
-    ZuError::InvalidArgument(detail)
-}
 
 /// One aggregate accumulator, the integer subset of the old engine's
 /// Acc with identical finalize semantics: sum of nothing is 0, avg of
@@ -72,12 +69,12 @@ impl Acc {
             Acc::Sum(acc) => {
                 let scaled = v
                     .checked_mul(mult)
-                    .ok_or_else(|| invalid("integer overflow in sum()".into()))?;
+                    .ok_or_else(|| ZuError::gql(codes::C22003, "integer overflow in sum()"))?;
                 *acc = Some(match *acc {
                     None => scaled,
                     Some(prev) => prev
                         .checked_add(scaled)
-                        .ok_or_else(|| invalid("integer overflow in sum()".into()))?,
+                        .ok_or_else(|| ZuError::gql(codes::C22003, "integer overflow in sum()"))?,
                 });
             }
             Acc::Avg { sum, n } => {
@@ -102,13 +99,13 @@ impl Acc {
         match (self, *other) {
             (Acc::Count(n), Acc::Count(m)) => *n += m,
             (Acc::Sum(a), Acc::Sum(b)) => {
-                *a = match (*a, b) {
-                    (Some(x), Some(y)) => Some(
-                        x.checked_add(y)
-                            .ok_or_else(|| invalid("integer overflow in sum()".into()))?,
-                    ),
-                    (x, y) => x.or(y),
-                };
+                *a =
+                    match (*a, b) {
+                        (Some(x), Some(y)) => Some(x.checked_add(y).ok_or_else(|| {
+                            ZuError::gql(codes::C22003, "integer overflow in sum()")
+                        })?),
+                        (x, y) => x.or(y),
+                    };
             }
             (Acc::Avg { sum, n }, Acc::Avg { sum: s2, n: n2 }) => {
                 *sum += s2;

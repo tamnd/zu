@@ -97,9 +97,12 @@ impl Clock {
     /// The clock read now, in UTC, which is what a statement does once
     /// before its first row.
     ///
-    /// The displacement is nought because zu's session time zone is
-    /// UTC, which is one of the implementation-defined choices the
-    /// standard leaves open and is written down as such. A clock before
+    /// The displacement is nought because a session opens in UTC, which
+    /// is one of the implementation-defined choices the standard leaves
+    /// open and is written down as such. A session that has moved its
+    /// zone stamps this reading with what it moved to (GS15), so the
+    /// zone rides in beside the instant rather than being read here. A
+    /// clock before
     /// the epoch on a machine whose time is set wrong reads as the
     /// epoch rather than refusing, since a statement asking what time
     /// it is has no better answer to give and no condition to raise.
@@ -331,6 +334,47 @@ impl Temporal {
         Some(match qualifier.start.kind() {
             DurationKind::YearMonth => Temporal::Duration(DurationKind::YearMonth, sign * months),
             DurationKind::DayTime => Temporal::Duration(DurationKind::DayTime, sign * nanos),
+        })
+    }
+
+    /// The value a record constructor spells, or `None` where it
+    /// spells none.
+    ///
+    /// This is the second way ISO 20.27 and 20.29 write a temporal
+    /// value: `DATE({year: 2024, month: 1, day: 1})` beside
+    /// `DATE('2024-01-01')`. A field the record left out takes the
+    /// least value it has, so `DATE({year: 2024})` is the first of
+    /// January, which is what the standard's default for an omitted
+    /// `<field>` comes to.
+    ///
+    /// `None` is the calendar refusing, not the record being malformed:
+    /// the names were checked before anything got here and what is
+    /// left is a thirteenth month or a thirty-first of February, which
+    /// the caller reports as 22G06.
+    pub fn from_parts(ty: &LogicalType, parts: &Parts) -> Option<Temporal> {
+        if let LogicalType::Duration(_) = ty {
+            return parts.duration();
+        }
+        let days = match ty {
+            LogicalType::LocalTime | LogicalType::ZonedTime => 0,
+            _ => parts.days()?,
+        };
+        let nanos = parts.nanos()?;
+        let offset = parts.timezone.unwrap_or(0);
+        if !(-1080..=1080).contains(&offset) {
+            return None;
+        }
+        Some(match ty {
+            LogicalType::Date => Temporal::Date(days),
+            LogicalType::LocalTime => Temporal::LocalTime(nanos),
+            LogicalType::ZonedTime => Temporal::ZonedTime { nanos, offset },
+            LogicalType::LocalDatetime => Temporal::LocalDatetime(instant_at(days, nanos)?),
+            LogicalType::ZonedDatetime => Temporal::ZonedDatetime {
+                nanos: instant_at(days, nanos)?
+                    .checked_sub(i64::from(offset).checked_mul(NANOS_PER_MINUTE)?)?,
+                offset,
+            },
+            _ => return None,
         })
     }
 
@@ -622,6 +666,29 @@ fn parse_seconds(text: &str) -> Option<(i64, i64)> {
     }
 }
 
+/// A time zone displacement on its own, as minutes east of UTC, or
+/// `None` for a string that is not one (GS15, ISO 7.1).
+///
+/// `SESSION SET TIME ZONE` is where a displacement is written with no
+/// time in front of it, so the reader below, which takes the zone off
+/// the end of a time, has nothing to take it off. What it accepts is
+/// what a zoned literal accepts, `Z` and `+hh`, `+hhmm` and `+hh:mm`
+/// either way of nought, and an empty body is the whole of the
+/// difference: a string that reads as a zone and leaves anything in
+/// front of it is a time and not a displacement.
+///
+/// A name is not a displacement and is refused as one. A zone name is
+/// a rule that changes when the zone database is updated, so a session
+/// set to `Europe/Dublin` would mean one thing today and another after
+/// an upgrade, and `02 §3.4` writes zu's answer to that down: an offset
+/// or nothing.
+pub fn zone_offset(text: &str) -> Option<i16> {
+    match split_offset(text.trim())? {
+        ("", Some(minutes)) => Some(minutes),
+        _ => None,
+    }
+}
+
 /// A written time split into the part before the zone and the zone in
 /// minutes, `None` in the second place when no zone is written.
 ///
@@ -777,6 +844,129 @@ fn scaled(text: &str, unit: i64) -> Option<i64> {
 }
 
 /// Days in `month` of `year`, which is where the leap rule lives.
+/// The fields ISO 20.27 and 20.29 name for a record written in front of
+/// a temporal value function, in the order the standard writes them.
+///
+/// The names belong to the type and not to the record, which is what
+/// separates the two conditions this feeds: a name that is not on this
+/// list is 22G05 for a datetime and 22G07 for a duration, whatever the
+/// value beside it was, and a name that is on it and holds a
+/// thirteenth month is 22G06.
+///
+/// A time has no calendar part and a local value has no zone, so each
+/// type gets its own list rather than one list and a check afterwards.
+/// `DATE({hour: 1})` is not a date with an hour it will ignore.
+pub fn fields_of(ty: &LogicalType) -> &'static [&'static str] {
+    match ty {
+        LogicalType::Date => &["year", "month", "day"],
+        LogicalType::LocalTime => &["hour", "minute", "second"],
+        LogicalType::ZonedTime => &["hour", "minute", "second", "timezone"],
+        LogicalType::LocalDatetime => &["year", "month", "day", "hour", "minute", "second"],
+        LogicalType::ZonedDatetime => &[
+            "year", "month", "day", "hour", "minute", "second", "timezone",
+        ],
+        LogicalType::Duration(_) => &["year", "month", "day", "hour", "minute", "second"],
+        _ => &[],
+    }
+}
+
+/// The named parts a record constructor gave, before they are a value.
+///
+/// Every part is optional because the standard's fields are, and the
+/// meaning of an absent one differs by type: an absent month is
+/// January and an absent month in a duration is nought months. The
+/// seconds are a float because ISO's `<seconds value>` carries a
+/// fraction and the other five do not.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Parts {
+    pub year: Option<i64>,
+    pub month: Option<i64>,
+    pub day: Option<i64>,
+    pub hour: Option<i64>,
+    pub minute: Option<i64>,
+    pub second: Option<f64>,
+    /// The zone as an offset from UTC in minutes, which is the only
+    /// form zu holds one in; see the module note.
+    pub timezone: Option<i16>,
+}
+
+impl Parts {
+    /// The day count the calendar parts name, or `None` where they
+    /// name no day.
+    ///
+    /// The range checks are the calendar's own and not a clamp. A
+    /// thirteenth month has no day and a thirty-first of February has
+    /// none either, and answering with the nearest real day would turn
+    /// a statement that is wrong into a row that is wrong.
+    fn days(&self) -> Option<i32> {
+        let year = i32::try_from(self.year.unwrap_or(1)).ok()?;
+        let month = u32::try_from(self.month.unwrap_or(1)).ok()?;
+        let day = u32::try_from(self.day.unwrap_or(1)).ok()?;
+        if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+            return None;
+        }
+        if day < 1 || day > days_in(year, month) {
+            return None;
+        }
+        Some(days_from_civil(year, month, day))
+    }
+
+    /// The nanoseconds into the day the clock parts name.
+    ///
+    /// Twenty-four hours is not a time and neither is sixty seconds:
+    /// the standard's `<hours value>` runs to 23 and its `<seconds
+    /// value>` stops short of 60, so a leap second is not spellable
+    /// here any more than it is in the string form.
+    fn nanos(&self) -> Option<i64> {
+        let hour = self.hour.unwrap_or(0);
+        let minute = self.minute.unwrap_or(0);
+        let second = self.second.unwrap_or(0.0);
+        if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+            return None;
+        }
+        if !(second.is_finite() && (0.0..60.0).contains(&second)) {
+            return None;
+        }
+        let whole = second.trunc() as i64;
+        let fraction = ((second - second.trunc()) * NANOS_PER_SEC as f64).round() as i64;
+        Some(hour * NANOS_PER_HOUR + minute * NANOS_PER_MINUTE + whole * NANOS_PER_SEC + fraction)
+    }
+
+    /// The duration the parts name, of whichever kind they name.
+    ///
+    /// The two kinds do not mix, for the reason the module note gives,
+    /// so a record naming a year and a day names no duration. The
+    /// parts are counts here rather than positions on a calendar, so
+    /// nothing is range checked: `DURATION({hour: 100})` is a hundred
+    /// hours and is a perfectly good length of time.
+    fn duration(&self) -> Option<Temporal> {
+        let months = self.year.unwrap_or(0).checked_mul(12)? + self.month.unwrap_or(0);
+        let has_months = self.year.is_some() || self.month.is_some();
+        let has_nanos = self.day.is_some()
+            || self.hour.is_some()
+            || self.minute.is_some()
+            || self.second.is_some();
+        if has_months && has_nanos {
+            return None;
+        }
+        if has_months {
+            return Some(Temporal::Duration(DurationKind::YearMonth, months));
+        }
+        let second = self.second.unwrap_or(0.0);
+        if !second.is_finite() {
+            return None;
+        }
+        let nanos = self
+            .day
+            .unwrap_or(0)
+            .checked_mul(NANOS_PER_DAY)?
+            .checked_add(self.hour.unwrap_or(0).checked_mul(NANOS_PER_HOUR)?)?
+            .checked_add(self.minute.unwrap_or(0).checked_mul(NANOS_PER_MINUTE)?)?
+            .checked_add((second * NANOS_PER_SEC as f64).round() as i64)?;
+        Some(Temporal::Duration(DurationKind::DayTime, nanos))
+    }
+}
+
 fn days_in(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -1182,5 +1372,26 @@ mod tests {
         assert_eq!(instant_at(1, 5), Some(NANOS_PER_DAY + 5));
         assert_eq!(instant_at(MAX_DAY, 0), None);
         assert_eq!(instant_at(MIN_DAY, 0), None);
+    }
+
+    /// GS15. A displacement on its own, which is what a session takes,
+    /// and never a name.
+    #[test]
+    fn a_session_zone_is_a_displacement_and_not_a_name() {
+        assert_eq!(zone_offset("+07:00"), Some(420));
+        assert_eq!(zone_offset("-05:30"), Some(-330));
+        assert_eq!(zone_offset("+0700"), Some(420));
+        assert_eq!(zone_offset("+07"), Some(420));
+        assert_eq!(zone_offset(" Z "), Some(0));
+        assert_eq!(zone_offset("-00:00"), Some(0));
+        assert_eq!(zone_offset("+00:00"), Some(0));
+
+        assert_eq!(zone_offset("UTC"), None);
+        assert_eq!(zone_offset("Europe/Dublin"), None);
+        assert_eq!(zone_offset(""), None);
+        // Eighteen hours is the widest displacement there is, and a
+        // time in front of the sign is a time and not a zone.
+        assert_eq!(zone_offset("+19:00"), None);
+        assert_eq!(zone_offset("12:00:00+07:00"), None);
     }
 }

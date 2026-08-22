@@ -16,6 +16,7 @@ pub mod pins;
 pub mod platforms;
 pub mod repos;
 pub mod rustdoc;
+pub mod scratch;
 pub mod sha256;
 pub mod tarball;
 pub mod terms;

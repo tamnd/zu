@@ -813,31 +813,33 @@ impl Snapshot for Zu1Snapshot<'_> {
         {
             Some(rel) => {
                 self.ensure_reader(rel)?;
-                let found = {
-                    let Self { db, readers, .. } = self;
-                    let reader = readers.get_mut(&rel).expect("just loaded");
-                    match reader.directory().keys.is_none() {
-                        true => Some(key),
-                        false => reader.lookup_key(db, key)?,
-                    }
-                };
-                match found {
-                    Some(row) => Some(row),
-                    // The index is the file's and a deferred commit
-                    // rewrites nothing, so a row it added is in no
-                    // index and the patch is where its key is.
-                    None => self.appended_key(table, key)?,
+                let Self { db, readers, .. } = self;
+                let reader = readers.get_mut(&rel).expect("just loaded");
+                match reader.directory().keys.is_none() {
+                    true => Some(key),
+                    false => reader.lookup_key(db, key)?,
                 }
             }
             None => Some(key),
         };
         let rows = self.table_rows(table)?;
-        let Some(row) = row.filter(|&r| r < rows) else {
-            return Ok(None);
-        };
         // A key still names the row it always named after a delete,
         // because offsets do not move and the index is not rewritten,
         // so the tombstone is what says the row is gone.
+        if let Some(row) = row.filter(|&r| r < rows)
+            && !self.ensure_gone()?.holds(table, row)
+        {
+            return Ok(Some(row));
+        }
+        // The index is the file's and a deferred commit rewrites
+        // nothing, so a row it added is in no index and the patch is
+        // where its key is. That is the answer for a key the index
+        // never held, and for one it holds against a row that has gone
+        // as well: the row going leaves the key free, and a commit
+        // since then is free to have taken it.
+        let Some(row) = self.appended_key(table, key)?.filter(|&r| r < rows) else {
+            return Ok(None);
+        };
         Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
     }
 

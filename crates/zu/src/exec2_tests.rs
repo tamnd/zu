@@ -119,7 +119,7 @@ fn run_new(
     sip: Sip,
 ) -> Option<exec::QueryResult> {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
     let options = Options {
         threads,
@@ -140,7 +140,7 @@ fn run_old(
     source: &str,
 ) -> exec::QueryResult {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         sip: Sip::On,
@@ -313,7 +313,7 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
         "MATCH (a:person)<-[:knows]-(b) RETURN count(b) AS n",
         "MATCH (a:person)-[:knows]-(b) RETURN count(b) AS n",
-        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks",
         "MATCH (a:person)-[:knows]->(b)<-[:knows]-(c) RETURN count(c) AS n",
         // Hub shapes: expands fanning out of one scanned level, the
         // plan the optimizer picks for an unseeded two-hop. The count
@@ -507,6 +507,14 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WHERE sqrt(p.score) > 10 RETURN count(*) AS n",
         "MATCH (p:person) RETURN sin(p.age) AS b, p.id AS id ORDER BY id LIMIT 20",
         "MATCH (p:person) RETURN radians(p.age) * 2 AS b, p.id AS id ORDER BY id LIMIT 20",
+        // And a root in a projection that nothing stands between and
+        // the answer, which is the shape a column of roots is written
+        // in. Every row the level carries is a row the answer is built
+        // from, so the kernel measures what the old engine measures
+        // and a value neither has an answer for raises on both.
+        "MATCH (p:person) RETURN sqrt(p.score) AS b, p.id AS id",
+        "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
+        "MATCH (p:person) RETURN power(p.age, 2) AS b, p.id AS id",
         // The three that take two numbers. A remainder by a written
         // number that is not nought is a computed column like any
         // other, and a power and a logarithm stand in a filter, where
@@ -1208,21 +1216,30 @@ fn fallback_queries() -> &'static [&'static str] {
         // A sort inside a WITH orders rows the pipeline is not the
         // last reader of, so the whole chain goes back.
         "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
-        // A division by a column in a projection. A computed column is
-        // filled before the filter that would have dropped the row
-        // whose divisor is nought, so a condition raised here is one
-        // the old engine never reached, and the shape stays where the
-        // question of raising it belongs.
+        // A division by a column in a projection, with something
+        // between the level and the answer. A computed column is
+        // filled where the level is built, so a filter or a slice
+        // after it means the kernel is asked about a row the old
+        // engine never reached, and the shape stays where the question
+        // of raising the condition belongs. Without one of those the
+        // same projection compiles, which is the pair of these in
+        // `covered_queries`.
+        "MATCH (p:person) WHERE p.id > 0 RETURN p.score / p.id AS b",
+        // Two conditions in the one program, which the two engines
+        // reach in different orders: the program divides the whole
+        // chunk before the sum that makes the divisor has seen a
+        // second row, and the old engine finishes each row before it
+        // starts the next. Either could be the one that raises, so the
+        // plan goes back rather than raising whichever this one would.
         "MATCH (p:person) RETURN p.score / (p.id + 1) AS b",
         "MATCH (p:person) RETURN p.age % (p.id + 1) AS b, p.id AS id",
-        // The same rule over a numeric function that has a condition
-        // behind it: the distance of the bottom integer from nought is
-        // one past the top of one, so a projection holding a distance
-        // declines where a floor would not.
-        "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id",
-        "MATCH (p:person) RETURN sqrt(p.score) AS b, p.id AS id",
-        "MATCH (p:person) RETURN power(p.age, 2) AS b, p.id AS id",
         "MATCH (p:person) RETURN mod(p.age, p.id + 1) AS b, p.id AS id",
+        // The same rule over a numeric function that has a condition
+        // behind it: a root has no answer below nought, so a
+        // projection holding one declines behind a guard where a floor
+        // would not.
+        "MATCH (p:person) WHERE p.score > 0 RETURN sqrt(p.score) AS b, p.id AS id",
+        "MATCH (p:person) RETURN abs(p.age) AS b, p.id AS id LIMIT 5",
         // And behind an OR, where the old engine reads the halves in
         // the order they were written and never asks the second one
         // about a row the first said yes to. An AND is not the same
@@ -1464,7 +1481,7 @@ shard_tests! {
 /// this query.
 fn zone_skipped(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()
@@ -1511,7 +1528,7 @@ fn a_float_bound_skips_the_chunks_its_integer_bound_skips() {
 /// Chunks the scan decoded and then took rows out of.
 fn zone_thinned(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()
@@ -1876,7 +1893,7 @@ fn a_binding_variable_definition_falls_back_and_still_answers() {
     // own and that helper is for the statements that take none.
     {
         let (query, plan, _) =
-            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema).unwrap();
+            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema, "/").unwrap();
         let args = vec![Value::Null; query.params.len()];
         let mut snap = Zu1Snapshot::new(&mut db, catalog.clone());
         let new = zu_exec::try_execute(

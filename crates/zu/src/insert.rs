@@ -307,6 +307,30 @@ impl<'a> Batch<'a> {
             .collect()
     }
 
+    /// The key every new row of a keyed table takes, as table, key and
+    /// the position in the statement the row came from, which is what
+    /// [`refuse_duplicate_keys`] checks against the store.
+    ///
+    /// A table whose rows carry no `id` column is not in here, and
+    /// neither is a row that named no `id`: the first has no key and
+    /// the second left its key null, and a null is not a value the
+    /// index holds.
+    pub(crate) fn new_keys(&self) -> Vec<(u32, u64)> {
+        let mut keys = Vec::new();
+        for node in &self.nodes {
+            let Some(cols) = self.columns.get(&node.table) else {
+                continue;
+            };
+            let Some(at) = cols.iter().position(|col| col.name == "id") else {
+                continue;
+            };
+            if let Some((_, Cell::Int(key))) = node.cols.iter().find(|(c, _)| *c as usize == at) {
+                keys.push((node.table, *key));
+            }
+        }
+        keys
+    }
+
     /// The rows this run is creating, as table and offset. They are not
     /// in the store yet, so nothing may be asked of the store about
     /// them.
@@ -379,6 +403,56 @@ pub(crate) fn refuse_duplicate_pairs(
                 .map_or("?", |rel| rel.name.as_str()),
             edge.src,
             edge.dst
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a row whose key a keyed table already holds, before the
+/// write reaches the log.
+///
+/// The index over a keyed table maps each key to the one row that has
+/// it, and it is rebuilt from the rows every time the table is folded.
+/// Two rows under one key have no such mapping, so the rebuild raises,
+/// and it raises during a fold rather than during the statement that
+/// caused it. What that leaves behind is a file whose every read of the
+/// table fails, from a write that was told it succeeded, and no
+/// statement can undo it because no statement can run. So the second
+/// row is refused here, where the statement is still in a position to
+/// be told which key was already taken.
+///
+/// Twice in one statement counts, and the store cannot be asked about
+/// the first of the two because it is not in it yet, so this walks in
+/// statement order and remembers what it has seen.
+///
+/// A table with no key index is not asked about at all, because under
+/// the dense-id contract every key names the row of the same number and
+/// so every key would look taken.
+pub(crate) fn refuse_duplicate_keys(
+    graph: &mut impl zu_query::exec::Graph,
+    catalog: &Catalog,
+    keys: &[(u32, u64)],
+) -> Result<()> {
+    let mut asked: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut written: BTreeSet<(u32, u64)> = BTreeSet::new();
+    for &(table, key) in keys {
+        let keyed = match asked.get(&table) {
+            Some(&known) => known,
+            None => {
+                let known = graph.keyed(table)?;
+                asked.insert(table, known);
+                known
+            }
+        };
+        if !keyed {
+            continue;
+        }
+        if written.insert((table, key)) && graph.lookup_key(table, key)?.is_none() {
+            continue;
+        }
+        return Err(ZuError::InvalidArgument(format!(
+            "'{}' keys its rows by 'id', and {key} is the id of a row it already holds",
+            name_of(catalog, table)
         )));
     }
     Ok(())
@@ -516,7 +590,7 @@ fn row(
             id: node.table,
         });
     }
-    fill("element", &node.props, columns, values)
+    fill("node", codes::C22G0S, &node.props, columns, values)
 }
 
 /// One edge: every column its table stores, in column order, filled
@@ -541,16 +615,22 @@ fn edge_row(
             id: rel.table,
         });
     }
-    fill("edge", &rel.props, columns, values)
+    fill("edge", codes::C22G0T, &rel.props, columns, values)
 }
 
 /// The cells of one new row of one table: every column of it, in column
 /// order, filled from the properties the pattern wrote.
 ///
 /// `noun` is what is being written, which is all that separates the
-/// message an element gets from the one an edge gets.
+/// message an element gets from the one an edge gets, and `over` is the
+/// condition raised when the pattern carries a property the table has no
+/// column for: 22G0S for a node and 22G0T for an edge, the two halves of
+/// ISO 24.5.2 item IL002. A table's columns are settled when it is
+/// created, so the property set an element can hold is the one its table
+/// declared and a key outside it is one property too many.
 fn fill(
     noun: &str,
+    over: zu_common::gqlstatus::GqlStatus,
     props: &[(String, BoundExpr)],
     columns: &[PropColumn],
     values: &[Value],
@@ -570,9 +650,14 @@ fn fill(
     }
     for (key, _) in props {
         if !columns.iter().any(|col| col.name == *key) {
-            return Err(ZuError::InvalidArgument(format!(
-                "the {noun} carries '{key}', which is not a column of the table it is created in"
-            )));
+            let names: Vec<&str> = columns.iter().map(|col| col.name.as_str()).collect();
+            return Err(ZuError::gql(
+                over,
+                format!(
+                    "a {noun} holds the properties its table declares, and '{key}' is not one of them: the table declares {}",
+                    names.join(", ")
+                ),
+            ));
         }
     }
     Ok(cells)
@@ -771,7 +856,7 @@ mod tests {
         let out = session
             .run(
                 "INSERT (x:person {age: 30, name: 'zoe'}), (y:person {age: 40, name: 'raj'}) \
-                 RETURN x.name AS first, y.name AS second",
+                 RETURN x.name AS first, y.name AS later",
                 &[],
             )
             .expect("insert");
@@ -922,7 +1007,7 @@ mod tests {
         let out = session
             .run(
                 "INSERT (x:person {age: 30, name: 'zoe'})-[k:knows]->(y:person {age: 40, name: 'raj'}) \
-                 RETURN x.name AS from, y.name AS to",
+                 RETURN x.name AS src, y.name AS to",
                 &[],
             )
             .expect("insert an edge");
@@ -1094,7 +1179,7 @@ mod tests {
         // The fixture has ada knows kay, and now kay knows ada too.
         let out = session
             .run(
-                "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS from, b.name AS to ORDER BY from",
+                "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS src, b.name AS to ORDER BY src",
                 &[],
             )
             .expect("walk");
@@ -1111,7 +1196,7 @@ mod tests {
 
         let out = session
             .run(
-                "INSERT (a:person {age: 1, name: 'one'}) INSERT (a)-[:knows]->(b:person {age: 2, name: 'two'}) RETURN a.name AS first, b.name AS second",
+                "INSERT (a:person {age: 1, name: 'one'}) INSERT (a)-[:knows]->(b:person {age: 2, name: 'two'}) RETURN a.name AS first, b.name AS later",
                 &[],
             )
             .expect("insert");
@@ -1212,7 +1297,7 @@ mod tests {
 
         let out = session
             .run(
-                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS from, k.since AS since ORDER BY from",
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read the years back");
@@ -1245,7 +1330,7 @@ mod tests {
 
         let out = session
             .run(
-                "MATCH (a:person)-[k:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS from, k.since AS since ORDER BY from",
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read them back");

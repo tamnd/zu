@@ -321,7 +321,7 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     }
     let expected: i64 = edges.iter().map(|&(_, d)| outdeg[d as usize] as i64).sum();
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths";
+    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks";
     let runs = 50usize;
     for _ in 0..5 {
         zu::query::run(source, &mut db, &[]).expect("warmup run");

@@ -48,7 +48,7 @@ const LONG: &str = "MATCH (a:Person {city: 'Hanoi'})-[:KNOWS]->(b:Person)\n\
      WHERE b.age > 30 AND b.name STARTS WITH 'N'\n\
      WITH a, b, count(*) AS mutual\n\
      ORDER BY mutual DESC\n\
-     RETURN a.name AS from, b.name AS to, mutual\n\
+     RETURN a.name AS src, b.name AS to, mutual\n\
      LIMIT 25";
 
 fn main() {

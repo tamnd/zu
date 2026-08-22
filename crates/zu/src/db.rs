@@ -54,6 +54,7 @@ pub struct Config {
     memory_limit: usize,
     threads: usize,
     read_only: bool,
+    stale_bound: u64,
 }
 
 impl Default for Config {
@@ -62,6 +63,7 @@ impl Default for Config {
             memory_limit: crate::zu1::file::DEFAULT_MEMORY_LIMIT,
             threads: 0,
             read_only: false,
+            stale_bound: crate::session::DEFAULT_STALE_BOUND,
         }
     }
 }
@@ -102,6 +104,20 @@ impl Config {
     /// to refuse them less helpfully.
     pub fn read_only(mut self, read_only: bool) -> Config {
         self.read_only = read_only;
+        self
+    }
+
+    /// How many epochs a session parameter holding a binding table may
+    /// fall behind before the statement after it carries a warning
+    /// saying so (plan/06 §2).
+    ///
+    /// A pin holds no blocks in zu, since a binding table parameter
+    /// holds rows copied out of the snapshot rather than a reader into
+    /// it, so this is not a knob against the store growing. It is how
+    /// long a caller wants to go without being told that what it is
+    /// holding was read a while ago.
+    pub fn stale_bound(mut self, epochs: u64) -> Config {
+        self.stale_bound = epochs;
         self
     }
 
@@ -283,6 +299,7 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let mut session = Session::on(self.handle()?)?;
         session.set_options(self.config.over(session.options().clone()));
+        session.set_stale_bound(self.config.stale_bound);
         Ok(Connection {
             session,
             read_only: self.config.read_only,
@@ -863,7 +880,7 @@ mod tests {
         let db = Database::open_with(&path, Config::new().read_only(true)).expect("open");
         let mut conn = db.connect().expect("connect");
         let err = conn
-            .query("CREATE PROPERTY GRAPH second ANY")
+            .query("CREATE PROPERTY GRAPH later ANY")
             .expect_err("refused");
         assert!(err.to_string().contains("read-only"), "{err}");
         let err = conn
@@ -894,13 +911,13 @@ mod tests {
         let (_dir, path) = scratch("write.zu1");
         let db = Database::open(&path).expect("open");
         let mut conn = db.connect().expect("connect");
-        conn.execute("CREATE PROPERTY GRAPH second ANY")
+        conn.execute("CREATE PROPERTY GRAPH later ANY")
             .expect("create");
         // The new graph is empty, so a statement against it gets past
         // the name and finds nothing, which is what says the catalog
         // took the write: an unknown graph is the error, and a graph
         // with nothing in it is an empty answer.
-        let seen = conn.query("USE second MATCH (p) RETURN p").expect("query");
+        let seen = conn.query("USE later MATCH (p) RETURN p").expect("query");
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
@@ -923,12 +940,12 @@ mod tests {
         let mut reader = db.connect().expect("connect");
 
         let missing = reader
-            .query("USE second MATCH (p) RETURN p")
+            .query("USE later MATCH (p) RETURN p")
             .expect_err("no such graph yet");
         assert!(missing.to_string().contains("is no graph"), "{missing}");
 
         writer
-            .execute("CREATE PROPERTY GRAPH second ANY")
+            .execute("CREATE PROPERTY GRAPH later ANY")
             .expect("create");
 
         // The new graph is empty, so a statement against it gets past
@@ -936,7 +953,7 @@ mod tests {
         // reached this connection: a moment ago the same text could not
         // resolve the name at all.
         let seen = reader
-            .query("USE second MATCH (p) RETURN p")
+            .query("USE later MATCH (p) RETURN p")
             .expect("the graph the other connection made");
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
@@ -1336,13 +1353,15 @@ mod tests {
         let config = Config::new()
             .memory_limit(1 << 20)
             .threads(2)
-            .read_only(true);
+            .read_only(true)
+            .stale_bound(4);
         assert_eq!(
             config,
             Config {
                 memory_limit: 1 << 20,
                 threads: 2,
                 read_only: true,
+                stale_bound: 4,
             }
         );
     }

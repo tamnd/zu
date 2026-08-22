@@ -69,6 +69,28 @@ fn string_eq_baseline(strings: &[String], needle: &str) -> usize {
     n
 }
 
+/// The arithmetic kernel's compute loop with no condition behind it:
+/// the same allocation out of the same arena and the same wrapping
+/// addition, and none of the fold that answers whether any row went
+/// over the top of an integer.
+///
+/// It is here to price that fold, which is the whole of what the answer
+/// path pays for the conditions the row engine raises. inline(never)
+/// for the reason the string baseline is: the gate is a ratio and its
+/// divisor has to be the same code between builds.
+#[inline(never)]
+fn unguarded_add(arena: &mut MorselArena, l: &ValueVector, r: &ValueVector, len: usize) -> u32 {
+    let mut out = ValueVector::flat_uninit(arena, PhysType::Int64, len);
+    {
+        let dst = out.values_mut::<i64>();
+        let (a, b) = (l.values::<i64>(), r.values::<i64>());
+        for i in 0..len {
+            dst[i] = a[i].wrapping_add(b[i]);
+        }
+    }
+    out.len
+}
+
 /// What the read path does per row today: materialize a fresh String
 /// (alloc, copy, utf8 check), then compare.
 #[inline(never)]
@@ -260,7 +282,52 @@ fn main() {
         );
     });
     let arith_checked = per_sec_wide * VECTOR as f64 / 1e9;
-    println!("arith_i64_add_checked: {arith_checked:.2} G rows/s (no target, the slow path)");
+    println!("arith_i64_add_checked: {arith_checked:.2} G rows/s (the walk, no target)");
+
+    // The two gates on the fault bit pattern (plan/07 section 1.1), one
+    // for each half of what it claims.
+    //
+    // The first half is that a chunk with an answer for every row pays
+    // one branch free pass and nothing else, so the answer path is
+    // priced against the same allocation and the same wrapping addition
+    // with no condition behind them at all.
+    //
+    // The second half is that the fold is what clears the chunk rather
+    // than a check standing in the loop. A kernel that checked every
+    // row where it computed it would read the same on both lines above,
+    // since the wide operands differ from the ordinary ones only in
+    // whether the fold can rule them out, so the distance between the
+    // two is the fold doing its job and a ratio near one is the pattern
+    // gone.
+    let per_sec_raw = measure(|| {
+        arith_scratch.reset();
+        black_box(unguarded_add(
+            &mut arith_scratch,
+            black_box(&v),
+            black_box(&w),
+            VECTOR,
+        ));
+    });
+    let unguarded = per_sec_raw * VECTOR as f64 / 1e9;
+    let guard_x = unguarded / arith_grows.max(0.001);
+    println!(
+        "arith_i64_add_unguarded: {unguarded:.2} G rows/s, so the guard costs {guard_x:.2}x \
+         the answer it guards"
+    );
+    if let Some(ceiling) = budgets.get("vec_guard_x")
+        && guard_x > ceiling
+    {
+        println!("GATE FAIL vec_guard_x: {guard_x:.2} > ceiling {ceiling}");
+        failed = true;
+    }
+    let walk_x = arith_grows / arith_checked.max(0.001);
+    println!("the walk behind the fold costs {walk_x:.2}x the fold that skips it");
+    if let Some(floor) = budgets.get("vec_condition_walk_x")
+        && walk_x < floor
+    {
+        println!("GATE FAIL vec_condition_walk_x: {walk_x:.2} < floor {floor}");
+        failed = true;
+    }
 
     // The numeric library, GF01, over the same width. The distance from
     // nought is the one of the five with a condition behind it on every

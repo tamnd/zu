@@ -36,10 +36,20 @@ cases:
     query: SELECT 1
     raises: "42001"
 
-  - name: a-clause-that-is-reserved-and-not-here-yet
-    doc: SESSION opens the session statements and this engine does not run them, and a statement that names one is still a syntax condition rather than a feature flag, because the answer does not depend on the data.
-    query: SESSION SET VALUE $x = 1
+  - name: a-reserved-word-where-a-name-belongs
+    doc: ISO 21.3 says a regular identifier is not a reserved word, and it says it in the Syntax Rules rather than in the productions, so an engine reading the grammar alone will happily take START as an alias and every conforming engine has to refuse it.
+    query: RETURN 1 AS start
     raises: "42001"
+
+  - name: the-same-word-in-accent-quotes-is-a-name
+    doc: A delimited identifier is not a reserved word whatever it spells, which is what the rule above leaves for anybody who wants the word. The column comes back spelled the way it was written.
+    query: RETURN 1 AS `start`
+    columns:
+      - start
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
 
   - name: a-write-clause-that-is-reserved
     doc: CREATE opens statements that are not in the v0 core, and the parser names it rather than saying it expected MATCH, which is the difference between a useful refusal and a puzzle.

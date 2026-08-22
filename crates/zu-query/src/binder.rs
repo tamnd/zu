@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, ZuError};
 
@@ -72,8 +72,30 @@ fn guaranteed(schema: &Schema, tables: &[u32]) -> u64 {
 /// name in the statement does not resolve, or resolves to something
 /// already taken. The statement parses, so this is not 42001; it just
 /// mentions something that is not there.
-fn bad_reference(detail: String) -> ZuError {
-    ZuError::gql(codes::C42002, detail)
+/// How many labels a label expression names, which is what the
+/// maximum in ISO 24.5.2 IL001 is counted against. A negation or a
+/// wildcard names none of its own and is counted through, because what
+/// the number is for is telling a reader how far over the limit they
+/// went rather than being arithmetic anything relies on.
+fn label_count(expr: &LabelExpr) -> usize {
+    match expr {
+        LabelExpr::Label(_) => 1,
+        LabelExpr::Wildcard => 1,
+        LabelExpr::Not(inner) => label_count(inner),
+        LabelExpr::And(l, r) | LabelExpr::Or(l, r) => label_count(l) + label_count(r),
+    }
+}
+
+/// `42002`, invalid reference, which is the condition for every name a
+/// statement writes that the catalog or the scope has no answer for.
+///
+/// The subject is not optional here, and that is the point: every one
+/// of these is about a name, the caller has that name in hand at the
+/// moment it raises, and a record whose subject is empty makes a client
+/// read the name back out of an English sentence. Requiring it in the
+/// signature is what keeps the next one from forgetting.
+fn bad_reference(subject: Subject, detail: String) -> ZuError {
+    ZuError::gql(codes::C42002, detail).about(subject)
 }
 
 /// A group variable a match written several ways bound, read behind
@@ -85,13 +107,16 @@ fn bad_reference(detail: String) -> ZuError {
 /// Binding it costs nothing and reading it is what has nowhere to come
 /// from, so the refusal is here and not where the pattern was written.
 fn out_of_reach(name: &str) -> ZuError {
-    bad_reference(format!(
-        "'{name}' stands for what a repeated stretch bound, and the stretch is \
+    bad_reference(
+        Subject::Variable(name.to_string()),
+        format!(
+            "'{name}' stands for what a repeated stretch bound, and the stretch is \
          written a number of lengths rather than one, so the elements it stands \
          for are in a different place in each of them; write the lengths as \
          statements of their own, joined with UNION, where each of them reads a \
          stretch of one length"
-    ))
+        ),
+    )
 }
 
 /// `22G03 data exception, invalid value type`: the expression is well
@@ -665,6 +690,17 @@ pub struct Schema {
 
 /// The most labels one graph holds, one bit of the word a row carries.
 pub const MAX_LABELS: usize = 64;
+
+/// GA08. The name of the built-in that answers the GQL-status object
+/// the statement before this one ended with, as a record value.
+///
+/// ISO/IEC 39075:2024 writes no statement for reading a status back:
+/// there is no `GET DIAGNOSTICS` in it, and subclause 23 is about
+/// producing the record and exposing it rather than about a statement
+/// that asks for one. So the name is zu's, spelled the way the rest of
+/// the value functions are spelled, and it is an extension and not a
+/// reading of the standard.
+pub const STATUS_FN: &str = "current_status";
 
 /// The factor the ceilings have to beat the estimates by before the
 /// join order DP takes the robust order, when nothing overrides it.
@@ -1540,6 +1576,26 @@ pub struct BoundNode {
     pub filter: Option<BoundExpr>,
 }
 
+/// The label set of a closed node or edge reference value type, GV56
+/// and GV57, as the executor checks it.
+///
+/// A node answers with the word its row carries and an edge with the
+/// table it is in, which is the same split [`BoundExpr::IsLabeled`]
+/// makes, for the same reason: an edge's label is the name of its
+/// table and is settled before any row is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constrained {
+    pub node: LabelTest,
+    pub rels: Vec<u32>,
+    /// The name as the statement wrote it, so a refusal can say which
+    /// label the value did not wear rather than printing a bit mask.
+    pub wanted: String,
+    /// Whether the type names nodes. A cast to `NODE :P` of an edge is
+    /// the wrong base type and not an unworn label, and the executor
+    /// needs this to tell the two conditions apart.
+    pub over_nodes: bool,
+}
+
 /// A compiled label expression: bit tests over the one word a row
 /// carries (docs/03 §1). The bits are dictionary ids, which are a
 /// property of the graph and not of any one table, so a test reads the
@@ -2090,6 +2146,14 @@ pub enum BoundExpr {
     /// later statement with it. A leaf the run supplies is read where
     /// the run is, once per statement.
     Clock,
+    /// GA08. The GQL-status object the statement before this one ended
+    /// with, as a record value.
+    ///
+    /// A leaf for the same reason the clock is one: what it answers is
+    /// session state, it reaches the run through the switches, and a
+    /// plan that folded it would answer every later statement with the
+    /// status of whatever statement happened to compile it.
+    Status,
     Call {
         func: Func,
         /// Which row of the function registry answers this call, found
@@ -2128,6 +2192,10 @@ pub enum BoundExpr {
     Cast {
         expr: Box<BoundExpr>,
         ty: LogicalType,
+        /// The label set a closed reference value type names, GV56 and
+        /// GV57, compiled here because it is a question about the
+        /// graph and the cast itself is a pure function over values.
+        constrained: Option<Box<Constrained>>,
     },
     /// GE01. `CASE` in both forms, the branches in the order they were
     /// written, which is the order they are asked in: a branch is only
@@ -2238,27 +2306,39 @@ enum Projected {
 
 /// The schema an `AT` clause names, written as a catalog path (GP16).
 ///
-/// `CURRENT_SCHEMA` and `HOME_SCHEMA` both answer the root, because
-/// nothing moves a session out of it: the schema a session opens in is
-/// the schema it works in for as long as it lives, so the two words
-/// name the same directory and always will until a statement that
-/// changes the working schema exists.
-fn at_path(at: &Option<ast::SchemaRef>) -> Option<&str> {
+/// `session` is the schema the statement was sent in, which is the root
+/// until a `SESSION SET SCHEMA` moves it (GS05). `CURRENT_SCHEMA` is
+/// that one and `HOME_SCHEMA` is the root, the schema the session
+/// opened in: the two words name the same directory until something
+/// moves the current one, which is the whole reason there are two of
+/// them.
+fn at_path<'a>(at: &'a Option<ast::SchemaRef>, session: &'a str) -> Option<&'a str> {
     match at.as_ref()? {
-        ast::SchemaRef::Current | ast::SchemaRef::Home => Some(procedures::ROOT),
+        ast::SchemaRef::Current => Some(session),
+        ast::SchemaRef::Home => Some(procedures::ROOT),
         ast::SchemaRef::Path(path) => Some(path),
     }
 }
 
-/// Binds a parsed query against a schema.
+/// Binds a parsed query against a schema, in the root catalog schema.
+///
+/// This is the reading a statement gets when nobody says where it was
+/// sent from, which is every caller that is not a session: a session
+/// can be moved out of the root and reaches for [`bind_in`].
+pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
+    bind_in(query, schema, procedures::ROOT)
+}
+
+/// Binds a parsed query against a schema, sent from a session working
+/// in `session`, a catalog path (GS05).
 ///
 /// A composite is bound operand by operand, left to right. Each gets a
 /// binder of its own, because the operands share no variables: what
 /// they do share is the parameter list, which is positional and belongs
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
-pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
-    let at = at_path(&query.at_schema);
+pub fn bind_in(query: &ast::Query, schema: &Schema, session: &str) -> Result<BoundQuery> {
+    let at = at_path(&query.at_schema, session).or(Some(session));
     let mut params = Vec::new();
     // The binding variable definition block at the head of the
     // statement (GP17), bound before anything that could read one of
@@ -2406,10 +2486,13 @@ fn bind_bindings(
 ) -> Result<()> {
     for def in defs {
         if visible.iter().any(|v| v.name == def.name) {
-            return Err(bad_reference(format!(
-                "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
-                def.name
-            )));
+            return Err(bad_reference(
+                Subject::Variable(def.name.clone()),
+                format!(
+                    "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
+                    def.name
+                ),
+            ));
         }
         let query = match &def.init {
             ast::BindingInit::Query(query) => (**query).clone(),
@@ -2421,7 +2504,7 @@ fn bind_bindings(
         // A definition holding a query of its own may say which schema
         // that query resolves in, and one that does not resolves where
         // the statement around it does.
-        let at = at_path(&query.at_schema).or(at);
+        let at = at_path(&query.at_schema, at.unwrap_or(procedures::ROOT)).or(at);
         let mut inner = visible.clone();
         bind_bindings(&query.bindings, schema, at, params, out, &mut inner)?;
         let mut bound = bind_body(&query.body, schema, at, params, &[], &inner)?;
@@ -2448,10 +2531,13 @@ fn bind_bindings(
         }
         for scalar in &bound.scalars {
             if !scalar.captures.is_empty() {
-                return Err(bad_reference(format!(
-                    "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
-                    def.name
-                )));
+                return Err(bad_reference(
+                    Subject::Variable(def.name.clone()),
+                    format!(
+                        "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
+                        def.name
+                    ),
+                ));
             }
         }
         if def.kind != ast::BindingKind::Table && bound.columns.len() != 1 {
@@ -2522,7 +2608,11 @@ struct Visible {
 /// One shape reaches the executor rather than two: a definition is a
 /// query whatever it was written as, so there is one way to work one
 /// out and one place for that to be wrong.
-fn returning(expr: ast::Expr, name: &str) -> ast::Query {
+///
+/// It is public because a session parameter is a definition too (GS01
+/// through GS03), and the session works one out by running the
+/// definition with this wrapped round the name it defines.
+pub fn returning(expr: ast::Expr, name: &str) -> ast::Query {
     ast::Query {
         at_schema: None,
         use_graph: None,
@@ -2786,7 +2876,11 @@ fn merge_props<'a>(
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) | BoundExpr::Clock => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Graph(_)
+        | BoundExpr::Clock
+        | BoundExpr::Status => {}
         // A value query expression reads the slots the query inside it
         // captured, and nothing at all when it captured none, which is
         // what makes that one a single value for the whole run.
@@ -2884,6 +2978,7 @@ fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundE
         | BoundExpr::Param(_)
         | BoundExpr::Graph(_)
         | BoundExpr::Clock
+        | BoundExpr::Status
         | BoundExpr::Scalar { .. }
         | BoundExpr::Var(_)
         | BoundExpr::HasLabels { .. } => {}
@@ -3163,9 +3258,10 @@ impl Binder<'_> {
 
     fn declare(&mut self, name: &str, ty: Type) -> Result<usize> {
         if self.scope.contains_key(name) {
-            return Err(bad_reference(format!(
-                "variable '{name}' is already defined"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!("variable '{name}' is already defined"),
+            ));
         }
         let slot = self.new_slot(name.to_string(), ty);
         self.scope.insert(name.to_string(), slot);
@@ -4224,19 +4320,25 @@ impl Binder<'_> {
             // from a procedure that is nowhere, because the caller
             // spelled the name right and looked in the wrong place.
             if procedures::resolve(procedures::ROOT, &reference.name).is_some() {
-                bad_reference(format!(
-                    "no procedure '{}' in the schema '{schema}', it is in the root schema",
-                    reference.name
-                ))
+                bad_reference(
+                    Subject::Function(reference.name.clone()),
+                    format!(
+                        "no procedure '{}' in the schema '{schema}', it is in the root schema",
+                        reference.name
+                    ),
+                )
             } else {
-                bad_reference(format!(
-                    "no procedure '{}' in the schema '{schema}', the ones there are {}",
-                    reference.name,
-                    match procedures::in_schema(schema).join(", ").as_str() {
-                        "" => "none".to_string(),
-                        list => list.to_string(),
-                    }
-                ))
+                bad_reference(
+                    Subject::Function(reference.name.clone()),
+                    format!(
+                        "no procedure '{}' in the schema '{schema}', the ones there are {}",
+                        reference.name,
+                        match procedures::in_schema(schema).join(", ").as_str() {
+                            "" => "none".to_string(),
+                            list => list.to_string(),
+                        }
+                    ),
+                )
             }
         })?;
         let func = proc.func;
@@ -4258,15 +4360,20 @@ impl Binder<'_> {
                 .schema
                 .rel_in_graph(handle.id, rel_name)
                 .ok_or_else(|| {
-                    bad_reference(format!(
-                        "the graph '{}' holds no rel table '{rel_name}'",
-                        handle.name
-                    ))
+                    bad_reference(
+                        Subject::Label(rel_name.to_string()),
+                        format!(
+                            "the graph '{}' holds no rel table '{rel_name}'",
+                            handle.name
+                        ),
+                    )
                 })?,
-            None => self
-                .schema
-                .rel_by_name(rel_name)
-                .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?,
+            None => self.schema.rel_by_name(rel_name).ok_or_else(|| {
+                bad_reference(
+                    Subject::Label(rel_name.to_string()),
+                    format!("unknown rel table '{rel_name}'"),
+                )
+            })?,
         };
         if rel.from != rel.to {
             return Err(invalid(format!(
@@ -4488,10 +4595,10 @@ impl Binder<'_> {
         let mut new_scope: HashMap<String, usize> = HashMap::new();
         for item in &mut items {
             if names_rows && new_scope.contains_key(&item.name) {
-                return Err(bad_reference(format!(
-                    "duplicate name '{}' in {clause}",
-                    item.name
-                )));
+                return Err(bad_reference(
+                    Subject::Variable(item.name.clone()),
+                    format!("duplicate name '{}' in {clause}", item.name),
+                ));
             }
             // Projecting a plain variable keeps its slot; anything else
             // gets a fresh one carrying the item's type.
@@ -5013,11 +5120,14 @@ impl Binder<'_> {
         // rather than at a slot of its own.
         for group in &path.groups {
             if self.scope.contains_key(&group.name) {
-                return Err(bad_reference(format!(
-                    "'{}' already stands for one element, and a name inside a repeated \
+                return Err(bad_reference(
+                    Subject::Variable(group.name.clone()),
+                    format!(
+                        "'{}' already stands for one element, and a name inside a repeated \
                      stretch stands for one per repetition",
-                    group.name
-                )));
+                        group.name
+                    ),
+                ));
             }
             let element = match group.kind {
                 ast::GroupKind::Node => Type::Node,
@@ -5440,9 +5550,12 @@ impl Binder<'_> {
     /// which of their clauses is the one that cannot run.
     fn write_target(&self, verb: &str, name: &str) -> Result<usize> {
         let Some(&target) = self.scope.get(name) else {
-            return Err(bad_reference(format!(
-                "'{name}' stands for nothing here, and {verb} changes an element an earlier clause found"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!(
+                    "'{name}' stands for nothing here, and {verb} changes an element an earlier clause found"
+                ),
+            ));
         };
         match self.variables[target].ty {
             // An edge takes a property the way a node does. Where it
@@ -5465,9 +5578,12 @@ impl Binder<'_> {
     /// table holds it in.
     fn bind_delete_target(&mut self, name: &str) -> Result<usize> {
         let Some(&target) = self.scope.get(name) else {
-            return Err(bad_reference(format!(
-                "'{name}' stands for nothing here, and DELETE takes away an element an earlier clause found"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!(
+                    "'{name}' stands for nothing here, and DELETE takes away an element an earlier clause found"
+                ),
+            ));
         };
         match self.variables[target].ty {
             // An edge is deletable the same way an element is, and it
@@ -5530,8 +5646,21 @@ impl Binder<'_> {
         }
         let [name] = pat.types.as_slice() else {
             return Err(match pat.types.is_empty() {
-                true => invalid(format!(
-                    "{verb} needs an edge type saying which table the edge goes in, and this one names none"
+                // 22G0Q. An edge lives in a rel table and the table's
+                // own name is the edge's one label, so the smallest
+                // edge label set this engine holds has one label in it
+                // and an edge pattern that names none is under the
+                // minimum. ISO 24.5.2 leaves the number to the
+                // implementation; this one is 1, and it is 1 at both
+                // ends (see 22G0R below).
+                true => ZuError::gql(
+                    codes::C22G0Q,
+                    format!(
+                        "{verb} needs an edge type saying which table the edge goes in, and this one names none"
+                    ),
+                )
+                .about(Subject::Variable(
+                    pat.var.clone().unwrap_or_default(),
                 )),
                 false => invalid(format!(
                     "an edge goes in one table, and '{}' names {}",
@@ -5545,7 +5674,12 @@ impl Binder<'_> {
             .rels
             .iter()
             .find(|r| r.name == *name)
-            .ok_or_else(|| bad_reference(format!("no edge table is named '{name}'")))?
+            .ok_or_else(|| {
+                bad_reference(
+                    Subject::Label(name.to_string()),
+                    format!("no edge table is named '{name}'"),
+                )
+            })?
             .clone();
         // Which way round the arrow points is which row the edge leaves
         // and which it arrives at, and that is the whole of the
@@ -5586,13 +5720,16 @@ impl Binder<'_> {
             };
             if !tables.is_empty() && !tables.contains(&want) {
                 let names: Vec<&str> = tables.iter().map(|t| self.table_name(*t)).collect();
-                return Err(bad_reference(format!(
-                    "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
-                    rel.name,
-                    self.table_name(want),
-                    self.var_text(end),
-                    names.join("|")
-                )));
+                return Err(bad_reference(
+                    Subject::Label(rel.name.clone()),
+                    format!(
+                        "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
+                        rel.name,
+                        self.table_name(want),
+                        self.var_text(end),
+                        names.join("|")
+                    ),
+                ));
             }
         }
         Ok((rel.id, src, dst))
@@ -5652,15 +5789,35 @@ impl Binder<'_> {
     /// their clauses is the one that cannot run.
     fn insert_table(&self, pat: &NodePattern, verb: &str) -> Result<u32> {
         let Some(label) = &pat.label else {
-            return Err(invalid(format!(
-                "{verb} needs a label saying which table the element goes in, and '({})' names none",
-                pat.var.as_deref().unwrap_or("")
-            )));
+            // 22G0N. A row lands in a node table and the table's own
+            // name is the row's key label, so an element this engine
+            // holds carries at least one label and a pattern that
+            // names none is under the minimum. ISO 24.5.2 leaves the
+            // number to the implementation; this one is 1.
+            return Err(ZuError::gql(
+                codes::C22G0N,
+                format!(
+                    "{verb} needs a label saying which table the element goes in, and '({})' names none",
+                    pat.var.as_deref().unwrap_or("")
+                ),
+            )
+            .about(Subject::Variable(pat.var.clone().unwrap_or_default())));
         };
         let LabelExpr::Label(name) = label else {
-            return Err(not_yet(&format!(
-                "{verb} of an element whose labels are written as anything but one name,"
-            )));
+            // 22G0P, the other end of the same item. The key label set
+            // of an element this engine creates is the one table it
+            // goes in, so the maximum an INSERT can write is 1 and a
+            // label expression naming more is over it. Secondary
+            // labels are a thing a row carries rather than somewhere
+            // it lives, and SET is where one is added.
+            return Err(ZuError::gql(
+                codes::C22G0P,
+                format!(
+                    "{verb} writes an element into the one table its label names, so it takes one label and this pattern writes {}; add the rest with SET",
+                    label_count(label)
+                ),
+            )
+            .about(Subject::Variable(pat.var.clone().unwrap_or_default())));
         };
         // A row lands in a table, and the label a table gives every row
         // it holds is its own name, so that is the one that says where
@@ -5674,7 +5831,7 @@ impl Binder<'_> {
             .iter()
             .find(|n| n.name == *name)
             .ok_or_else(|| {
-                bad_reference(format!(
+                bad_reference(Subject::Label(name.to_string()), format!(
                     "no node table is named '{name}', and an element is created in the table whose own name is the label"
                 ))
             })?
@@ -5720,10 +5877,13 @@ impl Binder<'_> {
                     if self.variables[slot].ty != Type::Node {
                         // The name resolves and resolves to something
                         // already taken, which is what 42002 is for.
-                        return Err(bad_reference(format!(
-                            "'{name}' is already bound as {}, not a node",
-                            self.variables[slot].ty
-                        )));
+                        return Err(bad_reference(
+                            Subject::Variable(name.to_string()),
+                            format!(
+                                "'{name}' is already bound as {}, not a node",
+                                self.variables[slot].ty
+                            ),
+                        ));
                     }
                     // A reused variable narrows to the tables both
                     // occurrences allow.
@@ -5757,10 +5917,13 @@ impl Binder<'_> {
             match self.scope.get(name).copied() {
                 Some(seen) if seen == slot => {}
                 Some(_) => {
-                    return Err(bad_reference(format!(
-                        "'{name}' already stands for something else, and where two stretches of \
+                    return Err(bad_reference(
+                        Subject::Variable(name.to_string()),
+                        format!(
+                            "'{name}' already stands for something else, and where two stretches of \
                          a pattern meet it would have to stand for the node they meet at"
-                    )));
+                        ),
+                    ));
                 }
                 None => {
                     self.scope.insert(name.clone(), slot);
@@ -5791,6 +5954,37 @@ impl Binder<'_> {
     /// A conjunction of plain names collapses to one mask, which is the
     /// shape almost every pattern has and the one the runtime answers
     /// with a single AND.
+    /// The label test a closed reference value type carries, or `None`
+    /// where the type names no label set.
+    ///
+    /// A cast to `NODE :Person` asks two questions and the standard
+    /// gives each its own condition: whether the value is a node at
+    /// all, which is 22G0V and is the type's own business, and whether
+    /// it wears the label, which is 22G0W and is the row's. The second
+    /// is the same question `IS LABELED` asks, so it is compiled the
+    /// same way and answered by the same test rather than by a second
+    /// piece of label logic that could disagree with the first.
+    fn constrain(&self, ty: &LogicalType) -> Result<Option<Box<Constrained>>> {
+        let (name, node) = match ty.base() {
+            LogicalType::Node(Some(name)) => (name, true),
+            LogicalType::Edge(Some(name)) => (name, false),
+            _ => return Ok(None),
+        };
+        let label = LabelExpr::Label(name.clone());
+        Ok(Some(Box::new(Constrained {
+            node: self.compile_label(&label)?,
+            rels: self
+                .schema
+                .rels()
+                .iter()
+                .filter(|rel| label_holds(&label, &rel.name))
+                .map(|rel| rel.id)
+                .collect(),
+            wanted: name.clone(),
+            over_nodes: node,
+        })))
+    }
+
     fn compile_label(&self, expr: &LabelExpr) -> Result<LabelTest> {
         Ok(match expr {
             // A name the dictionary does not hold is not a mistake to
@@ -5899,9 +6093,10 @@ impl Binder<'_> {
                     // Cypher's relationship uniqueness: a rel variable
                     // binds exactly once, and a second declaration of a
                     // name already taken is an invalid reference.
-                    return Err(bad_reference(format!(
-                        "relationship variable '{name}' is already bound"
-                    )));
+                    return Err(bad_reference(
+                        Subject::Variable(name.to_string()),
+                        format!("relationship variable '{name}' is already bound"),
+                    ));
                 }
                 self.declare(name, ty)?
             }
@@ -6182,7 +6377,10 @@ impl Binder<'_> {
                 if self.outer.iter().any(|n| n == name) {
                     return Ok((BoundExpr::Param(self.capture(name)), Type::Any));
                 }
-                Err(bad_reference(format!("variable '{name}' is not defined")))
+                Err(bad_reference(
+                    Subject::Variable(name.to_string()),
+                    format!("variable '{name}' is not defined"),
+                ))
             }
             // A property read on a group variable is read of each of
             // its elements, and the row holds the list of the answers
@@ -6200,6 +6398,22 @@ impl Binder<'_> {
             }
             Expr::Property { base, key } => {
                 let (bound, ty) = self.bind_expr(base, ctx)?;
+                // GQ17 again, by the other road. A quantified edge
+                // variable is held as a list of elements in one slot
+                // rather than as a group over several, so the read that
+                // the arm above answers through slots this one answers
+                // through the value, and both answer a list.
+                if let Type::List(element) = &ty
+                    && matches!(**element, Type::Node | Type::Rel | Type::Any)
+                {
+                    return Ok((
+                        BoundExpr::Property {
+                            base: Box::new(bound),
+                            key: key.clone(),
+                        },
+                        Type::List(Box::new(Type::Any)),
+                    ));
+                }
                 if !matches!(ty, Type::Node | Type::Rel | Type::Record | Type::Any) {
                     return Err(invalid(format!(
                         "property access needs a node, rel, or record, got {ty} from {}",
@@ -6578,6 +6792,7 @@ impl Binder<'_> {
                     BoundExpr::Cast {
                         expr: Box::new(bound),
                         ty: ty.clone(),
+                        constrained: self.constrain(ty)?,
                     },
                     plan_type(ty),
                 ))
@@ -6705,9 +6920,12 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let at = at_path(&query.at_schema)
-            .map(str::to_string)
-            .or_else(|| self.at.clone());
+        let at = at_path(
+            &query.at_schema,
+            self.at.as_deref().unwrap_or(procedures::ROOT),
+        )
+        .map(str::to_string)
+        .or_else(|| self.at.clone());
         let mut bound = bind_body(
             &query.body,
             self.schema,
@@ -6871,8 +7089,25 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
-        let at = crate::functions::lookup(name)
-            .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        // GA08. The status of the statement before this one, which is
+        // not in the registry because no kernel could answer it: a
+        // kernel sees its arguments and this reads session state. It
+        // reaches the run the way the clock does, through the switches,
+        // so it binds to a leaf here rather than to a call.
+        if name.eq_ignore_ascii_case(STATUS_FN) {
+            if distinct || star || !args.is_empty() {
+                return Err(invalid(format!(
+                    "{STATUS_FN}() is the status of the statement before this one and takes nothing"
+                )));
+            }
+            return Ok((BoundExpr::Status, Type::Any));
+        }
+        let at = crate::functions::lookup(name).ok_or_else(|| {
+            bad_reference(
+                Subject::Function(name.to_string()),
+                format!("unknown function '{name}'"),
+            )
+        })?;
         self.bind_row(at, name, distinct, star, args, ctx)
     }
 
@@ -8497,14 +8732,48 @@ mod tests {
 
     /// An element goes in one table, and the pattern has to say which:
     /// a label expression that names none, or names more than one, is
-    /// not a table.
+    /// not a table. Both are the label-count limit of ISO 24.5.2
+    /// IL001, which is one at each end here, so both carry the code
+    /// for the end they went over.
     #[test]
     fn an_insert_wants_one_plain_label_naming_a_table() {
         assert!(bind_err("INSERT (x)").contains("label"));
+        assert_eq!(
+            bind(&parse("INSERT (x)").expect("parse"), &schema())
+                .expect_err("no label")
+                .gqlstatus(),
+            Some(codes::C22G0N)
+        );
         let e = bind_err("INSERT (x:Person|Place)");
-        assert!(e.contains("one name"), "got: {e}");
+        assert!(e.contains("this pattern writes 2"), "got: {e}");
+        assert_eq!(
+            bind(&parse("INSERT (x:Person&Place)").expect("parse"), &schema())
+                .expect_err("two labels")
+                .gqlstatus(),
+            Some(codes::C22G0P)
+        );
         let e = bind_err("INSERT (x:Company)");
         assert!(e.contains("Company"), "got: {e}");
+    }
+
+    /// An edge label set holds one label here, so a step that names
+    /// none is under the minimum and a conjunction is over the
+    /// maximum. The second is caught while the statement is read, so
+    /// it carries the class 42 twin of the class 22 code.
+    #[test]
+    fn an_edge_label_set_holds_exactly_one_label() {
+        assert_eq!(
+            bind(
+                &parse("MATCH (a:Person), (b:Person) INSERT (a)-[]->(b)").expect("parse"),
+                &schema()
+            )
+            .expect_err("no type")
+            .gqlstatus(),
+            Some(codes::C22G0Q)
+        );
+        let e = parse("MATCH (a:Person)-[:KNOWS&LIKES]->(b:Person) RETURN a").expect_err("two");
+        assert_eq!(e.gqlstatus(), Some(codes::C42007));
+        assert!(e.to_string().contains("this step names 2"), "got: {e}");
     }
 
     #[test]

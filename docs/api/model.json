@@ -198,6 +198,14 @@
       "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
     },
     {
+      "id": "zu::Config::stale_bound",
+      "kind": "method",
+      "name": "stale_bound",
+      "of": "zu::Config",
+      "signature": "fn stale_bound(self, epochs: u64) -> Config",
+      "doc": "How many epochs a session parameter holding a binding table may\nfall behind before the statement after it carries a warning\nsaying so (plan/06 §2).\n\nA pin holds no blocks in zu, since a binding table parameter\nholds rows copied out of the snapshot rather than a reader into\nit, so this is not a knob against the store growing. It is how\nlong a caller wants to go without being told that what it is\nholding was read a while ago."
+    },
+    {
       "id": "zu::Config::threads",
       "kind": "method",
       "name": "threads",
@@ -467,6 +475,14 @@
       "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers.\n\n`excerpt` is the line that position falls on, kept because the\ncaller furthest from the statement is the one most likely to be\nshowing this to a person: a driver, a notebook cell, a log line. The\nengine has the text in hand when it raises the condition and the\ncaller may not have it at all by the time it prints one."
     },
     {
+      "id": "zu::DiagnosticRecord::about",
+      "kind": "method",
+      "name": "about",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn about(self, subject: Subject) -> Self",
+      "doc": "The same, about a thing the statement named.\n\nWritten as a builder so a raise site reads as one expression and\nso that adding the subject to a site never reshapes the call it\nwas already making."
+    },
+    {
       "id": "zu::DiagnosticRecord::at",
       "kind": "method",
       "name": "at",
@@ -496,6 +512,14 @@
       "of": "zu::DiagnosticRecord",
       "signature": "Option<String>",
       "doc": "The whole line `position` is on, without its newline, so that\n`column` indexes into it. `None` when there is no position, when\nthe line is empty, and when it is longer than a person is going\nto read, which are the three cases where quoting it back helps\nnobody."
+    },
+    {
+      "id": "zu::DiagnosticRecord::graph",
+      "kind": "field",
+      "name": "graph",
+      "of": "zu::DiagnosticRecord",
+      "signature": "Option<String>",
+      "doc": "The graph the statement was running against, and the schema that\ngraph was reached through. Both are filled at the session\nboundary rather than at the raise site, because that is the one\nplace that knows them and there are two hundred raise sites."
     },
     {
       "id": "zu::DiagnosticRecord::in_source",
@@ -529,6 +553,13 @@
       "doc": "Whether running the statement again could succeed."
     },
     {
+      "id": "zu::DiagnosticRecord::schema",
+      "kind": "field",
+      "name": "schema",
+      "of": "zu::DiagnosticRecord",
+      "signature": "Option<String>"
+    },
+    {
       "id": "zu::DiagnosticRecord::severity",
       "kind": "method",
       "name": "severity",
@@ -541,6 +572,22 @@
       "name": "status",
       "of": "zu::DiagnosticRecord",
       "signature": "GqlStatus"
+    },
+    {
+      "id": "zu::DiagnosticRecord::subject",
+      "kind": "field",
+      "name": "subject",
+      "of": "zu::DiagnosticRecord",
+      "signature": "Option<Subject>",
+      "doc": "What the condition is about, where it is about something the\nstatement named. `None` for the conditions that are about no\nparticular thing: a division by zero is about an expression and\nan expression has no name."
+    },
+    {
+      "id": "zu::DiagnosticRecord::within",
+      "kind": "method",
+      "name": "within",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn within(&mut self, graph: &str, schema: &str)",
+      "doc": "Where the statement was running, filled in on the way out.\n\nIt does not overwrite: a condition raised about a graph other\nthan the working one has already said which, and the session\nsaying otherwise on the way past would be the session being\nwrong."
     },
     {
       "id": "zu::Direction",
@@ -1651,6 +1698,14 @@
       "doc": "Whether a join hands what it knows about its keys to the\noperators producing its probe side, the sideways pass of\nperf/13 §1."
     },
     {
+      "id": "zu::Options::status",
+      "kind": "field",
+      "name": "status",
+      "of": "zu::Options",
+      "signature": "Option<Value>",
+      "doc": "GA08. The GQL-status object the statement before this one in\nthis session ended with, as the record value\n[`crate::binder::STATUS_FN`] answers, and `None` for a session\nthat has run nothing yet.\n\nHere for the reason the clock is here: it is session state, one\nvalue for the length of a statement, and every path through the\nexecutor already carries the switches. The session builds it\nonce on the way in, so a scan of ten million rows reading it\nclones a record rather than formatting one."
+    },
+    {
       "id": "zu::Options::threads",
       "kind": "field",
       "name": "threads",
@@ -1665,6 +1720,14 @@
       "of": "zu::Options",
       "signature": "Wcoj",
       "doc": "How closing-edge probes reach the `MultiwayIntersect`, the\nWCOJ closing step of docs/07 §4."
+    },
+    {
+      "id": "zu::Options::zone",
+      "kind": "field",
+      "name": "zone",
+      "of": "zu::Options",
+      "signature": "i16",
+      "doc": "GS07 and GS15. The session time zone as minutes east of UTC,\nwhich is the displacement the clock read below is stamped with.\nNought is UTC, which is what a session opens in and what every\nrun that never set one keeps.\n\nA displacement and never a zone name: a name is a rule the zone\ndatabase can change, so a session set to one would answer one\nthing today and another after an upgrade, while a session set to\nan offset answers the offset for as long as it holds it."
     },
     {
       "id": "zu::PlanNode",
@@ -2064,6 +2127,14 @@
       "doc": "True when the statement kept its result. Warnings ride along with\nan answer; exceptions replace it."
     },
     {
+      "id": "zu::Severity::letter",
+      "kind": "method",
+      "name": "letter",
+      "of": "zu::Severity",
+      "signature": "const fn letter(self) -> &str",
+      "doc": "The one character ISO writes it as, which is what a status read\nas a value carries: a client that has to print or compare one\nshould not have to pick its own spelling of these five words."
+    },
+    {
       "id": "zu::Sink",
       "kind": "enum",
       "name": "Sink",
@@ -2287,6 +2358,14 @@
       "doc": "The duration from `from` to `to`, of the kind asked for, or\n`None` when the two are not two instants of one shape or the\nanswer leaves the calendar.\n\nThis is what `DURATION_BETWEEN` answers and what a minus\nbetween two instants answers, so the operator and the function\ncannot drift apart.\n\nThe two operands have to be the same shape. A date and a time\nhave no length between them, and a local datetime and a zoned\none have none either, because a local value names a wall clock\nand not an instant, so the length would depend on a zone nobody\nwrote.\n\nA day-time answer is a count of nanoseconds and needs no\ncalendar. A year-month answer is the largest count of whole\nmonths that does not carry `from` past `to`, which is stated\nagainst zu's own month addition rather than against a\ncomparison of day numbers. The two readings differ: 31 March to\n30 April is one month here, because 31 March plus one month is\n30 April and lands exactly on it, and is nought under a rule\nthat compares the days of the month first. Stating it against\nthe addition is what makes `from + DURATION_BETWEEN(from, to)`\nland at or before `to` and one month more overshoot, and a law\nthat holds is worth more than agreement with a rule that does\nnot.\n\nA backwards answer truncates toward nought the same way, so the\ntwo directions are not mirror images when a month is clipped."
     },
     {
+      "id": "zu::Temporal::from_parts",
+      "kind": "method",
+      "name": "from_parts",
+      "of": "zu::Temporal",
+      "signature": "fn from_parts(ty: &LogicalType, parts: &Parts) -> Option<Temporal>",
+      "doc": "The value a record constructor spells, or `None` where it\nspells none.\n\nThis is the second way ISO 20.27 and 20.29 write a temporal\nvalue: `DATE({year: 2024, month: 1, day: 1})` beside\n`DATE('2024-01-01')`. A field the record left out takes the\nleast value it has, so `DATE({year: 2024})` is the first of\nJanuary, which is what the standard's default for an omitted\n`<field>` comes to.\n\n`None` is the calendar refusing, not the record being malformed:\nthe names were checked before anything got here and what is\nleft is a thirteenth month or a thirty-first of February, which\nthe caller reports as 22G06."
+    },
+    {
       "id": "zu::Temporal::logical_type",
       "kind": "method",
       "name": "logical_type",
@@ -2406,6 +2485,14 @@
       "signature": "Unsupported { what: &str, id: u32 }"
     },
     {
+      "id": "zu::ZuError::about",
+      "kind": "method",
+      "name": "about",
+      "of": "zu::ZuError",
+      "signature": "fn about(self, subject: Subject) -> Self",
+      "doc": "The same error, about a thing the statement named.\n\nA builder rather than a fourth constructor, so that a raise site\nadds a subject without changing which of the three it went\nthrough. It does nothing to an engine-internal failure, which\nhas no record to put a subject on."
+    },
+    {
       "id": "zu::ZuError::diagnostic",
       "kind": "method",
       "name": "diagnostic",
@@ -2468,6 +2555,14 @@
       "of": "zu::ZuError",
       "signature": "fn retryable(&self) -> bool",
       "doc": "Whether running the same thing again could succeed, which is the\none question a caller writing a retry loop is asking.\n\nA lost compare-and-swap is the case: a concurrent writer got\nthere first, so the work was not applied and the same call on a\nfresh read may well win. A condition answers for itself, which\nis `40000 transaction rollback` and nothing else. Everything\nremaining is false, including an interruption, which is not the\nengine failing but the caller having asked it to stop."
+    },
+    {
+      "id": "zu::ZuError::subject",
+      "kind": "method",
+      "name": "subject",
+      "of": "zu::ZuError",
+      "signature": "fn subject(&self) -> Option<&Subject>",
+      "doc": "What the condition is about, when it is about something named."
     },
     {
       "id": "zu::append",
@@ -2842,6 +2937,14 @@
       "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
     },
     {
+      "id": "zu::db::Config::stale_bound",
+      "kind": "method",
+      "name": "stale_bound",
+      "of": "zu::db::Config",
+      "signature": "fn stale_bound(self, epochs: u64) -> Config",
+      "doc": "How many epochs a session parameter holding a binding table may\nfall behind before the statement after it carries a warning\nsaying so (plan/06 §2).\n\nA pin holds no blocks in zu, since a binding table parameter\nholds rows copied out of the snapshot rather than a reader into\nit, so this is not a knob against the store growing. It is how\nlong a caller wants to go without being told that what it is\nholding was read a while ago."
+    },
+    {
       "id": "zu::db::Config::threads",
       "kind": "method",
       "name": "threads",
@@ -3159,6 +3262,14 @@
       "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers.\n\n`excerpt` is the line that position falls on, kept because the\ncaller furthest from the statement is the one most likely to be\nshowing this to a person: a driver, a notebook cell, a log line. The\nengine has the text in hand when it raises the condition and the\ncaller may not have it at all by the time it prints one."
     },
     {
+      "id": "zu::gqlstatus::DiagnosticRecord::about",
+      "kind": "method",
+      "name": "about",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn about(self, subject: Subject) -> Self",
+      "doc": "The same, about a thing the statement named.\n\nWritten as a builder so a raise site reads as one expression and\nso that adding the subject to a site never reshapes the call it\nwas already making."
+    },
+    {
       "id": "zu::gqlstatus::DiagnosticRecord::at",
       "kind": "method",
       "name": "at",
@@ -3188,6 +3299,14 @@
       "of": "zu::gqlstatus::DiagnosticRecord",
       "signature": "Option<String>",
       "doc": "The whole line `position` is on, without its newline, so that\n`column` indexes into it. `None` when there is no position, when\nthe line is empty, and when it is longer than a person is going\nto read, which are the three cases where quoting it back helps\nnobody."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::graph",
+      "kind": "field",
+      "name": "graph",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "Option<String>",
+      "doc": "The graph the statement was running against, and the schema that\ngraph was reached through. Both are filled at the session\nboundary rather than at the raise site, because that is the one\nplace that knows them and there are two hundred raise sites."
     },
     {
       "id": "zu::gqlstatus::DiagnosticRecord::in_source",
@@ -3221,6 +3340,13 @@
       "doc": "Whether running the statement again could succeed."
     },
     {
+      "id": "zu::gqlstatus::DiagnosticRecord::schema",
+      "kind": "field",
+      "name": "schema",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "Option<String>"
+    },
+    {
       "id": "zu::gqlstatus::DiagnosticRecord::severity",
       "kind": "method",
       "name": "severity",
@@ -3233,6 +3359,22 @@
       "name": "status",
       "of": "zu::gqlstatus::DiagnosticRecord",
       "signature": "GqlStatus"
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::subject",
+      "kind": "field",
+      "name": "subject",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "Option<Subject>",
+      "doc": "What the condition is about, where it is about something the\nstatement named. `None` for the conditions that are about no\nparticular thing: a division by zero is about an expression and\nan expression has no name."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::within",
+      "kind": "method",
+      "name": "within",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn within(&mut self, graph: &str, schema: &str)",
+      "doc": "Where the statement was running, filled in on the way out.\n\nIt does not overwrite: a condition raised about a graph other\nthan the working one has already said which, and the session\nsaying otherwise on the way past would be the session being\nwrong."
     },
     {
       "id": "zu::gqlstatus::GqlStatus",
@@ -3391,6 +3533,92 @@
       "of": "zu::gqlstatus::Severity",
       "signature": "const fn is_success(self) -> bool",
       "doc": "True when the statement kept its result. Warnings ride along with\nan answer; exceptions replace it."
+    },
+    {
+      "id": "zu::gqlstatus::Severity::letter",
+      "kind": "method",
+      "name": "letter",
+      "of": "zu::gqlstatus::Severity",
+      "signature": "const fn letter(self) -> &str",
+      "doc": "The one character ISO writes it as, which is what a status read\nas a value carries: a client that has to print or compare one\nshould not have to pick its own spelling of these five words."
+    },
+    {
+      "id": "zu::gqlstatus::Subject",
+      "kind": "enum",
+      "name": "Subject",
+      "doc": "What a condition is about, when it is about something a statement\nnamed.\n\nISO 23.2 calls this the subject of the diagnostic record, and what it\nbuys is the difference between a message and a fact. `42002` says a\nname is not defined and the detail says which one in English; the\nsubject says which one in a field, so a client underlining the name,\na linter counting the labels a graph is missing, or a driver mapping\nthe condition onto its own exception type never has to read the\nsentence back.\n\nThe variants are the kinds of thing a GQL statement can name, and\nthere is deliberately no `Other(String)`: a condition about something\nwith no kind here has no subject, which is honest, where a catch-all\nwould be a second message field wearing the subject's name."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Function",
+      "kind": "variant",
+      "name": "Function",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Function(String)",
+      "doc": "A function or a procedure, by name."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Graph",
+      "kind": "variant",
+      "name": "Graph",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Graph(String)",
+      "doc": "A graph, by the name the statement reached it under."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Label",
+      "kind": "variant",
+      "name": "Label",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Label(String)",
+      "doc": "A label, which is what names a node type or an edge type."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Property",
+      "kind": "variant",
+      "name": "Property",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Property(String)",
+      "doc": "A property, by the name written after the dot or before the\ncolon."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Schema",
+      "kind": "variant",
+      "name": "Schema",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Schema(String)",
+      "doc": "A schema, by its path."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Type",
+      "kind": "variant",
+      "name": "Type",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Type(String)",
+      "doc": "A value type, spelled the way a statement would spell it."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::Variable",
+      "kind": "variant",
+      "name": "Variable",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "Variable(String)",
+      "doc": "A binding variable."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::kind",
+      "kind": "method",
+      "name": "kind",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "const fn kind(&self) -> &str",
+      "doc": "What kind of thing this is, in one word, for a caller rendering\nthe record rather than matching on it."
+    },
+    {
+      "id": "zu::gqlstatus::Subject::name",
+      "kind": "method",
+      "name": "name",
+      "of": "zu::gqlstatus::Subject",
+      "signature": "fn name(&self) -> &str",
+      "doc": "The name itself, without the kind."
     },
     {
       "id": "zu::gqlstatus::all",
@@ -5323,6 +5551,59 @@
       "doc": "A persistent query session over one zu1 file: the catalog, stats,\nand schema stay resident, compiled plans are cached by source text,\nand the graph readers keep their decoded groups warm across\nqueries. The one-shot entry points in [`crate::query`] pay the full\nopen-load-parse-plan cost on every call, which is fine for a CLI\ninvocation and hopeless for a server loop; a session pays it once\nand then a warm query is a hash lookup, parameter binding, and\nexecution.\n\nStaleness is a single u64 compare: every entry point checks the\nhandle's header epoch and reloads the catalog, stats, and plan\ncache when it moved. Reads through one session are serial (the\nunderlying handle seeks), so a session is Send but queries on it\ndo not overlap; open one session per thread."
     },
     {
+      "id": "zu::session::DEFAULT_STALE_BOUND",
+      "kind": "constant",
+      "name": "DEFAULT_STALE_BOUND",
+      "signature": "u64",
+      "doc": "How many epochs a held binding table may fall behind before the\nsession mentions it.\n\nAny number here is a judgement rather than a fact, and this one is\nthe judgement that a session which has fallen sixteen epochs behind\nis holding rows from before a fair amount of churn and would like to\nhear about it, where one or two epochs behind is what an ordinary\nbusy store does under a session that is doing nothing wrong."
+    },
+    {
+      "id": "zu::session::Pin",
+      "kind": "struct",
+      "name": "Pin",
+      "doc": "What one held reference parameter is pinned to (plan/06 §2).\n\nWorth being clear about what a pin is here and what it is not. It is\nan epoch number written on a handle, and it holds no blocks: a lease\nlives for a statement, and a binding table parameter holds rows that\nwere copied out of the snapshot rather than a reader into it. So a\nsession sitting on an old parameter does not stop a checkpoint from\nreusing anything and does not grow the store. What goes stale is the\nmeaning of the reference, not the space behind it, and that is what\nthis reports."
+    },
+    {
+      "id": "zu::session::Pin::epoch",
+      "kind": "field",
+      "name": "epoch",
+      "of": "zu::session::Pin",
+      "signature": "u64",
+      "doc": "The epoch the reference was taken at."
+    },
+    {
+      "id": "zu::session::Pin::kind",
+      "kind": "field",
+      "name": "kind",
+      "of": "zu::session::Pin",
+      "signature": "&str",
+      "doc": "`GRAPH` or `BINDING TABLE`, the word it was set with."
+    },
+    {
+      "id": "zu::session::Pin::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::session::Pin",
+      "signature": "String",
+      "doc": "The name the session holds it under, without the dollar."
+    },
+    {
+      "id": "zu::session::Pin::stale",
+      "kind": "field",
+      "name": "stale",
+      "of": "zu::session::Pin",
+      "signature": "Stale",
+      "doc": "Whether it still means what it meant."
+    },
+    {
+      "id": "zu::session::Pin::what",
+      "kind": "field",
+      "name": "what",
+      "of": "zu::session::Pin",
+      "signature": "String",
+      "doc": "What it names, as a line a person reads."
+    },
+    {
       "id": "zu::session::Session",
       "kind": "struct",
       "name": "Session"
@@ -5485,6 +5766,22 @@
       "doc": "The execution switches this session runs statements under."
     },
     {
+      "id": "zu::session::Session::pinned_epoch",
+      "kind": "method",
+      "name": "pinned_epoch",
+      "of": "zu::session::Session",
+      "signature": "fn pinned_epoch(&self) -> Option<u64>",
+      "doc": "The oldest epoch any held parameter is pinned to, which is the\none number a caller watching a long-lived session wants."
+    },
+    {
+      "id": "zu::session::Session::pins",
+      "kind": "method",
+      "name": "pins",
+      "of": "zu::session::Session",
+      "signature": "fn pins(&self) -> Vec<Pin>",
+      "doc": "What the reference parameters this session holds are pinned to,\nin name order, one entry per parameter holding a graph or a\nbinding table (GS01, GS02, GS10 and GS13).\n\nA value parameter is not here because it pins nothing: a number\nis a number at every epoch. The two reference kinds each carry\nthe epoch they were taken at, and that is the pin."
+    },
+    {
       "id": "zu::session::Session::prepare",
       "kind": "method",
       "name": "prepare",
@@ -5533,12 +5830,44 @@
       "doc": "Runs one query and hands its rows to `sink` in batches as they\nare made, instead of returning them.\n\nA statement that has to see every row before it can give one,\nwhich is ORDER BY, DISTINCT and the aggregates, runs whole and is\nhanded over in batches afterwards, and so does a statement that\nwrites, because a write runs as the parts it was split into and\nthe rows come out of the last of them. Which happened is in\n[`Streamed::streamed`], and the caller's loop is the same either\nway."
     },
     {
+      "id": "zu::session::Session::session_params",
+      "kind": "method",
+      "name": "session_params",
+      "of": "zu::session::Session",
+      "signature": "fn session_params(&self) -> Vec<(&str, &str, &Value)>",
+      "doc": "The parameters this session is holding, each as its name, the\nword it was set with, and the value it holds, in name order\n(GS01 through GS03).\n\nA statement cannot ask this: `$p` answers what `$p` holds, and\nthere is no expression that answers what a session holds under\nevery name. So a shell that prints them and a test that says\nwhat a reset took away both come here."
+    },
+    {
+      "id": "zu::session::Session::session_schema",
+      "kind": "method",
+      "name": "session_schema",
+      "of": "zu::session::Session",
+      "signature": "fn session_schema(&self) -> &str",
+      "doc": "The catalog schema this session works in (GS05), which is the\nroot until a `SESSION SET SCHEMA` moves it."
+    },
+    {
       "id": "zu::session::Session::set_options",
       "kind": "method",
       "name": "set_options",
       "of": "zu::session::Session",
       "signature": "fn set_options(&mut self, options: exec::Options)",
-      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement."
+      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement.\n\nSo does the time zone, for the same reason and a stronger one:\nit is a session characteristic a statement set (GS15), not a\nswitch a caller configured, and a thread count arriving from\n[`crate::db::Config`] has nothing to say about what time it is.\n\nAnd so does the status of the last statement, for that same\nreason. It is what the statement before this one ended with, so\nchanging a switch between two statements must not be able to\nanswer the second one with a blank where the first one's\ncondition was."
+    },
+    {
+      "id": "zu::session::Session::set_stale_bound",
+      "kind": "method",
+      "name": "set_stale_bound",
+      "of": "zu::session::Session",
+      "signature": "fn set_stale_bound(&mut self, epochs: u64)",
+      "doc": "How many epochs a held binding table may fall behind before the\nsession says so on the statement after it. The default is\n[`DEFAULT_STALE_BOUND`]."
+    },
+    {
+      "id": "zu::session::Session::time_zone",
+      "kind": "method",
+      "name": "time_zone",
+      "of": "zu::session::Session",
+      "signature": "fn time_zone(&self) -> i16",
+      "doc": "The session time zone as minutes east of UTC (GS07 and GS15),\nnought being the UTC a session opens in."
     },
     {
       "id": "zu::session::Session::unregister_frame",
@@ -5557,6 +5886,14 @@
       "doc": "Makes sure a statement is compiled and cached, and reports\nwhether it already was. A server preloads its statement set\nwith this at startup; the P0 plan-hit gate times the `true`\npath, which is exactly the work between receiving a known\nquery text and starting execution: the epoch check and the\ncache lookup."
     },
     {
+      "id": "zu::session::Session::working_graph",
+      "kind": "method",
+      "name": "working_graph",
+      "of": "zu::session::Session",
+      "signature": "fn working_graph(&self) -> u32",
+      "doc": "The id of the graph a statement on this session runs against\nwhen it carries no `USE` (GS06)."
+    },
+    {
       "id": "zu::session::Session::working_graph_ref",
       "kind": "method",
       "name": "working_graph_ref",
@@ -5571,6 +5908,36 @@
       "of": "zu::session::Session",
       "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<T>",
       "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes.\n\nThe frames go to the log here and the wait for the platter does\nnot: it happens in [`Self::durable`], after the write side has\ngone back, so the writer queued behind this one stages into the\nsame sync rather than after it. What that costs is that the\nstate has to be held back too, because a reader shown a commit\na crash could take away is the one thing the deferral must not\nbuy."
+    },
+    {
+      "id": "zu::session::Stale",
+      "kind": "enum",
+      "name": "Stale",
+      "doc": "What has happened to what a held reference parameter names, which is\nwhat decides whether the session says anything about it."
+    },
+    {
+      "id": "zu::session::Stale::Fresh",
+      "kind": "variant",
+      "name": "Fresh",
+      "of": "zu::session::Stale",
+      "signature": "Fresh",
+      "doc": "The reference still means what it meant."
+    },
+    {
+      "id": "zu::session::Stale::Gone",
+      "kind": "variant",
+      "name": "Gone",
+      "of": "zu::session::Stale",
+      "signature": "Gone",
+      "doc": "A statement reading it will be refused: the graph is dropped, or\nthe rows name elements of a snapshot that has moved."
+    },
+    {
+      "id": "zu::session::Stale::Old",
+      "kind": "variant",
+      "name": "Old",
+      "of": "zu::session::Stale",
+      "signature": "Old",
+      "doc": "Behind the bound but still usable: the rows hold no element\nreferences, so what they say is as true now as it was."
     },
     {
       "id": "zu::shared",
@@ -5638,7 +6005,7 @@
       "name": "put",
       "of": "zu::shared::FileHandle",
       "signature": "fn put(&self, side: WriteSide)",
-      "doc": "Gives the write side back and serves the next ticket."
+      "doc": "Gives the write side back, to the writer at the front of the line\nif anyone is waiting."
     },
     {
       "id": "zu::shared::FileHandle::reader",
@@ -9455,11 +9822,20 @@
       "signature": "fn is_empty(&self) -> bool"
     },
     {
-      "id": "zu::zu1::props::CellPatch::new",
+      "id": "zu::zu1::props::CellPatch::set",
       "kind": "method",
-      "name": "new",
+      "name": "set",
       "of": "zu::zu1::props::CellPatch",
-      "signature": "fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>, strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>) -> Self"
+      "signature": "fn set(&mut self, col: usize, row: u64, word: u64)",
+      "doc": "Writes `word` onto row `row` of lane column `col`.\n\nA row written twice before a fold is in here once, holding what\nthe later of the two commits left, which is why this answers\nwith nothing: there is no history to keep, only the value a read\ngets now."
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::set_bytes",
+      "kind": "method",
+      "name": "set_bytes",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn set_bytes(&mut self, col: usize, row: u64, value: Vec<u8>)",
+      "doc": "The same for a blob column, where what the row held also has to\ncome off the byte count the writer bounds."
     },
     {
       "id": "zu::zu1::props::EdgesWithProps",
@@ -10006,8 +10382,7 @@
     {
       "id": "zu::zu1::props::RowPatch",
       "kind": "struct",
-      "name": "RowPatch",
-      "doc": "The rows a commit added that no fold has put in the columns yet.\n\n[`CellPatch`] carries a new value for a row the columns already hold,\nwhich is an update. This carries whole rows past the end of them,\nwhich is what an edge insert leaves behind once the adjacency reader\nstopped needing the CSR rebuilt to see it: the edge takes the next\nordinal, its property values sit here under that ordinal, and a\ngather asking for it reads them from here rather than off a column\nthat has not been rewritten.\n\nAny value at all, unlike the lane patch, because these rows are not\nstored anywhere yet and there is nothing to lay a word over: a\nstring is the bytes and an absent value is [`Cell::Null`]."
+      "name": "RowPatch"
     },
     {
       "id": "zu::zu1::props::RowPatch::base",
@@ -10045,8 +10420,8 @@
       "kind": "method",
       "name": "new",
       "of": "zu::zu1::props::RowPatch",
-      "signature": "fn new(base: u64) -> Self",
-      "doc": "An empty patch over columns holding `base` rows."
+      "signature": "fn new(base: u64, key: Option<usize>) -> Self",
+      "doc": "An empty patch over columns holding `base` rows, where `key` is\nthe column a key lookup will ask about if the table has one."
     },
     {
       "id": "zu::zu1::props::RowPatch::push",
@@ -10062,7 +10437,7 @@
       "name": "row_with",
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn row_with(&self, col: usize, word: u64) -> Option<u64>",
-      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column. The walk is over the rows a handful of commits\nadded rather than over the table, and it is bounded by what the\nwriter lets the patch grow to."
+      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column.\n\nThe sealed chunks answer out of the index each of them built as\nit was sealed, and the chunk being filled is walked, so what a\nlookup costs is a probe per sealed chunk and a walk of at most\n[`PATCH_CHUNK`] rows. Asked about any other column it walks the\nwhole run, which is what it used to do for every column and is\nwhat the fold's own index is for."
     },
     {
       "id": "zu::zu1::props::list_elements",

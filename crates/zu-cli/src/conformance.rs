@@ -24,6 +24,7 @@
 
 use std::process::ExitCode;
 
+use zu::zu1::catalog::{MAX_LABELS, MAX_PROPERTIES};
 use zu_json::{self as json, Json};
 
 /// One capability zu declares, with the reason attached.
@@ -150,6 +151,77 @@ const ENGINE: &[Declared] = &[
         key: "isolated",
         supported: true,
         why: "a reset is a statement on the running session, so a case starts on a graph the case before it did not write to",
+    },
+];
+
+/// One implementation-defined limit zu declares a finite value for.
+///
+/// Sixteen of the standard's sixty-eight conditions exist only because
+/// an implementation declares a limit. An engine with no maximum on
+/// node properties can never raise 22G0S, and a harness asking for
+/// sixty-four properties is asking a question with two correct
+/// answers, so the number has to come from the engine rather than from
+/// the test. This is where it comes from: the item's code in ISO
+/// 24.5.2, which kind of element it is the limit of, and the largest a
+/// statement may ask for.
+///
+/// A limit that is not in here is one zu declares no finite value for,
+/// and a harness reading this must treat the absence as an absence
+/// rather than as a zero.
+struct Limit {
+    /// The item's code in ISO 24.5.2.
+    item: &'static str,
+    /// Which kind of graph element the value is for, because the items
+    /// that matter here are all written "for each kind of graph
+    /// element" and one number would be answering half the question.
+    kind: &'static str,
+    /// The largest a statement may ask for. One more than this raises
+    /// the condition the standard gives that limit.
+    max: usize,
+    why: &'static str,
+}
+
+/// The limits zu declares, which are the storage's own numbers rather
+/// than a set picked to make conditions reachable. A label set is the
+/// bits of one word, an element holds the columns its table declares,
+/// and a key label set is one label short of the word for the same
+/// reason the label set is the word.
+const LIMITS: &[Limit] = &[
+    Limit {
+        item: "IL001",
+        kind: "node",
+        max: MAX_LABELS,
+        why: "a node's labels are the bits of one word, so the dictionary and the node are the same 64 wide",
+    },
+    Limit {
+        item: "IL001",
+        kind: "edge",
+        max: 1,
+        why: "an edge is stored under the one type its rel table is named by, so its label set holds one label",
+    },
+    Limit {
+        item: "IL002",
+        kind: "node",
+        max: MAX_PROPERTIES,
+        why: "a node holds the property columns its table declares, and a table is 4096 columns wide",
+    },
+    Limit {
+        item: "IL002",
+        kind: "edge",
+        max: MAX_PROPERTIES,
+        why: "an edge holds the property columns its rel table declares, under the same width",
+    },
+    Limit {
+        item: "IL003",
+        kind: "node",
+        max: 63,
+        why: "a key label set has to leave room in the word for whatever the pattern around it adds, so it is one short of the label set that has to contain it",
+    },
+    Limit {
+        item: "IL003",
+        kind: "edge",
+        max: 63,
+        why: "an edge type's key label set is bounded by the same word, for the same reason",
     },
 ];
 
@@ -404,6 +476,24 @@ const NOTES: &[&str] = &[
      both refused by name rather than reading what the row used to hold",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
+    "six of the standard's conditions are ones no statement reaches here, and none of the six \
+     is a gap a case could close. 22G04 says two values are not comparable, and zu supports \
+     GA04, so every pair of values has an order and an engine whose x < y said unknown while \
+     its ORDER BY x put x first would have two orders and be wrong in one of them. 22G13 says \
+     a group variable stood where one value belongs, and zu supports GQ17, so a property read \
+     off a group is the list of that property over the group. 25G02 says catalog and data \
+     statements do not mix in one transaction, and they do here, under GP18. 25G04 says two \
+     graphs do not, and they do, under GT03. 08007 needs the connection to die between a \
+     commit and its answer, and 40003 needs a rollback after which the engine cannot say \
+     whether a statement completed, and both are states reached by losing track of work \
+     rather than by anything a statement said",
+    "two implementation-defined items zu declares no value for, which is the whole reason the \
+     conditions hanging off them are unreachable rather than untested: IL015, the maximum \
+     cardinality of a constructed value, because a path or a list built by a query is bounded \
+     by the row it is built for and not by a number worth publishing, so 22G10 has no length \
+     to exceed; and IW014, the test for visually confusable identifiers, which zu does not \
+     apply, so no two identifiers it reads are confusable and 42004 has nothing to raise on. \
+     Both answers are conformant and both are choices rather than omissions",
 ];
 
 /// Renders the declaration as TOML.
@@ -435,6 +525,18 @@ pub(crate) fn render() -> String {
     out.push_str("\n# What the session and the wire protocol can do.\n[capabilities]\n");
     for d in ENGINE {
         out.push_str(&format!("{} = {}  # {}\n", d.key, d.supported, d.why));
+    }
+    out.push_str(
+        "\n# The implementation-defined limits of ISO 24.5.2 that zu declares a\n\
+         # finite value for, as the largest a statement may ask for. An item\n\
+         # that is not here is one zu sets no maximum on, and a reader must\n\
+         # take the absence for an absence rather than for a zero.\n[limits]\n",
+    );
+    for l in LIMITS {
+        out.push_str(&format!(
+            "\"{}/{}\" = {}  # {}\n",
+            l.item, l.kind, l.max, l.why
+        ));
     }
     out.push_str("\n# Printed verbatim beside zu's numbers in the report.\nnotes = [\n");
     for n in NOTES {
@@ -498,6 +600,30 @@ fn verify_report(report: &Json) -> Vec<String> {
             )),
             _ => problems.push(format!(
                 "capability {key}: zu declares {declared} and the harness reported nothing at all"
+            )),
+        }
+    }
+
+    // A limit drifts the same way a capability does and is worse when
+    // it drifts, because a harness sizing a statement from a stale
+    // number does not fail: it sends a statement under the real limit
+    // and records that the condition was not reachable.
+    let limits = caps.get("Limits");
+    for l in LIMITS {
+        let key = format!("{}/{}", l.item, l.kind);
+        match limits
+            .and_then(|m| m.get(&key))
+            .and_then(Json::as_u64)
+            .map(|n| n as usize)
+        {
+            Some(reported) if reported == l.max => {}
+            Some(reported) => problems.push(format!(
+                "limit {key}: zu declares {} but the harness reported {reported}",
+                l.max
+            )),
+            None => problems.push(format!(
+                "limit {key}: zu declares {} and the harness reported nothing at all",
+                l.max
             )),
         }
     }
@@ -617,6 +743,13 @@ fn render_json() -> String {
         }
         out.push_str(&format!("\"{}\":{}", d.key, d.supported));
     }
+    out.push_str("},\"limits\":{");
+    for (i, l) in LIMITS.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"{}/{}\":{}", l.item, l.kind, l.max));
+    }
     out.push_str("},\"notes\":[");
     for (i, n) in NOTES.iter().enumerate() {
         if i > 0 {
@@ -646,6 +779,20 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
                 }
                 _ => crate::usage_error("conformance"),
             },
+            _ => crate::usage_error("conformance"),
+        },
+        // The Clause 24.5.2 register, which is the other half of what a
+        // conformance statement has to say: `--declare` says what zu
+        // supports and this says what zu chose where the standard left
+        // the choice open.
+        Some("--implementation-defined") if args.len() == 1 => {
+            print!("{}", crate::impdef::render());
+            ExitCode::SUCCESS
+        }
+        // The Clause 24 claim itself, rendered from a tally rather than
+        // written, so no line of it can outrun the run behind it.
+        Some("--statement") => match args.get(1) {
+            Some(path) if args.len() == 2 => crate::statement::statement_command(path),
             _ => crate::usage_error("conformance"),
         },
         Some("--verify") => match args.get(1) {
@@ -711,6 +858,56 @@ mod tests {
                 d.supported
             );
         }
+        for l in LIMITS {
+            assert!(
+                !l.why.trim().is_empty(),
+                "{}/{} declares {} with no reason",
+                l.item,
+                l.kind,
+                l.max
+            );
+        }
+    }
+
+    /// A limit is only worth declaring if it is the number the engine
+    /// actually enforces. The two that live in a constant are read from
+    /// it; the key label set is a number the parser holds privately, so
+    /// it is written here and asserted against the message the parser
+    /// produces in its own tests.
+    #[test]
+    fn the_declared_limits_are_the_engines_own_numbers() {
+        let of = |item: &str, kind: &str| {
+            LIMITS
+                .iter()
+                .find(|l| l.item == item && l.kind == kind)
+                .unwrap_or_else(|| panic!("{item}/{kind} is declared"))
+                .max
+        };
+        assert_eq!(of("IL001", "node"), MAX_LABELS);
+        assert_eq!(of("IL001", "edge"), 1);
+        assert_eq!(of("IL002", "node"), MAX_PROPERTIES);
+        assert_eq!(of("IL002", "edge"), MAX_PROPERTIES);
+        assert_eq!(of("IL003", "node"), MAX_LABELS - 1);
+        assert_eq!(of("IL003", "edge"), MAX_LABELS - 1);
+    }
+
+    /// Every item zu declares a value for is one of ISO 24.5.2's, and
+    /// no kind is invented either: a harness keys on both halves, and a
+    /// typo in one of them reads as an engine that declares nothing.
+    #[test]
+    fn the_limits_name_items_and_kinds_the_standard_has() {
+        for l in LIMITS {
+            assert!(
+                matches!(l.item, "IL001" | "IL002" | "IL003"),
+                "{} is not an implementation-defined item this engine declares",
+                l.item
+            );
+            assert!(
+                matches!(l.kind, "node" | "edge"),
+                "{} is not a kind of graph element",
+                l.kind
+            );
+        }
     }
 
     #[test]
@@ -722,6 +919,7 @@ mod tests {
             .iter()
             .chain(ENGINE)
             .flat_map(|d| [d.key, d.why])
+            .chain(LIMITS.iter().flat_map(|l| [l.item, l.kind, l.why]))
             .chain(NOTES.iter().copied());
         for s in all {
             assert!(
@@ -776,6 +974,34 @@ mod tests {
         assert!(toml.contains(
             "float-values = true  # float columns ride the fixed width lane as their IEEE bits"
         ));
+        // A limit is a number and a reason on one line, under a key
+        // naming the item and the kind of element, because ISO writes
+        // these items per kind and one number would answer half.
+        assert!(toml.contains("[limits]"));
+        assert!(
+            toml.contains("\"IL002/node\" = 4096  # a node holds"),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("\"IL001/edge\" = 1  # an edge is stored"),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn the_rendered_json_carries_the_limits_a_harness_sizes_from() {
+        let text = render_json();
+        let json = json::parse(&text).expect("the declaration is JSON");
+        let limits = json.get("limits").expect("a limits object");
+        assert_eq!(
+            limits.get("IL002/node").and_then(Json::as_u64),
+            Some(MAX_PROPERTIES as u64)
+        );
+        assert_eq!(limits.get("IL001/edge").and_then(Json::as_u64), Some(1));
+        // An item with no finite value is absent rather than zero: a
+        // harness that read a zero would send an empty statement and
+        // call the condition unreachable.
+        assert!(limits.get("IL015/path").is_none());
     }
 
     #[test]

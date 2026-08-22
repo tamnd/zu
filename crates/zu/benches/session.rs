@@ -14,6 +14,12 @@
 //! between receiving a known query and starting execution.
 //! session_point_us gates the full warm point read: plan hit,
 //! parameter bind, key lookup, one-hop count, result row out.
+//! session_point_held_us gates the same read on a session that is
+//! holding session parameters, which is the G8 question: a session
+//! that has set something is a session that has to fold what it holds
+//! into what the caller passed on every statement, and the gate is
+//! there so that cost stays a fold over a small map rather than
+//! becoming a per statement allocation nobody measured.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench session
 
@@ -117,6 +123,48 @@ fn run_session_point(path: &std::path::Path, degree: &[i64]) -> f64 {
     lat[lat.len() / 2] as f64 / 1e3
 }
 
+/// The same point read on a session holding three session parameters,
+/// one of each kind (G8, GS01 through GS03).
+///
+/// Nothing the query reads comes from them. That is the point: what
+/// is being measured is what a statement pays for a session having
+/// state at all, which is the fold of the held map over the passed
+/// list and the reference check that goes with it.
+fn run_session_point_held(path: &std::path::Path, degree: &[i64]) -> f64 {
+    let mut session = Session::open(path).expect("open");
+    session
+        .run("SESSION SET VALUE $cut = 35", &[])
+        .expect("a value parameter");
+    session
+        .run(
+            "SESSION SET PROPERTY GRAPH $g = CURRENT_PROPERTY_GRAPH",
+            &[],
+        )
+        .expect("a graph parameter");
+    session
+        .run("SESSION SET BINDING TABLE $t = { RETURN 1 AS one }", &[])
+        .expect("a binding table parameter");
+    let mut rng = 0xbeefu64;
+    for _ in 0..100 {
+        let src = (xorshift(&mut rng) % u64::from(NODES)) as i64;
+        session
+            .run(POINT_Q, &[("src", Value::Int(src))])
+            .expect("warmup");
+    }
+    let mut lat: Vec<u64> = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let src = (xorshift(&mut rng) % u64::from(NODES)) as i64;
+        let start = Instant::now();
+        let r = session
+            .run(POINT_Q, &[("src", Value::Int(src))])
+            .expect("point");
+        lat.push(start.elapsed().as_nanos() as u64);
+        assert_eq!(count_of(&r), degree[src as usize], "src {src}");
+    }
+    lat.sort_unstable();
+    lat[lat.len() / 2] as f64 / 1e3
+}
+
 /// The same point read through the one-shot path a bare `zu query`
 /// pays: open, load catalog and stats, parse, plan, run. Printed for
 /// contrast, not gated; the CLI's spawn cost is not even included.
@@ -147,6 +195,12 @@ fn main() {
     println!("plan cache hit: p50 {plan_hit_us:.2} us over 10000 warm hits");
     let point_us = run_session_point(&path, &degree);
     println!("session point read: p50 {point_us:.2} us over 10000 warm reads");
+    let held_us = run_session_point_held(&path, &degree);
+    println!(
+        "session point read holding three parameters: p50 {held_us:.2} us, \
+         {over:+.2} us over the empty session",
+        over = held_us - point_us
+    );
     let one_shot_us = run_one_shot_point(&path, &degree);
     println!(
         "one-shot point read (open+plan+run, no spawn): p50 {one_shot_us:.2} us, \
@@ -165,6 +219,12 @@ fn main() {
         && point_us > ceiling
     {
         println!("GATE FAIL session point read: p50 {point_us:.2} us > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("session_point_held_us")
+        && held_us > ceiling
+    {
+        println!("GATE FAIL held session point read: p50 {held_us:.2} us > ceiling {ceiling}");
         failed = true;
     }
     if gate && failed {

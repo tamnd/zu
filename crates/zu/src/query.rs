@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{IdMap, Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, DeletedRows, Graph};
@@ -166,7 +166,13 @@ pub fn check(source: &str) -> Result<()> {
 /// graph reference this binds ever reaches a caller.
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
+    let graph = graph_of(
+        catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        &[],
+    )?;
     binder::bind(&parsed, &schema_of_graph(catalog, graph, 0)?)
 }
 
@@ -174,7 +180,13 @@ pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
 /// EXPLAIN listing of the plan that would execute.
 pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
+    let graph = graph_of(
+        catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        &[],
+    )?;
     let schema = schema_of_graph(catalog, graph, 0)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
@@ -938,18 +950,47 @@ impl Graph for Zu1Graph<'_> {
             }
             reader.lookup_key(db, key)?
         };
-        let row = match found {
-            Some(row) => row,
-            None => match self.appended_key(table, key)? {
-                Some(row) => row,
-                None => return Ok(None),
-            },
-        };
         // A fold takes the key of a deleted row out of the index as it
         // rebuilds the table, so a key lookup after one answers nothing.
         // An unfolded delete has not rebuilt anything, and the tombstone
         // is what says the row is gone either way.
+        if let Some(row) = found
+            && !self.ensure_gone()?.holds(table, row)
+        {
+            return Ok(Some(row));
+        }
+        // Gone is not the end of the question. The row the index names
+        // being gone leaves the key free, and a commit since then is
+        // free to have taken it, so a delete and an insert of the same
+        // key between two folds land here: the index still names the
+        // row that went, and the row that holds the key now is in the
+        // patch, exactly where a key the index never held would be.
+        let Some(row) = self.appended_key(table, key)? else {
+            return Ok(None);
+        };
         Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
+    }
+
+    fn keyed(&mut self, table: u32) -> Result<bool> {
+        // Asked the way [`Self::lookup_key`] asks it, because it is the
+        // same question one step earlier: a frame has no index over it,
+        // a table no rel table leaves keeps the dense contract, and
+        // otherwise the group directory of a rel table over these rows
+        // is where the index lives.
+        if self.frames.get(table).is_some() {
+            return Ok(false);
+        }
+        let Some(rel) = self
+            .catalog
+            .rel_tables()
+            .iter()
+            .find(|r| r.from == table)
+            .map(|r| r.id)
+        else {
+            return Ok(false);
+        };
+        self.ensure_reader(rel)?;
+        Ok(self.readers[&rel].directory().keys.is_some())
     }
 
     fn appended(&mut self, table: u32) -> Result<u64> {
@@ -1199,16 +1240,43 @@ pub(crate) fn schema_with_stats(db: &mut Zu1File, catalog: &Catalog, graph: u32)
 ///
 /// The parameters are here because `USE $g` names its graph with one,
 /// and that is the one form whose answer is not in the text.
+///
+/// `schema` is the catalog schema the statement was sent in, which is
+/// the root until a `SESSION SET SCHEMA` moves it (GS05): a `USE` that
+/// names a graph and no path is looked up there.
 pub(crate) fn graph_of(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     query: &zu_query::ast::Query,
     params: &[(&str, Value)],
 ) -> Result<u32> {
     let Some(named) = &query.use_graph else {
-        return Ok(working);
+        return working_graph(catalog, working);
     };
-    graph_of_ref(catalog, working, named, &query.bindings, params)
+    graph_of_ref(catalog, schema, working, named, &query.bindings, params)
+}
+
+/// The graph the session is working in, or `42002` when it has been
+/// dropped since the session moved into it.
+///
+/// A working graph is a reference and not a name, so the only way it
+/// stops meaning something is somebody dropping the graph, and this is
+/// where that is said. It costs a catalog lookup per compile and
+/// nothing per execution: a drop moves the epoch, an epoch empties the
+/// plan cache, and a statement answered out of the cache is therefore
+/// one whose graph was there when the plan was made and has not been
+/// dropped since.
+fn working_graph(catalog: &Catalog, working: u32) -> Result<u32> {
+    if catalog.graph_by_id(working).is_none() {
+        return Err(ZuError::gql(
+            codes::C42002,
+            "the graph this session is working in has been dropped, so a statement that names \
+             no graph names nothing: SESSION RESET PROPERTY GRAPH goes back to the home graph"
+                .to_string(),
+        ));
+    }
+    Ok(working)
 }
 
 /// The graph one reference names, which is the body of [`graph_of`]
@@ -1219,8 +1287,9 @@ pub(crate) fn graph_of(
 /// they are what a name is looked up in before the catalog is: a
 /// definition is a name the statement itself gave, so it stands in
 /// front of a graph the catalog happens to hold under that name.
-fn graph_of_ref(
+pub(crate) fn graph_of_ref(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     named: &zu_query::ast::GraphRef,
     bindings: &[zu_query::ast::BindingDef],
@@ -1228,12 +1297,12 @@ fn graph_of_ref(
 ) -> Result<u32> {
     use zu_query::ast::GraphRef;
     match named {
-        GraphRef::Current => Ok(working),
+        GraphRef::Current => working_graph(catalog, working),
         GraphRef::Home => Ok(catalog.home_graph_id()),
         GraphRef::Named(name) if name.schema.is_none() => {
             match graph_variable(bindings, &name.name) {
-                Some(upto) => graph_of_variable(catalog, working, upto, params),
-                None => graph_of_name(catalog, "/", &name.name),
+                Some(upto) => graph_of_variable(catalog, schema, working, upto, params),
+                None => graph_of_name(catalog, schema, &name.name),
             }
         }
         GraphRef::Named(name) => {
@@ -1248,8 +1317,9 @@ fn graph_of_name(catalog: &Catalog, schema: &str, name: &str) -> Result<u32> {
     catalog.graph(schema, name).map(|g| g.id).ok_or_else(|| {
         ZuError::gql(
             codes::C42002,
-            format!("USE names '{name}', which is no graph in '{schema}'"),
+            format!("'{name}' is no graph in the schema '{schema}'"),
         )
+        .about(Subject::Graph(name.to_string()))
     })
 }
 
@@ -1284,13 +1354,14 @@ fn graph_variable<'a>(
 /// against one graph and running it against another.
 fn graph_of_variable(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     upto: &[zu_query::ast::BindingDef],
     params: &[(&str, Value)],
 ) -> Result<u32> {
     let (def, above) = upto.split_last().expect("a definition was found");
     if let Some(named) = def.init.graph_ref() {
-        return graph_of_ref(catalog, working, named, above, params);
+        return graph_of_ref(catalog, schema, working, named, above, params);
     }
     match &def.init {
         zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::Param(name)) => {
@@ -1323,7 +1394,8 @@ pub(crate) fn graph_of_param(
         return Err(ZuError::gql(
             codes::C42002,
             format!("USE names ${name}, and no parameter of that name was given"),
-        ));
+        )
+        .about(Subject::Variable(name.to_string())));
     };
     let Value::Graph(handle) = value else {
         return Err(ZuError::gql(
@@ -1332,7 +1404,8 @@ pub(crate) fn graph_of_param(
                 "USE ${name} names a graph, so ${name} has to be a graph reference and not {}: take one with Session::graph_ref",
                 crate::insert::describe(value)
             ),
-        ));
+        )
+        .about(Subject::Variable(name.to_string())));
     };
     match catalog.graph(&handle.schema, &handle.name) {
         Some(graph) if graph.id == handle.id => Ok(handle.id),
@@ -1342,7 +1415,8 @@ pub(crate) fn graph_of_param(
                 "USE ${name} names {}, which is no longer the graph the reference was taken on",
                 handle.label()
             ),
-        )),
+        )
+        .about(Subject::Graph(handle.label()))),
     }
 }
 
@@ -1354,8 +1428,9 @@ pub(crate) fn graph_of_param(
 pub(crate) fn compile_parsed(
     parsed: &zu_query::ast::Query,
     schema: &Schema,
+    session_schema: &str,
 ) -> Result<(BoundQuery, plan::LogicalPlan, Vec<String>)> {
-    let query = binder::bind(parsed, schema)?;
+    let query = binder::bind_in(parsed, schema, session_schema)?;
     let built = plan::build(&query)?;
     let (plan, notes) = optimizer::optimize_noted(built, &query, schema)?;
     Ok((query, plan, notes))
@@ -1382,10 +1457,10 @@ pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Ve
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {
-                return Err(ZuError::gql(
-                    codes::C42002,
-                    format!("missing parameter ${name}"),
-                ));
+                return Err(
+                    ZuError::gql(codes::C42002, format!("missing parameter ${name}"))
+                        .about(Subject::Variable(name.to_string())),
+                );
             }
         }
     }
@@ -1402,6 +1477,10 @@ pub(crate) enum NotAQuery {
     /// GP18. Several statements chained by `NEXT`, one of which changes
     /// the catalog, each carried as its own text.
     Block(Vec<String>),
+    /// GS01 through GS16. One that changes the session it was sent on:
+    /// a parameter it holds, the schema or the graph it works in, or
+    /// the time zone it reads a clock in.
+    Session(zu_query::ast::SessionStmt),
 }
 
 /// What this source is when it is not a query, `None` when it is one.
@@ -1414,6 +1493,7 @@ pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
         zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
         zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
         zu_query::ast::Statement::Block(parts) => Ok(Some(NotAQuery::Block(parts))),
+        zu_query::ast::Statement::Session(stmt) => Ok(Some(NotAQuery::Session(stmt))),
         zu_query::ast::Statement::Query(_) => Ok(None),
     }
 }
@@ -1423,9 +1503,15 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     let parsed = parser::parse(source)?;
     // A one-shot call has no session, so the graph it works in is the
     // home graph and a `USE` is the only way to name another one.
-    let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed, params)?;
+    let graph = graph_of(
+        &catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        params,
+    )?;
     let schema = schema_with_stats(db, &catalog, graph)?;
-    let (query, plan, notes) = compile_parsed(&parsed, &schema)?;
+    let (query, plan, notes) = compile_parsed(&parsed, &schema, zu_query::procedures::ROOT)?;
     // A write needs the log and the overlay a session owns, and this
     // entry point has neither: it was given a file handle and it hands
     // it back. Saying so here is better than compiling a plan whose
@@ -1504,6 +1590,14 @@ pub fn run_with(
                 "a statement block runs its parts as one transaction, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
+        // A session statement changes the session the statements after
+        // it run in, and this entry point has none: what it changed
+        // would go away with the call that changed it.
+        Some(NotAQuery::Session(_)) => {
+            return Err(ZuError::InvalidArgument(
+                "a session statement changes what the statements after it run in, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
+            ));
+        }
         None => {}
     }
     let p = prepare(source, db, params)?;
@@ -1511,7 +1605,7 @@ pub fn run_with(
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a
     // read gets this far: a write was refused while it was prepared.
-    if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
+    if let Some(parts) = crate::split::split(&p.query, &p.schema, zu_query::procedures::ROOT)? {
         return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
             read_one(plan, query, &p.schema, db, &p.catalog, args, options)
         });
@@ -1769,7 +1863,7 @@ mod tests {
             .sum();
         let r = run(
             "MATCH (a:person {id: $src})-[:follows]->(b)-[:follows]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &mut db,
             &[("src", Value::Int(i64::from(src)))],
         )
@@ -1860,7 +1954,7 @@ mod tests {
         let shortest_paths: i64 = reached.iter().map(|&v| ways[v as usize]).sum();
         let r = run(
             "MATCH ALL SHORTEST (a:person {id: $src})-[r:follows*]->(b) \
-             RETURN count(b) AS paths",
+             RETURN count(b) AS walks",
             &mut db,
             &[("src", Value::Int(i64::from(src)))],
         )
@@ -2494,7 +2588,7 @@ mod tests {
         // The unfiltered 2-hop count runs on degrees, not lists, all
         // the way through real storage.
         let text = explain_analyze(
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             &mut db,
             &[],
         )
@@ -2660,7 +2754,7 @@ mod tests {
 
         let mut db = Zu1File::open(&path).expect("open");
         let text = explain_analyze(
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             &mut db,
             &[],
         )
@@ -3317,7 +3411,7 @@ mod tests {
 
         let mut db = Zu1File::open(&path).expect("open");
         let sources = [
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             "MATCH (a:person)-[:follows]->(b) RETURN a.id AS a, b.id AS b",
             "MATCH (a:person)-[:follows]->(b) \
              RETURN a.id AS a, count(*) AS deg ORDER BY deg DESC, a LIMIT 10",

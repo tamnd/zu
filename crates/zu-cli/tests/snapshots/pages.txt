@@ -127,6 +127,8 @@ $ zu conformance --help
 zu conformance: declare, verify, tally, and score conformance reports
 
 usage: zu conformance --declare [--format toml|json]
+       zu conformance --implementation-defined
+       zu conformance --statement <tally.json>
        zu conformance --verify <report.json>
        zu conformance --tally <report.json>
        zu conformance --scoreboard <tally.json>...
@@ -134,6 +136,8 @@ usage: zu conformance --declare [--format toml|json]
 
 examples:
   zu conformance --declare --format json > report.json
+  zu conformance --implementation-defined > register.md
+  zu conformance --statement docs/conformance/zu.json
   zu conformance --regressed report.json baseline.json
 
 see also: corpus

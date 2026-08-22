@@ -231,7 +231,11 @@ pub(crate) struct Subquery {
 /// Splits a bound statement into the parts the session runs, or
 /// answers `None` for a statement that runs as one plan the way every
 /// ordinary read does.
-pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Part>>> {
+pub(crate) fn split(
+    query: &BoundQuery,
+    schema: &Schema,
+    session_schema: &str,
+) -> Result<Option<Vec<Part>>> {
     if !query.clauses.iter().any(is_seam) {
         return Ok(None);
     }
@@ -264,7 +268,7 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
                 (Seam::Fork(fork), exprs, carry.clone())
             }
             other => {
-                let write = write_of(other, schema)?;
+                let write = write_of(other, schema, session_schema)?;
                 clauses.extend(write.before());
                 let exprs: Vec<BoundExpr> = write
                     .carry()
@@ -477,7 +481,7 @@ fn elements(patterns: &[BoundPath]) -> Vec<usize> {
 }
 
 /// The write a clause [`is_write`] answered for describes.
-fn write_of(clause: &BoundClause, schema: &Schema) -> Result<Write> {
+fn write_of(clause: &BoundClause, schema: &Schema, session_schema: &str) -> Result<Write> {
     Ok(match clause {
         BoundClause::Insert { nodes, rels, carry } => Write::Insert(Insert {
             nodes: nodes.clone(),
@@ -502,7 +506,7 @@ fn write_of(clause: &BoundClause, schema: &Schema) -> Result<Write> {
             slots: slots.clone(),
             queries: queries
                 .iter()
-                .map(|nested| nested_query(nested, schema))
+                .map(|nested| nested_query(nested, schema, session_schema))
                 .collect::<Result<Vec<_>>>()?,
             carry: carry.clone(),
             detach: *detach,
@@ -570,8 +574,12 @@ fn write_of(clause: &BoundClause, schema: &Schema) -> Result<Write> {
 /// change the graph, and an engine that ran one anyway would be
 /// deciding on its own whether the inner write happened before or after
 /// the outer delete.
-fn nested_query(parsed: &zu_query::ast::Query, schema: &Schema) -> Result<Subquery> {
-    let (query, plan, _) = crate::query::compile_parsed(parsed, schema)?;
+fn nested_query(
+    parsed: &zu_query::ast::Query,
+    schema: &Schema,
+    session_schema: &str,
+) -> Result<Subquery> {
+    let (query, plan, _) = crate::query::compile_parsed(parsed, schema, session_schema)?;
     if query.clauses.iter().any(is_write) {
         return Err(ZuError::gql(
             codes::C42001,

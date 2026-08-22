@@ -75,7 +75,8 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::binder::{
-    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Percentile, Schema, TableFunc,
+    BoundExpr, BoundItem, BoundQuery, Constrained, Deviation, Func, PathPart, Percentile, Schema,
+    TableFunc,
 };
 use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
@@ -738,6 +739,19 @@ pub trait Graph {
         let _ = table;
         Ok(Some(key))
     }
+    /// Whether this table carries a primary-key index, which is the
+    /// question [`Self::lookup_key`] cannot be asked instead of: under
+    /// the dense-id contract it answers every key with the row of the
+    /// same number, so a caller trying to tell a taken key from a free
+    /// one would hear that every key is taken.
+    ///
+    /// An INSERT is what asks. A key the table already holds has to be
+    /// refused where the statement can be told why, and a table that is
+    /// not keyed has no key to refuse.
+    fn keyed(&mut self, table: u32) -> Result<bool> {
+        let _ = table;
+        Ok(false)
+    }
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
@@ -894,6 +908,27 @@ pub struct Options {
     /// A caller may set it before running, which is how a test pins the
     /// time.
     pub clock: Option<Clock>,
+    /// GA08. The GQL-status object the statement before this one in
+    /// this session ended with, as the record value
+    /// [`crate::binder::STATUS_FN`] answers, and `None` for a session
+    /// that has run nothing yet.
+    ///
+    /// Here for the reason the clock is here: it is session state, one
+    /// value for the length of a statement, and every path through the
+    /// executor already carries the switches. The session builds it
+    /// once on the way in, so a scan of ten million rows reading it
+    /// clones a record rather than formatting one.
+    pub status: Option<Value>,
+    /// GS07 and GS15. The session time zone as minutes east of UTC,
+    /// which is the displacement the clock read below is stamped with.
+    /// Nought is UTC, which is what a session opens in and what every
+    /// run that never set one keeps.
+    ///
+    /// A displacement and never a zone name: a name is a rule the zone
+    /// database can change, so a session set to one would answer one
+    /// thing today and another after an upgrade, while a session set to
+    /// an offset answers the offset for as long as it holds it.
+    pub zone: i16,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -3332,6 +3367,66 @@ struct StageCtx<'a> {
     notices: Vec<DiagnosticRecord>,
 }
 
+/// The property `key` of one value, which is a read of an element, a
+/// field of a record, or the same question asked of every element of a
+/// group (ISO 22.7, feature GQ17).
+///
+/// The group case is what makes this a function rather than a match
+/// arm. A name a quantifier bound stands for the elements of every
+/// repetition, so a property read on it is read of each of them and the
+/// row holds the list of the answers in the order the walk took them.
+/// The answer to a group is a list, which is why the recursion is
+/// element-wise and not flattening: a group of groups would answer a
+/// list of lists, and that is what it means.
+fn property_of(ctx: &mut StageCtx, base: Value, key: &str) -> Result<Value> {
+    match base {
+        // A delete leaves the element bound, so a clause after one
+        // can hold a reference to a row that is no longer there.
+        // Reading it is 22G11 rather than the value the row used to
+        // hold: a scan never hands one out, so a node that is in
+        // the deleted set here arrived across a write of this
+        // statement and nothing else.
+        Value::Node { table, offset } if deleted(ctx.gone, table, offset) => Err(gql(
+            codes::C22G11,
+            format!(
+                "'{key}' is being read off an element that a DELETE in this statement took away, row {offset} of table {table}"
+            ),
+        )),
+        Value::Node { table, offset } => ctx.graph.property(table, offset, key),
+        // A field the record does not have is null rather than an
+        // error, which is what a property a node does not have
+        // already answers. A record whose shape a query can rely
+        // on is one the query declared, and that is what a cast to
+        // a record type is for.
+        ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
+        // An edge with no stored row reads null here rather than in
+        // every engine, so an engine's `rel_property` only ever
+        // sees a row it holds.
+        Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
+        Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(property_of(ctx, item, key)?);
+            }
+            Ok(Value::List(out))
+        }
+        // A quantified edge variable is still a chain here, because
+        // settling happens where a value leaves the pipeline and this
+        // read is inside it. Settling one costs the walk of its links,
+        // which is the same walk the read would have to do anyway.
+        chain @ Value::Chain(_) => property_of(ctx, settle(chain), key),
+        Value::Null => Ok(Value::Null),
+        other => Err(gql(
+            codes::C22G03,
+            format!(
+                "a property is read off an element, a record or a group of them, and this is {}",
+                crate::cast::value_type(&other)
+            ),
+        )),
+    }
+}
+
 fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
     if let Some(v) = ctx.overlay.get(&slot) {
         return Ok(v.clone());
@@ -5509,7 +5604,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 if !next(descs, ctx, i - 1)? {
                     return Ok(false);
                 }
-                if truthy(&eval(ctx, expr)?) {
+                if holds(&eval(ctx, expr)?)? {
                     return Ok(true);
                 }
             },
@@ -5524,7 +5619,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         let mut keep = Vec::with_capacity(size);
                         for pos in 0..size {
                             ctx.chunks[*chunk].cur = Some(pos);
-                            keep.push(truthy(&eval(ctx, expr)?));
+                            keep.push(holds(&eval(ctx, expr)?)?);
                         }
                         ctx.chunks[*chunk].cur = None;
                         keep
@@ -5811,8 +5906,28 @@ fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
-fn truthy(v: &Value) -> bool {
-    matches!(v, Value::Bool(true))
+/// Whether a search condition holds, ISO 19.1.
+///
+/// Three-valued and then some. True keeps the row, false drops it and
+/// null drops it too, a condition nobody could answer not being a
+/// condition anything passes. A value that is not a boolean at all is
+/// none of those three: `WHERE p.age` is not a question with a wrong
+/// answer, it is not a question, and `22G03` is the condition for an
+/// operand of a type the operator does not take. Dropping every row
+/// quietly would answer a question nobody asked, and keeping them all
+/// would be worse.
+fn holds(v: &Value) -> Result<bool> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Null => Ok(false),
+        other => Err(gql(
+            codes::C22G03,
+            format!(
+                "a search condition is a boolean, and this one is {}",
+                crate::cast::value_type(other)
+            ),
+        )),
+    }
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
@@ -6082,7 +6197,9 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
     if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
         return temporal_arith(op, &a, &b);
     }
-    let overflow = || invalid("integer overflow".into());
+    // `22003 numeric value out of range`, the same condition the
+    // vector kernel raises for the same answer.
+    let overflow = || gql(codes::C22003, "integer overflow".into());
     match (&a, &b) {
         (Value::Int(x), Value::Int(y)) => {
             let (x, y) = (*x, *y);
@@ -6453,7 +6570,7 @@ fn vector_filter(ctx: &mut StageCtx, expr: &BoundExpr, chunk: usize) -> Result<O
     ctx.graph.properties(table, &rows, key, &mut values)?;
     let mut keep = Vec::with_capacity(size);
     for value in values {
-        keep.push(truthy(&compare(op, &settle(value), &other)?));
+        keep.push(holds(&compare(op, &settle(value), &other)?)?);
     }
     Ok(Some(keep))
 }
@@ -6514,6 +6631,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         BoundExpr::Clock => Ok(Value::Temporal(
             ctx.scalars.options.clock.unwrap_or_default().instant(),
         )),
+        // GA08. The GQL-status object the statement before this one
+        // ended with, built once by the session and handed out here as
+        // many times as the rows ask for it. A session that has run
+        // nothing yet answers null rather than a record of nulls,
+        // because there is no status before the first statement and a
+        // record saying nothing would read as one that said so.
+        BoundExpr::Status => Ok(ctx.scalars.options.status.clone().unwrap_or(Value::Null)),
         // GE01. The binder already asked the catalog which graph this
         // is, so the row's work is a clone of the handle and nothing
         // else.
@@ -6645,36 +6769,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 "PROPERTY_EXISTS asks about a node or an edge, got {other:?}"
             ))),
         },
-        BoundExpr::Property { base, key } => match eval(ctx, base)? {
-            // A delete leaves the element bound, so a clause after one
-            // can hold a reference to a row that is no longer there.
-            // Reading it is 22G11 rather than the value the row used to
-            // hold: a scan never hands one out, so a node that is in
-            // the deleted set here arrived across a write of this
-            // statement and nothing else.
-            Value::Node { table, offset } if deleted(ctx.gone, table, offset) => Err(gql(
-                codes::C22G11,
-                format!(
-                    "'{key}' is being read off an element that a DELETE in this statement took away, row {offset} of table {table}"
-                ),
-            )),
-            Value::Node { table, offset } => ctx.graph.property(table, offset, key),
-            // A field the record does not have is null rather than an
-            // error, which is what a property a node does not have
-            // already answers. A record whose shape a query can rely
-            // on is one the query declared, and that is what a cast to
-            // a record type is for.
-            ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
-            // An edge with no stored row reads null here rather than in
-            // every engine, so an engine's `rel_property` only ever
-            // sees a row it holds.
-            Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
-            Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
-            Value::Null => Ok(Value::Null),
-            other => Err(invalid(format!(
-                "property access on {other:?}, expected a node"
-            ))),
-        },
+        BoundExpr::Property { base, key } => {
+            let base = eval(ctx, base)?;
+            property_of(ctx, base, key)
+        }
         BoundExpr::Unary { op, expr } => {
             let v = eval(ctx, expr)?;
             match op {
@@ -6683,10 +6781,11 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     None => Value::Null,
                 }),
                 UnaryOp::Neg => match v {
-                    Value::Int(i) => Ok(Value::Int(
-                        i.checked_neg()
-                            .ok_or_else(|| invalid("integer overflow".into()))?,
-                    )),
+                    Value::Int(i) => {
+                        Ok(Value::Int(i.checked_neg().ok_or_else(|| {
+                            gql(codes::C22003, "integer overflow".into())
+                        })?))
+                    }
                     Value::Float(f) => Ok(Value::Float(-f)),
                     Value::Null => Ok(Value::Null),
                     other => Err(invalid(format!("cannot negate {other:?}"))),
@@ -6878,7 +6977,17 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             }
             Value::path(out)
         }
-        BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
+        BoundExpr::Cast {
+            expr,
+            ty,
+            constrained,
+        } => {
+            let v = eval(ctx, expr)?;
+            match constrained {
+                Some(wants) => constrained_reference(ctx, v, ty, wants),
+                None => crate::cast::cast_noting(v, ty, &mut ctx.notices),
+            }
+        }
         // GE01. The branches are asked in the order they were written
         // and the walk stops at the first that says yes, so a branch
         // below one that matched is never evaluated and neither is a
@@ -6929,6 +7038,56 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             })
         }
     }
+}
+
+/// A cast to a closed node or edge reference value type, GV56 and
+/// GV57: `CAST(p AS NODE :Person)`.
+///
+/// The two conditions the standard gives this are asked in the order
+/// they can be answered. 22G0V is the base type, and it is the same
+/// answer an open reference type would give, so the value goes through
+/// the ordinary cast first and a node handed to `EDGE :T` is refused
+/// there. 22G0W is the constraint, and it is only a question once the
+/// value is known to be of the right kind: a Person is a node, and it
+/// is not a Company.
+///
+/// A null casts to null, the way it does for every other type, so a
+/// missing optional match does not turn into a condition.
+fn constrained_reference(
+    ctx: &mut StageCtx,
+    v: Value,
+    ty: &zu_common::LogicalType,
+    wants: &Constrained,
+) -> Result<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let base = match ty.base() {
+        zu_common::LogicalType::Node(_) => zu_common::LogicalType::Node(None),
+        _ => zu_common::LogicalType::Edge(None),
+    };
+    let v = crate::cast::cast_noting(v, &base, &mut ctx.notices)?;
+    let wears = match &v {
+        Value::Node { table, offset } => wants.node.matches(ctx.graph.labels(*table, *offset)?),
+        Value::Rel { table, .. } => wants.rels.binary_search(table).is_ok(),
+        other => {
+            return Err(invalid(format!(
+                "a reference type asks about a node or an edge, got {other:?}"
+            )));
+        }
+    };
+    if wears {
+        return Ok(v);
+    }
+    Err(ZuError::gql(
+        codes::C22G0W,
+        format!(
+            "this {} does not wear the label '{}' that '{}' asks for",
+            if wants.over_nodes { "node" } else { "edge" },
+            wants.wanted,
+            ty.base()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -7164,19 +7323,19 @@ impl AggState {
         match &mut self.acc {
             Acc::Count(n) => *n += mult,
             Acc::Sum(acc) => {
-                let scaled = match &v {
-                    Value::Int(i) => Value::Int(
-                        i.checked_mul(mult)
-                            .ok_or_else(|| invalid("integer overflow in sum()".into()))?,
-                    ),
-                    Value::Float(f) => Value::Float(f * mult as f64),
-                    other => {
-                        return Err(gql(
-                            codes::C22G03,
-                            format!("sum() needs numbers, got {other:?}"),
-                        ));
-                    }
-                };
+                let scaled =
+                    match &v {
+                        Value::Int(i) => Value::Int(i.checked_mul(mult).ok_or_else(|| {
+                            gql(codes::C22003, "integer overflow in sum()".into())
+                        })?),
+                        Value::Float(f) => Value::Float(f * mult as f64),
+                        other => {
+                            return Err(gql(
+                                codes::C22G03,
+                                format!("sum() needs numbers, got {other:?}"),
+                            ));
+                        }
+                    };
                 *acc = Some(match acc.take() {
                     None => scaled,
                     Some(prev) => arith(BinaryOp::Add, prev, scaled)?,
@@ -7616,7 +7775,7 @@ fn apply_post(sink: &SinkDef, ctx: &mut StageCtx, mut rows: Vec<Row>) -> Result<
                 let mut kept = Vec::with_capacity(rows.len());
                 for mut row in rows {
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
-                    let pass = truthy(&eval(ctx, expr)?);
+                    let pass = holds(&eval(ctx, expr)?)?;
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
                     if pass {
                         kept.push(row);
@@ -7860,7 +8019,7 @@ fn stream_batch(
                 let mut kept = Vec::with_capacity(rows.len());
                 for mut row in rows {
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
-                    let pass = truthy(&eval(ctx, expr)?);
+                    let pass = holds(&eval(ctx, expr)?)?;
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
                     if pass {
                         kept.push(row);
@@ -8553,13 +8712,18 @@ fn run_stages(
     // with, read here and nowhere else. A run that arrives with one
     // already keeps it, which is what makes a query written inside an
     // expression agree with the query around it, and what lets a test
-    // say what time it is.
+    // say what time it is. The displacement it is stamped with is the
+    // session's (GS15), so the instant is the same instant either way
+    // and what moves is the zone the statement reads it in.
     let read;
     let options = match options.clock {
         Some(_) => options,
         None => {
             read = Options {
-                clock: Some(Clock::read()),
+                clock: Some(Clock {
+                    offset: options.zone,
+                    ..Clock::read()
+                }),
                 ..options.clone()
             };
             &read
@@ -9632,7 +9796,7 @@ mod tests {
     fn two_hop_count_stays_factorized() {
         let r = run(
             "MATCH (a:Person {id: $src})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &[("src", Value::Int(0))],
         );
         assert_eq!(int_rows(&r), [[3]]);
@@ -10113,7 +10277,7 @@ mod tests {
         // join inner and drop the nine open 2-paths.
         let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
                       OPTIONAL MATCH (a)-[t:KNOWS]->(c) \
-                      RETURN count(*) AS paths, count(t) AS closed";
+                      RETURN count(*) AS walks, count(t) AS closed";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[10, 1]]);
         assert_eq!(r, run_opts(source, &[], no_wcoj()));
@@ -10235,7 +10399,7 @@ mod tests {
         let r = run(
             "CALL wcc('KNOWS') YIELD node, component \
              MATCH (node)-[:KNOWS]->(m) \
-             RETURN count(*) AS paths",
+             RETURN count(*) AS walks",
             &[],
         );
         assert_eq!(int_rows(&r), [[8]]);
@@ -11208,7 +11372,7 @@ mod tests {
     fn profile_shows_the_factorized_second_hop() {
         let (r, p) = profiled(
             "MATCH (a:Person {id: 0})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &[],
         );
         assert_eq!(int_rows(&r), [[3]]);
@@ -11625,7 +11789,7 @@ mod tests {
             ),
             (
                 "MATCH (a:Person {id: $src})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-                 RETURN count(c) AS paths",
+                 RETURN count(c) AS walks",
                 &[("src", Value::Int(0))],
             ),
             (
@@ -11702,7 +11866,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, b.id AS b ORDER BY b, a \
              SKIP 2 LIMIT 3",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT b.id AS b",
-            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS paths",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS walks",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, count(*) AS deg",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, collect(b.id) AS friends",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b.id) AS heads",

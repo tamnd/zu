@@ -1,9 +1,9 @@
 //! Binary arithmetic kernels.
 //!
 //! The answers are the row engine's answers, conditions included: an
-//! integer answer that does not fit raises, and a divisor of nought
-//! raises `22012` whatever the numeric type, rather than answering the
-//! infinity the hardware would. A kernel that quietly answered the
+//! integer answer that does not fit raises `22003`, and a divisor of
+//! nought raises `22012` whatever the numeric type, rather than
+//! answering the infinity the hardware would. A kernel that quietly answered the
 //! wrapped number or a null would be giving a wrong answer where the
 //! standard asks for a condition, and which of the two a query got
 //! would depend on which engine took its plan.
@@ -24,7 +24,7 @@
 
 use zu_common::{Result, ZuError, gqlstatus::codes};
 
-use crate::arena::MorselArena;
+use crate::arena::{MorselArena, Pod};
 use crate::bitmap::Bitmap;
 use crate::sel::SelVector;
 use crate::vector::{PhysType, ValueVector, VecEncoding};
@@ -38,16 +38,15 @@ pub enum BinOp {
     Mod,
 }
 
+/// The answer for one pair, which is what a chunk of two constants
+/// needs. The loops below do not go through here: they settle the
+/// operation before they start, for the reason `fill` gives.
 #[inline(always)]
 fn apply_i64(op: BinOp, a: i64, b: i64) -> i64 {
     match op {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // A divisor of nought is remapped to one so the hardware
-        // cannot trap on a row nobody selected. A selected row never
-        // gets here with one, since the check ahead of the loop raised
-        // on it, so the number this answers is never read.
         BinOp::Div => a.wrapping_div(if b == 0 { 1 } else { b }),
         BinOp::Mod => a.wrapping_rem(if b == 0 { 1 } else { b }),
     }
@@ -62,6 +61,54 @@ fn apply_f64(op: BinOp, a: f64, b: f64) -> f64 {
         BinOp::Div => a / b,
         BinOp::Mod => a % b,
     }
+}
+
+/// The compute loop over one of the three shapes a pair of vectors
+/// comes in, with the operation already chosen.
+///
+/// `f` arrives monomorphic, so the compiler stamps one loop per
+/// operation and each one holds a single instruction per row wherever
+/// the hardware has one. Which operation it is has to be settled
+/// outside, the way the compare kernel has always settled it: a match
+/// left standing in the loop is a branch the vectorizer will not lift,
+/// and it costs about seven times the throughput of the loop it is
+/// standing in.
+#[inline(always)]
+fn fill<T: Pod, F: Fn(T, T) -> T>(
+    dst: &mut [T],
+    l: &ValueVector,
+    r: &ValueVector,
+    len: usize,
+    f: F,
+) -> Result<()> {
+    match (l.encoding, r.encoding) {
+        (VecEncoding::Flat, VecEncoding::Flat) => {
+            let (a, b) = (l.values::<T>(), r.values::<T>());
+            for i in 0..len {
+                dst[i] = f(a[i], b[i]);
+            }
+        }
+        (VecEncoding::Flat, VecEncoding::Constant) => {
+            let a = l.values::<T>();
+            let c = r.constant_value::<T>();
+            for i in 0..len {
+                dst[i] = f(a[i], c);
+            }
+        }
+        (VecEncoding::Constant, VecEncoding::Flat) => {
+            let c = l.constant_value::<T>();
+            let b = r.values::<T>();
+            for i in 0..len {
+                dst[i] = f(c, b[i]);
+            }
+        }
+        _ => {
+            return Err(ZuError::InvalidArgument(
+                "arithmetic on dict vectors: materialize first".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate `l op r` into a new flat vector. The full vector is computed
@@ -116,32 +163,21 @@ pub fn binary(
         PhysType::Int64 | PhysType::Interval => {
             {
                 let dst = out.values_mut::<i64>();
-                match (l.encoding, r.encoding) {
-                    (VecEncoding::Flat, VecEncoding::Flat) => {
-                        let (a, b) = (l.values::<i64>(), r.values::<i64>());
-                        for i in 0..len {
-                            dst[i] = apply_i64(op, a[i], b[i]);
-                        }
-                    }
-                    (VecEncoding::Flat, VecEncoding::Constant) => {
-                        let a = l.values::<i64>();
-                        let c = r.constant_value::<i64>();
-                        for i in 0..len {
-                            dst[i] = apply_i64(op, a[i], c);
-                        }
-                    }
-                    (VecEncoding::Constant, VecEncoding::Flat) => {
-                        let c = l.constant_value::<i64>();
-                        let b = r.values::<i64>();
-                        for i in 0..len {
-                            dst[i] = apply_i64(op, c, b[i]);
-                        }
-                    }
-                    _ => {
-                        return Err(ZuError::InvalidArgument(
-                            "arithmetic on dict vectors: materialize first".into(),
-                        ));
-                    }
+                match op {
+                    BinOp::Add => fill(dst, l, r, len, i64::wrapping_add)?,
+                    BinOp::Sub => fill(dst, l, r, len, i64::wrapping_sub)?,
+                    BinOp::Mul => fill(dst, l, r, len, i64::wrapping_mul)?,
+                    // A divisor of nought is remapped to one so the
+                    // hardware cannot trap on a row nobody selected. A
+                    // selected row never gets here with one, since the
+                    // check ahead of the loop raised on it, so the
+                    // number these two answer is never read.
+                    BinOp::Div => fill(dst, l, r, len, |a: i64, b: i64| {
+                        a.wrapping_div(if b == 0 { 1 } else { b })
+                    })?,
+                    BinOp::Mod => fill(dst, l, r, len, |a: i64, b: i64| {
+                        a.wrapping_rem(if b == 0 { 1 } else { b })
+                    })?,
                 }
             }
             out.validity = merged_validity(arena, l, r, len);
@@ -149,32 +185,12 @@ pub fn binary(
         PhysType::Float64 => {
             {
                 let dst = out.values_mut::<f64>();
-                match (l.encoding, r.encoding) {
-                    (VecEncoding::Flat, VecEncoding::Flat) => {
-                        let (a, b) = (l.values::<f64>(), r.values::<f64>());
-                        for i in 0..len {
-                            dst[i] = apply_f64(op, a[i], b[i]);
-                        }
-                    }
-                    (VecEncoding::Flat, VecEncoding::Constant) => {
-                        let a = l.values::<f64>();
-                        let c = r.constant_value::<f64>();
-                        for i in 0..len {
-                            dst[i] = apply_f64(op, a[i], c);
-                        }
-                    }
-                    (VecEncoding::Constant, VecEncoding::Flat) => {
-                        let c = l.constant_value::<f64>();
-                        let b = r.values::<f64>();
-                        for i in 0..len {
-                            dst[i] = apply_f64(op, c, b[i]);
-                        }
-                    }
-                    _ => {
-                        return Err(ZuError::InvalidArgument(
-                            "arithmetic on dict vectors: materialize first".into(),
-                        ));
-                    }
+                match op {
+                    BinOp::Add => fill(dst, l, r, len, |a: f64, b: f64| a + b)?,
+                    BinOp::Sub => fill(dst, l, r, len, |a: f64, b: f64| a - b)?,
+                    BinOp::Mul => fill(dst, l, r, len, |a: f64, b: f64| a * b)?,
+                    BinOp::Div => fill(dst, l, r, len, |a: f64, b: f64| a / b)?,
+                    BinOp::Mod => fill(dst, l, r, len, |a: f64, b: f64| a % b)?,
                 }
             }
             out.validity = merged_validity(arena, l, r, len);
@@ -202,12 +218,17 @@ fn divide_by_zero(op: BinOp) -> ZuError {
     ZuError::gql(codes::C22012, format!("{what} by zero"))
 }
 
-/// An integer answer that does not fit in an integer, which is the
-/// other thing arithmetic can fail at and is not a GQL condition: the
-/// standard's numeric conditions are about the value the statement
-/// wrote, and this is about the width of the type holding it.
+/// `22003 data exception, numeric value out of range`, for the other
+/// thing arithmetic can fail at: an answer that does not fit the type
+/// holding it.
+///
+/// The float half of the library has always raised this for an answer
+/// that left the range a double holds, and an integer answer that left
+/// the range an i64 holds is the same sentence about a different width.
+/// A statement that got a bare refusal instead was told the engine
+/// would not answer without being told what the standard calls it.
 fn overflow() -> ZuError {
-    ZuError::InvalidArgument("integer overflow".into())
+    ZuError::gql(codes::C22003, "integer overflow".to_string())
 }
 
 /// Raises what the row engine raises for the first row of the selection
@@ -427,28 +448,29 @@ mod tests {
         assert!(!out.is_valid(1), "null in, null out");
     }
 
-    /// An answer too wide for the type is the row engine's `integer
-    /// overflow`, and the fold that finds it looks at the operands
-    /// rather than at the answer, so a chunk of ordinary numbers never
-    /// reaches the walk that builds the condition.
+    /// An answer too wide for the type is `22003 numeric value out of
+    /// range`, the same condition the row engine raises for it, and the
+    /// fold that finds it looks at the operands rather than at the
+    /// answer, so a chunk of ordinary numbers never reaches the walk
+    /// that builds the condition.
     #[test]
     fn an_integer_answer_that_does_not_fit_raises() {
         let mut arena = MorselArena::new();
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, i64::MAX]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, 1i64, 2);
         let out = binary(&mut arena, BinOp::Add, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
 
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, 1 << 40]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, 1i64 << 40, 2);
         let out = binary(&mut arena, BinOp::Mul, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
 
         // The one dividend a divisor of minus one has no answer for.
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[i64::MIN]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, -1i64, 1);
         let out = binary(&mut arena, BinOp::Div, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
     }
 
     /// The approximate numbers raise on a divisor of nought too, which
@@ -471,5 +493,44 @@ mod tests {
         let r = ValueVector::constant(&mut arena, PhysType::Int64, 0i64, 2);
         let out = binary(&mut arena, BinOp::Add, &l, &r, None).unwrap();
         assert_eq!(out.values::<i64>(), &[i64::MAX, i64::MIN]);
+    }
+
+    /// The kernel settles the operation outside its loop, so the answer
+    /// a chunk gets is written in five places where it used to be
+    /// written in one. This walks every operation over every shape a
+    /// pair of vectors comes in and compares what the kernel wrote
+    /// against what one pair at a time answers, which is the check that
+    /// keeps the two from drifting apart.
+    #[test]
+    fn every_operation_answers_what_one_pair_answers() {
+        const OPS: [BinOp; 5] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod];
+        let whole: [i64; 4] = [7, -30, 1, 5];
+        let real: [f64; 4] = [7.5, -30.25, 1.0, 5.0];
+        let mut arena = MorselArena::new();
+        for op in OPS {
+            let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &whole);
+            let r = ValueVector::flat_from(&mut arena, PhysType::Int64, &[2i64, 3, 4, 5]);
+            let c = ValueVector::constant(&mut arena, PhysType::Int64, 3i64, 4);
+            for (name, l, r) in [("flat flat", &l, &r), ("flat const", &l, &c)] {
+                let out = binary(&mut arena, op, l, r, None).unwrap();
+                for i in 0..4 {
+                    let want = apply_i64(op, at_i64(l, i), at_i64(r, i));
+                    assert_eq!(out.values::<i64>()[i], want, "{op:?} {name} row {i}");
+                }
+            }
+            let out = binary(&mut arena, op, &c, &r, None).unwrap();
+            for i in 0..4 {
+                let want = apply_i64(op, 3, at_i64(&r, i));
+                assert_eq!(out.values::<i64>()[i], want, "{op:?} const flat row {i}");
+            }
+
+            let l = ValueVector::flat_from(&mut arena, PhysType::Float64, &real);
+            let r = ValueVector::flat_from(&mut arena, PhysType::Float64, &[2.0f64, 3.0, 4.0, 0.5]);
+            let out = binary(&mut arena, op, &l, &r, None).unwrap();
+            for (i, x) in real.iter().enumerate() {
+                let want = apply_f64(op, *x, at_f64(&r, i));
+                assert_eq!(out.values::<f64>()[i], want, "{op:?} float row {i}");
+            }
+        }
     }
 }

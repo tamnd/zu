@@ -241,3 +241,63 @@ fn an_endpoint_no_node_file_declared_is_refused() {
         "so does the table that has no such row: {text}"
     );
 }
+
+/// A key the table already holds is refused where the statement can be
+/// told about it.
+///
+/// The index over a keyed table maps one key to one row and is rebuilt
+/// from the rows on every fold, so two rows under one key have nothing
+/// to build. The rebuild raises, and it raises inside a later fold
+/// rather than inside the statement that caused it, which leaves a file
+/// whose every read of the table fails from a write that was told it
+/// worked. Nothing can be run against it afterwards to put it right,
+/// because running anything is what fails. So the refusal has to come
+/// first, and the table stays readable behind it.
+#[test]
+fn a_key_the_table_already_holds_is_refused_rather_than_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, rels) = write(dir.path());
+    let path = dir.path().join("keys.zu1");
+    load_dataset(&nodes, &rels, &path).expect("load");
+    let mut session = zu::session::Session::open(&path).expect("open");
+    let err = session
+        .run("INSERT (:Account {id: 11, name: 'again', balance: 0})", &[])
+        .expect_err("11 is an account the file already holds");
+    let text = err.to_string();
+    assert!(text.contains("11"), "the key belongs in the error: {text}");
+    assert!(
+        text.contains("Account"),
+        "so does the table holding it: {text}"
+    );
+    // Twice in one statement is the same duplicate, and the store
+    // cannot be asked about the first of the two.
+    session
+        .run(
+            "INSERT (:Account {id: 20, name: 'one', balance: 0}), \
+             (:Account {id: 20, name: 'two', balance: 0})",
+            &[],
+        )
+        .expect_err("20 twice in one statement is 20 twice");
+    // A free key still goes in, and the table still reads.
+    session
+        .run("INSERT (:Account {id: 20, name: 'new', balance: 0})", &[])
+        .expect("20 is free");
+    drop(session);
+    let mut db = Zu1File::open(&path).unwrap();
+    assert_eq!(
+        ints(&mut db, "MATCH (a:Account) RETURN a.id AS id ORDER BY id"),
+        vec![10, 11, 12, 20]
+    );
+    drop(db);
+    // And a fold has nothing to choke on, which is the whole point.
+    let mut session = zu::session::Session::open(&path).expect("reopen");
+    session
+        .run("INSERT (:Account {id: 21, name: 'next', balance: 0})", &[])
+        .expect("21 is free");
+    drop(session);
+    let mut db = Zu1File::open(&path).unwrap();
+    assert_eq!(
+        ints(&mut db, "MATCH (a:Account) RETURN a.id AS id ORDER BY id"),
+        vec![10, 11, 12, 20, 21]
+    );
+}

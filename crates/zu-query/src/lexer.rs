@@ -18,6 +18,7 @@
 //! to parse, which is the loud way for this to go wrong.
 
 use zu_common::gqlstatus::codes;
+use zu_common::unicode;
 use zu_common::{Result, ZuError};
 
 /// One lexed token with its byte span in the source.
@@ -317,12 +318,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 // characters in front of the name, which is the rule
                 // `GRAPH $g` beside `$g` is already read under.
                 let name = ix + 1 + usize::from(bytes.get(ix + 1) == Some(&b'$'));
-                let mut end = name;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
-                }
+                let end = ident_end(source, name);
                 if end == name {
                     return Err(err(source, ix, "expected a parameter name after '$'"));
                 }
@@ -340,13 +336,12 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 ix = end;
                 continue;
             }
-            _ if b.is_ascii_alphabetic() || b == b'_' => {
-                let mut end = ix + 1;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
+            _ => {
+                let ch = source[ix..].chars().next().unwrap_or('\u{fffd}');
+                if !unicode::is_ident_start(ch) {
+                    return Err(err(source, ix, &format!("unexpected character '{ch}'")));
                 }
+                let end = ident_end(source, ix + ch.len_utf8());
                 tokens.push(Token {
                     kind: TokenKind::Ident(source[ix..end].to_string()),
                     start,
@@ -354,10 +349,6 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 });
                 ix = end;
                 continue;
-            }
-            _ => {
-                let ch = source[ix..].chars().next().unwrap_or('\u{fffd}');
-                return Err(err(source, ix, &format!("unexpected character '{ch}'")));
             }
         }
         ix += 1;
@@ -587,6 +578,26 @@ fn digits(bytes: &[u8], from: usize) -> usize {
 /// an error rather than a silent float. A `0x`, `0o` or `0b` prefix
 /// changes the radix, and an `M`, `F` or `D` suffix says which kind of
 /// number the text means.
+/// Where the identifier that starts at `at` ends, `at` being one past
+/// its first character.
+///
+/// ISO 21.3 builds a regular identifier out of Unicode general
+/// category classes rather than out of ASCII, so a name written in any
+/// script is a name. The scan is over characters and not bytes for the
+/// same reason, and it costs nothing extra on the ASCII that nearly
+/// every identifier is: [`unicode::is_ident_extend`] answers those
+/// without reading a table.
+fn ident_end(source: &str, at: usize) -> usize {
+    let mut end = at;
+    for c in source[at..].chars() {
+        if !unicode::is_ident_extend(c) {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    end
+}
+
 fn lex_number(source: &str, start: usize) -> Result<(TokenKind, usize)> {
     let bytes = source.as_bytes();
     if bytes[start] == b'0'
@@ -763,6 +774,32 @@ mod tests {
             kinds("1Fx"),
             vec![TokenKind::Int(1), TokenKind::Ident("Fx".into())]
         );
+    }
+
+    /// GL01. An identifier is built out of Unicode general category
+    /// classes (ISO 21.3), so a name in any script is a name, and two
+    /// names that render alike are two names: the Latin a and the
+    /// Cyrillic a are different characters in every encoding and this
+    /// engine reads them as different variables. ISO leaves the test
+    /// for confusability to the implementation and this one declines
+    /// to make it (IW014).
+    #[test]
+    fn an_identifier_is_unicode_and_two_that_look_alike_are_two() {
+        assert_eq!(
+            kinds("\u{430} a naïve _x1 \u{4e2d}\u{6587}"),
+            vec![
+                TokenKind::Ident("\u{430}".into()),
+                TokenKind::Ident("a".into()),
+                TokenKind::Ident("naïve".into()),
+                TokenKind::Ident("_x1".into()),
+                TokenKind::Ident("\u{4e2d}\u{6587}".into()),
+            ]
+        );
+        // A character of no identifier class is still nothing, and a
+        // combining mark goes on a name rather than starting one.
+        assert!(lex("RETURN \u{a7}").is_err());
+        assert!(lex("RETURN \u{301}x").is_err());
+        assert_eq!(kinds("e\u{301}"), vec![TokenKind::Ident("e\u{301}".into())]);
     }
 
     /// GL11. The `@` form hands back the characters that were written,

@@ -9,8 +9,8 @@ use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Temporal};
 
 /// One statement: a query that reads, a catalog statement that changes
-/// what the file declares, or one of the three that say where a
-/// transaction begins and ends.
+/// what the file declares, one of the three that say where a
+/// transaction begins and ends, or one that changes the session.
 ///
 /// They are parsed by the same entry point and told apart by their
 /// first word, because a caller with a string in its hand does not know
@@ -22,6 +22,7 @@ pub enum Statement {
     Query(Query),
     Catalog(CatalogStmt),
     Transaction(TxnStmt),
+    Session(SessionStmt),
     /// GP18. Several of them chained by `NEXT`, at least one of which
     /// changes the catalog and at least one of which does not.
     ///
@@ -52,6 +53,65 @@ pub enum TxnStmt {
     },
     Commit,
     Rollback,
+}
+
+/// A statement that changes the session (ISO 7.1 and 7.2, GS01 through
+/// GS16).
+///
+/// A session is a named mutable environment rather than a connection:
+/// the schema names resolve in, the graph a statement with no `USE` is
+/// against, the displacement the datetime value functions answer in,
+/// and the parameters every statement sent afterwards can read. These
+/// statements are what moves it. None of them reads the graph, so none
+/// of them has a binding table or a plan, which is what they have in
+/// common with the catalog and transaction statements above.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionStmt {
+    /// GS01 through GS03 and GS10 through GS14. `SESSION SET VALUE $p =
+    /// 1`, and the binding table and graph forms of the same.
+    ///
+    /// What follows the name is the definition a statement writes at
+    /// its head (GP05 through GP13), because it is the same thing: a
+    /// name, a kind, an optional type, and either an expression or a
+    /// query in braces. The only difference is where the name lives
+    /// afterwards, so the parse is shared and this carries a
+    /// [`BindingDef`] whose `name` is the parameter's, written without
+    /// the dollar.
+    SetParameter {
+        def: BindingDef,
+        /// `IF NOT EXISTS`, which leaves a parameter that is already
+        /// set as it was rather than replacing it.
+        if_not_exists: bool,
+    },
+    /// `SESSION SET SCHEMA /app`. What GS05 resets.
+    SetSchema(SchemaRef),
+    /// `SESSION SET PROPERTY GRAPH g`. What GS06 resets.
+    SetGraph(GraphRef),
+    /// GS15. The session's time zone displacement, in minutes east of
+    /// UTC, read out of the string at parse time because a displacement
+    /// that is not one is a fault in the statement and not in the
+    /// session.
+    SetTimeZone(i16),
+    Reset(SessionReset),
+}
+
+/// What a `SESSION RESET` puts back (ISO 7.2, GS04 through GS08 and
+/// GS16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReset {
+    /// GS04. Everything below at once, which is also what `SESSION
+    /// RESET` written with no arguments means.
+    Characteristics,
+    /// GS05.
+    Schema,
+    /// GS06.
+    Graph,
+    /// GS07.
+    TimeZone,
+    /// GS08.
+    Parameters,
+    /// GS16, one parameter by name, written without the dollar.
+    Parameter(String),
 }
 
 /// A statement that changes the catalog (docs/07 §9, GC03).

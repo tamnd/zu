@@ -388,6 +388,21 @@ open_p99_ms = 10.0
 session_plan_hit_us = 5.0
 session_point_us = 10.0
 
+# G8 (zu#123). The same point read on a session holding three session
+# parameters, one of each kind, none of which the query reads. What it
+# gates is the price of a session having state at all: the held map is
+# folded over what the caller passed and the references among them are
+# checked, once per statement. A session that has set nothing does not
+# even clone the pointer, so it is the empty path above that the P0
+# gate covers and this one that covers the rest.
+#
+# The ceiling is the same 10 the empty read gets, deliberately, because
+# the fold is over a map of three and a session that has set three
+# parameters should not be measurably slower than one that has set
+# none. If this ever needs its own looser number, the thing to fix is
+# the fold and not the number.
+session_point_held_us = 10.0
+
 # P1 vector kernel gates (Spec/2064g/perf/02 and perf/11, zu#74),
 # benches/kernels.rs, single core, all inputs cache resident. The spec
 # targets print next to every measurement; floors sit under the worst
@@ -2010,6 +2025,37 @@ vec_math_real_grows_s = 0.2
 # observed run on the loaded vCPU hosts. Raise floors, never lower them.
 vec_math_pair_grows_s = 0.2
 
+# G9 (zu#124). The fault bit per morsel pattern, priced (plan/07
+# section 1.1). The four floors above say the kernels are fast; these
+# two say the conditions are why, and they are ratios rather than rates
+# because what they gate is a shape and a shape reads the same on a
+# quiet machine and a swamped one.
+#
+# The first is what the guard costs, as the same allocation and the
+# same wrapping addition with no condition behind them over the answer
+# the kernel gives with one. The fold reads both operands where the
+# loop reads both and writes one, so about twice the traffic and about
+# twice the time is the honest price of the pattern on the very
+# cheapest operation there is, and every operation dearer than an
+# integer add pays less of it. Measured on the local M series over
+# three interleaved passes at load 11: 1.93, 1.97, 2.11. The ceiling is
+# 3, which is not where the measurements are but is well under where a
+# check standing in the loop lands: this gate read 6.97 before the
+# arithmetic kernel settled its operation outside its loop, and that is
+# the number it exists to catch.
+vec_guard_x = 3.0
+
+# The second is what the walk costs, as the fold that clears a chunk
+# over the walk behind it, both measured on the same operands and the
+# same kernel with only the magnitude of the numbers differing. A
+# kernel that checked every row where it computed it would read near 1
+# here, since the wide operands differ from the ordinary ones only in
+# whether the fold can rule them out. Measured on the same three
+# passes: 12.50, 11.18, 12.61. The floor is 4, far under the
+# measurements and far above where the pattern gone reads. Raise this
+# floor, never lower it.
+vec_condition_walk_x = 4.0
+
 # A count of characters over a 2048-row flat string vector, the string
 # library's first kernel. Nothing here can raise, so the loop is a fold
 # over the bytes of each row with no check ahead of it, and the same
@@ -2223,3 +2269,112 @@ write_cpu_nosync_shared_us = 60.0
 # because two readings on a loaded box is all it has been read off.
 # Raise this floor, never lower it.
 exec_temporal_mrows_s_core = 70.0
+
+# What a burst of eight writers sees at the tail, on a store whose
+# syncs return without asking a disk (zu#78, crates/zu/benches/commit.rs).
+#
+# The durable columns of that bench cannot carry this. They report
+# ratios, and ratios are all they can report: a laptop pays four
+# milliseconds a commit to fcntl and a runner on a memory filesystem
+# pays none, so the same engine reads two orders of magnitude apart and
+# an absolute ceiling over them would be a ceiling on whichever disk
+# the run happened to land on. The unsynced pass is the same burst with
+# the storage taken out from under it, and what is left is the part
+# this repository owns: the queue in front of the write side, and the
+# fold that runs while a writer is holding it.
+#
+# The number is the fold. A fold lands every so many statements, costs
+# milliseconds where a statement costs microseconds, and holds the write
+# side while it runs, so the writers queued behind it wait it out too.
+# That puts about one statement in every (bound / writers) over a
+# millisecond, and while the bound was 256 the tail at eight writers was
+# a fold every time: six runs on a quiet thirty two core box read
+# between 3450 and 3645 with the median statement at 281.
+#
+# The bound is 4096 now for what this bench writes, which is rows on the
+# end of a table, and a p99 at eight writers no longer reaches a fold.
+# It reads 357 on that box and 156 to 188 on a laptop, against the 3548
+# the same box read on the commit before. That is under the P5 target of
+# 2000 and this ceiling is under it too, which it could not be while the
+# tail was a fold. Writes over rows that are already there keep the old
+# bound of 256 and would read the old tail, for the reason DEFERRED_COPIED
+# gives: what they cost is not the commit but every scan after it.
+#
+# What made the bound moveable was not the fold getting cheaper. It was
+# the deferred patch: every commit used to copy the whole run of rows it
+# had accumulated, so a run of length n cost n squared and 256 was as far
+# as it went. The patch keeps its rows in sealed chunks now and a commit
+# copies a pointer, so the run costs what it holds.
+#
+# Set at four times the worst reading rather than at the measurement,
+# because a fold is processor work and a box with somebody else's build
+# on it stretches processor work: the same commit was seen at 156, 357
+# and 523 on three boxes at three loads. Four times the worst still
+# catches the tail going back to being a fold, which is the regression
+# this is here for and is a factor of seven away.
+#
+# Both of these are held only where the level's own median leaves room
+# under a millisecond. On two shared cores eight writers queue for
+# long enough that a tail in milliseconds is reading the box, and the
+# bench says so and reports rather than failing.
+commit_p99_nosync_us = 1500.0
+
+# How many statements a fold makes slow, at eight writers on the
+# unsynced store.
+#
+# The tail above says how slow and this says how many. It read 3.21
+# percent on a quiet laptop and 3.77 to 3.99 over six runs on the
+# thirty two core box while a fold landed every 256 statements, against
+# 0.58 percent at one writer, and the gap between those two is the
+# whole point: one fold is one slow statement when one writer is
+# waiting for the write side and eight when eight are.
+#
+# So this is the number that goes down when folds come off the
+# statement's path. It is 0.34 percent now, on the laptop and on the
+# thirty two core box, which is the same arithmetic run at a bound of
+# 4096 instead of 256.
+#
+# The ceiling is not three times that but four, and the reason is a
+# reading of 0.73 percent on the laptop under load, on a run whose
+# median was 246 us against the 80 of the quiet one. A fold costs
+# milliseconds on any box, so the folds themselves put the same count
+# over the line either way, but a loaded box also queues statements
+# past a millisecond that no fold was anywhere near, and those land on
+# this number too. Four times leaves room for that and still catches
+# the bound going back, which would be worth ten times.
+commit_slow_share = 0.015
+
+# What eight writers get through against one, on the same unsynced
+# store.
+#
+# One is the ceiling and not the floor: a store has one write side, so
+# eight writers take turns at it and the best a wide level can do is
+# lose nothing to the taking of turns. What this catches is the turns
+# costing more than the work. It read 0.40 before the write side began
+# handing over to one waiter instead of waking all of them, and 0.53
+# after, on the same box in the same hour.
+#
+# Left where it is although both ends of it got faster, because the
+# ratio went the wrong way while doing so: one writer went from 36915
+# statements a second to 67475 and eight went from 20849 to 31647, so
+# more got through at both widths and the ratio fell from 0.56 to 0.47.
+# That is one writer having been the one paying most of the copy this
+# ratio's denominator is made of, and it is not the taking of turns
+# getting worse. The laptop, whose cores are not shared, reads 0.96.
+commit_stmt_nosync_x = 0.45
+
+# What an append costs at ten times the table
+# (crates/zu/benches/write.rs).
+#
+# A fold rewrites the columns a statement touched, and an append
+# touches every column of its table because it adds a row past the end
+# of each of them. Whether that means rewriting a column or extending
+# one is the difference between an insert rate that holds as a table
+# fills and one that falls off, and nothing here asked: the bench
+# priced SET at two table sizes and INSERT at one.
+#
+# It extends. Ten times the rows costs 1.11x the processor time, which
+# is the fold copying the encoded bytes of the chunks it did not
+# change rather than putting them back through the encoder. The ceiling
+# is where a real rewrite would show up long before it reached ten.
+insert_fold_x = 2.0

@@ -925,6 +925,90 @@ pub(crate) fn build_direction(
     Ok(dirs)
 }
 
+/// The same, for a rebuild that no edge write went into: the neighbour
+/// lists are the lists `old` already holds, group for group, and only
+/// the offsets are written again.
+///
+/// A rel table is rebuilt when either end table grows, because the row
+/// domain the CSR is keyed by has moved, and a row appended to the end
+/// of that domain adds an offset and no neighbour. The offsets are one
+/// word a row and the neighbours are one word an edge, so on any graph
+/// with more than a couple of edges a node the neighbours are the whole
+/// of what the rebuild costs, and they are the part of it that has not
+/// changed.
+///
+/// The caller keeps the old segments out of the free list, since the
+/// directory it is about to write names them.
+pub(crate) fn build_direction_over(
+    db: &mut Zu1File,
+    end: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+    old: &[GroupMeta],
+    dir: Direction,
+) -> Result<Vec<DirectionMeta>> {
+    #[cfg(debug_assertions)]
+    for w in edges.windows(2) {
+        debug_assert!(w[0] <= w[1], "edges must be sorted");
+    }
+    // Every group the old directory had, even one past the end of this
+    // direction's row domain: the two directions are padded to a common
+    // count, so the shorter end holds empty groups, and carrying them
+    // is what keeps the segments they name from being lost.
+    let group_count = node_count
+        .div_ceil(GROUP_ROWS as u64)
+        .max(1)
+        .max(old.len() as u64) as usize;
+    let mut dirs = Vec::with_capacity(group_count);
+    let mut edge_ix = 0usize;
+    let mut offsets = Vec::new();
+    for g in 0..group_count as u64 {
+        let first_row = g * GROUP_ROWS as u64;
+        let row_count = group_rows(node_count, g);
+        offsets.clear();
+        offsets.push(0);
+        let mut count = 0u64;
+        for row in 0..u64::from(row_count) {
+            let node = (first_row + row) as u32;
+            while edge_ix < edges.len() && edges[edge_ix].0 == node {
+                count += 1;
+                edge_ix += 1;
+            }
+            offsets.push(count);
+        }
+        // A group the old directory never had holds no edges, because
+        // the rows are the ones the growth added and no edge was
+        // written. Anything else means the count above and the segment
+        // being carried disagree, which is a slip in the caller rather
+        // than a file that is wrong, and it says so here instead of
+        // writing a directory nobody can read.
+        let neighbors = match old.get(g as usize) {
+            Some(group) => group.dir(dir).neighbors.clone(),
+            None => write_segment(db, &[])?,
+        };
+        if neighbors.value_count != count {
+            return Err(ZuError::Corrupt {
+                what: "rel directory",
+                detail: format!(
+                    "group {g} carries {} neighbours over {count} the offsets name",
+                    neighbors.value_count
+                ),
+            });
+        }
+        dirs.push(DirectionMeta {
+            offsets: write_segment(db, &offsets)?,
+            neighbors,
+        });
+    }
+    if edge_ix != edges.len() {
+        return Err(ZuError::InvalidArgument(format!(
+            "{} edges name a {end} at or above the {node_count} rows of its node table",
+            edges.len() - edge_ix
+        )));
+    }
+    Ok(dirs)
+}
+
 /// The ordinal of each group's first edge: how many of `edges` name a
 /// source in an earlier group. The edges must be sorted, which is the
 /// contract of every caller that builds a direction out of them.
@@ -946,7 +1030,7 @@ pub(crate) fn group_bases(node_count: u64, edges: &[(u32, u32)]) -> Vec<u64> {
 /// at. The blocks recycle at the next checkpoint per the
 /// shadow-publishing rules.
 pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_directory_parts(db, root, true)
+    free_directory_parts(db, root, true, false)
 }
 
 /// [`free_directory`] leaving the edge property chain alone, for a
@@ -954,10 +1038,22 @@ pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
 /// caller owns the root from then on: nothing else names it once the old
 /// directory is gone.
 pub(crate) fn free_directory_keeping_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_directory_parts(db, root, false)
+    free_directory_parts(db, root, false, false)
 }
 
-fn free_directory_parts(db: &mut Zu1File, root: BlockPtr, props: bool) -> Result<()> {
+/// The same, leaving the neighbour lists alone too, for the rebuild
+/// [`build_direction_over`] does: the directory being written names
+/// those segments, so freeing them would hand out blocks it reads from.
+pub(crate) fn free_directory_keeping_edges(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_directory_parts(db, root, false, true)
+}
+
+fn free_directory_parts(
+    db: &mut Zu1File,
+    root: BlockPtr,
+    props: bool,
+    neighbors: bool,
+) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
     if props && directory.props != NULL_BLOCK {
         crate::props::free_props(db, directory.props)?;
@@ -970,12 +1066,16 @@ fn free_directory_parts(db: &mut Zu1File, root: BlockPtr, props: bool) -> Result
         }
     }
     for group in &directory.groups {
-        for seg in [
-            &group.fwd.offsets,
-            &group.fwd.neighbors,
-            &group.bwd.offsets,
-            &group.bwd.neighbors,
-        ] {
+        let segs = match neighbors {
+            true => vec![&group.fwd.offsets, &group.bwd.offsets],
+            false => vec![
+                &group.fwd.offsets,
+                &group.fwd.neighbors,
+                &group.bwd.offsets,
+                &group.bwd.neighbors,
+            ],
+        };
+        for seg in segs {
             for &ptr in &seg.blocks {
                 db.free_block(ptr)?;
             }
@@ -1529,10 +1629,18 @@ impl EdgePatch {
     }
 
     /// Takes one edge and answers with the ordinal it was given.
+    ///
+    /// A pair the dead set holds comes out of it, so that a pair is
+    /// ever only in one of the two. The file holds no copy of one that
+    /// gets this far, because a pair it does hold is refused before it
+    /// is added, so there is nothing in the dead set for a reader still
+    /// to want.
     pub fn add(&mut self, src: u64, dst: u64) -> u64 {
         let ord = self.base + self.added;
         put(&mut self.fwd, src, dst, ord);
         put(&mut self.bwd, dst, src, ord);
+        self.dead.remove(&(src, dst));
+        self.dead_bwd.remove(&(dst, src));
         self.added += 1;
         ord
     }
@@ -1545,7 +1653,21 @@ impl EdgePatch {
 
     /// Takes one edge away, by the pair it runs between, which is every
     /// copy of it the file holds.
+    ///
+    /// A pair this patch added itself comes out of the lists instead of
+    /// going into the dead set, because the file holds no copy of it to
+    /// be told about: a pair the file already runs through is refused
+    /// before it is ever added here. The ordinal it took stays spent,
+    /// and so does the row of edge properties that went with it. Both
+    /// are only ever reached through the lists this drops it from, and
+    /// the next edge takes the next ordinal either way, so what is left
+    /// behind is a row nothing reads rather than a hole in a run
+    /// something counts on.
     pub fn remove(&mut self, src: u64, dst: u64) {
+        if take(&mut self.fwd, src, dst) {
+            take(&mut self.bwd, dst, src);
+            return;
+        }
         self.dead.insert((src, dst));
         self.dead_bwd.insert((dst, src));
     }
@@ -1575,6 +1697,15 @@ impl EdgePatch {
         let list = self.of(src, Direction::Fwd);
         let at = list.partition_point(|&(n, _)| n < dst);
         list.get(at).is_some_and(|&(n, _)| n == dst)
+    }
+
+    /// The neighbors `node` has in `dir` that this patch put there,
+    /// which are exactly the ones no read of the file turns up. A
+    /// writer deciding whether a row can go asks this beside the file's
+    /// own list, because between the two is the whole list a fold would
+    /// have found on the row.
+    pub fn adds_on(&self, node: u64, dir: Direction) -> impl Iterator<Item = u64> + '_ {
+        self.of(node, dir).iter().map(|&(other, _)| other)
     }
 
     /// Whether this has taken away the edges between `node` and `other`,
@@ -1633,6 +1764,24 @@ fn put(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64, ord: u6
     let list = side.entry(node).or_default();
     let at = list.partition_point(|&(n, o)| (n, o) < (other, ord));
     list.insert(at, (other, ord));
+}
+
+/// Takes every copy of a pair back out of one side's list, and answers
+/// whether there was one, which is what says the pair was this patch's
+/// own rather than the file's. The node's entry goes when its list
+/// empties, because an entry that is there at all is what the reads
+/// take to mean the patch has something to say about that list.
+fn take(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64) -> bool {
+    let Some(list) = side.get_mut(&node) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|&(n, _)| n != other);
+    let took = list.len() < before;
+    if list.is_empty() {
+        side.remove(&node);
+    }
+    took
 }
 
 /// Copies a stretch of `node`'s list onto the end of a group being
@@ -1760,9 +1909,10 @@ impl GraphReader {
     /// the id is allowed to be.
     ///
     /// `None` is a row appended since the CSR was built, which is a
-    /// real row of a real table with nowhere in the CSR to be. It has
-    /// no edges, because an edge onto it is a fold, so every caller
-    /// answers it with the empty list its own return shape spells.
+    /// real row of a real table with nowhere in the CSR to be. The file
+    /// holds none of its edges, so every caller answers it out of the
+    /// patch alone, which for a row nothing has been linked to is the
+    /// empty list its own return shape spells.
     fn locate(&self, node: u64, dir: Direction) -> Result<Option<(usize, usize)>> {
         let rows = self.directory.rows(dir);
         if node >= rows {
@@ -2088,7 +2238,11 @@ impl GraphReader {
     /// the neighbor values never decode for a count.
     pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
         let Some((g, row)) = self.locate(node, dir)? else {
-            return Ok(0);
+            // A row appended since the CSR was built is in no group, so
+            // its whole degree is what the patch put on it. Nothing can
+            // have been taken off it, because nothing but the patch ever
+            // put anything on.
+            return Ok(self.added(node, dir) as u64);
         };
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
@@ -2217,14 +2371,16 @@ impl GraphReader {
         dir: Direction,
         out: &mut Vec<u64>,
     ) -> Result<()> {
-        let Some((g, row)) = self.locate(node, dir)? else {
-            return Ok(());
-        };
-        let meta = self.directory.groups[g].dir(dir);
-        let mut offs = Vec::with_capacity(2);
-        read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
         let from = out.len();
-        read_range(db, &meta.neighbors, offs[0], offs[1], out)?;
+        // A row appended since the CSR was built is in no group and the
+        // file holds none of its edges, so the read below is skipped and
+        // the merge that follows is the whole answer.
+        if let Some((g, row)) = self.locate(node, dir)? {
+            let meta = self.directory.groups[g].dir(dir);
+            let mut offs = Vec::with_capacity(2);
+            read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
+            read_range(db, &meta.neighbors, offs[0], offs[1], out)?;
+        }
         // The unfolded edges go into the list they belong in rather than
         // on the end of it, because the caller is owed a sorted list and
         // reads it as one. Each goes after the run of its own value, so

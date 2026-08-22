@@ -16,6 +16,7 @@
 //! joins the two. Everything here is testable without a terminal, and
 //! everything but the gathering without a file.
 
+use zu::session::Pin;
 use zu::zu1::catalog::{Catalog, GraphTypeOf};
 
 /// What a backslash line asked for.
@@ -29,6 +30,9 @@ pub(crate) enum Command<'a> {
     Describe(&'a str),
     /// Every graph in the file.
     Graphs,
+    /// What this session is set to: schema, graph, time zone and the
+    /// parameters it holds.
+    SessionState,
     /// Turn timing on, off, or over.
     Timing(Option<bool>),
     /// Run the statements in a file.
@@ -73,6 +77,10 @@ pub(crate) const COMMANDS: &[Entry] = &[
         summary: "the graphs in the file",
     },
     Entry {
+        synopsis: "\\session",
+        summary: "the schema, graph, time zone and parameters of this session",
+    },
+    Entry {
         synopsis: "\\i FILE",
         summary: "run the statements in a file",
     },
@@ -105,6 +113,7 @@ pub(crate) fn parse(line: &str) -> Option<Command<'_>> {
         "d" if arg.is_empty() => Command::Tables,
         "d" => Command::Describe(arg),
         "l" => Command::Graphs,
+        "session" => Command::SessionState,
         "i" if arg.is_empty() => Command::Wrong("\\i wants a file to read".into()),
         "i" => Command::Include(arg),
         "timing" => match arg {
@@ -204,6 +213,72 @@ pub(crate) fn graphs(catalog: &Catalog) -> String {
     let mut out = crate::aligned(&["name", "schema", "type"], &rows);
     out.push_str(&count(n, "graph"));
     out
+}
+
+/// What a session is set to, as `\session` prints it (ISO 7.1, GS01
+/// through GS16).
+///
+/// Four lines and then a table, because the four are what every session
+/// has and the table is what this one has been given. The zone is
+/// written the way a statement writes it, `+07:00` rather than 420, so
+/// that a reader who wants to put it back can copy it.
+///
+/// The epoch column is the pin. It is empty for a value parameter,
+/// which pins nothing, and holds the epoch the reference was taken at
+/// for a graph or a binding table, with a word beside it when that
+/// epoch has gone stale. A pin holds no blocks: a binding table
+/// parameter holds rows copied out of the snapshot, so an old one costs
+/// the memory of its rows and nothing on the file.
+pub(crate) fn session_state(
+    schema: &str,
+    graph: &str,
+    zone: i16,
+    epoch: u64,
+    params: &[(&str, &'static str, String)],
+    pins: &[Pin],
+) -> String {
+    let mut out = format!(
+        "schema:    {schema}\ngraph:     {graph}\ntime zone: {}\nepoch:     {epoch}\n",
+        zone_text(zone)
+    );
+    if params.is_empty() {
+        out.push_str("no parameters set\n");
+        return out;
+    }
+    let rows: Vec<Vec<String>> = params
+        .iter()
+        .map(|(name, kind, value)| {
+            let pin = pins.iter().find(|p| p.name == *name);
+            vec![
+                format!("${name}"),
+                kind.to_string(),
+                value.clone(),
+                match pin {
+                    Some(pin) => match pin.stale {
+                        zu::session::Stale::Fresh => pin.epoch.to_string(),
+                        zu::session::Stale::Old => format!("{} (old)", pin.epoch),
+                        zu::session::Stale::Gone => format!("{} (gone)", pin.epoch),
+                    },
+                    None => String::new(),
+                },
+            ]
+        })
+        .collect();
+    let n = rows.len();
+    out.push_str(&crate::aligned(
+        &["name", "kind", "value", "pinned at"],
+        &rows,
+    ));
+    out.push_str(&count(n, "parameter"));
+    out
+}
+
+/// A time zone displacement as a statement writes it, minutes east of
+/// UTC turned back into the sign, hours and minutes they came from.
+fn zone_text(minutes: i16) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let minutes = minutes.unsigned_abs();
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// One column of a table, as the file stores it.
@@ -665,6 +740,48 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1_000), "1 000");
         assert_eq!(grouped(12_345_678), "12 345 678");
+    }
+
+    #[test]
+    fn a_session_with_nothing_set_says_the_four_lines_and_stops() {
+        let shown = session_state("/", "/social", 0, 3, &[], &[]);
+        assert_eq!(
+            shown,
+            "schema:    /\ngraph:     /social\ntime zone: +00:00\nepoch:     3\nno parameters set\n"
+        );
+    }
+
+    #[test]
+    fn a_pinned_parameter_says_the_epoch_it_is_pinned_at() {
+        let pins = vec![
+            Pin {
+                name: "g".to_string(),
+                kind: "GRAPH",
+                epoch: 2,
+                what: "GRAPH /scratch".to_string(),
+                stale: zu::session::Stale::Gone,
+            },
+            Pin {
+                name: "t".to_string(),
+                kind: "BINDING TABLE",
+                epoch: 5,
+                what: "BINDING TABLE #1 (1 column, 4 rows)".to_string(),
+                stale: zu::session::Stale::Old,
+            },
+        ];
+        let params = [
+            ("cut", "VALUE", "35".to_string()),
+            ("g", "GRAPH", "GRAPH /scratch".to_string()),
+            ("t", "BINDING TABLE", "BINDING TABLE #1".to_string()),
+        ];
+        let shown = session_state("/", "/social", -330, 9, &params, &pins);
+        assert!(shown.contains("time zone: -05:30"), "{shown}");
+        // A value pins nothing, so its cell is empty, and the two that
+        // do pin say what has become of what they name.
+        assert!(shown.contains("$cut"), "{shown}");
+        assert!(shown.contains("2 (gone)"), "{shown}");
+        assert!(shown.contains("5 (old)"), "{shown}");
+        assert!(shown.contains("3 parameters"), "{shown}");
     }
 
     #[test]

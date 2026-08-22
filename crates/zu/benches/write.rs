@@ -107,23 +107,38 @@ const LARGE: u64 = 100_000;
 /// enough to keep the bench in seconds and large enough that one slow
 /// sync does not decide the number.
 const WRITES: u64 = 200;
-/// Statements the sustained run makes before its clock starts.
+/// Folds the sustained run goes through before its clock starts.
 ///
 /// A store that has just been loaded has never folded and has nothing
-/// on its free list, so its first thousand statements are a ramp: the
-/// file grows because no checkpoint has published anything to hand back
-/// yet, and what those statements cost is not what a running store
-/// costs. This is past the point where the small store stops growing.
-const RAMP: u64 = 1_500;
-/// Statements in the measured sustained window.
+/// on its free list, so its first statements are a ramp: the file grows
+/// because no checkpoint has published anything to hand back yet, and
+/// what those statements cost is not what a running store costs. Six
+/// folds is past the point where the small store stops growing.
+const FOLDS_RAMP: u64 = 6;
+/// Folds in the measured sustained window.
 ///
 /// Long enough to hold folds at the rate they happen and more than one
-/// checkpoint, which on the small store is a fold every few hundred
-/// statements and a checkpoint every few folds. The length is the whole
-/// point of the run: a window short enough to fall between two folds
-/// measures a write path with its housekeeping taken out, and the
+/// checkpoint, which is a checkpoint every few folds. The length is the
+/// whole point of the run: a window short enough to fall between two
+/// folds measures a write path with its housekeeping taken out, and the
 /// housekeeping is not optional.
-const SUSTAINED: u64 = 2_500;
+///
+/// Both of these count folds rather than statements, and they used to
+/// count statements. The trouble with that is that a statement count is
+/// a fold count times a rate this file cannot see, and the rate moved:
+/// the write path's deferral bound went from 256 to 4096, the ramp and
+/// the window stayed at the 1500 and 2500 statements that had held six
+/// folds and ten, and they went on calling themselves a ramp and a
+/// window while holding one fold and two. So the run measures the rate
+/// first and multiplies. See [`fold_every`].
+const FOLDS_WINDOW: u64 = 10;
+/// Statements the fold rate is measured over.
+///
+/// Long enough to hold folds at any rate the bound is likely to be set
+/// to, and cheap because it runs with no disk under it: a statement
+/// there is tens of microseconds, so the whole probe is a fraction of a
+/// second against the minute of syncs it sizes.
+const PROBE: u64 = 16_384;
 /// How often the sustained run stops to look at the two files.
 ///
 /// A stat is a microsecond against a statement that is thousands of
@@ -1158,6 +1173,76 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// The statement both sustained runs make. It writes one cell over a
+/// row the store already holds and touches nothing else, so what the
+/// run costs above the cell is the housekeeping.
+fn set(conn: &mut zu::Connection, age: u64) {
+    conn.query(&format!(
+        "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
+    ))
+    .expect("set");
+}
+
+/// One edge out of every node, which is what a seeded store carries so
+/// that a fold has a graph to rebuild and not just a column to rewrite.
+fn ring(rows: u64) -> Vec<(u32, u32)> {
+    (0..rows as u32)
+        .map(|i| (i, (i * 7 + 1) % rows as u32))
+        .collect()
+}
+
+/// Statements from one fold to the next, measured on a store whose
+/// syncs ask no disk.
+///
+/// The two runs below have to hold folds at the rate they happen, and
+/// that rate is a bound inside the write path rather than anything this
+/// file can see. Counting them is possible anyway. A fold rewrites a
+/// column and writes two segments where a deferred commit appends a log
+/// frame, so it is milliseconds where a statement is microseconds, and
+/// with no sync in the way it is the only thing that is. The slow
+/// statements are therefore the folds, and the statements over the
+/// number of them is the rate.
+///
+/// The line between the two is drawn off the probe's own median rather
+/// than at a number of microseconds, because the median moves by a
+/// factor of ten between a quiet laptop and a shared runner while the
+/// gap between a statement and a fold stays two orders of magnitude.
+fn fold_every(rows: u64) -> u64 {
+    let db = Database::memory_with(Config::new().threads(1)).expect("memory");
+    let mut conn = db.connect().expect("connect");
+    seed(
+        conn.session_mut().file_mut().expect("the store"),
+        rows,
+        &ring(rows),
+    );
+
+    let mut spent = Vec::with_capacity(PROBE as usize);
+    for age in 0..PROBE {
+        let at = Instant::now();
+        set(&mut conn, age % rows);
+        spent.push(at.elapsed().as_nanos() as f64 / 1e3);
+    }
+    let mut sorted = spent.clone();
+    sorted.sort_by(f64::total_cmp);
+    let slow = slow_us(&sorted);
+    let folds = spent.iter().filter(|us| **us > slow).count() as u64;
+
+    // A probe with no fold in it has not measured a rate, and a window
+    // sized off the answer would run for as long as the bound is wrong
+    // by, so the rate is capped at what makes the window the length of
+    // the probe. A bound that outran the probe fails the fold check in
+    // `main` and says so, which is the right way to find out.
+    (PROBE / folds.max(1)).min(PROBE / FOLDS_WINDOW)
+}
+
+/// The time above which a statement is a fold, out of a sorted run of
+/// them. Twenty times the median, and never under a fifth of a
+/// millisecond, which is well above a statement and well under a fold
+/// on any store this file builds.
+fn slow_us(sorted: &[f64]) -> f64 {
+    (sorted[sorted.len() / 2] * 20.0).max(200.0)
+}
+
 /// What a sustained run cost, which is a [`Cost`] and the two things
 /// only a long window can say.
 struct Sustained {
@@ -1205,19 +1290,13 @@ struct Sustained {
 /// and a checkpoint publishing them is the only thing that hands a
 /// block back. Neither number can be had by a run that quietly stopped
 /// churning, which is the point of checking them.
-fn run_sustained(dir: &Path, rows: u64) -> Sustained {
+fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
     let path = build(dir, rows);
     let loaded = parts(dir).0;
     let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
     let mut conn = db.connect().expect("connect");
     let mut age = 0;
-    let set = |conn: &mut zu::Connection, age: u64| {
-        conn.query(&format!(
-            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
-        ))
-        .expect("set");
-    };
-    for _ in 0..RAMP {
+    for _ in 0..ramp {
         set(&mut conn, age % rows);
         age += 1;
     }
@@ -1226,7 +1305,7 @@ fn run_sustained(dir: &Path, rows: u64) -> Sustained {
     let store_before = parts(dir).0;
     let mut peak = store_before;
     let start = Instant::now();
-    for i in 0..SUSTAINED {
+    for i in 0..window {
         set(&mut conn, age % rows);
         age += 1;
         if (i + 1) % SAMPLE == 0 {
@@ -1244,16 +1323,25 @@ fn run_sustained(dir: &Path, rows: u64) -> Sustained {
     );
     Sustained {
         cost: Cost {
-            us: elapsed.as_nanos() as f64 / 1e3 / SUSTAINED as f64,
-            cpu: after.cpu.saturating_sub(before.cpu) as f64 / SUSTAINED as f64,
-            written: after.written.saturating_sub(before.written) as f64 / SUSTAINED as f64,
-            growth: store_after.saturating_sub(store_before) as f64 / SUSTAINED as f64,
+            us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+            cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
+            written: after.written.saturating_sub(before.written) as f64 / window as f64,
+            growth: store_after.saturating_sub(store_before) as f64 / window as f64,
             rss: after.rss,
             peak: after.peak_rss.saturating_sub(before.peak_rss),
         },
         file_x: peak as f64 / loaded.max(1) as f64,
         window_x: peak as f64 / store_before.max(1) as f64,
     }
+}
+
+/// What the unsynced window cost and how many folds were in it.
+struct Unsynced {
+    cost: Cost,
+    /// Statements in the window that took a fold's worth of time. On a
+    /// store with no sync in the way nothing else does, so this is the
+    /// count of folds the window held.
+    folds: u64,
 }
 
 /// The same sustained window with nothing to sync to, which is what
@@ -1283,12 +1371,9 @@ fn run_sustained(dir: &Path, rows: u64) -> Sustained {
 /// reads 19.1, so the folds in the sustained window are about four
 /// microseconds of the number and the run is not quietly measuring a
 /// store that stopped working.
-fn run_unsynced(rows: u64) -> Cost {
+fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     let db = Database::memory_with(Config::new().threads(1)).expect("memory");
     let mut conn = db.connect().expect("connect");
-    let edges: Vec<(u32, u32)> = (0..rows as u32)
-        .map(|i| (i, (i * 7 + 1) % rows as u32))
-        .collect();
     // A memory database opens empty, so the rows go in through the
     // store itself rather than through a file that was loaded before
     // anything opened it. This is the one place a bench reaches for the
@@ -1297,25 +1382,27 @@ fn run_unsynced(rows: u64) -> Cost {
     seed(
         conn.session_mut().file_mut().expect("the store"),
         rows,
-        &edges,
+        &ring(rows),
     );
 
     let mut age = 0;
-    let set = |conn: &mut zu::Connection, age: u64| {
-        conn.query(&format!(
-            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
-        ))
-        .expect("set");
-    };
-    for _ in 0..RAMP {
+    for _ in 0..ramp {
         set(&mut conn, age % rows);
         age += 1;
     }
 
     let before = usage();
     let start = Instant::now();
-    for _ in 0..SUSTAINED {
+    // Timed one at a time as well as end to end, because with no sync
+    // in the way the folds are the only statements that take
+    // milliseconds and counting them is counting the folds. That is the
+    // check that the window held its housekeeping, and it is a count of
+    // the thing itself rather than an inference from a byte total.
+    let mut spent = Vec::with_capacity(window as usize);
+    for _ in 0..window {
+        let at = Instant::now();
         set(&mut conn, age % rows);
+        spent.push(at.elapsed().as_nanos() as f64 / 1e3);
         age += 1;
     }
     let elapsed = start.elapsed();
@@ -1326,9 +1413,12 @@ fn run_unsynced(rows: u64) -> Cost {
         rows as i64,
         "no row was added or lost"
     );
-    Cost {
-        us: elapsed.as_nanos() as f64 / 1e3 / SUSTAINED as f64,
-        cpu: after.cpu.saturating_sub(before.cpu) as f64 / SUSTAINED as f64,
+    let mut sorted = spent.clone();
+    sorted.sort_by(f64::total_cmp);
+    let slow = slow_us(&sorted);
+    let cost = Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
         // A store with no file under it pushes nothing at a disk and
         // grows no file, so both columns are zero by construction
         // rather than by measurement and neither is gated.
@@ -1336,6 +1426,10 @@ fn run_unsynced(rows: u64) -> Cost {
         growth: 0.0,
         rss: after.rss,
         peak: after.peak_rss.saturating_sub(before.peak_rss),
+    };
+    Unsynced {
+        cost,
+        folds: spent.iter().filter(|us| **us > slow).count() as u64,
     }
 }
 
@@ -1372,6 +1466,17 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
+    // The same statement over ten times the table, which is the one
+    // question the `SET` pair above cannot answer. A `SET` leaves the
+    // row domain where it was, so the fold rewrites the chunks the
+    // statement touched and leaves every other column alone. An
+    // `INSERT` grows the domain, and a column that has to grow is a
+    // column the fold has to rewrite, so the work an append leaves for
+    // the fold is set by the table and not by the append. Whether that
+    // is what happens is `insert_fold_x`.
+    let insert_large = run_insert(&root.path().join("insert-large"), LARGE);
+    insert_large.report(&format!("INSERT, {LARGE} rows"), sync);
+
     let merge = run_merge(&root.path().join("merge"), SMALL);
     merge.report(&format!("MERGE, one found one made, {SMALL} rows"), sync);
 
@@ -1405,7 +1510,17 @@ fn main() {
     let detach = run_detach(&root.path().join("detach"), SMALL);
     detach.report(&format!("DETACH DELETE, {SMALL} rows"), sync);
 
-    let sustained = run_sustained(&root.path().join("sustained"), SMALL);
+    // How long the two runs below have to be, which is a question about
+    // the write path and not one this file gets to answer on its own.
+    // See [`fold_every`].
+    let every = fold_every(SMALL);
+    let (ramp, window) = (FOLDS_RAMP * every, FOLDS_WINDOW * every);
+    println!(
+        "a fold every {every} statements, so the sustained window is {window} of them with \
+         {ramp} ahead of it"
+    );
+
+    let sustained = run_sustained(&root.path().join("sustained"), SMALL, ramp, window);
     sustained
         .cost
         .report(&format!("SET sustained, {SMALL} rows"), sync);
@@ -1432,12 +1547,48 @@ fn main() {
         "sustained_window_x: {:.2}x store at its peak against the store as the window opened",
         sustained.window_x
     );
+    // The byte counter is the operating system's, and it counts what
+    // reached a block device. A store on a memory filesystem, which is
+    // what /tmp is on a good many Linux boxes, reaches one never, so
+    // the column reads zero for every scenario and the ratio is zero
+    // over zero. That is the instrument missing rather than the folds
+    // missing, and the two have to be told apart: the file check below
+    // holds either way, and it is the one that would catch a run that
+    // stopped churning.
+    //
+    // What it reads is set by the fold rate and not by how long the
+    // window is, since both halves of it grow together: a fold on this
+    // store pushes about a megabyte, a commit pushes sixteen kilobytes,
+    // so a fold every thousand statements is a kilobyte a statement on
+    // top of sixteen and the ratio is about 1.07. It read 1.27 when a
+    // fold landed every 256. That is the reason the floor below is 1.03
+    // rather than anything tighter: the deferral bound is what decides
+    // the headroom this check has, and raising it spends some. The
+    // count of folds in the unsynced window is the direct form of the
+    // same question and is checked further down.
+    let bytes_counted = set_small.written > 0.0 || sustained.cost.written > 0.0;
+    match bytes_counted {
+        true => assert!(
+            sustained_fold_x > 1.03,
+            "the sustained window has to contain the folds it is measuring, and it pushed \
+             {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
+            sustained.cost.written / 1024.0,
+            set_small.written / 1024.0
+        ),
+        false => println!(
+            "sustained_fold_x: nothing this run wrote reached a block device, so the bytes \
+             are the counter and not the folds: reported, not checked"
+        ),
+    }
+    // What the folds did to the file, which is on the file itself and
+    // so is there to read wherever the store is. A run whose folds
+    // stopped is a run that loaded a store and left it the size it
+    // loaded it.
     assert!(
-        sustained_fold_x > 1.05,
-        "the sustained window has to contain the folds it is measuring, and it pushed \
-         {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
-        sustained.cost.written / 1024.0,
-        set_small.written / 1024.0
+        sustained.file_x > 1.05,
+        "the sustained window has to contain the folds it is measuring, and the store came \
+         out of it {:.2}x the size it was loaded at",
+        sustained.file_x
     );
     assert!(
         sustained.window_x < 1.25,
@@ -1446,8 +1597,28 @@ fn main() {
         sustained.window_x
     );
 
-    let unsynced = run_unsynced(SMALL);
-    unsynced.report(&format!("SET unsynced, {SMALL} rows"), 0.0);
+    let unsynced = run_unsynced(SMALL, ramp, window);
+    unsynced
+        .cost
+        .report(&format!("SET unsynced, {SMALL} rows"), 0.0);
+    // The folds counted rather than inferred. The window was sized to
+    // hold [`FOLDS_WINDOW`] of them and a run that quietly stopped
+    // folding is the thing every check around here is looking for, so
+    // this is that question asked of the folds themselves. Half is the
+    // floor because the rate was measured on one store and used on
+    // another, and because a checkpoint lands among them and takes a
+    // fold's worth of time of its own.
+    println!(
+        "sustained_folds: {} folds in the window with no sync in it, against the {FOLDS_WINDOW} \
+         it was sized for",
+        unsynced.folds
+    );
+    assert!(
+        unsynced.folds >= FOLDS_WINDOW / 2,
+        "the sustained window has to contain the folds it is measuring, and {window} statements \
+         with no sync in them held {} of them",
+        unsynced.folds
+    );
     // The write path on its own, which is the same window over a store
     // whose syncs return without asking a disk. This is the number the
     // P5 point write budget is read against, because it is measured
@@ -1456,7 +1627,7 @@ fn main() {
     println!(
         "write_cpu_nosync_us: {:.1} us of processor time a statement, against the {:.1} the \
          same window costs with the syncs in it",
-        unsynced.cpu, sustained.cost.cpu
+        unsynced.cost.cpu, sustained.cost.cpu
     );
 
     // How much of a one cell write is the table it sits in, in time and
@@ -1467,6 +1638,16 @@ fn main() {
     let write_x = set_large.written / set_small.written.max(1.0);
     println!("set_fold_x:  {fold_x:.2}x in time from {SMALL} to {LARGE} rows");
     println!("set_write_x: {write_x:.2}x in bytes written from {SMALL} to {LARGE} rows");
+
+    // The same question of the append, on the processor time rather
+    // than the clock for the reason the edge ratio below gives. An
+    // `INSERT` puts one row past the end of every column, so what it
+    // asks of the store does not depend on how many rows are already
+    // there, and a ratio near one is that. A ratio near ten is the fold
+    // rewriting the whole table to add a row to it, which is a cost per
+    // statement that goes up forever as the table fills.
+    let insert_x = insert_large.cpu / insert.cpu.max(0.001);
+    println!("insert_fold_x: {insert_x:.2}x in processor time from {SMALL} to {LARGE} rows");
 
     // The same question of an edge insert, which is the one write that
     // rebuilds a whole structure rather than rewriting a column of it.
@@ -1535,6 +1716,7 @@ fn main() {
         ("set_peak_rss_mb", set_small.peak as f64 / MB),
         ("set_fold_x", fold_x),
         ("set_write_x", write_x),
+        ("insert_fold_x", insert_x),
         ("sustained_stmt_us", sustained.cost.us),
         ("sustained_stmt_cpu_us", sustained.cost.cpu),
         (
@@ -1544,7 +1726,7 @@ fn main() {
         ("sustained_stmt_kb", sustained.cost.written / 1024.0),
         ("sustained_stmt_growth_b", sustained.cost.growth),
         ("sustained_file_x", sustained.file_x),
-        ("write_cpu_nosync_us", unsynced.cpu),
+        ("write_cpu_nosync_us", unsynced.cost.cpu),
     ];
     for (key, got) in checks {
         // The one key with a ceiling per box class. On a shared runner

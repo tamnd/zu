@@ -94,8 +94,13 @@ words = ["START", "TRANSACTION", "COMMIT", "ROLLBACK", "READ", "ONLY", "WRITE"]
 
 [[group]]
 kind = "keyword"
+doc = "The session statements, ISO 7.1 and 7.2. SESSION opens one and SET or RESET says which, and the words behind them are the parts of a session a statement can move: the parameters, one at a time or all at once, the schema, the graph, and the time zone. ZONE only ever stands behind TIME and PARAMETER only behind a RESET, so both are ordinary variable names everywhere else, the way the access modes are. The nouns the two verbs share with the rest of the language, SCHEMA and GRAPH and VALUE and BINDING TABLE, are coloured by the groups they already belong to."
+words = ["SESSION", "RESET", "CHARACTERISTICS", "PARAMETERS", "PARAMETER", "ZONE"]
+
+[[group]]
+kind = "keyword"
 doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word. ON is here because a MERGE is the only place it stands, in the ON CREATE SET and ON MATCH SET that say which of the two the MERGE did, and a word only a refused statement can hold is refused along with it."
-words = ["MERGE", "SESSION", "ON"]
+words = ["MERGE", "ON"]
 
 [[group]]
 kind = "keyword"

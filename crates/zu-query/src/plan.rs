@@ -1515,6 +1515,9 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         // of the five words above and is printed as the word a query
         // would have written to ask for it whole.
         BoundExpr::Clock => "CURRENT_TIMESTAMP".into(),
+        // The status of the statement before this one, printed as the
+        // call a query writes to ask for it.
+        BoundExpr::Status => format!("{}()", crate::binder::STATUS_FN.to_uppercase()),
         BoundExpr::Map(entries) => {
             let rendered: Vec<String> = entries
                 .iter()
@@ -1539,7 +1542,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 expr_text(body, query)
             )
         }
-        BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
+        BoundExpr::Cast { expr, ty, .. } => format!("CAST({} AS {ty})", expr_text(expr, query)),
         BoundExpr::Case {
             subject,
             branches,

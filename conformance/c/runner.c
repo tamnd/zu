@@ -297,6 +297,19 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
         out->as.str.len = text_len;
         return 0;
     }
+    case ZU_TYPE_BYTES: {
+        const uint8_t *octets = NULL;
+        size_t octet_len = 0;
+        if (zu_value_bytes(v, &octets, &octet_len) != ZU_OK) {
+            return say(detail, len, "%s says it is a BYTES and does not read as one", where);
+        }
+        out->kind = CV_BYTES;
+        /* A byte string of no octets is a value, and the pointer for one
+         * is allowed to be null, so the length is what says what it is. */
+        out->as.bytes.ptr = (const char *)octets;
+        out->as.bytes.len = octet_len;
+        return 0;
+    }
     case ZU_TYPE_TEMPORAL: {
         int32_t kind = -1, offset = 0;
         int64_t count = 0;

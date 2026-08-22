@@ -167,7 +167,7 @@ fn a_write_cannot_be_profiled_and_a_read_only_connection_says_so_first() {
     let ro = Database::open_with(&path, Config::new().read_only(true)).expect("open");
     let mut ro = ro.connect().expect("connect");
     let err = ro
-        .profile("CREATE PROPERTY GRAPH second ANY", &[])
+        .profile("CREATE PROPERTY GRAPH later ANY", &[])
         .expect_err("read-only refuses a statement that writes");
     assert!(err.to_string().contains("read-only"), "{err}");
 

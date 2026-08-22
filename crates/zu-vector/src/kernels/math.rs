@@ -32,10 +32,67 @@
 
 use zu_common::{Result, ZuError, gqlstatus::codes};
 
-use crate::arena::MorselArena;
+use crate::arena::{MorselArena, Pod};
 use crate::bitmap::Bitmap;
 use crate::sel::SelVector;
 use crate::vector::{PhysType, ValueVector, VecEncoding};
+
+/// The compute loop over one argument, with the function already chosen
+/// and the encoding already settled.
+///
+/// Both have to be settled outside, for the reason the arithmetic
+/// kernel settles its operation outside: a match standing in the loop
+/// is a branch the vectorizer will not lift, and a loop it will not
+/// lift runs a row at a time.
+#[inline(always)]
+fn fill1<S: Pod, D: Pod, F: Fn(S) -> D>(dst: &mut [D], v: &ValueVector, len: usize, f: F) {
+    match v.encoding {
+        VecEncoding::Constant => dst[..len].fill(f(v.constant_value::<S>())),
+        _ => {
+            let src = v.values::<S>();
+            for i in 0..len {
+                dst[i] = f(src[i]);
+            }
+        }
+    }
+}
+
+/// The same over two arguments, whose physical types agree because
+/// [`MathPair::answer_type`] answers only where they do.
+#[inline(always)]
+fn fill2<S: Pod, D: Pod, F: Fn(S, S) -> D>(
+    dst: &mut [D],
+    l: &ValueVector,
+    r: &ValueVector,
+    len: usize,
+    f: F,
+) {
+    match (l.encoding, r.encoding) {
+        (VecEncoding::Constant, VecEncoding::Constant) => {
+            dst[..len].fill(f(l.constant_value::<S>(), r.constant_value::<S>()));
+        }
+        (VecEncoding::Constant, _) => {
+            let c = l.constant_value::<S>();
+            let b = r.values::<S>();
+            for i in 0..len {
+                dst[i] = f(c, b[i]);
+            }
+        }
+        (_, VecEncoding::Constant) => {
+            let a = l.values::<S>();
+            let c = r.constant_value::<S>();
+            for i in 0..len {
+                dst[i] = f(a[i], c);
+            }
+        }
+        _ => {
+            let (a, b) = (l.values::<S>(), r.values::<S>());
+            for i in 0..len {
+                dst[i] = f(a[i], b[i]);
+            }
+        }
+    }
+}
 
 /// One of the numeric functions of one argument, with the digit count
 /// ROUND was written with. A second argument that is not a constant is
@@ -163,67 +220,17 @@ pub fn unary(
     check(op, v, sel, len)?;
     let mut out = ValueVector::flat_uninit(arena, answer, len);
     match (v.phys, answer) {
-        (PhysType::Int64, PhysType::Int64) => {
-            let dst = out.values_mut::<i64>();
-            match v.encoding {
-                VecEncoding::Constant => {
-                    let c = exact(op, v.constant_value::<i64>());
-                    dst[..len].fill(c);
-                }
-                _ => {
-                    let src = v.values::<i64>();
-                    for i in 0..len {
-                        dst[i] = exact(op, src[i]);
-                    }
-                }
-            }
-        }
+        (PhysType::Int64, PhysType::Int64) => fill_exact(op, out.values_mut::<i64>(), v, len),
         (PhysType::Float64, PhysType::Int64) => {
-            let dst = out.values_mut::<i64>();
-            match v.encoding {
-                VecEncoding::Constant => {
-                    let c = sign_f64(v.constant_value::<f64>());
-                    dst[..len].fill(c);
-                }
-                _ => {
-                    let src = v.values::<f64>();
-                    for i in 0..len {
-                        dst[i] = sign_f64(src[i]);
-                    }
-                }
-            }
+            fill1(out.values_mut::<i64>(), v, len, sign_f64);
         }
         // A whole number through a root or an angle, which is the one
         // shape where the answer is wider than what arrived.
         (PhysType::Int64, PhysType::Float64) => {
-            let dst = out.values_mut::<f64>();
-            match v.encoding {
-                VecEncoding::Constant => {
-                    let c = real(op, v.constant_value::<i64>() as f64);
-                    dst[..len].fill(c);
-                }
-                _ => {
-                    let src = v.values::<i64>();
-                    for i in 0..len {
-                        dst[i] = real(op, src[i] as f64);
-                    }
-                }
-            }
+            fill_real(op, out.values_mut::<f64>(), v, len, |x: i64| x as f64);
         }
         (PhysType::Float64, PhysType::Float64) => {
-            let dst = out.values_mut::<f64>();
-            match v.encoding {
-                VecEncoding::Constant => {
-                    let c = real(op, v.constant_value::<f64>());
-                    dst[..len].fill(c);
-                }
-                _ => {
-                    let src = v.values::<f64>();
-                    for i in 0..len {
-                        dst[i] = real(op, src[i]);
-                    }
-                }
-            }
+            fill_real(op, out.values_mut::<f64>(), v, len, |x: f64| x);
         }
         _ => unreachable!("answer_type answers for these four shapes only"),
     }
@@ -314,21 +321,18 @@ pub fn pair(
     let mut out = ValueVector::flat_uninit(arena, answer, len);
     match answer {
         PhysType::Int64 => {
-            let dst = out.values_mut::<i64>();
-            for (i, slot) in dst[..len].iter_mut().enumerate() {
-                let (x, y) = (at_i64(l, i), at_i64(r, i));
-                // A divisor of nought is remapped to one so the
-                // hardware cannot trap on a row nobody selected, which
-                // is what the arithmetic kernel does and for the same
-                // reason.
-                *slot = x.wrapping_rem(if y == 0 { 1 } else { y });
-            }
+            // A divisor of nought is remapped to one so the hardware
+            // cannot trap on a row nobody selected, which is what the
+            // arithmetic kernel does and for the same reason.
+            fill2(out.values_mut::<i64>(), l, r, len, |x: i64, y: i64| {
+                x.wrapping_rem(if y == 0 { 1 } else { y })
+            });
+        }
+        _ if l.phys == PhysType::Int64 => {
+            fill_pair_real(op, out.values_mut::<f64>(), l, r, len, |x: i64| x as f64);
         }
         _ => {
-            let dst = out.values_mut::<f64>();
-            for (i, slot) in dst[..len].iter_mut().enumerate() {
-                *slot = apply_pair(op, arg_f64(l, i), arg_f64(r, i));
-            }
+            fill_pair_real(op, out.values_mut::<f64>(), l, r, len, |x: f64| x);
         }
     }
     verify_pair(op, l, r, &out, sel, len)?;
@@ -338,16 +342,24 @@ pub fn pair(
     Ok(out)
 }
 
-/// The answer over two approximate numbers, computed for every row
-/// whatever the conditions say, since nothing here traps.
+/// The two argument functions over approximate numbers, dispatched once
+/// for the whole chunk and computed for every row whatever the
+/// conditions say, since nothing here traps.
 #[inline(always)]
-fn apply_pair(op: MathPair, x: f64, y: f64) -> f64 {
+fn fill_pair_real<S: Pod, C: Fn(S) -> f64 + Copy>(
+    op: MathPair,
+    dst: &mut [f64],
+    l: &ValueVector,
+    r: &ValueVector,
+    len: usize,
+    conv: C,
+) {
     match op {
-        MathPair::Power => x.powf(y),
+        MathPair::Power => fill2(dst, l, r, len, |x, y| conv(x).powf(conv(y))),
         // LOG takes the base first and the number second, which is the
         // order ISO 20.22 writes it in.
-        MathPair::Log => y.log(x),
-        MathPair::Mod => x % y,
+        MathPair::Log => fill2(dst, l, r, len, |x, y| conv(y).log(conv(x))),
+        MathPair::Mod => fill2(dst, l, r, len, |x, y| conv(x) % conv(y)),
     }
 }
 
@@ -507,63 +519,93 @@ fn merged_validity(
     Some(copy)
 }
 
-/// The answer over a whole number, which is a whole number.
+/// The exact half, dispatched once for the whole chunk.
 ///
 /// The two shapes that can have no answer wrap here rather than
 /// branching, the way the arithmetic loop wraps: a row the check ahead
 /// of the loop let through has an answer, and a row it did not is a row
 /// nobody reads.
 #[inline(always)]
-fn exact(op: MathOp, x: i64) -> i64 {
+fn fill_exact(op: MathOp, dst: &mut [i64], v: &ValueVector, len: usize) {
     match op {
-        MathOp::Abs => x.wrapping_abs(),
-        MathOp::Sign => x.signum(),
+        MathOp::Abs => fill1(dst, v, len, i64::wrapping_abs),
+        MathOp::Sign => fill1(dst, v, len, i64::signum),
         // A whole number is already at its own ceiling and its own
         // floor, and rounding one to a digit inside the fraction leaves
         // it where it is, so these answer what they were handed rather
         // than going through a float that could not hold it.
-        MathOp::Ceil | MathOp::Floor => x,
-        MathOp::Round(digits) if digits >= 0 => x,
-        MathOp::Round(digits) => rounded_int(x, digits).unwrap_or(0),
+        MathOp::Ceil | MathOp::Floor => fill1(dst, v, len, |x: i64| x),
+        MathOp::Round(digits) if digits >= 0 => fill1(dst, v, len, |x: i64| x),
+        MathOp::Round(digits) => fill1(dst, v, len, move |x: i64| {
+            rounded_int(x, digits).unwrap_or(0)
+        }),
         _ => unreachable!("the approximate half answers a float"),
     }
 }
 
-/// The answer over an approximate number, which is every one of these
-/// but the sign.
+/// The approximate half, which is every one of these but the sign,
+/// dispatched once for the whole chunk.
 ///
-/// Nothing here branches on the value: a row the check ahead of the
+/// `conv` carries whatever arrived to the double the function takes, so
+/// one copy of these arms serves a column of whole numbers and a column
+/// of approximate ones.
+///
+/// Nothing in here branches on the value: a row the check ahead of the
 /// loop let through has an answer, and where it did not the hardware
 /// hands back an infinity or a NaN that nobody reads.
 #[inline(always)]
-fn real(op: MathOp, x: f64) -> f64 {
+fn fill_real<S: Pod, C: Fn(S) -> f64 + Copy>(
+    op: MathOp,
+    dst: &mut [f64],
+    v: &ValueVector,
+    len: usize,
+    conv: C,
+) {
     match op {
-        MathOp::Abs => x.abs(),
-        MathOp::Ceil => x.ceil(),
-        MathOp::Floor => x.floor(),
-        MathOp::Round(0) => x.round(),
+        MathOp::Abs => fill1(dst, v, len, |x| conv(x).abs()),
+        MathOp::Ceil => fill1(dst, v, len, |x| conv(x).ceil()),
+        MathOp::Floor => fill1(dst, v, len, |x| conv(x).floor()),
+        MathOp::Round(0) => fill1(dst, v, len, |x| conv(x).round()),
         MathOp::Round(digits) => {
             let scale = 10f64.powi(digits.clamp(-308, 308) as i32);
-            (x * scale).round() / scale
+            fill1(dst, v, len, move |x| (conv(x) * scale).round() / scale);
         }
-        MathOp::Sqrt => x.sqrt(),
-        MathOp::Exp => x.exp(),
-        MathOp::Ln => x.ln(),
-        MathOp::Log10 => x.log10(),
-        MathOp::Sin => x.sin(),
-        MathOp::Cos => x.cos(),
-        MathOp::Tan => x.tan(),
+        MathOp::Sqrt => fill1(dst, v, len, |x| conv(x).sqrt()),
+        MathOp::Exp => fill1(dst, v, len, |x| conv(x).exp()),
+        MathOp::Ln => fill1(dst, v, len, |x| conv(x).ln()),
+        MathOp::Log10 => fill1(dst, v, len, |x| conv(x).log10()),
+        MathOp::Sin => fill1(dst, v, len, |x| conv(x).sin()),
+        MathOp::Cos => fill1(dst, v, len, |x| conv(x).cos()),
+        MathOp::Tan => fill1(dst, v, len, |x| conv(x).tan()),
         // The cotangent is the cosine over the sine, which is what the
         // row engine computes and why a sine of nought is a division by
-        // nought there rather than a condition of its own.
-        MathOp::Cot => x.cos() / x.sin(),
-        MathOp::Asin => x.asin(),
-        MathOp::Acos => x.acos(),
-        MathOp::Atan => x.atan(),
-        MathOp::Degrees => x.to_degrees(),
-        MathOp::Radians => x.to_radians(),
+        // nought there rather than a condition of its own. It is the
+        // one of these written out of line, for the reason [`cot`]
+        // gives.
+        MathOp::Cot => fill1(dst, v, len, |x| cot(conv(x))),
+        MathOp::Asin => fill1(dst, v, len, |x| conv(x).asin()),
+        MathOp::Acos => fill1(dst, v, len, |x| conv(x).acos()),
+        MathOp::Atan => fill1(dst, v, len, |x| conv(x).atan()),
+        MathOp::Degrees => fill1(dst, v, len, |x| conv(x).to_degrees()),
+        MathOp::Radians => fill1(dst, v, len, |x| conv(x).to_radians()),
         MathOp::Sign => unreachable!("sign answers an integer"),
     }
+}
+
+/// The cotangent, written once and called from both engines.
+///
+/// Every other function here is one libm call and rounds the same way
+/// wherever it is written. This one is a division of two of them, and
+/// that does not survive being written twice: the same expression in
+/// the row engine's crate and in this one comes out one place apart at
+/// 0.75, the optimizer being free to fold the pair of calls together
+/// in one and not in the other. Which of the two is the better answer
+/// is not the question. Nothing in a statement says which engine takes
+/// it, so the two have to agree, and the way to make two crates agree
+/// on a float is to give them one function rather than one formula.
+#[inline(never)]
+pub fn cot(x: f64) -> f64 {
+    x.cos() / x.sin()
 }
 
 #[inline(always)]
@@ -691,6 +733,38 @@ fn risky(op: MathOp, v: &ValueVector, len: usize) -> bool {
         // multiplying by the scale is where a finite number can leave.
         (PhysType::Float64, MathOp::Round(digits)) => digits != 0,
         _ => false,
+    }
+}
+
+/// The answer over one approximate number, which the walk needs and the
+/// loops do not: the walk runs before the answers are written and asks
+/// of a single row whether one exists, where [`fill_real`] settles the
+/// function once and writes a chunk of them. The two hold the same
+/// arms, and a change to either belongs in both.
+fn real(op: MathOp, x: f64) -> f64 {
+    match op {
+        MathOp::Abs => x.abs(),
+        MathOp::Ceil => x.ceil(),
+        MathOp::Floor => x.floor(),
+        MathOp::Round(0) => x.round(),
+        MathOp::Round(digits) => {
+            let scale = 10f64.powi(digits.clamp(-308, 308) as i32);
+            (x * scale).round() / scale
+        }
+        MathOp::Sqrt => x.sqrt(),
+        MathOp::Exp => x.exp(),
+        MathOp::Ln => x.ln(),
+        MathOp::Log10 => x.log10(),
+        MathOp::Sin => x.sin(),
+        MathOp::Cos => x.cos(),
+        MathOp::Tan => x.tan(),
+        MathOp::Cot => cot(x),
+        MathOp::Asin => x.asin(),
+        MathOp::Acos => x.acos(),
+        MathOp::Atan => x.atan(),
+        MathOp::Degrees => x.to_degrees(),
+        MathOp::Radians => x.to_radians(),
+        MathOp::Sign => unreachable!("sign answers an integer"),
     }
 }
 
@@ -1293,5 +1367,73 @@ mod tests {
             MathPair::Log.answer_type(PhysType::Str, PhysType::Str),
             None
         );
+    }
+
+    /// The approximate half is written twice, once as the chunk the
+    /// kernel fills and once as the single answer the walk reads, and
+    /// the two have to agree for every function or a statement can tell
+    /// which path it took. This runs all eighteen through both, over an
+    /// approximate column and a whole one, on arguments every one of
+    /// them has an answer for.
+    #[test]
+    fn every_function_fills_what_one_row_answers() {
+        const OPS: [MathOp; 18] = [
+            MathOp::Abs,
+            MathOp::Ceil,
+            MathOp::Floor,
+            MathOp::Round(0),
+            MathOp::Round(2),
+            MathOp::Sqrt,
+            MathOp::Exp,
+            MathOp::Ln,
+            MathOp::Log10,
+            MathOp::Sin,
+            MathOp::Cos,
+            MathOp::Tan,
+            MathOp::Cot,
+            MathOp::Asin,
+            MathOp::Acos,
+            MathOp::Atan,
+            MathOp::Degrees,
+            MathOp::Radians,
+        ];
+        let reals: [f64; 3] = [0.25, 0.5, 1.0];
+        // One is the only whole number all eighteen have an answer for,
+        // an inverse sine having none above it and a logarithm none at
+        // nought, so the whole column carries the conversion rather
+        // than the spread and the approximate column above carries the
+        // spread.
+        let wholes: [i64; 3] = [1, 1, 1];
+        let mut arena = MorselArena::new();
+        for op in OPS {
+            let v = floats(&mut arena, &reals);
+            let out = unary(&mut arena, op, &v, None).unwrap();
+            for (i, x) in reals.iter().enumerate() {
+                assert_eq!(out.values::<f64>()[i], real(op, *x), "{op:?} on {x}");
+            }
+            // Every one of these is real over a whole number too, bar
+            // the four the exact half keeps exact, and those answer an
+            // integer rather than going through here at all.
+            if !matches!(
+                op,
+                MathOp::Abs | MathOp::Ceil | MathOp::Floor | MathOp::Round(_)
+            ) {
+                let v = ints(&mut arena, &wholes);
+                let out = unary(&mut arena, op, &v, None).unwrap();
+                for (i, x) in wholes.iter().enumerate() {
+                    let want = real(op, *x as f64);
+                    assert_eq!(out.values::<f64>()[i], want, "{op:?} on the whole {x}");
+                }
+            }
+            // A column of one repeated value takes the constant arm,
+            // which is the shape a pinned argument arrives in.
+            let c = ValueVector::constant(&mut arena, PhysType::Float64, 0.5f64, 3);
+            let out = unary(&mut arena, op, &c, None).unwrap();
+            assert_eq!(
+                out.values::<f64>()[2],
+                real(op, 0.5),
+                "{op:?} on a constant"
+            );
+        }
     }
 }

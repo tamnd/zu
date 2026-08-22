@@ -50,6 +50,8 @@ A statement that failed answers with `error` and a `failure` object:
 
 `gqlstatus` is the standard's condition code, `condition` is the standard's own text for it, `severity` is one of `success`, `no data`, `warning`, `informational`, `exception`, and `message` is zu's sentence, which names the position and keeps naming it, so printing the message alone is still a complete report.
 
+The rest of what ISO 39075 subclause 23.2 asks a diagnostic record to carry is written beside those where the record carries it, and left out where it does not, because a field holding null for what the condition is about reads as a condition about nothing rather than as a record with no opinion. `subject` is the thing the statement named that the condition is about, spelled the way the statement spelled it, and `subject_kind` is one lower-case word out of `graph`, `schema`, `label`, `property`, `variable`, `type` and `function`, so a client asking whether this is about a label compares one string against one word instead of parsing a phrase; the two are written together or not at all. `graph` and `schema` are where the statement was running. `line`, `column` and `offset` are the place, counted the three ways, and `excerpt` is the whole line that place falls on, quoted at the moment the condition was raised, for the client that has the failure and no longer has the statement. A condition raised while the statement ran, a division by zero say, has no token to point at and so carries none of the four. Adding a member does not move the protocol version, so a client that reads only the code keeps working.
+
 A failure the protocol raised, rather than the engine, has `error` and no `failure`:
 
 ```json

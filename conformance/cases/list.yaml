@@ -759,9 +759,14 @@ cases:
           - type: BOOL
             value: true
 
-  - name: the-name-does-not-take-the-word
-    doc: The type name is only a constructor when a bracket follows it, so a query may still bind a variable called list and read it back.
+  - name: the-word-is-a-type-and-not-a-name
+    doc: LIST is a reserved word of ISO 21.3, so it is a type where a type belongs and nothing at all where a name belongs. A query that wants the word as a variable writes it in accent quotes, and one that writes it plainly is refused.
     query: LET list = 7 RETURN list AS n
+    raises: "42001"
+
+  - name: an-ordinary-name-in-the-same-slot-binds
+    doc: The other half of the rule above. The slot after LET takes a name, and a name the standard leaves alone binds and reads back the way any name does.
+    query: LET tally = 7 RETURN tally AS n
     columns:
       - n
     rows:

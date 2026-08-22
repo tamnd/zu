@@ -966,10 +966,10 @@ cases:
 
   - name: either-case-of-hexit-writes-the-same-octets
     doc: The hexits above nine are letters and both cases of them spell the same octet, so a client that keeps the source text rather than the value gives back two different answers for one value.
-    query: RETURN X'00ab' AS lower, X'00AB' AS upper
+    query: RETURN X'00ab' AS lowercase, X'00AB' AS uppercase
     columns:
-      - lower
-      - upper
+      - lowercase
+      - uppercase
     rows:
       - values:
           - type: BYTES
@@ -979,9 +979,9 @@ cases:
 
   - name: a-byte-string-is-not-the-string-it-encodes
     doc: The octets of X'0041' are those of a NUL and the letter A in every encoding anyone uses, and the two values are still not equal, because a byte string is a sequence of octets and a character string is a sequence of characters and no comparison between them is defined.
-    query: RETURN X'0041' = 'A' AS same
+    query: RETURN X'0041' = 'A' AS alike
     columns:
-      - same
+      - alike
     rows:
       - values:
           - type: BOOL

@@ -14,7 +14,7 @@ load:
         - "40"
         - "50"
         - "40"
-    - name: big
+    - name: huge
       type: INT64
       values:
         - "9223372036854775807"
@@ -123,7 +123,7 @@ cases:
 
   - name: the-integer-extremes-survive-the-store
     doc: The two ends of the signed 64 bit range and the two values next to zero, which is where a loader that hands its values over as unsigned turns the smallest into the largest.
-    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.big) AS n
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.huge) AS n
     columns:
       - n
     rows:
@@ -510,7 +510,7 @@ cases:
 
   - name: a-stored-value-goes-into-a-list
     doc: Stored values gathered into a list by the query rather than by an aggregate, which puts a value that came out of the store back into a container on the way out.
-    query: MATCH (n:person) WHERE n.name = 'ann' RETURN [n.age, n.big] AS n
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN [n.age, n.huge] AS n
     columns:
       - n
     rows:
@@ -524,7 +524,7 @@ cases:
 
   - name: a-stored-value-compares-with-another-stored-value
     doc: Two columns of one row compared against each other, which is a comparison the query never sees the operands of and so tests the store rather than the reader.
-    query: MATCH (n:person) WHERE n.age > n.big RETURN n.name AS who ORDER BY who
+    query: MATCH (n:person) WHERE n.age > n.huge RETURN n.name AS who ORDER BY who
     columns:
       - who
     rows:
@@ -673,12 +673,12 @@ cases:
 
   - name: the-bottom-integer-has-no-distance-from-nought
     doc: The one whole number whose distance from nought is not a whole number, because it is one past the top of the type holding it. The standard's 22003 is the answer rather than the number wrapped back to itself, which is what an engine computing it without a check hands back.
-    query: MATCH (n:person) RETURN abs(n.big) AS a ORDER BY a
+    query: MATCH (n:person) RETURN abs(n.huge) AS a ORDER BY a
     raises: "22003"
 
   - name: the-sign-of-a-stored-column
     doc: Minus one, nought or one, which is exact whatever arrived and is the one numeric function whose answer is not the type of its argument.
-    query: MATCH (n:person) RETURN sign(n.big) AS s ORDER BY s
+    query: MATCH (n:person) RETURN sign(n.huge) AS s ORDER BY s
     columns:
       - s
     rows:
@@ -726,7 +726,7 @@ cases:
 
   - name: a-numeric-function-behind-a-guard-never-runs
     doc: The same rule the division behind a guard follows. Nobody here is over a hundred, so the distance from nought of the bottom integer is never worked out and the statement answers no rows rather than raising.
-    query: MATCH (n:person) WHERE n.age > 100 AND abs(n.big) > 0 RETURN count(*) AS c
+    query: MATCH (n:person) WHERE n.age > 100 AND abs(n.huge) > 0 RETURN count(*) AS c
     columns:
       - c
     rows:
@@ -834,7 +834,7 @@ cases:
 
   - name: the-bottom-integer-has-no-remainder-by-minus-one
     doc: The one pair of whole numbers whose remainder is not a whole number, for the reason the distance of the bottom integer from nought is not one. An engine that answers nought here has answered from the hardware rather than from the type.
-    query: MATCH (n:person) RETURN mod(n.big, -1) AS m ORDER BY m
+    query: MATCH (n:person) RETURN mod(n.huge, -1) AS m ORDER BY m
     raises: "22003"
 
   - name: a-remainder-behind-a-guard-never-runs

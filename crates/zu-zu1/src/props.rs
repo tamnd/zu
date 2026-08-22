@@ -28,7 +28,7 @@
 //! could be null costs anything to read now.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use zu_common::{
@@ -1402,6 +1402,34 @@ struct StrChunk {
     ends: Vec<u64>,
 }
 
+/// The rows a column has been written into since the run beside them
+/// was last rebuilt.
+///
+/// A reader asks about a chunk at a time and wants the rows of it in
+/// order, which a sorted run answers as a subslice. The writer adds to
+/// it on every deferred commit while the readers hold the version
+/// before that one, so a commit that wrote into the run would have to
+/// copy the whole of it, and a few hundred commits of that is quadratic
+/// in how long the run gets. So the recent cells sit in a map instead
+/// and the run is left alone, which is what [`CellPatch::seal`] is
+/// about. A map is in order too, and what its range costs over a
+/// subslice is a walk down a handful of nodes for the few dozen entries
+/// this is allowed to hold.
+type Rows<T> = BTreeMap<u64, T>;
+
+/// How many cells a column's map takes before it is folded into the run
+/// beside it.
+///
+/// The two halves cost opposite things. A commit copies the map, so a
+/// short map is a cheap commit; sealing walks the run, so a long map
+/// means sealing less often. Sealing every `k` cells over a run that
+/// reaches `n` copies about `n` squared over `k` entries in the seals
+/// and `k` per commit, which is smallest where `k` is the square root
+/// of `n`. The deferral bounds hold a run to about a thousand cells, so
+/// thirty two is that, and like the chunk size in [`RowPatch`] it is a
+/// size rather than a tuning.
+const PATCH_SEAL: usize = 32;
+
 /// The cell writes a commit made that no fold has sealed into the
 /// columns of one table yet.
 ///
@@ -1419,35 +1447,36 @@ struct StrChunk {
 /// did. A label has a bitset of its own and [`LabelPatch`] carries it.
 #[derive(Debug, Default, Clone)]
 pub struct CellPatch {
-    /// Row and new word, ascending by row, for each lane column the
-    /// commit wrote into. Ascending because a reader asks about a chunk
-    /// at a time and a run of rows sharing one is then a subslice.
-    cols: BTreeMap<usize, Vec<(u64, u64)>>,
+    /// The cells of each lane column in a sorted run, which is the
+    /// shape a reader wants and the shape nothing writes into. A copy
+    /// of this patch shares the runs rather than copying them.
+    runs: BTreeMap<usize, Arc<Vec<(u64, u64)>>>,
+    /// Row and new word for each lane column written into since. Bounded
+    /// by [`PATCH_SEAL`], so this is what a commit copies.
+    cols: BTreeMap<usize, Rows<u64>>,
     /// Row and new bytes the same way, for the columns stored as
     /// blobs. They are apart from the words because the two are read
     /// through different paths all the way down, a lane gather against
     /// a blob range, and nothing asks for both at once.
-    strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>,
+    strs: BTreeMap<usize, Rows<Vec<u8>>>,
+    /// What the strings hold between them, carried rather than counted
+    /// because the writer asks on every commit and the answer is a walk
+    /// over every string in here.
+    bytes: usize,
+    /// How many rows the two maps name between them, for the same
+    /// reason.
+    cells: usize,
 }
 
 impl CellPatch {
-    pub fn new(
-        cols: BTreeMap<usize, Vec<(u64, u64)>>,
-        strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>,
-    ) -> Self {
-        Self { cols, strs }
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.cols.values().all(|rows| rows.is_empty())
-            && self.strs.values().all(|rows| rows.is_empty())
+        self.cells == 0
     }
 
     /// How many cells this holds, which is what a writer bounds when it
     /// decides whether to keep deferring the fold.
     pub fn cells(&self) -> usize {
-        self.cols.values().map(Vec::len).sum::<usize>()
-            + self.strs.values().map(Vec::len).sum::<usize>()
+        self.cells
     }
 
     /// How many bytes the strings in it hold between them, the other
@@ -1455,48 +1484,118 @@ impl CellPatch {
     /// whatever the statement wrote, and a run of long ones would be
     /// carried until the next fold.
     pub fn bytes(&self) -> usize {
-        self.strs
-            .values()
-            .flat_map(|rows| rows.iter())
-            .map(|(_, bytes)| bytes.len())
-            .sum()
+        self.bytes
     }
 
-    fn of(&self, col: usize) -> &[(u64, u64)] {
-        self.cols.get(&col).map_or(&[][..], Vec::as_slice)
+    /// Writes `word` onto row `row` of lane column `col`.
+    ///
+    /// A row written twice before a fold is in here once, holding what
+    /// the later of the two commits left, which is why this answers
+    /// with nothing: there is no history to keep, only the value a read
+    /// gets now.
+    pub fn set(&mut self, col: usize, row: u64, word: u64) {
+        // Asked before the write rather than off what the map hands
+        // back, because a row already in the run is not a new cell
+        // either and the map has never heard of it.
+        let fresh = self.get(col, row).is_none();
+        let recent = self.cols.entry(col).or_default();
+        recent.insert(row, word);
+        if fresh {
+            self.cells += 1;
+        }
+        if recent.len() >= PATCH_SEAL {
+            self.seal(col);
+        }
     }
 
-    /// The entries for rows `lo..hi`, which is a subslice because the
-    /// rows are in order.
-    fn span(&self, col: usize, lo: u64, hi: u64) -> &[(u64, u64)] {
-        let rows = self.of(col);
-        let from = rows.partition_point(|&(row, _)| row < lo);
-        let to = rows.partition_point(|&(row, _)| row < hi);
-        &rows[from..to]
+    /// Folds a column's recent cells into its run.
+    ///
+    /// This is the whole of what the run costs: the copy a commit was
+    /// making of every cell it had accumulated happens here instead,
+    /// once every [`PATCH_SEAL`] cells rather than once a commit. The
+    /// readers holding the patch as it was keep the run they were given,
+    /// which is why the new one is built beside it rather than into it.
+    fn seal(&mut self, col: usize) {
+        let recent = self.cols.remove(&col).unwrap_or_default();
+        let was = self.runs.get(&col).map_or(&[][..], |run| run.as_slice());
+        let mut run = Vec::with_capacity(was.len() + recent.len());
+        let mut older = was.iter().copied().peekable();
+        for (&row, &word) in &recent {
+            while older.peek().is_some_and(|(at, _)| *at < row) {
+                run.push(older.next().expect("peeked"));
+            }
+            // The same row in both is the newer of the two, and the
+            // older one goes nowhere: there is no history here, only
+            // what a read gets now.
+            older.next_if(|(at, _)| *at == row);
+            run.push((row, word));
+        }
+        run.extend(older);
+        self.runs.insert(col, Arc::new(run));
+    }
+
+    /// The same for a blob column, where what the row held also has to
+    /// come off the byte count the writer bounds.
+    pub fn set_bytes(&mut self, col: usize, row: u64, value: Vec<u8>) {
+        self.bytes += value.len();
+        match self.strs.entry(col).or_default().insert(row, value) {
+            Some(was) => self.bytes -= was.len(),
+            None => self.cells += 1,
+        }
+    }
+
+    /// Whether a lane column has anything patched over it at all.
+    fn holds(&self, col: usize) -> bool {
+        self.runs.get(&col).is_some_and(|run| !run.is_empty())
+            || self.cols.get(&col).is_some_and(|rows| !rows.is_empty())
+    }
+
+    /// The entries for rows `lo..hi`, the run first and the recent
+    /// cells after it.
+    ///
+    /// Row order within each half and not across the two, which is what
+    /// both callers want: one writes each entry into a decoded chunk at
+    /// its own offset, so a row in both halves has to arrive from the
+    /// run before it arrives from the map and does, and the other is
+    /// widening a pair of bounds and does not care what order it sees
+    /// them in.
+    fn span(&self, col: usize, lo: u64, hi: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let run = self.runs.get(&col).map_or(&[][..], |run| run.as_slice());
+        let from = run.partition_point(|(row, _)| *row < lo);
+        let to = run.partition_point(|(row, _)| *row < hi);
+        run[from..to].iter().copied().chain(
+            self.cols
+                .get(&col)
+                .into_iter()
+                .flat_map(move |rows| rows.range(lo..hi))
+                .map(|(&row, &word)| (row, word)),
+        )
     }
 
     fn get(&self, col: usize, row: u64) -> Option<u64> {
-        let rows = self.of(col);
-        let at = rows.partition_point(|&(r, _)| r < row);
-        rows.get(at).filter(|&&(r, _)| r == row).map(|&(_, v)| v)
+        if let Some(word) = self.cols.get(&col).and_then(|rows| rows.get(&row)) {
+            return Some(*word);
+        }
+        let run = self.runs.get(&col)?;
+        let at = run.partition_point(|(held, _)| *held < row);
+        run.get(at)
+            .filter(|(held, _)| *held == row)
+            .map(|(_, w)| *w)
     }
 
     /// The bytes written onto row `row` of blob column `col`.
     fn bytes_of(&self, col: usize, row: u64) -> Option<&[u8]> {
-        let rows = self.strs.get(&col)?;
-        let at = rows.partition_point(|(r, _)| *r < row);
-        rows.get(at)
-            .filter(|(r, _)| *r == row)
-            .map(|(_, bytes)| &bytes[..])
+        self.strs.get(&col)?.get(&row).map(Vec::as_slice)
     }
 
-    /// The blob entries for rows `lo..hi`, a subslice for the same
-    /// reason [`Self::span`] is one.
-    fn str_span(&self, col: usize, lo: u64, hi: u64) -> &[(u64, Vec<u8>)] {
-        let rows = self.strs.get(&col).map_or(&[][..], Vec::as_slice);
-        let from = rows.partition_point(|(row, _)| *row < lo);
-        let to = rows.partition_point(|(row, _)| *row < hi);
-        &rows[from..to]
+    /// The blob entries for rows `lo..hi`, in row order for the same
+    /// reason [`Self::span`] is.
+    fn str_span(&self, col: usize, lo: u64, hi: u64) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+        self.strs
+            .get(&col)
+            .into_iter()
+            .flat_map(move |rows| rows.range(lo..hi))
+            .map(|(&row, bytes)| (row, bytes.as_slice()))
     }
 
     /// `bounds` widened over whatever this holds for rows `lo..hi`.
@@ -1508,7 +1607,7 @@ impl CellPatch {
     /// a chunk read and a bound that is too narrow loses a row.
     fn widen(&self, col: usize, lo: u64, hi: u64, bounds: (u64, u64)) -> (u64, u64) {
         let (mut min, mut max) = bounds;
-        for &(_, value) in self.span(col, lo, hi) {
+        for (_, value) in self.span(col, lo, hi) {
             min = min.min(value);
             max = max.max(value);
         }
@@ -1569,29 +1668,104 @@ impl LabelPatch {
 /// Any value at all, unlike the lane patch, because these rows are not
 /// stored anywhere yet and there is nothing to lay a word over: a
 /// string is the bytes and an absent value is [`Cell::Null`].
+/// How many rows a sealed chunk of a [`RowPatch`] holds.
+///
+/// The patch grows a row at a time and is copied whole every time a
+/// reader is looking at it, which every reader between two commits is,
+/// so what a copy costs decides what a long run of appends costs. Cut
+/// into chunks, a copy is a pointer per sealed chunk and the rows of
+/// the one being filled, which is smallest where the chunk is about the
+/// square root of what the run reaches. The deferral bounds keep a run
+/// to a few thousand rows, so sixty four rows a chunk is that, and it
+/// is a size rather than a tuning: anything within a factor of two of
+/// the root is within a few percent of the best a chunk size can do.
+const PATCH_CHUNK: usize = 64;
+
 #[derive(Debug, Default, Clone)]
 pub struct RowPatch {
     /// The first row this holds, which is what the columns count.
     base: u64,
-    /// One entry per unfolded row in ordinal order, each a cell for
-    /// every column the table stores, by position in the directory.
-    rows: Vec<Vec<Cell>>,
+    /// The rows in ordinal order, a chunk at a time, each row a cell
+    /// for every column the table stores, by position in the directory.
+    /// A chunk in here is full and never written into again, so a copy
+    /// of this patch shares the chunks rather than the rows.
+    chunks: Arc<Vec<Arc<Vec<Vec<Cell>>>>>,
+    /// The chunk being filled, which is the only one an append touches
+    /// and so the only one a copy has to leave alone.
+    tail: Arc<Vec<Vec<Cell>>>,
+    /// The column a key lookup asks about, where the table has one.
+    ///
+    /// A key index is built by a fold, so the rows in here are in none
+    /// and [`Self::row_with`] is what answers instead. Walking them
+    /// works and is what it used to do, and it costs the length of the
+    /// run on every lookup, which is a per read cost that grows with
+    /// how long the writer is allowed to defer. So the sealed chunks
+    /// carry their own index of this column and the walk is over the
+    /// chunk being filled.
+    key: Option<usize>,
+    /// Row by the word it holds in [`Self::key`], one map per sealed
+    /// chunk so that a copy of this patch shares them the same way it
+    /// shares the chunks.
+    keyed: Arc<Vec<Arc<HashMap<u64, u64>>>>,
+    /// How many rows the two hold between them.
+    len: usize,
+    /// What the strings among them hold, carried rather than counted.
+    ///
+    /// The writer asks this of the whole patch before every deferred
+    /// commit, to decide whether the run can go on, and counting it
+    /// means walking every cell of every row added since the last fold.
+    /// That is a walk of the run on every commit of the run, which is
+    /// quadratic in how long the run is allowed to get, and how long
+    /// the run is allowed to get is the thing that decides how often a
+    /// fold lands on a statement. So it is carried.
+    bytes: usize,
 }
 
 impl RowPatch {
-    /// An empty patch over columns holding `base` rows.
-    pub fn new(base: u64) -> Self {
+    /// An empty patch over columns holding `base` rows, where `key` is
+    /// the column a key lookup will ask about if the table has one.
+    pub fn new(base: u64, key: Option<usize>) -> Self {
         RowPatch {
             base,
-            rows: Vec::new(),
+            key,
+            ..RowPatch::default()
         }
     }
 
     /// Takes one row, a cell per column, and answers with the row
     /// number it was given.
     pub fn push(&mut self, cells: Vec<Cell>) -> u64 {
-        let row = self.base + self.rows.len() as u64;
-        self.rows.push(cells);
+        let row = self.base + self.len as u64;
+        self.bytes += cells
+            .iter()
+            .map(|cell| match cell {
+                Cell::Str(bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        // The copy a reader is owed happens here and nowhere else, and
+        // it is a copy of the chunk being filled rather than of the run.
+        let tail = Arc::make_mut(&mut self.tail);
+        tail.push(cells);
+        if tail.len() == PATCH_CHUNK {
+            let full = std::mem::replace(&mut self.tail, Arc::new(Vec::with_capacity(PATCH_CHUNK)));
+            if let Some(col) = self.key {
+                // Built once, as the chunk is sealed, rather than on
+                // the lookups that read it. The last row wins where two
+                // hold the same word, for the reason [`Self::row_with`]
+                // reads the run backwards.
+                let first = self.base + (self.chunks.len() * PATCH_CHUNK) as u64;
+                let mut index = HashMap::with_capacity(full.len());
+                for (at, cells) in full.iter().enumerate() {
+                    if let Some(Cell::Int(word)) = cells.get(col) {
+                        index.insert(*word, first + at as u64);
+                    }
+                }
+                Arc::make_mut(&mut self.keyed).push(Arc::new(index));
+            }
+            Arc::make_mut(&mut self.chunks).push(full);
+        }
+        self.len += 1;
         row
     }
 
@@ -1604,31 +1778,40 @@ impl RowPatch {
     /// How many rows this holds, which is what a writer bounds when it
     /// decides whether to keep deferring the fold.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len == 0
     }
 
     /// How many bytes of string the rows hold between them, which a
     /// writer bounds along with the count of them.
     pub fn bytes(&self) -> usize {
-        self.rows
+        self.bytes
+    }
+
+    /// The `at`th row this holds, counting from the first one it added.
+    fn row_at(&self, at: usize) -> Option<&Vec<Cell>> {
+        match self.chunks.get(at / PATCH_CHUNK) {
+            Some(chunk) => chunk.get(at % PATCH_CHUNK),
+            None => self.tail.get(at - self.chunks.len() * PATCH_CHUNK),
+        }
+    }
+
+    /// Every row it holds, in the order their ordinals are in.
+    fn all(&self) -> impl Iterator<Item = &Vec<Cell>> + '_ {
+        self.chunks
             .iter()
-            .flatten()
-            .map(|cell| match cell {
-                Cell::Str(bytes) => bytes.len(),
-                _ => 0,
-            })
-            .sum()
+            .flat_map(|chunk| chunk.iter())
+            .chain(self.tail.iter())
     }
 
     /// The cell row `row` holds in `col`, or `None` when the row is one
     /// the columns already hold or the column was never given a value.
     fn get(&self, col: usize, row: u64) -> Option<&Cell> {
         let at = row.checked_sub(self.base)? as usize;
-        self.rows.get(at)?.get(col)
+        self.row_at(at)?.get(col)
     }
 
     /// The word row `row` holds in `col`, for the lane read paths. A
@@ -1652,21 +1835,52 @@ impl RowPatch {
         }
     }
 
-    /// The row whose `col` holds `word`, `None` when none of them
+    /// The last row whose `col` holds `word`, `None` when none of them
     /// does.
     ///
     /// This is the key index for the rows nothing has folded yet. A
     /// key index is built by a fold and a deferred commit runs none,
     /// so the rows in here are in no index, and what the fold would
     /// have put in one is the value each of them holds in the table's
-    /// `id` column. The walk is over the rows a handful of commits
-    /// added rather than over the table, and it is bounded by what the
-    /// writer lets the patch grow to.
+    /// `id` column.
+    ///
+    /// The last rather than the first, because a run of deferred
+    /// commits can hold one key twice: a row takes a key, goes away,
+    /// and a row after it takes the key the first one left free. Only
+    /// one of them is a row that is still there, and it is the last,
+    /// because a key is only free to be taken again once the row
+    /// holding it has gone and a row that has gone does not come back.
+    ///
+    /// The sealed chunks answer out of the index each of them built as
+    /// it was sealed, and the chunk being filled is walked, so what a
+    /// lookup costs is a probe per sealed chunk and a walk of at most
+    /// [`PATCH_CHUNK`] rows. Asked about any other column it walks the
+    /// whole run, which is what it used to do for every column and is
+    /// what the fold's own index is for.
     pub fn row_with(&self, col: usize, word: u64) -> Option<u64> {
-        self.rows
+        if self.key != Some(col) {
+            let mut found = None;
+            for (at, cells) in self.all().enumerate() {
+                if matches!(cells.get(col), Some(Cell::Int(held)) if *held == word) {
+                    found = Some(self.base + at as u64);
+                }
+            }
+            return found;
+        }
+        let first = self.base + (self.chunks.len() * PATCH_CHUNK) as u64;
+        let tail = self
+            .tail
             .iter()
-            .position(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
-            .map(|at| self.base + at as u64)
+            .rposition(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
+            .map(|at| first + at as u64);
+        if tail.is_some() {
+            return tail;
+        }
+        self.keyed
+            .iter()
+            .rev()
+            .find_map(|index| index.get(&word))
+            .copied()
     }
 
     /// The rows of this patch that fall in `lo..hi`, which is what a
@@ -1674,7 +1888,7 @@ impl RowPatch {
     /// it read.
     fn span(&self, lo: u64, hi: u64) -> std::ops::Range<u64> {
         let start = lo.max(self.base);
-        let end = hi.min(self.base + self.rows.len() as u64);
+        let end = hi.min(self.base + self.len as u64);
         start..end.max(start)
     }
 
@@ -1943,7 +2157,7 @@ impl PropsReader {
             false => out.clear(),
         }
         if let Some(patch) = &self.patch {
-            for &(row, value) in patch.span(col, base, base + out.len() as u64) {
+            for (row, value) in patch.span(col, base, base + out.len() as u64) {
                 out[(row - base) as usize] = value;
             }
         }
@@ -2041,21 +2255,19 @@ impl PropsReader {
         let Some(patch) = &self.patch else {
             return;
         };
-        let written = patch.str_span(col, start, start + ends.len() as u64);
-        if written.is_empty() {
+        let mut written = patch
+            .str_span(col, start, start + ends.len() as u64)
+            .peekable();
+        if written.peek().is_none() {
             return;
         }
         let mut fresh = Vec::with_capacity(bytes.len());
         let mut moved = Vec::with_capacity(ends.len());
-        let mut at = 0usize;
         let mut lo = 0usize;
         for (i, &hi) in ends.iter().enumerate() {
-            match written.get(at) {
-                Some((row, new)) if *row == start + i as u64 => {
-                    fresh.extend_from_slice(new);
-                    at += 1;
-                }
-                _ => fresh.extend_from_slice(&bytes[lo..hi as usize]),
+            match written.next_if(|(row, _)| *row == start + i as u64) {
+                Some((_, new)) => fresh.extend_from_slice(new),
+                None => fresh.extend_from_slice(&bytes[lo..hi as usize]),
             }
             moved.push(fresh.len() as u64);
             lo = hi as usize;
@@ -2161,7 +2373,7 @@ impl PropsReader {
         // by chunk and this is a lookup per row: doing it here keeps
         // the whole of it off a column no commit has written into.
         if let Some(patch) = &self.patch
-            && !patch.of(col).is_empty()
+            && patch.holds(col)
         {
             for (at, &row) in rows.iter().enumerate() {
                 if let Some(value) = patch.get(col, row) {
@@ -2431,7 +2643,7 @@ mod tests {
         let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
         let (age, name) = (reader.col("age").unwrap(), reader.col("name").unwrap());
 
-        let mut patch = RowPatch::new(4);
+        let mut patch = RowPatch::new(4, Some(age));
         assert_eq!(
             patch.push(vec![Cell::Int(50), Cell::Str(b"eva".to_vec())]),
             4
@@ -2470,6 +2682,64 @@ mod tests {
         assert!(reader.gather_int(&mut db, age, &[6], &mut out).is_err());
     }
 
+    /// A key lookup over the appended rows answers the same whether the
+    /// row it wants is in a sealed chunk or in the one being filled,
+    /// and the same as walking every row would have.
+    #[test]
+    fn appended_rows_answer_a_key_lookup_from_any_chunk() {
+        // Past two seals and a bit, so the answer comes out of the
+        // index for some of these and out of the walk for the rest.
+        let rows = PATCH_CHUNK * 2 + 5;
+        let mut patch = RowPatch::new(100, Some(0));
+        for at in 0..rows {
+            patch.push(vec![Cell::Int(1000 + at as u64), Cell::Int(7)]);
+        }
+
+        for at in 0..rows {
+            assert_eq!(
+                patch.row_with(0, 1000 + at as u64),
+                Some(100 + at as u64),
+                "row {at} of {rows}"
+            );
+        }
+        assert_eq!(patch.row_with(0, 999), None);
+        assert_eq!(patch.row_with(0, 1000 + rows as u64), None);
+
+        // A column that is not the key one is walked, and a word every
+        // row holds answers with the last of them either way.
+        assert_eq!(patch.row_with(1, 7), Some(100 + rows as u64 - 1));
+        assert_eq!(patch.row_with(1, 8), None);
+    }
+
+    /// Two rows under one key answer with the second, which is the only
+    /// one that can still be there, whichever side of a seal the pair
+    /// falls.
+    #[test]
+    fn a_repeated_key_answers_with_the_row_that_took_it_last() {
+        let mut words: Vec<u64> = (0..PATCH_CHUNK * 2 + 3)
+            .map(|at| 1000 + at as u64)
+            .collect();
+        // A pair inside one sealed chunk, a pair either side of a seal,
+        // and a pair with the second of them in the chunk being filled.
+        words[1] = words[0];
+        words[PATCH_CHUNK] = words[PATCH_CHUNK - 1];
+        words[PATCH_CHUNK * 2 + 1] = words[PATCH_CHUNK + 2];
+
+        let mut patch = RowPatch::new(0, Some(0));
+        for word in &words {
+            patch.push(vec![Cell::Int(*word)]);
+        }
+        assert_eq!(patch.row_with(0, words[0]), Some(1));
+        assert_eq!(
+            patch.row_with(0, words[PATCH_CHUNK]),
+            Some(PATCH_CHUNK as u64)
+        );
+        assert_eq!(
+            patch.row_with(0, words[PATCH_CHUNK * 2 + 1]),
+            Some(PATCH_CHUNK as u64 * 2 + 1)
+        );
+    }
+
     /// Strings written over rows the column already holds are read the
     /// same way, by the same three paths, and the lengths change under
     /// them: a blob range is one buffer of values end to end, so a
@@ -2490,11 +2760,10 @@ mod tests {
 
         // One longer than what it goes over and one shorter, so neither
         // direction of the shift is the untested one.
-        let strs = BTreeMap::from([(
-            name,
-            vec![(1u64, b"katherine".to_vec()), (3, b"al".to_vec())],
-        )]);
-        reader.set_patch(Some(Arc::new(CellPatch::new(BTreeMap::new(), strs))));
+        let mut patch = CellPatch::default();
+        patch.set_bytes(name, 1, b"katherine".to_vec());
+        patch.set_bytes(name, 3, b"al".to_vec());
+        reader.set_patch(Some(Arc::new(patch)));
 
         let mut bytes = Vec::new();
         reader.read_str(&mut db, name, 1, &mut bytes).unwrap();

@@ -79,17 +79,20 @@ fn a_temporal_literal_is_read_at_parse_time_and_written_back_the_same_way() {
     );
 }
 
-/// A type name is a name until a string follows it, and the string is
-/// read as whatever the name says, so a local time written with an
-/// offset is refused rather than quietly losing it. A zoned time
-/// written without one is not the same case: the standard fills that
-/// in from the default displacement, which here is UTC.
+/// A type name in front of a string reads the string as whatever the
+/// name says, so a local time written with an offset is refused rather
+/// than quietly losing it. A zoned time written without one is not the
+/// same case: the standard fills that in from the default displacement,
+/// which here is UTC. The type names themselves are reserved words
+/// (ISO 21.3), so nothing else is competing for the position.
 #[test]
-fn a_name_that_is_not_a_literal_is_still_a_variable() {
+fn a_type_name_in_front_of_a_string_says_how_to_read_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    let source = "UNWIND [1, 2] AS date RETURN sum(date) AS v";
-    assert_eq!(one(&mut db, source), Value::Int(3));
+    assert_eq!(
+        code(&mut db, "UNWIND [1, 2] AS date RETURN sum(date) AS v"),
+        "42001"
+    );
     assert_eq!(
         code(&mut db, "RETURN LOCAL TIME '10:30:00+02:00' AS v"),
         "22007"

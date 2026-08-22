@@ -219,24 +219,6 @@ static void quoted(zy_str s, char *buf, size_t len) {
  *
  * A minimum of zero is what says the type is unsigned, and an unsigned
  * type refuses a sign outright rather than accepting `-0`. */
-/* The value of one hexit, or -1 for a character that is not one. Both
- * cases, because ISO writes the literal in upper case and a person
- * writing a case does not always. Spelled out rather than reached for
- * through isxdigit, which answers for the locale and this file does
- * not have one. */
-static int hexit(char c) {
-    if (c >= '0' && c <= '9') {
-        return c - '0';
-    }
-    if (c >= 'a' && c <= 'f') {
-        return c - 'a' + 10;
-    }
-    if (c >= 'A' && c <= 'F') {
-        return c - 'A' + 10;
-    }
-    return -1;
-}
-
 static int parse_int(zy_str text, int64_t min, int64_t max, int64_t *out) {
     size_t i = 0;
     int negative = 0;
@@ -848,12 +830,13 @@ static const cv_type TYPES[24] = {
     {"INT16", CV_EXACT},         {"INT32", CV_EXACT},         {"INT64", CV_TEXT},
     {"UINT8", CV_EXACT},         {"UINT16", CV_EXACT},        {"UINT32", CV_EXACT},
     {"UINT64", CV_TEXT},         {"FLOAT32", CV_TEXT},        {"FLOAT64", CV_TEXT},
-    {"STRING", CV_EXACT},        {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
+    {"STRING", CV_EXACT},
+    /* Written in quotes because what a case spells is the hexits, and a
+     * run of them is text in every reader: 0041 bare is a number that
+     * reads back as 41 and 00AB bare is not a scalar at all. */
+    {"BYTES", CV_TEXT},          {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
     {"ZONEDTIME", CV_TEXT},      {"LOCALDATETIME", CV_TEXT},  {"ZONEDDATETIME", CV_TEXT},
     {"DURATION", CV_TEXT},       {"LIST", CV_EXACT},
-    /* Hexits in quotes, because a bare 00AB reads as a number in some
-     * reader of this file and an empty one reads as nothing at all. */
-    {"BYTES", CV_TEXT},
     /* A node and an edge are written in quotes because what a case
      * spells is a name and two numbers with punctuation between them,
      * which is text in every reader and a number in none. */
@@ -892,6 +875,62 @@ static int unknown(char *err, size_t err_len, size_t line, const char *ty) {
     return fail(err, err_len, line, "%s is not a type this encoding knows", ty);
 }
 
+/* The nibble a hexit names, or -1. Both cases spell the same nibble,
+ * because the value is the octets and the case a case was written in is
+ * not part of it. */
+static int nibble(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* The octets a run of hexits names, two hexits to an octet. Space is
+ * allowed anywhere and dropped, which is what the standard's production
+ * allows and what lets a long literal be written in groups. A run of an
+ * odd length names half an octet and is refused. */
+static int parse_hexits(cv_arena *a, zy_str text, cv *out) {
+    size_t i, n = 0;
+    unsigned char *p;
+    int hi = -1;
+    /* Two hexits an octet, so the octets can never outnumber them, and
+     * one byte over is what an empty payload needs to allocate at all. */
+    p = (unsigned char *)cv_alloc(a, text.len / 2 + 1);
+    if (p == NULL) {
+        return -2;
+    }
+    for (i = 0; i < text.len; i++) {
+        char c = text.ptr[i];
+        int v;
+        if (c == ' ' || c == '\t') {
+            continue;
+        }
+        v = nibble(c);
+        if (v < 0) {
+            return -1;
+        }
+        if (hi < 0) {
+            hi = v;
+        } else {
+            p[n++] = (unsigned char)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    if (hi >= 0) {
+        return -1;
+    }
+    out->kind = CV_BYTES;
+    out->as.bytes.ptr = (const char *)p;
+    out->as.bytes.len = n;
+    return 0;
+}
+
 /* The value a scalar payload spells, or -1 if it does not spell one of
  * that type. */
 static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
@@ -916,35 +955,7 @@ static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
         return out->as.str.ptr == NULL ? -2 : 0;
     }
     if (strcmp(ty, "BYTES") == 0) {
-        /* The octets the hexits name, decoded here rather than kept as
-         * the source text, because keeping the text is the misread the
-         * cases are written to catch: X'0041' is one octet pair and not
-         * the letter A, and a reader that never decodes cannot tell the
-         * difference between the two. An odd count of hexits names half
-         * an octet and anything outside the hexits names none, so both
-         * are the text failing to be a BYTES. */
-        size_t i;
-        char *p;
-        if (text.len % 2 != 0) {
-            return -1;
-        }
-        for (i = 0; i < text.len; i++) {
-            if (hexit(text.ptr[i]) < 0) {
-                return -1;
-            }
-        }
-        out->kind = CV_BYTES;
-        p = (char *)cv_alloc(a, text.len / 2 + 1);
-        if (p == NULL) {
-            return -2;
-        }
-        for (i = 0; i < text.len; i += 2) {
-            p[i / 2] = (char)((hexit(text.ptr[i]) << 4) | hexit(text.ptr[i + 1]));
-        }
-        p[text.len / 2] = '\0';
-        out->as.bytes.ptr = p;
-        out->as.bytes.len = text.len / 2;
-        return 0;
+        return parse_hexits(a, text, out);
     }
     if (strcmp(ty, "FLOAT32") == 0 || strcmp(ty, "FLOAT64") == 0) {
         double f;
@@ -1439,17 +1450,13 @@ static void emit_value(cv_out *o, const cv *v) {
         emit(o, "STRING ");
         emit_quoted(o, v->as.str);
         return;
-    case CV_BYTES: {
-        /* Back to the hexits, upper case, which is how ISO writes the
-         * literal and therefore how the corpus writes the payload. */
-        size_t i;
+    case CV_BYTES:
         emit(o, "BYTES \"");
         for (i = 0; i < v->as.bytes.len; i++) {
             emit(o, "%02X", (unsigned)(unsigned char)v->as.bytes.ptr[i]);
         }
         emit(o, "\"");
         return;
-    }
     case CV_TEMPORAL:
         emit(o, "%s \"", unit_name(v->as.temporal.unit));
         switch (v->as.temporal.unit) {
@@ -1511,8 +1518,12 @@ size_t cv_show(const cv *v, char *buf, size_t len) {
 
 /* Two strings, which is a length and a memcmp because a corpus string
  * may hold a NUL of its own. */
+/* The length first and then the octets, and nothing at all when there
+ * are none: a byte string of no octets may come back as a null pointer
+ * and a length of zero, and memcmp on a null pointer is undefined even
+ * for a length of zero. */
 static int same_str(zy_str a, zy_str b) {
-    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
+    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);
 }
 
 static uint64_t bits(double f) {

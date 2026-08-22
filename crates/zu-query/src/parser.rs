@@ -10,6 +10,7 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
+use zu_common::keywords;
 use zu_common::unicode::NormalForm;
 use zu_common::{
     DurationKind, Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result,
@@ -22,8 +23,8 @@ use crate::ast::{
     GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
     MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
     Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
-    Repeat, SchemaRef, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
-    TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
+    Repeat, SchemaRef, Selector, SessionReset, SessionStmt, SetInto, SetItem, SetOp, Simple,
+    SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -415,7 +416,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
+const UNIMPLEMENTED: &[&str] = &["CREATE"];
 
 /// Every word that can stand where a query begins once the schema
 /// clause is read: the graph clause, the three that open a binding
@@ -467,6 +468,10 @@ pub fn parse(source: &str) -> Result<Query> {
             codes::C42001,
             "a transaction statement says where a transaction begins or ends and reads nothing, so it runs through the session rather than the query path".to_string(),
         )),
+        Statement::Session(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a session statement changes the session and answers no rows, so it runs through the session rather than the query path".to_string(),
+        )),
         Statement::Block(_) => Err(ZuError::gql(
             codes::C42001,
             "a statement block holds a catalog statement among its parts, so it runs through the session rather than the query path".to_string(),
@@ -475,9 +480,9 @@ pub fn parse(source: &str) -> Result<Query> {
 }
 
 /// Parses one statement: a query, a catalog statement, a transaction
-/// statement, or a block of them chained by `NEXT`. The first word
-/// tells the first three apart, and a `NEXT` handing over to a catalog
-/// statement is what makes it the fourth.
+/// statement, a session statement, or a block of them chained by
+/// `NEXT`. The first word tells the first four apart, and a `NEXT`
+/// handing over to a catalog statement is what makes it the fifth.
 pub fn parse_statement(source: &str) -> Result<Statement> {
     let tokens = lex(source)?;
     let mut parser = Parser {
@@ -499,6 +504,10 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
         return Ok(Statement::Transaction(stmt));
+    }
+    if parser.at_kw("SESSION") {
+        let stmt = parser.parse_session_stmt()?;
+        return Ok(Statement::Session(stmt));
     }
     // GP18, ISO 13.6. A linear statement is all query or all catalog,
     // so a chain that is neither is a statement block, and this is the
@@ -670,22 +679,108 @@ impl Parser<'_> {
     }
 
     /// An identifier in name position: unquoted or backticked.
+    /// An `<identifier>` (ISO 21.3): a regular one, or a delimited one
+    /// written either of the two ways the standard writes it.
+    ///
+    /// A reserved word is not a regular identifier, and the rule is in
+    /// the Syntax Rules rather than in the productions, so it is
+    /// enforced here. Delimiting the word puts it back:
+    /// `RETURN 1 AS MATCH` is refused and ``RETURN 1 AS `MATCH` `` is
+    /// not, which is what the delimited form is for.
     fn expect_name(&mut self, what: &str) -> Result<String> {
-        match self.peek() {
-            Some(Token {
-                kind: TokenKind::Ident(s),
-                ..
-            })
-            | Some(Token {
-                kind: TokenKind::QuotedIdent(s),
-                ..
-            }) => {
-                let name = s.clone();
-                self.pos += 1;
-                Ok(name)
+        self.name(what, false)
+    }
+
+    /// A property name or a record field name, which admits a reserved
+    /// word where the other name slots do not.
+    ///
+    /// Read strictly, ISO refuses one here too: `<property name>` and
+    /// `<field name>` are both `<identifier>` and the 21.3 rule reaches
+    /// every one of them. But the standard writes its own datetime
+    /// constructors as records with the fields `year`, `month`, `day`,
+    /// `hour`, `minute` and `second`, and all six of those words are in
+    /// `<reserved word>`, so `DATE({year: 2024, month: 1, day: 1})` is
+    /// a statement the standard both defines and forbids. Something has
+    /// to give, and the rule is what gives: a name in this slot always
+    /// stands between a delimiter and a colon or behind a dot, so no
+    /// word here could be read as the keyword it is spelled like, and
+    /// the rule buys nothing where there is nothing to disambiguate.
+    ///
+    /// The slots where a word could be read either way keep the rule.
+    /// `RETURN 1 AS year` is still refused, and so is `MATCH (year)`.
+    /// This is a deviation and `docs/07-query-engine.md` records it.
+    fn expect_field_name(&mut self, what: &str) -> Result<String> {
+        self.name(what, true)
+    }
+
+    fn name(&mut self, what: &str, reserved_admitted: bool) -> Result<String> {
+        let Some(token) = self.peek() else {
+            return Err(self.error(what));
+        };
+        let name = match &token.kind {
+            TokenKind::Ident(s) => {
+                if !reserved_admitted && keywords::is_reserved(s) {
+                    let at = token.start;
+                    let word = s.clone();
+                    return Err(ZuError::gql_in(
+                        codes::C42001,
+                        self.source,
+                        at,
+                        format_args!(
+                            "'{word}' is a reserved word and a name written plainly is not one; \
+                             write it in accent quotes to use it as {what}"
+                        ),
+                    ));
+                }
+                s.clone()
             }
-            _ => Err(self.error(what)),
+            TokenKind::QuotedIdent(s) => s.clone(),
+            // A double quoted sequence is a delimited identifier and a
+            // character string literal both, and which one it is comes
+            // from where it stands. Here a name is what is wanted, so
+            // it is a name; a single quoted one is only ever a string
+            // and stays out.
+            TokenKind::Str(s) if self.double_quoted(token) => s.clone(),
+            _ => return Err(self.error(what)),
+        };
+        self.pos += 1;
+        Ok(name)
+    }
+
+    /// Whether the token was written with double quotes, which is what
+    /// tells a delimited identifier from a string literal. The lexer
+    /// makes one token of both, because they hold the same characters
+    /// and differ only in where they may stand.
+    fn double_quoted(&self, token: &Token) -> bool {
+        let at = self.source[token.start..].trim_start_matches('@');
+        at.starts_with('"')
+    }
+
+    /// A `<binding variable>` (ISO 16.4), which is a regular identifier
+    /// and nothing else.
+    ///
+    /// The chain is `<element variable>` to `<binding variable>` to
+    /// `<regular identifier>`, one alternative at every step, so a
+    /// delimited identifier does not reach this slot however it is
+    /// written. Cypher admits a backticked variable and engines grown
+    /// out of Cypher take one; this one says what the grammar says.
+    fn expect_variable(&mut self, what: &str) -> Result<String> {
+        if let Some(token) = self.peek()
+            && matches!(token.kind, TokenKind::QuotedIdent(_) | TokenKind::Str(_))
+            && !matches!(token.kind, TokenKind::Str(_) if !self.double_quoted(token))
+        {
+            let at = token.start;
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                format_args!(
+                    "a variable is a plain name, and a delimited identifier is not one; \
+                     {what} has to be written without quotes"
+                ),
+            ));
         }
+        self.expect_name(what)
     }
 
     /// Whether this statement says where a transaction begins or ends.
@@ -748,6 +843,196 @@ impl Parser<'_> {
             ));
         }
         Ok(stmt)
+    }
+
+    /// `SESSION SET ...` and `SESSION RESET ...` (ISO 7.1 and 7.2, GS01
+    /// through GS16).
+    ///
+    /// The whole family is one word followed by one of two verbs, so
+    /// there is nothing else `SESSION` can open and no lookahead is
+    /// needed to know one is here. What comes after the verb is a small
+    /// matrix rather than fifteen statements: three parameter kinds
+    /// over two value sources, and the schema, the graph and the zone
+    /// beside them.
+    fn parse_session_stmt(&mut self) -> Result<SessionStmt> {
+        self.expect_kw("SESSION")?;
+        let stmt = if self.eat_kw("RESET") {
+            SessionStmt::Reset(self.parse_session_reset()?)
+        } else {
+            self.expect_kw("SET")?;
+            self.parse_session_set()?
+        };
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                token.start,
+                format_args!(
+                    "nothing may follow a session statement, found {}",
+                    token.kind.describe()
+                ),
+            ));
+        }
+        Ok(stmt)
+    }
+
+    /// What a `SESSION SET` sets.
+    ///
+    /// The three parameter clauses and the two clauses that move the
+    /// session itself are told apart by the word after the verb, and
+    /// only the graph is written both ways: `SESSION SET PROPERTY GRAPH
+    /// $p = g` binds a parameter and `SESSION SET PROPERTY GRAPH g`
+    /// moves the session's graph, so the dollar is what decides.
+    fn parse_session_set(&mut self) -> Result<SessionStmt> {
+        if self.at_kw("TIME") && self.kw_at(1, "ZONE") {
+            self.pos += 2;
+            return Ok(SessionStmt::SetTimeZone(self.parse_time_zone()?));
+        }
+        if self.at_kw("SCHEMA") {
+            self.pos += 1;
+            // The same three a schema is named by anywhere else: the
+            // two words and a path. `CURRENT_SCHEMA` moves a session
+            // nowhere and `HOME_SCHEMA` moves it back, which is the
+            // pair a reader needs to write the round trip without
+            // knowing where the session opened.
+            if self.eat_kw("CURRENT_SCHEMA") {
+                return Ok(SessionStmt::SetSchema(SchemaRef::Current));
+            }
+            if self.eat_kw("HOME_SCHEMA") {
+                return Ok(SessionStmt::SetSchema(SchemaRef::Home));
+            }
+            return Ok(SessionStmt::SetSchema(SchemaRef::Path(
+                self.parse_schema_path()?,
+            )));
+        }
+        let kind = if self.at_kw("VALUE") {
+            self.pos += 1;
+            BindingKind::Value
+        } else if self.at_kw("TABLE") || (self.at_kw("BINDING") && self.kw_at(1, "TABLE")) {
+            self.eat_kw("BINDING");
+            self.pos += 1;
+            BindingKind::Table
+        } else if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+            let at = usize::from(self.at_kw("PROPERTY"));
+            let parameter = matches!(
+                self.tokens.get(self.pos + at + 1).map(|t| &t.kind),
+                Some(TokenKind::Param(_))
+            );
+            self.eat_kw("PROPERTY");
+            self.pos += 1;
+            // ISO writes the graph the session works in as a graph
+            // expression behind the word, so the word is eaten here and
+            // what follows is read the way a `USE` reads it: the four
+            // that name a graph, one of them being a name.
+            if !parameter {
+                return Ok(SessionStmt::SetGraph(self.parse_graph_ref()?));
+            }
+            BindingKind::Graph
+        } else {
+            return Err(self.error(
+                "VALUE, BINDING TABLE, PROPERTY GRAPH, SCHEMA or TIME ZONE after SESSION SET",
+            ));
+        };
+        // ISO writes the modifier in front of the name rather than
+        // behind it, `SESSION SET VALUE IF NOT EXISTS $p = 1`, which is
+        // the other way round from the catalog statements.
+        let if_not_exists = self.eat_if_exists(true)?;
+        let def = self.parse_session_param_def(kind)?;
+        Ok(SessionStmt::SetParameter { def, if_not_exists })
+    }
+
+    /// One parameter definition, which is a binding variable definition
+    /// whose name is written with a dollar (ISO 7.1).
+    ///
+    /// The two are the same rule with two spellings of the name, so the
+    /// name is read here and the rest is [`Self::parse_binding_def`]'s.
+    /// That is not a shortcut: a session parameter and a binding
+    /// variable stand for the same three kinds of thing, take the same
+    /// optional type, and are initialized from the same expression or
+    /// the same query in braces, so two readers would be two chances to
+    /// accept different languages under one grammar.
+    fn parse_session_param_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
+        let Some(TokenKind::Param(name)) = self.peek().map(|t| t.kind.clone()) else {
+            return Err(self.error("a session parameter name, written with a dollar"));
+        };
+        self.pos += 1;
+        self.parse_binding_def_body(kind, name)
+    }
+
+    /// The displacement a `SESSION SET TIME ZONE` names (GS15).
+    ///
+    /// ISO writes it as a character string, and what zu takes is a
+    /// displacement and never a zone name (`02 §3.4`): a name is a rule
+    /// the zone database can change, so a session set to one would mean
+    /// a different instant after an upgrade. The string is read here
+    /// rather than at the session, because a string that is not a
+    /// displacement is a fault in the statement.
+    fn parse_time_zone(&mut self) -> Result<i16> {
+        let Some(Token {
+            kind: TokenKind::Str(text),
+            start,
+            ..
+        }) = self.peek().cloned()
+        else {
+            return Err(self.error("a time zone displacement in quotes, such as '+07:00'"));
+        };
+        self.pos += 1;
+        zu_common::temporal::zone_offset(&text).ok_or_else(|| {
+            ZuError::gql_in(
+                codes::C22007,
+                self.source,
+                start,
+                format_args!(
+                    "'{text}' is no time zone displacement: a session takes an offset from UTC, written 'Z' or '+hh', '+hhmm' or '+hh:mm' either way of nought, and never a zone name, since a name is a rule the zone database can change under a session that is holding it"
+                ),
+            )
+        })
+    }
+
+    /// What a `SESSION RESET` puts back (ISO 7.2).
+    ///
+    /// `SESSION RESET` on its own resets everything, which is what the
+    /// standard says a reset with no arguments means and is the same
+    /// thing `ALL CHARACTERISTICS` spells out.
+    fn parse_session_reset(&mut self) -> Result<SessionReset> {
+        let all = self.eat_kw("ALL");
+        if self.eat_kw("CHARACTERISTICS") {
+            return Ok(SessionReset::Characteristics);
+        }
+        if self.eat_kw("PARAMETERS") {
+            return Ok(SessionReset::Parameters);
+        }
+        if all {
+            return Err(self.error("PARAMETERS or CHARACTERISTICS after SESSION RESET ALL"));
+        }
+        if self.eat_kw("SCHEMA") {
+            return Ok(SessionReset::Schema);
+        }
+        if self.at_kw("TIME") && self.kw_at(1, "ZONE") {
+            self.pos += 2;
+            return Ok(SessionReset::TimeZone);
+        }
+        if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+            self.eat_kw("PROPERTY");
+            self.pos += 1;
+            return Ok(SessionReset::Graph);
+        }
+        if self.eat_kw("PARAMETER") {
+            let Some(TokenKind::Param(name)) = self.peek().map(|t| t.kind.clone()) else {
+                return Err(self.error("a session parameter name, written with a dollar"));
+            };
+            self.pos += 1;
+            return Ok(SessionReset::Parameter(name));
+        }
+        // A reset with nothing after it is the widest one, so the end
+        // of the statement is an answer and anything else is not.
+        if self.peek().is_none() || self.at(&TokenKind::Semicolon) {
+            return Ok(SessionReset::Characteristics);
+        }
+        Err(self.error(
+            "ALL CHARACTERISTICS, ALL PARAMETERS, PARAMETER $p, SCHEMA, PROPERTY GRAPH, TIME ZONE, or nothing at all after SESSION RESET",
+        ))
     }
 
     /// Whether this statement changes the catalog rather than reading
@@ -1287,7 +1572,7 @@ impl Parser<'_> {
         let mut properties = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let name = self.expect_name("a property name")?;
+                let name = self.expect_field_name("a property name")?;
                 if !self.eat_kw("TYPED") {
                     self.expect_double_colon()?;
                 }
@@ -1352,7 +1637,7 @@ impl Parser<'_> {
     /// carrying. `IS` is the other spelling of the colon, the way it is
     /// in a pattern.
     fn parse_remove_item(&mut self) -> Result<RemoveItem> {
-        let target = self.expect_name("a variable after REMOVE")?;
+        let target = self.expect_variable("a variable after REMOVE")?;
         if self.eat(&TokenKind::Colon) || self.eat_kw("IS") {
             let labels = self.parse_label_set()?;
             return Ok(RemoveItem {
@@ -1361,7 +1646,7 @@ impl Parser<'_> {
             });
         }
         self.expect(&TokenKind::Dot)?;
-        let key = self.expect_name("a property name after the dot")?;
+        let key = self.expect_field_name("a property name after the dot")?;
         Ok(RemoveItem {
             target,
             what: Removed::Property(key),
@@ -1444,7 +1729,7 @@ impl Parser<'_> {
     /// item is still one value per row. `IS` is the other spelling of the
     /// colon, the way it is in a pattern.
     fn parse_set_item(&mut self) -> Result<SetItem> {
-        let target = self.expect_name("a variable after SET")?;
+        let target = self.expect_variable("a variable after SET")?;
         if self.eat(&TokenKind::Colon) || self.eat_kw("IS") {
             let labels = self.parse_label_set()?;
             return Ok(SetItem {
@@ -1462,7 +1747,7 @@ impl Parser<'_> {
             });
         }
         self.expect(&TokenKind::Dot)?;
-        let key = self.expect_name("a property name after the dot")?;
+        let key = self.expect_field_name("a property name after the dot")?;
         self.expect(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
         Ok(SetItem {
@@ -1489,7 +1774,7 @@ impl Parser<'_> {
             return Ok(None);
         };
         self.pos += 2;
-        let name = self.expect_name("a variable name for the counter")?;
+        let name = self.expect_variable("a variable name for the counter")?;
         Ok(Some(Ordinal { name, start }))
     }
 
@@ -1501,7 +1786,7 @@ impl Parser<'_> {
     /// name. `LET p.age = 30` is a write written where a definition
     /// goes, so it is refused by saying what a definition looks like.
     fn parse_let_item(&mut self) -> Result<LetItem> {
-        let name = self.expect_name("a variable name after LET")?;
+        let name = self.expect_variable("a variable name after LET")?;
         if self.at(&TokenKind::Dot) {
             return Err(ZuError::gql_in(
                 codes::C42001,
@@ -1646,9 +1931,9 @@ impl Parser<'_> {
         }
         let mut names = Vec::new();
         if !self.at(&TokenKind::RParen) {
-            names.push(self.expect_name("a variable name in the scope of a CALL")?);
+            names.push(self.expect_variable("a variable name in the scope of a CALL")?);
             while self.eat(&TokenKind::Comma) {
-                names.push(self.expect_name("a variable name in the scope of a CALL")?);
+                names.push(self.expect_variable("a variable name in the scope of a CALL")?);
             }
         }
         self.expect(&TokenKind::RParen)?;
@@ -1855,7 +2140,14 @@ impl Parser<'_> {
     /// query is that expression written after the equals rather than a
     /// second rule here.
     fn parse_binding_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
-        let name = self.expect_name("a binding variable name")?;
+        let name = self.expect_variable("a binding variable name")?;
+        self.parse_binding_def_body(kind, name)
+    }
+
+    /// The definition behind the name, which is everything but the
+    /// name: a session parameter is written with a dollar and read the
+    /// same way from here on (ISO 7.1).
+    fn parse_binding_def_body(&mut self, kind: BindingKind, name: String) -> Result<BindingDef> {
         // GP06, the typed definition. ISO writes the separator two
         // ways, `::` and the word `TYPED`, and allows the type to be
         // written with neither, so all three are read here and the
@@ -2097,7 +2389,31 @@ impl Parser<'_> {
             if self.next_hands_to_catalog() || !self.eat_kw("NEXT") {
                 return Ok((Linear { statements }, ending));
             }
+            self.refuse_a_second_graph()?;
         }
+    }
+
+    /// The graph clause a statement past a `NEXT` writes for itself.
+    ///
+    /// ISO 13.1 admits it: `<next statement>` hands over to a whole
+    /// `<statement>`, and a focused one begins with its own `<use graph
+    /// clause>`, so a chain may walk from one graph into another. This
+    /// engine holds one graph open for the length of a statement, which
+    /// is why the answer is 25G04 and not a syntax error: the grammar is
+    /// fine and the engine is declining it.
+    fn refuse_a_second_graph(&mut self) -> Result<()> {
+        if !self.at_kw("USE") {
+            return Ok(());
+        }
+        let at = self.peek().expect("peeked").start;
+        Err(ZuError::gql_in(
+            codes::C25G04,
+            self.source,
+            at,
+            format_args!(
+                "a statement runs against the one graph it names, and this USE names a second one for the statement past the NEXT; write the two as two statements"
+            ),
+        ))
     }
 
     /// The operator joining this operand to the one before it, or
@@ -2309,7 +2625,7 @@ impl Parser<'_> {
                     ordinal: None,
                 });
             } else if self.eat_kw("FOR") {
-                let alias = self.expect_name("a variable name after FOR")?;
+                let alias = self.expect_variable("a variable name after FOR")?;
                 self.expect_kw("IN")?;
                 let expr = self.parse_expr()?;
                 let ordinal = self.parse_ordinal()?;
@@ -2501,7 +2817,7 @@ impl Parser<'_> {
 
     /// The variable form of a delete item.
     fn parse_delete_variable(&mut self) -> Result<String> {
-        let name = self.expect_name("a variable after DELETE")?;
+        let name = self.expect_variable("a variable after DELETE")?;
         if self.at(&TokenKind::Dot) {
             return Err(ZuError::gql_in(
                 codes::C42001,
@@ -2783,7 +3099,7 @@ impl Parser<'_> {
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
                 Some(TokenKind::Eq)
             ) {
-            let name = self.expect_name("a path variable")?;
+            let name = self.expect_variable("a path variable")?;
             self.expect(&TokenKind::Eq)?;
             Some(name)
         } else {
@@ -3003,7 +3319,7 @@ impl Parser<'_> {
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
                 Some(TokenKind::Eq)
             ) {
-            let name = self.expect_name("a subpath variable")?;
+            let name = self.expect_variable("a subpath variable")?;
             self.expect(&TokenKind::Eq)?;
             Some(name)
         } else {
@@ -3492,8 +3808,12 @@ impl Parser<'_> {
     fn parse_node(&mut self) -> Result<NodePattern> {
         self.expect(&TokenKind::LParen)?;
         let var = match self.peek().map(|t| &t.kind) {
-            Some(TokenKind::Ident(_)) | Some(TokenKind::QuotedIdent(_)) => {
-                Some(self.expect_name("a variable")?)
+            // A delimited identifier is read here and refused there,
+            // rather than left to fall through to the closing bracket:
+            // nothing else may stand in this slot, so a query that
+            // wrote one gets told the rule it broke.
+            Some(TokenKind::Ident(_) | TokenKind::QuotedIdent(_) | TokenKind::Str(_)) => {
+                Some(self.expect_variable("a variable")?)
             }
             _ => None,
         };
@@ -3582,8 +3902,12 @@ impl Parser<'_> {
         let bracketed = self.at(&TokenKind::LBracket);
         let (var, types, range, props, filter) = if self.eat(&TokenKind::LBracket) {
             let var = match self.peek().map(|t| &t.kind) {
-                Some(TokenKind::Ident(_)) | Some(TokenKind::QuotedIdent(_)) => {
-                    Some(self.expect_name("a variable")?)
+                // A delimited identifier is read here and refused
+                // there, rather than left to fall through to the
+                // bracket: nothing else may stand in this slot, so a
+                // query that wrote one gets told the rule it broke.
+                Some(TokenKind::Ident(_) | TokenKind::QuotedIdent(_) | TokenKind::Str(_)) => {
+                    Some(self.expect_variable("a variable")?)
                 }
                 _ => None,
             };
@@ -3593,6 +3917,7 @@ impl Parser<'_> {
                 while self.eat(&TokenKind::Pipe) {
                     types.push(self.expect_name("a relationship type")?);
                 }
+                self.refuse_edge_conjunction()?;
             }
             let range = if self.eat(&TokenKind::Star) {
                 Some(self.parse_hop_range()?)
@@ -3898,6 +4223,38 @@ impl Parser<'_> {
         Ok(out)
     }
 
+    /// Refuses a conjunction of edge types, which is 42007.
+    ///
+    /// An edge is stored under one type here, so the edge label set of
+    /// an edge this engine holds has exactly one label in it. A step
+    /// written `[:A&B]` asks for an edge with two, which is over the
+    /// maximum in ISO 24.5.2 IL001, and 42007 is that condition seen
+    /// while the statement is being read rather than while an element
+    /// is being built. Read after the bars, so `[:A|B&C]` is refused
+    /// for the conjunction rather than accepted as two alternatives
+    /// with a stray token after them.
+    fn refuse_edge_conjunction(&mut self) -> Result<()> {
+        if !self.at(&TokenKind::Amp) {
+            return Ok(());
+        }
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        let mut names = 2;
+        while self.eat(&TokenKind::Amp) {
+            self.expect_name("an edge type")?;
+            names += 1;
+        }
+        Err(ZuError::gql_in(
+            codes::C42007,
+            self.source,
+            at,
+            format_args!(
+                "an edge is stored under one type in this engine, so its label set holds \
+                 one label and this step names {}; write the one type the step walks",
+                names - 1
+            ),
+        ))
+    }
+
     /// One label, or a bracketed expression over labels.
     fn parse_simple_primary(&mut self) -> Result<Vec<Simplified>> {
         let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
@@ -3917,16 +4274,7 @@ impl Parser<'_> {
             return Ok(inner);
         }
         let name = self.expect_name("an edge type")?;
-        if self.at(&TokenKind::Amp) {
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                at,
-                "an edge is stored under one type in this engine, so no edge has two of \
-                 them at once and a conjunction of labels on a step matches nothing; \
-                 write the one type the step walks",
-            ));
-        }
+        self.refuse_edge_conjunction()?;
         Ok(vec![Simplified {
             types: vec![name],
             direction: None,
@@ -4010,7 +4358,7 @@ impl Parser<'_> {
         let mut props = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let key = self.expect_name("a property name")?;
+                let key = self.expect_field_name("a property name")?;
                 self.expect(&TokenKind::Colon)?;
                 props.push((key, self.parse_expr()?));
                 if !self.eat(&TokenKind::Comma) {
@@ -4306,7 +4654,7 @@ impl Parser<'_> {
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         while self.eat(&TokenKind::Dot) {
-            let key = self.expect_name("a property name after '.'")?;
+            let key = self.expect_field_name("a property name after '.'")?;
             expr = Expr::Property {
                 base: Box::new(expr),
                 key,
@@ -4662,7 +5010,7 @@ impl Parser<'_> {
     /// One item of a `YIELD`: a variable the match wrote, and the name
     /// it leaves the match under.
     fn parse_yield_item(&mut self) -> Result<YieldItem> {
-        let name = self.expect_name("a variable name after YIELD")?;
+        let name = self.expect_variable("a variable name after YIELD")?;
         let alias = match self.eat_kw("AS") {
             true => Some(self.expect_name("a name after AS")?),
             false => None,
@@ -5146,8 +5494,17 @@ impl Parser<'_> {
                 self.expect_kw("VALUE")?;
                 return Ok(LogicalType::AnyProperty);
             }
+            // GV56 and GV57 in their open spelling. ANY is optional in
+            // front of both, so the word is read here as well as below
+            // rather than the prefix being a type of its own.
+            if let Some(ty) = self.parse_reference_type()? {
+                return Ok(ty);
+            }
             self.eat_kw("VALUE");
             return Ok(LogicalType::Any);
+        }
+        if let Some(ty) = self.parse_reference_type()? {
+            return Ok(ty);
         }
         if self.eat_kw("RECORD") {
             return Ok(LogicalType::Record(self.parse_record_type()?));
@@ -5252,7 +5609,16 @@ impl Parser<'_> {
         // The one constraint a list type carries is a maximum length,
         // and it is a count rather than an expression for the same
         // reason a string's length is.
-        let max = if self.eat(&TokenKind::LParen) {
+        //
+        // ISO writes it in square brackets, `LIST<INT>[2]`, which is
+        // the only length in the grammar not written in parentheses.
+        // Both are read, since a query that spells it the way every
+        // other length is spelled meant the same thing.
+        let max = if self.eat(&TokenKind::LBracket) {
+            let n = self.parse_type_argument()?;
+            self.expect(&TokenKind::RBracket)?;
+            Some(n)
+        } else if self.eat(&TokenKind::LParen) {
             let n = self.parse_type_argument()?;
             self.expect(&TokenKind::RParen)?;
             Some(n)
@@ -5263,6 +5629,45 @@ impl Parser<'_> {
             elem: Box::new(elem),
             max,
         })
+    }
+
+    /// A node or edge reference value type, GV56 and GV57, or `None`
+    /// where the next word is neither synonym.
+    ///
+    /// Open and closed are one production here because they differ
+    /// only in what follows the synonym: `NODE` on its own admits any
+    /// node, and `NODE :Person` admits the ones wearing that label.
+    /// The two are the same word read one token further, so a caller
+    /// that had to choose between them before reading would have to
+    /// look ahead anyway.
+    ///
+    /// The label set is one name rather than a label expression. A
+    /// reference type in zu carries a name, and widening it to an
+    /// expression is worth doing when a cast to a disjunction is a
+    /// thing somebody writes; refusing the rest here says so plainly
+    /// rather than accepting a conjunction and checking one half of it.
+    fn parse_reference_type(&mut self) -> Result<Option<LogicalType>> {
+        let node = self.at_kw("NODE") || self.at_kw("VERTEX");
+        if !node && !(self.at_kw("EDGE") || self.at_kw("RELATIONSHIP")) {
+            return Ok(None);
+        }
+        self.pos += 1;
+        self.eat_kw("TYPE");
+        let mut label = None;
+        // `NODE (:Person)` is the pattern spelling of the same thing,
+        // and the parenthesis is what tells it from the phrase.
+        let parenthesised = self.eat(&TokenKind::LParen);
+        if self.eat(&TokenKind::Colon) {
+            label = Some(self.expect_name("a label in a reference type")?);
+        }
+        if parenthesised {
+            self.expect(&TokenKind::RParen)?;
+        }
+        Ok(Some(if node {
+            LogicalType::Node(label)
+        } else {
+            LogicalType::Edge(label)
+        }))
     }
 
     /// The fields of a record type, GV46, or no fields at all.
@@ -5279,7 +5684,7 @@ impl Parser<'_> {
         let mut fields = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let name = self.expect_name("a field name")?;
+                let name = self.expect_field_name("a field name")?;
                 self.expect_double_colon()?;
                 let ty = self.parse_value_type()?;
                 fields.push(Field { name, ty });
@@ -5348,7 +5753,7 @@ impl Parser<'_> {
         self.expect(&TokenKind::LParen)?;
         let expr = Box::new(self.parse_expr()?);
         self.expect(&TokenKind::Comma)?;
-        let key = self.expect_name("a property name")?;
+        let key = self.expect_field_name("a property name")?;
         self.expect(&TokenKind::RParen)?;
         Ok(Expr::PropertyExists { expr, key })
     }
@@ -5649,6 +6054,19 @@ mod tests {
         }
     }
 
+    fn session_stmt(source: &str) -> SessionStmt {
+        match parse_statement(source).expect("parse") {
+            Statement::Session(stmt) => stmt,
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    fn session_err(source: &str) -> String {
+        parse_statement(source)
+            .expect_err("should fail")
+            .to_string()
+    }
+
     fn catalog_err(source: &str) -> String {
         parse_statement(source)
             .expect_err("should fail")
@@ -5716,7 +6134,7 @@ mod tests {
                NODE TYPE PersonType (:Person => :Employee
                  {name :: STRING NOT NULL, nickname :: STRING}),
                (:Org),
-               (:Person)-[:KNOWS => :Close]->(:Org),
+               (:Person)-[:KNOWS => :Nearby]->(:Org),
                (:Person)<-[:EMPLOYS]-(:Org),
                (:Person)-[:MEETS]-(:Person),
                (:Person)~[:SITS_WITH]~(:Person)
@@ -6035,16 +6453,187 @@ mod tests {
         assert!(parse_err("CREATE (n) RETURN n").contains("CREATE is not implemented yet"));
     }
 
+    /// The three parameter kinds, which are the three a binding
+    /// variable has and are written the same way behind the name (GS01,
+    /// GS02, GS03).
+    #[test]
+    fn a_session_parameter_is_set_in_each_of_its_three_kinds() {
+        let kinds = [
+            ("SESSION SET VALUE $v = 1", BindingKind::Value, "v"),
+            (
+                "SESSION SET BINDING TABLE $t = { MATCH (p) RETURN p AS p }",
+                BindingKind::Table,
+                "t",
+            ),
+            (
+                "SESSION SET PROPERTY GRAPH $g = CURRENT_PROPERTY_GRAPH",
+                BindingKind::Graph,
+                "g",
+            ),
+        ];
+        for (source, kind, name) in kinds {
+            let SessionStmt::SetParameter { def, if_not_exists } = session_stmt(source) else {
+                panic!("{source} is not a parameter");
+            };
+            assert_eq!(def.kind, kind, "{source}");
+            assert_eq!(def.name, name, "{source}");
+            assert!(!if_not_exists, "{source}");
+        }
+        // The long spellings are the short ones. `TABLE` alone is a
+        // binding table and `GRAPH` alone is a property graph, which is
+        // how a binding variable definition reads them too.
+        assert_eq!(
+            session_stmt("SESSION SET TABLE $t = $u"),
+            session_stmt("SESSION SET BINDING TABLE $t = $u")
+        );
+        assert_eq!(
+            session_stmt("SESSION SET GRAPH $g = HOME_GRAPH"),
+            session_stmt("SESSION SET PROPERTY GRAPH $g = HOME_PROPERTY_GRAPH")
+        );
+    }
+
+    /// A definition may be written with a type and may be initialized
+    /// from a query in braces, which is the whole of GS10 and GS11: the
+    /// same two forms a binding variable takes.
+    #[test]
+    fn a_session_parameter_takes_a_type_and_a_query() {
+        let SessionStmt::SetParameter { def, .. } =
+            session_stmt("SESSION SET VALUE $n :: INTEGER = { MATCH (p) RETURN count(*) AS n }")
+        else {
+            panic!("not a parameter");
+        };
+        assert_eq!(
+            def.ty,
+            Some(LogicalType::Nullable(Box::new(
+                value_type::spelled("INTEGER", &[]).expect("a type")
+            )))
+        );
+        assert!(matches!(def.init, BindingInit::Query(_)));
+        let SessionStmt::SetParameter { def, if_not_exists } =
+            session_stmt("SESSION SET VALUE IF NOT EXISTS $n = 1")
+        else {
+            panic!("not a parameter");
+        };
+        assert!(if_not_exists);
+        assert_eq!(def.name, "n");
+    }
+
+    /// `SESSION SET PROPERTY GRAPH` is written two ways and the dollar
+    /// is the whole difference: with one it binds a parameter, without
+    /// one it moves the graph the session works in.
+    #[test]
+    fn the_dollar_tells_a_graph_parameter_from_the_session_graph() {
+        assert_eq!(
+            session_stmt("SESSION SET PROPERTY GRAPH social"),
+            SessionStmt::SetGraph(GraphRef::Named(GraphName {
+                schema: None,
+                name: "social".to_string(),
+            }))
+        );
+        assert_eq!(
+            session_stmt("SESSION SET GRAPH HOME_PROPERTY_GRAPH"),
+            SessionStmt::SetGraph(GraphRef::Home)
+        );
+        let SessionStmt::SetParameter { def, .. } =
+            session_stmt("SESSION SET PROPERTY GRAPH $g = social")
+        else {
+            panic!("not a parameter");
+        };
+        assert_eq!(def.kind, BindingKind::Graph);
+    }
+
+    #[test]
+    fn a_session_takes_a_schema_and_a_zone() {
+        assert_eq!(
+            session_stmt("SESSION SET SCHEMA /app"),
+            SessionStmt::SetSchema(SchemaRef::Path("/app".to_string()))
+        );
+        assert_eq!(
+            session_stmt("SESSION SET SCHEMA /"),
+            SessionStmt::SetSchema(SchemaRef::Path("/".to_string()))
+        );
+        // GS15. Every spelling of a displacement a zoned literal takes,
+        // and nought written either way of the sign is nought.
+        for (source, minutes) in [
+            ("SESSION SET TIME ZONE '+07:00'", 420),
+            ("SESSION SET TIME ZONE '-05:30'", -330),
+            ("SESSION SET TIME ZONE '+0700'", 420),
+            ("SESSION SET TIME ZONE '+07'", 420),
+            ("SESSION SET TIME ZONE 'Z'", 0),
+            ("SESSION SET TIME ZONE '-00:00'", 0),
+        ] {
+            assert_eq!(session_stmt(source), SessionStmt::SetTimeZone(minutes));
+        }
+    }
+
+    /// A zone name is not a displacement, and the refusal says so
+    /// rather than letting the session hold a rule the zone database
+    /// can change (`02 §3.4`).
+    #[test]
+    fn a_zone_name_is_not_a_displacement() {
+        let err = session_err("SESSION SET TIME ZONE 'Europe/Dublin'");
+        assert!(err.contains("no time zone displacement"), "{err}");
+        assert!(session_err("SESSION SET TIME ZONE '+19:00'").contains("displacement"));
+        assert!(session_err("SESSION SET TIME ZONE 7").contains("in quotes"));
+    }
+
+    #[test]
+    fn every_reset_is_read_and_a_bare_one_is_the_widest() {
+        let resets = [
+            ("SESSION RESET", SessionReset::Characteristics),
+            ("SESSION RESET;", SessionReset::Characteristics),
+            (
+                "SESSION RESET ALL CHARACTERISTICS",
+                SessionReset::Characteristics,
+            ),
+            (
+                "SESSION RESET CHARACTERISTICS",
+                SessionReset::Characteristics,
+            ),
+            ("SESSION RESET ALL PARAMETERS", SessionReset::Parameters),
+            ("SESSION RESET PARAMETERS", SessionReset::Parameters),
+            ("SESSION RESET SCHEMA", SessionReset::Schema),
+            ("SESSION RESET GRAPH", SessionReset::Graph),
+            ("SESSION RESET PROPERTY GRAPH", SessionReset::Graph),
+            ("SESSION RESET TIME ZONE", SessionReset::TimeZone),
+            (
+                "SESSION RESET PARAMETER $p",
+                SessionReset::Parameter("p".to_string()),
+            ),
+        ];
+        for (source, reset) in resets {
+            assert_eq!(session_stmt(source), SessionStmt::Reset(reset), "{source}");
+        }
+        assert!(session_err("SESSION RESET ALL SCHEMA").contains("SESSION RESET ALL"));
+        assert!(session_err("SESSION RESET PARAMETER p").contains("with a dollar"));
+        assert!(session_err("SESSION RESET WHAT").contains("after SESSION RESET"));
+    }
+
+    /// A session statement is whole on its own, the way a transaction
+    /// statement is: it has no binding table for anything behind it to
+    /// read, so a `NEXT` after one is a statement with nowhere to go.
+    #[test]
+    fn nothing_follows_a_session_statement() {
+        let err = session_err("SESSION RESET SCHEMA NEXT MATCH (p) RETURN p");
+        assert!(
+            err.contains("nothing may follow a session statement"),
+            "{err}"
+        );
+        assert!(session_err("SESSION SET VALUE 1 = 1").contains("with a dollar"));
+        assert!(session_err("SESSION SET WHAT $p = 1").contains("after SESSION SET"));
+        assert!(session_err("SESSION").contains("expected"));
+    }
+
     /// A statement GQL defines and the v0 core does not parse should be
     /// turned away by name. Being told the parser expected MATCH sends a
     /// reader looking for a typo in a statement they spelled correctly,
     /// which is the wrong place to look and the wrong thing to fix.
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
-        let err = parse_err("SESSION SET VALUE $x = 1");
+        let err = parse_err("CREATE (n) RETURN n");
         assert!(
-            err.contains("SESSION is not implemented yet"),
-            "refused with {err:?}, which does not name SESSION"
+            err.contains("CREATE is not implemented yet"),
+            "refused with {err:?}, which does not name CREATE"
         );
     }
 
@@ -7350,19 +7939,81 @@ mod tests {
         }
     }
 
-    /// Only the bracket or the brace makes the word a constructor, so
-    /// a query that binds a variable of that name still reads it back
-    /// as a variable.
+    /// The type words are reserved (ISO 21.3), so a variable cannot be
+    /// called one however the query is written: a variable is a plain
+    /// name and a plain name is not a reserved word. What the bracket
+    /// and the brace decide is which construct the word opens, and
+    /// that question is asked of the word and not of a binding.
     #[test]
-    fn a_type_name_is_still_a_name() {
+    fn a_type_word_is_reserved_and_is_not_a_variable() {
         for name in ["list", "array", "record"] {
-            let q = parsed(&format!("LET {name} = 1 RETURN {name}"));
-            assert_eq!(
-                q.result().expect("RETURN").items[0].expr,
-                Expr::Variable(name.to_string()),
-                "{name}"
-            );
+            let e = parse_err(&format!("LET {name} = 1 RETURN {name}"));
+            assert!(e.contains("reserved word"), "{name}: {e}");
         }
+        // A word that is not reserved is still a name, which is what
+        // says the refusal above is about the list and not about the
+        // slot.
+        let q = parsed("LET tally = 1 RETURN tally");
+        assert_eq!(
+            q.result().expect("RETURN").items[0].expr,
+            Expr::Variable("tally".to_string())
+        );
+    }
+
+    /// The deviation `expect_field_name` exists for: a reserved word
+    /// is a property name and a field name and is nothing else.
+    #[test]
+    fn a_reserved_word_is_still_a_property_name() {
+        for text in [
+            "INSERT (:Thing {year: 2024})",
+            "RETURN {year: 1} AS r",
+            "MATCH (n:Thing) RETURN n.year AS y",
+            "MATCH (n:Thing) SET n.year = 2024",
+            "RETURN DATE({year: 2024, month: 1, day: 1}) AS v",
+        ] {
+            parsed(text);
+        }
+        for text in [
+            "RETURN 1 AS year",
+            "MATCH (year:Person) RETURN 1 AS n",
+            "LET year = 1 RETURN year",
+        ] {
+            let e = parse_err(text);
+            assert!(e.contains("reserved word"), "{text}: {e}");
+        }
+    }
+
+    /// GV56 and GV57, both spellings of each, and GV50's maximum in
+    /// the brackets ISO writes it in.
+    #[test]
+    fn a_reference_value_type_parses_open_and_closed() {
+        let ty = |text: &str| {
+            let q = parsed(&format!("RETURN CAST(x AS {text}) AS v"));
+            match &q.result().expect("RETURN").items[0].expr {
+                Expr::Cast { ty, .. } => ty.base().clone(),
+                other => panic!("{text}: {other:?}"),
+            }
+        };
+        assert_eq!(ty("NODE"), LogicalType::Node(None));
+        assert_eq!(ty("ANY NODE"), LogicalType::Node(None));
+        assert_eq!(ty("ANY VERTEX"), LogicalType::Node(None));
+        assert_eq!(ty("EDGE"), LogicalType::Edge(None));
+        assert_eq!(ty("ANY RELATIONSHIP"), LogicalType::Edge(None));
+        assert_eq!(ty("NODE :Person"), LogicalType::Node(Some("Person".into())));
+        assert_eq!(
+            ty("NODE TYPE :Person"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(
+            ty("NODE (:Person)"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(ty("EDGE :KNOWS"), LogicalType::Edge(Some("KNOWS".into())));
+        assert_eq!(
+            ty("LIST<INT>[2]"),
+            ty("LIST<INT>(2)"),
+            "the two spellings of a maximum are one type"
+        );
     }
 
     #[test]
@@ -7785,9 +8436,41 @@ mod tests {
         );
     }
 
+    /// ISO 21.3. An `<identifier>` is a regular identifier or a
+    /// delimited one, and a delimited one is written in accent quotes
+    /// or in double quotes, the two being the same production. A
+    /// `<binding variable>` is a regular identifier only, so the
+    /// delimited forms do not reach a variable however they are
+    /// written, and a reserved word does not reach one either.
+    #[test]
+    fn a_name_may_be_delimited_and_a_variable_may_not() {
+        for source in [
+            "MATCH (u:`Unit`) RETURN 1 AS v",
+            r#"MATCH (u:"Unit") RETURN 1 AS v"#,
+            "RETURN 1 AS `MATCH`",
+            r#"RETURN 1 AS "MATCH""#,
+            "MATCH (u:Unit) RETURN u.`odd name` AS v",
+        ] {
+            parsed(source);
+        }
+        // A single quoted sequence is a string literal and only that,
+        // so it does not stand where a name belongs.
+        assert!(parse_err("RETURN 1 AS 'v'").contains("expected an alias"));
+        for source in [
+            "MATCH (`odd name`:Unit) RETURN 1 AS v",
+            r#"MATCH ("odd name":Unit) RETURN 1 AS v"#,
+        ] {
+            let e = parse_err(source);
+            assert!(e.contains("a variable is a plain name"), "{source}: {e}");
+        }
+        assert!(parse_err("RETURN 1 AS MATCH").contains("reserved word"));
+        // A pre-reserved word is a name here, which is the deviation
+        // `zu_common::keywords` writes down.
+        parsed("MATCH (u:Unit) RETURN 1 AS data");
+    }
+
     /// GQ18. A value query expression carries a whole query: it may
-    /// chain, sort and cut, and `value` is still a variable name where
-    /// no brace follows it.
+    /// chain, sort and cut, and it is the brace that makes it one.
     #[test]
     fn a_value_query_carries_a_whole_query() {
         let q = parsed("RETURN VALUE { MATCH (p:Person) RETURN COUNT(*) } AS total");
@@ -7802,9 +8485,13 @@ mod tests {
         let q = parsed("RETURN VALUE { MATCH (p:Person) RETURN p.id ORDER BY p.id LIMIT 1 } AS v");
         let items = &q.result().expect("a RETURN").items;
         assert!(matches!(&items[0].expr, Expr::ValueQuery(_)));
-        // The word is free everywhere a brace does not follow it.
-        let q = parsed("MATCH (value:Person) RETURN value.id AS id");
-        assert_eq!(q.result().expect("a RETURN").items.len(), 1);
+        // The brace is what says a value query, and the word without
+        // one is refused for being reserved rather than read as a
+        // variable, which is ISO 21.3 and not this expression's rule.
+        assert!(
+            parse_err("MATCH (value:Person) RETURN value.id AS id").contains("reserved word"),
+            "VALUE is reserved"
+        );
     }
 
     /// GQ21. An OPTIONAL takes a block as well as a single statement,
@@ -7851,14 +8538,19 @@ mod tests {
     }
 
     #[test]
-    fn exists_is_still_a_name_without_a_block() {
-        // Only an opening bracket makes it the predicate, so a variable
-        // of that name reads the way it always did.
-        let q = parsed("MATCH (exists:Person) RETURN exists.id AS id");
+    fn only_a_bracket_makes_exists_the_predicate() {
+        // An ordinary name in the same slot is an ordinary variable,
+        // which is what says the predicate is the bracket's doing.
+        // EXISTS itself is a reserved word and is no name at all.
+        let q = parsed("MATCH (present:Person) RETURN present.id AS id");
         let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
-        assert_eq!(patterns[0].start.var.as_deref(), Some("exists"));
+        assert_eq!(patterns[0].start.var.as_deref(), Some("present"));
+        assert!(
+            parse_err("MATCH (exists:Person) RETURN exists.id AS id").contains("reserved word"),
+            "EXISTS is reserved"
+        );
     }
 
     #[test]
@@ -8480,15 +9172,21 @@ mod tests {
         assert!(parse_err("DELETE VALUE { MATCH (p:person) RETURN p").contains("never closed"));
     }
 
-    /// VALUE is not reserved, so a variable somebody called that is
-    /// still a variable: what makes the item a query is the brace.
+    /// What makes a DELETE item a query is the brace and not the word
+    /// in front of it, so an ordinary name in that position is an
+    /// ordinary target. VALUE itself is reserved and cannot be the
+    /// name, which is the rule and not this clause's doing.
     #[test]
-    fn a_variable_called_value_is_read_as_a_variable() {
-        let q = parsed("MATCH (value:person) DELETE value");
+    fn a_name_in_front_of_no_brace_is_read_as_a_variable() {
+        let q = parsed("MATCH (holder:person) DELETE holder");
         let Clause::Delete { targets, .. } = &q.clauses()[1] else {
             panic!("DELETE");
         };
-        assert_eq!(vars(targets), ["value"]);
+        assert_eq!(vars(targets), ["holder"]);
+        assert!(
+            parse_err("MATCH (value:person) DELETE value").contains("reserved word"),
+            "VALUE is reserved"
+        );
     }
 
     /// A label is the other thing GQL lets REMOVE take, in either of

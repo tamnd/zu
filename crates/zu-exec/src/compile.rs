@@ -948,6 +948,7 @@ pub(crate) fn compile(
         func: None,
         marks: IdMap::default(),
         consts: Vec::new(),
+        every_row_answers: false,
     };
     c.compile(plan)
 }
@@ -1052,6 +1053,19 @@ struct Compiler<'a> {
     marks: IdMap<usize, (usize, usize)>,
     /// The constants the sink writes, in the order they were asked for.
     consts: Vec<Value>,
+    /// Whether every row the pipeline builds reaches the sink, so a
+    /// computed column filled where the level is built is filled for
+    /// exactly the rows the old engine projects.
+    ///
+    /// It is false while the pipeline is still growing and settled once
+    /// the operators are known, which is before the sink compiles and
+    /// therefore before anything reads it. A plan with no operator over
+    /// the driving level and no slice above the sink is the shape it
+    /// holds for: nothing drops a row between the level and the answer,
+    /// so a function that can have no answer for a row is asked about
+    /// the same rows on both engines and the two either raise together
+    /// or agree.
+    every_row_answers: bool,
 }
 
 impl Compiler<'_> {
@@ -1835,6 +1849,18 @@ impl Compiler<'_> {
         // are stages over a table the sink already holds.
         let sink_node = it.next();
         let tail: Vec<&LogicalPlan> = it.collect();
+
+        // Whether the rows the level carries are the rows the answer
+        // is built from. An operator between the two drops some of
+        // them, an expand multiplies them and drops the rows with
+        // nothing to walk to, and a slice above the sink stops reading
+        // partway; each of those is a row the old engine never projects
+        // and this one would have computed. With none of them written,
+        // the level's rows and the answer's rows are the same rows.
+        self.every_row_answers = ops.is_empty()
+            && !tail
+                .iter()
+                .any(|node| matches!(node, LogicalPlan::Skip { .. } | LogicalPlan::Limit { .. }));
 
         let mut sink = match sink_node {
             Some(LogicalPlan::Project { items, .. }) => {
@@ -3329,13 +3355,26 @@ impl Compiler<'_> {
     /// them, so nothing downstream of here has to know which of the two
     /// it is looking at.
     ///
-    /// Anything that could have no answer for a row declines. A
+    /// Anything that could have no answer for a row declines where
+    /// something between the level and the answer drops rows. A
     /// computed column is filled before the filter that would have
-    /// dropped the offending row, so a condition raised here is a
+    /// dropped the offending row, so a condition raised there is a
     /// condition the old engine never reached, and the two answers
     /// would differ on which engine took the plan. A divisor written as
     /// a number that is not nought cannot raise and neither can most of
-    /// the numeric functions, so those shapes are the ones that arrive.
+    /// the numeric functions, so those shapes arrive whatever else the
+    /// query wrote.
+    ///
+    /// Where nothing drops a row the question does not come up, and
+    /// that is the shape a column of roots or logarithms is written in:
+    /// `MATCH (p:person) RETURN ln(p.weight)` reads every row and
+    /// answers for every row, so the rows the kernel measures are the
+    /// rows the old engine measures and a value neither has an answer
+    /// for raises on both. `every_row_answers` is that condition, and
+    /// two things it does not settle: a conjunction, which decides per
+    /// row which of its own operands are measured at all, and a second
+    /// condition in the same program, which the two engines reach in
+    /// different orders.
     fn register_expr(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
         if !matches!(
             expr,
@@ -3383,7 +3422,9 @@ impl Compiler<'_> {
             },
             _ => return Ok(None),
         };
-        if may_raise(&b.ops) {
+        if may_raise(&b.ops)
+            && !(self.every_row_answers && !short_circuits(&b.ops) && conditions(&b) <= 1)
+        {
             return Ok(None);
         }
         let prog = Program {
@@ -4567,7 +4608,14 @@ impl Compiler<'_> {
             // same holds for a float column asked for as a float of at
             // least the width it has. Peeling those keeps a filter
             // written that way on the kernel.
-            BoundExpr::Cast { expr, ty } => {
+            // A cast carrying a label set is never one of those: it
+            // reads the graph and can raise, so it stays on the row
+            // engine whatever the register holds.
+            BoundExpr::Cast {
+                expr,
+                ty,
+                constrained: None,
+            } => {
                 let Some(src) = self.value_reg(b, expr, level, outer)? else {
                     return Ok(None);
                 };
@@ -5278,6 +5326,52 @@ fn may_raise(ops: &[ExprOp]) -> bool {
         ExprOp::StrCut { n, .. } => !written_nonneg(&ops[..i], *n),
         _ => false,
     })
+}
+
+/// Whether these ops hold a connective, which is what decides per row
+/// how much of the expression around it is measured at all. The old
+/// engine stops at the operand that decided the row and the program
+/// runs every op over the whole chunk, so `n <> 0 AND 100 / n > 5` is
+/// the one shape where a plan that drops nothing still asks a question
+/// the query said it would not.
+fn short_circuits(ops: &[ExprOp]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, ExprOp::And { .. } | ExprOp::Or { .. }))
+}
+
+/// How many of a program's ops have a condition, meaning a row they
+/// could have no answer for. Arithmetic over whole numbers is one of
+/// them, an answer that does not fit being a condition rather than an
+/// infinity, and so is every function `may_raise` names.
+///
+/// The count is what matters and not the list. One condition in a
+/// program is raised by the first row that has it, which is the same
+/// row on both engines and so the same message. Two are raised in
+/// different orders: the program runs an op over the whole chunk
+/// before the next op sees a row, so it finds the earlier op's
+/// condition on a later row, while the old engine finishes each row
+/// before it starts the next and finds whichever condition the first
+/// offending row has. `abs(-9223372036854775807 - p.id)` over a column
+/// of small numbers is the shape, the difference an integer that left
+/// the range against a distance that did.
+fn conditions(b: &ProgBuilder) -> usize {
+    b.ops
+        .iter()
+        .filter(|op| match op {
+            ExprOp::Binary {
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+                l,
+                ..
+            } => matches!(b.types[*l as usize], PhysType::Int64),
+            ExprOp::Binary {
+                op: BinOp::Div | BinOp::Mod,
+                ..
+            } => true,
+            ExprOp::Math { op, .. } => op.may_raise(),
+            ExprOp::MathPair { .. } | ExprOp::Between { .. } | ExprOp::StrCut { .. } => true,
+            _ => false,
+        })
+        .count()
 }
 
 /// Whether a register was last loaded with a number that is not

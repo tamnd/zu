@@ -51,6 +51,19 @@ impl Severity {
     pub const fn is_success(self) -> bool {
         !matches!(self, Severity::Exception)
     }
+
+    /// The one character ISO writes it as, which is what a status read
+    /// as a value carries: a client that has to print or compare one
+    /// should not have to pick its own spelling of these five words.
+    pub const fn letter(self) -> &'static str {
+        match self {
+            Severity::Success => "S",
+            Severity::NoData => "N",
+            Severity::Warning => "W",
+            Severity::Informational => "I",
+            Severity::Exception => "X",
+        }
+    }
 }
 
 /// One row of the standard's condition table.
@@ -243,6 +256,75 @@ impl fmt::Display for Position {
     }
 }
 
+/// What a condition is about, when it is about something a statement
+/// named.
+///
+/// ISO 23.2 calls this the subject of the diagnostic record, and what it
+/// buys is the difference between a message and a fact. `42002` says a
+/// name is not defined and the detail says which one in English; the
+/// subject says which one in a field, so a client underlining the name,
+/// a linter counting the labels a graph is missing, or a driver mapping
+/// the condition onto its own exception type never has to read the
+/// sentence back.
+///
+/// The variants are the kinds of thing a GQL statement can name, and
+/// there is deliberately no `Other(String)`: a condition about something
+/// with no kind here has no subject, which is honest, where a catch-all
+/// would be a second message field wearing the subject's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Subject {
+    /// A graph, by the name the statement reached it under.
+    Graph(String),
+    /// A schema, by its path.
+    Schema(String),
+    /// A label, which is what names a node type or an edge type.
+    Label(String),
+    /// A property, by the name written after the dot or before the
+    /// colon.
+    Property(String),
+    /// A binding variable.
+    Variable(String),
+    /// A value type, spelled the way a statement would spell it.
+    Type(String),
+    /// A function or a procedure, by name.
+    Function(String),
+}
+
+impl Subject {
+    /// What kind of thing this is, in one word, for a caller rendering
+    /// the record rather than matching on it.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Subject::Graph(_) => "graph",
+            Subject::Schema(_) => "schema",
+            Subject::Label(_) => "label",
+            Subject::Property(_) => "property",
+            Subject::Variable(_) => "variable",
+            Subject::Type(_) => "type",
+            Subject::Function(_) => "function",
+        }
+    }
+
+    /// The name itself, without the kind.
+    pub fn name(&self) -> &str {
+        match self {
+            Subject::Graph(s)
+            | Subject::Schema(s)
+            | Subject::Label(s)
+            | Subject::Property(s)
+            | Subject::Variable(s)
+            | Subject::Type(s)
+            | Subject::Function(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.kind(), self.name())
+    }
+}
+
 /// What zu hands back when a condition is raised: the standard's code and
 /// zu's own account of what happened.
 ///
@@ -275,6 +357,17 @@ pub struct DiagnosticRecord {
     /// to read, which are the three cases where quoting it back helps
     /// nobody.
     pub excerpt: Option<String>,
+    /// What the condition is about, where it is about something the
+    /// statement named. `None` for the conditions that are about no
+    /// particular thing: a division by zero is about an expression and
+    /// an expression has no name.
+    pub subject: Option<Subject>,
+    /// The graph the statement was running against, and the schema that
+    /// graph was reached through. Both are filled at the session
+    /// boundary rather than at the raise site, because that is the one
+    /// place that knows them and there are two hundred raise sites.
+    pub graph: Option<String>,
+    pub schema: Option<String>,
 }
 
 impl DiagnosticRecord {
@@ -284,7 +377,31 @@ impl DiagnosticRecord {
             detail: detail.into(),
             position: None,
             excerpt: None,
+            subject: None,
+            graph: None,
+            schema: None,
         }
+    }
+
+    /// The same, about a thing the statement named.
+    ///
+    /// Written as a builder so a raise site reads as one expression and
+    /// so that adding the subject to a site never reshapes the call it
+    /// was already making.
+    pub fn about(mut self, subject: Subject) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    /// Where the statement was running, filled in on the way out.
+    ///
+    /// It does not overwrite: a condition raised about a graph other
+    /// than the working one has already said which, and the session
+    /// saying otherwise on the way past would be the session being
+    /// wrong.
+    pub fn within(&mut self, graph: &str, schema: &str) {
+        self.graph.get_or_insert_with(|| graph.to_string());
+        self.schema.get_or_insert_with(|| schema.to_string());
     }
 
     /// The same, raised at a place. The position is written into the
@@ -292,10 +409,8 @@ impl DiagnosticRecord {
     /// the form every parser message already had.
     pub fn at(status: GqlStatus, position: Position, detail: impl fmt::Display) -> Self {
         DiagnosticRecord {
-            status,
-            detail: format!("{position}: {detail}"),
             position: Some(position),
-            excerpt: None,
+            ..DiagnosticRecord::new(status, format!("{position}: {detail}"))
         }
     }
 

@@ -121,6 +121,29 @@ fn one_process_serves_statements_frames_and_errors() {
     assert!(r.contains("\"failure\""), "got {r}");
     assert!(r.contains("42001"), "got {r}");
 
+    // A failure carries the whole diagnostic record ISO 23.2 asks for
+    // and not just the code, because a client that has to find the
+    // offending name inside an English sentence is parsing prose.
+    let r = ask(r#"{"op":"query","q":"MATCH (a:person) RETURN b.id AS id"}"#);
+    assert!(r.contains(r#""subject_kind":"variable""#), "got {r}");
+    assert!(r.contains(r#""subject":"b""#), "got {r}");
+    assert!(r.contains(r#""graph":"home""#), "got {r}");
+    assert!(r.contains(r#""schema":"/""#), "got {r}");
+
+    // A condition raised at a token says where, counted the three ways
+    // a caller needs, and quotes the line it happened on.
+    let r = ask(r#"{"op":"query","q":"MATCH (a:person) RETURN a.id AS id ORDR BY a.id"}"#);
+    assert!(r.contains(r#""line":1,"column":36,"offset":35"#), "got {r}");
+    assert!(r.contains(r#""excerpt":"MATCH"#), "got {r}");
+
+    // A condition about nothing named writes no empty field for it,
+    // since a null subject reads as a condition about nothing rather
+    // than as a record with no opinion.
+    let r = ask(r#"{"op":"query","q":"RETURN 1 / 0 AS v"}"#);
+    assert!(r.contains("22012"), "got {r}");
+    assert!(!r.contains("\"subject\""), "got {r}");
+    assert!(!r.contains("\"line\""), "got {r}");
+
     // Broken input gets an error line too, then real work continues.
     let r = ask(r#"{"op":"query","q":"#);
     assert!(r.contains("bad frame"), "got {r}");

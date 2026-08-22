@@ -665,6 +665,7 @@ mod tests {
     use super::*;
 
     use crate::platforms;
+    use crate::scratch::Scratch;
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -679,11 +680,8 @@ mod tests {
     }
 
     /// A scratch tree, so a test can stage into something.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zu-package-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("package-{name}"))
     }
 
     #[test]
@@ -707,13 +705,18 @@ mod tests {
         sorted.sort();
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
-        // dx/02 §8 is the v0.5 restructure, and the error model, the
+        // The number a binding tests for when it wants to know whether
+        // a call it needs is there. dx/02 §8 is the v0.5 restructure,
+        // and everything since has been additive: the error model, the
         // cancellation calls, the transaction boundaries, the appender,
-        // the diagnostics, the frames and the byte string of #543 added
-        // to it are all additive, so this is 0.14: the number a binding
-        // tests for when it wants to know whether zu_result_arrow is
-        // there. The two parts are counts rather than a decimal, so
-        // 0.10 is the one after 0.9.
+        // the diagnostics, the frames, the table a node came out of, and
+        // at 0.14 the byte string. The two parts are counts and not a
+        // decimal, so 0.10 is the one after 0.9.
+        //
+        // Written out rather than read from the constant the header is
+        // generated from, which would agree with itself whatever it
+        // said. Moving the ABI is a deliberate act and this is the line
+        // that makes it one.
         assert_eq!(abi.revision, ("0.14".to_string(), "0.14".to_string()));
     }
 
@@ -1063,7 +1066,6 @@ mod tests {
             assert_eq!(mode("lib/libzu.dylib"), 0o755);
             assert_eq!(mode("include/zu.h"), 0o644);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1080,6 +1082,5 @@ mod tests {
             .stage(&root(), &built, &dir.join("prefix"))
             .expect_err("no static archive");
         assert!(error.contains("libzu.a"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

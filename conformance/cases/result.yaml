@@ -194,7 +194,7 @@ cases:
 
   - name: no-rows-from-a-label-nothing-carries
     doc: A pattern that matches nothing gives no rows and not a null row, and the columns are still there, which is what a client needs to render an empty table.
-    query: MATCH (n:nothing) RETURN n.name AS a
+    query: MATCH (n:absent) RETURN n.name AS a
     columns:
       - a
     rows:
@@ -208,7 +208,7 @@ cases:
 
   - name: an-aggregate-over-nothing-still-answers
     doc: Counting nothing is zero and zero is a row, which is the case a client that returns an empty result for an empty match gets wrong.
-    query: MATCH (n:nothing) RETURN count(*) AS a
+    query: MATCH (n:absent) RETURN count(*) AS a
     columns:
       - a
     rows:
@@ -218,7 +218,7 @@ cases:
 
   - name: an-aggregate-with-a-key-over-nothing-answers-nothing
     doc: A grouped aggregate has one row per group and nothing has no groups, which is the other half of the rule above and points the opposite way.
-    query: MATCH (n:nothing) RETURN n.age AS a, count(*) AS b
+    query: MATCH (n:absent) RETURN n.age AS a, count(*) AS b
     columns:
       - a
       - b
@@ -1055,7 +1055,7 @@ cases:
 
   - name: a-total-over-nothing-is-zero
     doc: A sum of no rows is zero, which is the choice the case below differs from, so a client that has one empty answer for every set function gets one of the two wrong.
-    query: MATCH (n:nothing) RETURN sum(n.age) AS a
+    query: MATCH (n:absent) RETURN sum(n.age) AS a
     columns:
       - a
     rows:
@@ -1065,7 +1065,7 @@ cases:
 
   - name: a-smallest-over-nothing-is-null
     doc: The same empty answer from a function that has no natural zero at all.
-    query: MATCH (n:nothing) RETURN min(n.age) AS a
+    query: MATCH (n:absent) RETURN min(n.age) AS a
     columns:
       - a
     rows:
@@ -1074,7 +1074,7 @@ cases:
 
   - name: a-collection-over-nothing-is-empty
     doc: Collecting no rows gives a list of nothing and not a null, which is the one set function whose empty answer is a value.
-    query: MATCH (n:nothing) RETURN collect(n.name) AS a
+    query: MATCH (n:absent) RETURN collect(n.name) AS a
     columns:
       - a
     rows:

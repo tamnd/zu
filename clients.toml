@@ -149,7 +149,7 @@ package = "dev.zudb"
 registry = "Maven Central"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = []
+holds = ["reference", "idiom", "conditions"]
 doc = "Panama with a JNI fallback, and the Kotlin and Scala layers on top of it."
 
 [[client]]

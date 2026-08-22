@@ -19,11 +19,13 @@
 //!
 //! sqlite is given its fastest configuration rather than its default
 //! one, because a comparison against a rival's slow mode is not worth
-//! printing. WAL, synchronous off, a page cache big enough to hold the
-//! whole database, and mmap on top of it, with a prepared statement
-//! reused for the life of each thread and the blob copied into a buffer
-//! that is reused too. If sqlite loses here it is not because it was
-//! holding a hand behind its back.
+//! printing. WAL, synchronous off, a page cache, and an 8 GiB mmap over
+//! the file on top of it, with a prepared statement reused for the life
+//! of each thread and the blob copied into a buffer that is reused too.
+//! The mapping is the part that matters for a read: it is file backed
+//! and shared between connections, so the whole database is reachable
+//! without a copy into any one thread's cache. If sqlite loses here it
+//! is not because it was holding a hand behind its back.
 //!
 //! Each engine is measured twice, in the order zu2, sqlite, sqlite, zu2.
 //! If a host drifts under the run, or if one engine leaves the machine
@@ -164,14 +166,21 @@ where
 
 fn open_sqlite(path: &Path) -> rusqlite::Connection {
     let c = rusqlite::Connection::open(path).expect("sqlite open");
-    // sqlite's fastest honest read configuration. The cache is set in
-    // KiB with the negative form so it does not depend on page size, and
-    // it is large enough that a warm run is not touching the device at
-    // all, which is the same thing zu2's mapped log gets for free.
+    // sqlite's fastest honest read configuration.
+    //
+    // The cache is per connection, which is per thread here, and that is
+    // the detail that matters. It was a gigabyte and at eight threads
+    // that is eight gigabytes of page cache on a box with four free.
+    // The first attempt at this on server3 swapped instead of running
+    // and produced nothing in half an hour, which is not a slow
+    // benchmark, it is a benchmark of the swap. Sixty four mebibytes,
+    // and the mapping below is what covers the rest: mmap pages are
+    // file backed and shared between connections, so raising that costs
+    // address space rather than memory.
     for p in [
         "PRAGMA journal_mode = WAL",
         "PRAGMA synchronous = OFF",
-        "PRAGMA cache_size = -1048576",
+        "PRAGMA cache_size = -65536",
         "PRAGMA mmap_size = 8589934592",
         "PRAGMA temp_store = MEMORY",
     ] {
@@ -242,6 +251,18 @@ fn main() {
     let overhead = clock_overhead();
     let tick = clock_granularity();
 
+    // What the run needs, said before the numbers rather than after,
+    // because a host that cannot hold this swaps and then every row
+    // below is a measurement of the swap and not of either engine. zu2
+    // holds its whole log in the process by default (#636) and sqlite
+    // keeps a bounded cache per connection on top of its file, so the
+    // rough floor is one database per engine plus the caches.
+    let footprint = records * (VALUE as u64 + 64) * 2 + (threads as u64 * 64 << 20);
+    println!(
+        "# this run wants about {} MiB of memory; on a host with less than that the rows below \
+         are measuring the swap",
+        footprint >> 20
+    );
     println!("# records {records}, ops {ops}, threads {threads}, value {VALUE} bytes");
     println!(
         "# one read in {SAMPLE} timed, clock overhead {overhead} ns subtracted from every sample"
@@ -254,7 +275,7 @@ fn main() {
         );
     }
     println!(
-        "# sqlite: WAL, synchronous off, 1 GiB page cache, 8 GiB mmap, WITHOUT ROWID, prepared statement reused"
+        "# sqlite: WAL, synchronous off, 64 MiB page cache a connection, 8 GiB mmap, WITHOUT ROWID, prepared statement reused"
     );
     println!(
         "# ns/op is the mean including thread joins; p50 is the median of the sampled reads. They are not the same measurement."

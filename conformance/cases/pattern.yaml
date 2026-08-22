@@ -42,7 +42,7 @@ cases:
 
   - name: a-label-nothing-carries-selects-nothing
     doc: A label no element has is an empty result rather than a condition, because a graph is allowed not to hold something.
-    query: MATCH (n:nothing) RETURN count(*) AS a
+    query: MATCH (n:absent) RETURN count(*) AS a
     columns:
       - a
     rows:
@@ -271,7 +271,7 @@ cases:
 
   - name: an-edge-of-a-table-nothing-is-in
     doc: A rel table nobody declared, which selects nothing rather than refusing, the same way an unknown node label does.
-    query: MATCH (a:person)-[:nothing]->(b:person) RETURN count(*) AS a
+    query: MATCH (a:person)-[:absent]->(b:person) RETURN count(*) AS a
     columns:
       - a
     rows:
@@ -965,7 +965,7 @@ cases:
 
   - name: a-labeled-predicate-answers-no-for-a-label-nothing-carries
     doc: A name the graph has never held is a question with the answer no rather than a mistake, which is the reading a pattern naming one gets.
-    query: MATCH (n) WHERE n IS NOT LABELED nothing RETURN count(*) AS a
+    query: MATCH (n) WHERE n IS NOT LABELED absent RETURN count(*) AS a
     columns:
       - a
     rows:

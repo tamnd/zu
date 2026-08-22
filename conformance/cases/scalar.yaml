@@ -242,11 +242,16 @@ cases:
     query: RETURN size(RECORD {a: 1}) AS n
     raises: "22G03"
 
-  - name: record-is-still-a-name
-    doc: The word is a constructor only when a brace follows it, so a query may still bind a variable called record and read it back.
+  - name: record-is-a-constructor-and-not-a-name
+    doc: The word is a constructor where a brace follows it, and it is a reserved word of ISO 21.3 everywhere else, so the slot after LET does not take it.
     query: LET record = 'kept' RETURN record AS n
+    raises: "42001"
+
+  - name: the-word-in-accent-quotes-is-a-name-again
+    doc: A delimited identifier is not a reserved word whatever it spells, which is the escape ISO 21.3 leaves for anybody who wants the word as a name. A binding variable is a regular identifier only (ISO 16.4), so the quotes go on the alias rather than on the variable.
+    query: LET kept = 'kept' RETURN kept AS `record`
     columns:
-      - n
+      - record
     rows:
       - values:
           - type: STRING
@@ -312,12 +317,7 @@ cases:
           - type: INT64
             value: "20"
 
-  - name: let-is-still-a-name
-    doc: The word opens an expression only where a definition follows it, which is a name with an equals sign behind it, so a query may still bind a variable called let and read it back.
+  - name: let-is-a-clause-and-not-a-name
+    doc: The word opens an expression where a definition follows it, and ISO 21.3 reserves it, so the definition it opens cannot be of a variable spelled the same way.
     query: LET let = 'kept' RETURN let AS n
-    columns:
-      - n
-    rows:
-      - values:
-          - type: STRING
-            value: kept
+    raises: "42001"

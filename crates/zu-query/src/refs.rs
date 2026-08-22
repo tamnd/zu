@@ -137,6 +137,34 @@ impl BindingTable {
         self.epoch
     }
 
+    /// The same table, recorded as read at `epoch`.
+    ///
+    /// A table built inside a statement is made at epoch nought,
+    /// because a table that does not outlive its statement has no
+    /// later to be stale in and nothing ever asks. A session parameter
+    /// is the case where it does outlive it, and this is where it
+    /// picks up the epoch it was read at. The handle number is kept,
+    /// because it is the same table: nothing about it has changed
+    /// except that somebody now knows when it was read. The rows are
+    /// moved rather than copied whenever the handle is the only one,
+    /// which it is on the path this exists for.
+    pub fn held(table: Arc<BindingTable>, epoch: u64) -> Arc<BindingTable> {
+        if table.epoch == epoch {
+            return table;
+        }
+        let id = table.id;
+        let (columns, rows) = match Arc::try_unwrap(table) {
+            Ok(owned) => (owned.columns, owned.rows),
+            Err(shared) => (shared.columns.clone(), shared.rows.clone()),
+        };
+        Arc::new(BindingTable {
+            id,
+            columns,
+            rows,
+            epoch,
+        })
+    }
+
     /// One row as a record, which is the value form of a row: field
     /// names from the columns, in name order like every other record.
     pub fn record(&self, row: usize) -> Option<Value> {

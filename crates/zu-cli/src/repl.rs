@@ -149,6 +149,7 @@ fn backslash(session: &mut Session, command: Command<'_>, timing: &mut bool) -> 
         Command::Help => meta::help(),
         Command::Tables => meta::tables(catalog),
         Command::Graphs => meta::graphs(catalog),
+        Command::SessionState => session_state(session),
         Command::Describe(name) => {
             let columns = columns(session, name);
             meta::describe(session.catalog(), name, &columns)
@@ -162,6 +163,37 @@ fn backslash(session: &mut Session, command: Command<'_>, timing: &mut bool) -> 
         Command::Quit => String::new(),
         Command::Wrong(message) => format!("{message}\n"),
     }
+}
+
+/// What this session is set to (ISO 7.1, GS01 through GS16).
+///
+/// A session statement answers no rows, so without this the only way to
+/// see what one did is to run a second statement and read what it says.
+/// The shell is where a person is doing that by hand, which is why the
+/// question is answered here and not in the language: GQL has no
+/// expression for what a session holds under every name.
+fn session_state(session: &mut Session) -> String {
+    let working = session.working_graph();
+    let graph = session.catalog().graph_by_id(working).map_or_else(
+        || format!("{working}, dropped"),
+        |g| match g.schema.as_str() {
+            "/" => format!("/{}", g.name),
+            schema => format!("{schema}/{}", g.name),
+        },
+    );
+    let params: Vec<(&str, &'static str, String)> = session
+        .session_params()
+        .into_iter()
+        .map(|(name, kind, value)| (name, kind, crate::display_value(value)))
+        .collect();
+    meta::session_state(
+        session.session_schema(),
+        &graph,
+        session.time_zone(),
+        session.epoch(),
+        &params,
+        &session.pins(),
+    )
 }
 
 /// The columns of one table, as the file stores them.

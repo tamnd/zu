@@ -1223,9 +1223,31 @@ pub(crate) fn graph_of(
     params: &[(&str, Value)],
 ) -> Result<u32> {
     let Some(named) = &query.use_graph else {
-        return Ok(working);
+        return working_graph(catalog, working);
     };
     graph_of_ref(catalog, schema, working, named, &query.bindings, params)
+}
+
+/// The graph the session is working in, or `42002` when it has been
+/// dropped since the session moved into it.
+///
+/// A working graph is a reference and not a name, so the only way it
+/// stops meaning something is somebody dropping the graph, and this is
+/// where that is said. It costs a catalog lookup per compile and
+/// nothing per execution: a drop moves the epoch, an epoch empties the
+/// plan cache, and a statement answered out of the cache is therefore
+/// one whose graph was there when the plan was made and has not been
+/// dropped since.
+fn working_graph(catalog: &Catalog, working: u32) -> Result<u32> {
+    if catalog.graph_by_id(working).is_none() {
+        return Err(ZuError::gql(
+            codes::C42002,
+            "the graph this session is working in has been dropped, so a statement that names \
+             no graph names nothing: SESSION RESET PROPERTY GRAPH goes back to the home graph"
+                .to_string(),
+        ));
+    }
+    Ok(working)
 }
 
 /// The graph one reference names, which is the body of [`graph_of`]
@@ -1246,7 +1268,7 @@ pub(crate) fn graph_of_ref(
 ) -> Result<u32> {
     use zu_query::ast::GraphRef;
     match named {
-        GraphRef::Current => Ok(working),
+        GraphRef::Current => working_graph(catalog, working),
         GraphRef::Home => Ok(catalog.home_graph_id()),
         GraphRef::Named(name) if name.schema.is_none() => {
             match graph_variable(bindings, &name.name) {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::{IdMap, Interrupt, Result, ZuError};
 use zu_query::ast::{
-    BindingDef, BindingKind, GraphRef, SchemaRef, SessionReset, SessionStmt, TxnStmt,
+    BindingDef, BindingInit, BindingKind, GraphRef, SchemaRef, SessionReset, SessionStmt, TxnStmt,
 };
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
@@ -144,6 +144,54 @@ struct SessionParam {
     value: Value,
 }
 
+/// How many epochs a held binding table may fall behind before the
+/// session mentions it.
+///
+/// Any number here is a judgement rather than a fact, and this one is
+/// the judgement that a session which has fallen sixteen epochs behind
+/// is holding rows from before a fair amount of churn and would like to
+/// hear about it, where one or two epochs behind is what an ordinary
+/// busy store does under a session that is doing nothing wrong.
+pub const DEFAULT_STALE_BOUND: u64 = 16;
+
+/// What has happened to what a held reference parameter names, which is
+/// what decides whether the session says anything about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stale {
+    /// The reference still means what it meant.
+    Fresh,
+    /// Behind the bound but still usable: the rows hold no element
+    /// references, so what they say is as true now as it was.
+    Old,
+    /// A statement reading it will be refused: the graph is dropped, or
+    /// the rows name elements of a snapshot that has moved.
+    Gone,
+}
+
+/// What one held reference parameter is pinned to (plan/06 §2).
+///
+/// Worth being clear about what a pin is here and what it is not. It is
+/// an epoch number written on a handle, and it holds no blocks: a lease
+/// lives for a statement, and a binding table parameter holds rows that
+/// were copied out of the snapshot rather than a reader into it. So a
+/// session sitting on an old parameter does not stop a checkpoint from
+/// reusing anything and does not grow the store. What goes stale is the
+/// meaning of the reference, not the space behind it, and that is what
+/// this reports.
+#[derive(Clone, Debug)]
+pub struct Pin {
+    /// The name the session holds it under, without the dollar.
+    pub name: String,
+    /// `GRAPH` or `BINDING TABLE`, the word it was set with.
+    pub kind: &'static str,
+    /// The epoch the reference was taken at.
+    pub epoch: u64,
+    /// What it names, as a line a person reads.
+    pub what: String,
+    /// Whether it still means what it meant.
+    pub stale: Stale,
+}
+
 /// The parameters one statement runs with, which are what the caller
 /// passed on top of what the session holds (GS01 through GS03).
 ///
@@ -186,6 +234,10 @@ pub struct Session {
     /// statement clones the pointer, and a session holding none does
     /// not even do that, which is what the plan-hit path can afford.
     params: Arc<HashMap<String, SessionParam>>,
+    /// How many epochs a held binding table may fall behind before the
+    /// statement after it carries a warning saying so. See
+    /// [`DEFAULT_STALE_BOUND`].
+    stale_bound: u64,
     /// One schema per graph a statement has named, built on the first
     /// naming and dropped when the epoch moves.
     schemas: IdMap<u32, Arc<zu_query::binder::Schema>>,
@@ -310,6 +362,7 @@ impl Session {
             working,
             schema: zu_query::procedures::ROOT.to_string(),
             params: Arc::new(HashMap::new()),
+            stale_bound: DEFAULT_STALE_BOUND,
             schemas: IdMap::from_iter([(working, Arc::new(schema))]),
             epoch,
             snap,
@@ -832,6 +885,7 @@ impl Session {
             return Ok(());
         }
         let value = self.definition_value(def, params)?;
+        let value = self.held(def, value);
         Arc::make_mut(&mut self.params).insert(
             def.name.clone(),
             SessionParam {
@@ -840,6 +894,27 @@ impl Session {
             },
         );
         Ok(())
+    }
+
+    /// What the session holds, out of what the definition defined.
+    ///
+    /// The two differ in one case. A table collected by a query in
+    /// braces is built inside the statement that collects it and is
+    /// therefore stamped with epoch nought, since a table that dies
+    /// with its statement has no later to be stale in. Held by a
+    /// session it does have one, so it is stamped here with the epoch
+    /// it was in fact read at. A definition initialized with a
+    /// reference (GS13) is left alone: that table was read when it was
+    /// read, and naming it a second time does not make it newer.
+    fn held(&self, def: &BindingDef, value: Value) -> Value {
+        match value {
+            Value::BindingTable(t)
+                if def.kind == BindingKind::Table && matches!(def.init, BindingInit::Query(_)) =>
+            {
+                Value::BindingTable(BindingTable::held(t, self.epoch))
+            }
+            other => other,
+        }
     }
 
     /// What one binding variable definition defines, worked out here
@@ -892,7 +967,7 @@ impl Session {
             params,
         )?;
         let cached = Arc::new(self.compile_ast(parsed, graph)?);
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         match &cached.parts {
             Some(parts) if crate::split::writes(parts) => {
                 self.refuse_a_write()?;
@@ -1225,36 +1300,78 @@ impl Session {
     /// Both refusals are `42002 invalid reference`, which is what they
     /// are: the parameter is a reference to something the statement
     /// cannot be run against.
+    ///
+    /// A parameter the session holds is skipped here and checked where
+    /// the statement reads it, in [`Self::args_for`]. The two are not
+    /// the same promise. A caller passing a reference with a statement
+    /// is saying it is good now, so it is checked whether the statement
+    /// reads it or not; a session holding one is saying nothing about
+    /// this statement, and refusing every statement on a session whose
+    /// held graph has been dropped would take away the statement that
+    /// resets it.
     fn check_refs(&self, params: &[(&str, Value)]) -> Result<()> {
         for (name, value) in params {
-            match value {
-                Value::Graph(g) => {
-                    if self.graph.catalog().graph_by_id(g.id).is_none() {
-                        return Err(ZuError::gql(
-                            codes::C42002,
-                            format!(
-                                "${name} references {}, and that graph has been dropped",
-                                g.label()
-                            ),
-                        ));
-                    }
-                }
-                Value::BindingTable(t) if t.epoch() != self.epoch && t.holds_elements() => {
-                    return Err(ZuError::gql(
-                        codes::C42002,
-                        format!(
-                            "${name} references a binding table read at epoch {}, the session is \
-                             at epoch {}, and the table holds element references that name rows \
-                             of the older snapshot",
-                            t.epoch(),
-                            self.epoch
-                        ),
-                    ));
-                }
-                _ => {}
+            if self.params.contains_key(*name) {
+                continue;
             }
+            self.check_ref(name, value)?;
         }
         Ok(())
+    }
+
+    /// The same over the parameters a caller passed, all of them, which
+    /// is what a session with parameters of its own runs before folding
+    /// the two sets together and losing the distinction.
+    fn check_passed(&self, params: &[(&str, Value)]) -> Result<()> {
+        for (name, value) in params {
+            self.check_ref(name, value)?;
+        }
+        Ok(())
+    }
+
+    /// One parameter, which is where both of the two rules live.
+    fn check_ref(&self, name: &str, value: &Value) -> Result<()> {
+        match value {
+            Value::Graph(g) if self.graph.catalog().graph_by_id(g.id).is_none() => {
+                Err(ZuError::gql(
+                    codes::C42002,
+                    format!(
+                        "${name} references {}, and that graph has been dropped",
+                        g.label()
+                    ),
+                ))
+            }
+            Value::BindingTable(t) if t.epoch() != self.epoch && t.holds_elements() => {
+                Err(ZuError::gql(
+                    codes::C42002,
+                    format!(
+                        "${name} references a binding table read at epoch {}, the session is at \
+                         epoch {}, and the table holds element references that name rows of the \
+                         older snapshot",
+                        t.epoch(),
+                        self.epoch
+                    ),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The values a statement's parameter positions are filled with,
+    /// with the references among them checked.
+    ///
+    /// This is where a parameter the session holds is checked, because
+    /// `names` is exactly what the statement reads: a held reference
+    /// that has gone stale stops a statement that reads it and leaves
+    /// every other statement alone, including the one that resets it.
+    fn args_for(&self, names: &[String], params: &[(&str, Value)]) -> Result<Vec<Value>> {
+        let args = query::bind_args(names, params)?;
+        for (name, value) in names.iter().zip(&args) {
+            if self.params.contains_key(name) {
+                self.check_ref(name, value)?;
+            }
+        }
+        Ok(args)
     }
 
     /// The catalog schema this session works in (GS05), which is the
@@ -1273,6 +1390,120 @@ impl Session {
     /// when it carries no `USE` (GS06).
     pub fn working_graph(&self) -> u32 {
         self.working
+    }
+
+    /// What the reference parameters this session holds are pinned to,
+    /// in name order, one entry per parameter holding a graph or a
+    /// binding table (GS01, GS02, GS10 and GS13).
+    ///
+    /// A value parameter is not here because it pins nothing: a number
+    /// is a number at every epoch. The two reference kinds each carry
+    /// the epoch they were taken at, and that is the pin.
+    pub fn pins(&self) -> Vec<Pin> {
+        let mut out: Vec<Pin> = self
+            .params
+            .iter()
+            .filter_map(|(name, param)| self.pin_of(name, param))
+            .collect();
+        out.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// The oldest epoch any held parameter is pinned to, which is the
+    /// one number a caller watching a long-lived session wants.
+    pub fn pinned_epoch(&self) -> Option<u64> {
+        self.pins().into_iter().map(|pin| pin.epoch).min()
+    }
+
+    /// The pin one held parameter is, or nothing when it holds a value.
+    fn pin_of(&self, name: &str, param: &SessionParam) -> Option<Pin> {
+        let (epoch, what, stale) = match &param.value {
+            Value::Graph(g) => (
+                g.epoch,
+                g.label(),
+                match self.graph.catalog().graph_by_id(g.id) {
+                    Some(_) => Stale::Fresh,
+                    None => Stale::Gone,
+                },
+            ),
+            Value::BindingTable(t) => (
+                t.epoch(),
+                format!("BINDING TABLE of {} rows", t.rows().len()),
+                if t.epoch() == self.epoch {
+                    Stale::Fresh
+                } else if t.holds_elements() {
+                    Stale::Gone
+                } else if self.epoch - t.epoch() > self.stale_bound {
+                    Stale::Old
+                } else {
+                    Stale::Fresh
+                },
+            ),
+            _ => return None,
+        };
+        Some(Pin {
+            name: name.to_string(),
+            kind: param.kind.word(),
+            epoch,
+            what,
+            stale,
+        })
+    }
+
+    /// How many epochs a held binding table may fall behind before the
+    /// session says so on the statement after it. The default is
+    /// [`DEFAULT_STALE_BOUND`].
+    pub fn set_stale_bound(&mut self, epochs: u64) {
+        self.stale_bound = epochs;
+    }
+
+    /// Attaches a warning for every held reference parameter that has
+    /// gone stale, on a statement that ran (ISO 7.1, and plan/06 §2).
+    ///
+    /// A statement is answered and then told about the state of the
+    /// session it ran on, which is what a warning class status is for:
+    /// the answer is an answer, and the parameter the caller has stopped
+    /// being able to use is worth hearing about at the point it stopped
+    /// rather than at the statement that finally reads it.
+    ///
+    /// It runs only on a session holding parameters, which is the same
+    /// test the fold above it makes, so a session that never set one
+    /// pays nothing.
+    fn warn_stale(&self, held: &HashMap<String, SessionParam>, result: &mut QueryResult) {
+        for (name, param) in held {
+            let Some(pin) = self.pin_of(name, param) else {
+                continue;
+            };
+            let record = match pin.stale {
+                Stale::Fresh => continue,
+                Stale::Gone if matches!(param.value, Value::Graph(_)) => DiagnosticRecord::new(
+                    codes::C01G03,
+                    format!(
+                        "${name} holds {}, and that graph has been dropped, so a statement \
+                         reading it will be refused",
+                        pin.what
+                    ),
+                ),
+                Stale::Gone => DiagnosticRecord::new(
+                    codes::C01000,
+                    format!(
+                        "${name} holds a {} read at epoch {}, the session is at epoch {}, and \
+                         the rows name elements of the older snapshot, so a statement reading \
+                         it will be refused",
+                        pin.what, pin.epoch, self.epoch
+                    ),
+                ),
+                Stale::Old => DiagnosticRecord::new(
+                    codes::C01000,
+                    format!(
+                        "${name} holds a {} read at epoch {}, and the session is at epoch {}, \
+                         which is more than {} epochs on",
+                        pin.what, pin.epoch, self.epoch, self.stale_bound
+                    ),
+                ),
+            };
+            result.notice(record);
+        }
     }
 
     /// The parameters this session is holding, each as its name, the
@@ -1369,6 +1600,7 @@ impl Session {
         if self.params.is_empty() {
             return self.stream_in(source, params, batch_rows, sink);
         }
+        self.check_passed(params)?;
         let held = Arc::clone(&self.params);
         let merged = merged_params(&held, params);
         self.stream_in(source, &merged, batch_rows, sink)
@@ -1389,7 +1621,7 @@ impl Session {
             return exec::stream_result(result, batch_rows, sink);
         }
         let cached = self.plan_for(source, params)?;
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         if cached.parts.is_some() {
             let result = self.run_in(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
@@ -1439,9 +1671,15 @@ impl Session {
         if self.params.is_empty() {
             return self.run_in(source, params);
         }
+        self.check_passed(params)?;
         let held = Arc::clone(&self.params);
         let merged = merged_params(&held, params);
-        self.run_in(source, &merged)
+        let mut result = self.run_in(source, &merged)?;
+        // After the statement rather than before it, because the epoch
+        // a pin is judged against is the one the statement ran at and
+        // the session picks that up on its way in.
+        self.warn_stale(&held, &mut result);
+        Ok(result)
     }
 
     /// The same run, with the session's parameters already folded into
@@ -1494,7 +1732,7 @@ impl Session {
             // the savepoint the statement holds and goes back with it.
             Err(err) => return self.declaring(source, params, err),
         };
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         // A statement that writes runs as the parts it was split into,
         // because the clauses after the write read what it made rather
         // than reading the store again.
@@ -1894,7 +2132,7 @@ impl Session {
         params: &[(&str, Value)],
         options: &zu_query::exec::Options,
     ) -> Result<Value> {
-        let args = query::bind_args(&nested.query.params, params)?;
+        let args = self.args_for(&nested.query.params, params)?;
         let out = exec::execute(
             &nested.plan,
             &nested.query,
@@ -2005,6 +2243,7 @@ impl Session {
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
         if !self.params.is_empty() {
+            self.check_passed(params)?;
             let held = Arc::clone(&self.params);
             let merged = merged_params(&held, params);
             return self.analyze_in(source, &merged);
@@ -2038,7 +2277,7 @@ impl Session {
             return Ok(None);
         }
         let cached = self.plan_for(source, params)?;
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         let options = self.options.clone();
         let catalog = self.graph.catalog().clone();
         let warm = std::mem::take(&mut self.snap);
@@ -2061,6 +2300,7 @@ impl Session {
     /// cardinality` reads q-error off this.
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
         if !self.params.is_empty() {
+            self.check_passed(params)?;
             let held = Arc::clone(&self.params);
             let merged = merged_params(&held, params);
             return self.profile_in(source, &merged);
@@ -2078,7 +2318,7 @@ impl Session {
                 id: 0,
             });
         }
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         let options = self.options.clone();
         let (_, profile) = exec::execute_profiled(
             &cached.plan,
@@ -2145,7 +2385,7 @@ impl Session {
         self.publish_side();
         self.sync()?;
         let cached = self.plan_for(source, params)?;
-        let args = query::bind_args(&cached.query.params, params)?;
+        let args = self.args_for(&cached.query.params, params)?;
         let parts = cached.parts.as_ref().ok_or_else(|| {
             ZuError::InvalidArgument(
                 "a statement that makes a table writes, and this one compiled as a read"
@@ -2342,10 +2582,23 @@ impl Session {
             return Ok(());
         }
         let (catalog, schema) = query::load_schema(self.graph.file_mut())?;
-        self.working = catalog.home_graph_id();
+        // The graph this session is working in survives the epoch,
+        // because it is a reference and not a name (GS06). Resolving it
+        // by name again here is the thing that must not happen: a
+        // session working in a graph somebody dropped and made again
+        // would carry on against the new one without being told, and a
+        // session that had moved would find itself back home for no
+        // reason it could see. What does not survive is the graph being
+        // dropped, which the statement that needs it raises on, since a
+        // session is free to move somewhere else or reset before then.
+        //
+        // The schema loaded here is the home graph's, so it goes in
+        // under the home graph and not under wherever this session has
+        // moved to.
+        let home = catalog.home_graph_id();
         self.graph.set_catalog(catalog);
         self.schemas.clear();
-        self.schemas.insert(self.working, Arc::new(schema));
+        self.schemas.insert(home, Arc::new(schema));
         self.plans.clear();
         self.focused.clear();
         // The readers the last epoch's snapshots loaded describe a

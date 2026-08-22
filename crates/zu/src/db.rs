@@ -54,6 +54,7 @@ pub struct Config {
     memory_limit: usize,
     threads: usize,
     read_only: bool,
+    stale_bound: u64,
 }
 
 impl Default for Config {
@@ -62,6 +63,7 @@ impl Default for Config {
             memory_limit: crate::zu1::file::DEFAULT_MEMORY_LIMIT,
             threads: 0,
             read_only: false,
+            stale_bound: crate::session::DEFAULT_STALE_BOUND,
         }
     }
 }
@@ -102,6 +104,20 @@ impl Config {
     /// to refuse them less helpfully.
     pub fn read_only(mut self, read_only: bool) -> Config {
         self.read_only = read_only;
+        self
+    }
+
+    /// How many epochs a session parameter holding a binding table may
+    /// fall behind before the statement after it carries a warning
+    /// saying so (plan/06 §2).
+    ///
+    /// A pin holds no blocks in zu, since a binding table parameter
+    /// holds rows copied out of the snapshot rather than a reader into
+    /// it, so this is not a knob against the store growing. It is how
+    /// long a caller wants to go without being told that what it is
+    /// holding was read a while ago.
+    pub fn stale_bound(mut self, epochs: u64) -> Config {
+        self.stale_bound = epochs;
         self
     }
 
@@ -283,6 +299,7 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let mut session = Session::on(self.handle()?)?;
         session.set_options(self.config.over(session.options().clone()));
+        session.set_stale_bound(self.config.stale_bound);
         Ok(Connection {
             session,
             read_only: self.config.read_only,
@@ -1336,13 +1353,15 @@ mod tests {
         let config = Config::new()
             .memory_limit(1 << 20)
             .threads(2)
-            .read_only(true);
+            .read_only(true)
+            .stale_bound(4);
         assert_eq!(
             config,
             Config {
                 memory_limit: 1 << 20,
                 threads: 2,
                 read_only: true,
+                stale_bound: 4,
             }
         );
     }

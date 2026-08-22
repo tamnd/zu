@@ -561,3 +561,74 @@ fn promotion_can_be_turned_off() {
     }
     assert_eq!(db.promoted(), 0, "promotion was off and it promoted anyway");
 }
+
+/// A promoted record is two records with the same version, one in each
+/// tier, which is the one shape the replay's version rule does not
+/// decide by version alone. This is the reopen over it: nothing is lost,
+/// nothing comes back stale, and a key that was written again after the
+/// promotion still reads as the newer value.
+#[test]
+fn a_reopen_over_a_promoted_record_keeps_the_right_copy() {
+    for checkpoint in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("z.zu2");
+        let records = {
+            let db = Db::create(
+                &path,
+                Options {
+                    checkpoint_on_close: checkpoint,
+                    ordered: true,
+                    ..options()
+                },
+            )
+            .expect("create");
+            let records = lapped(&db, 3000);
+            assert!(db.cold_span() > 0, "nothing migrated");
+            let mut s = db.session();
+            // Every fifth key read, so the tier and the log both hold a
+            // copy of it, and every tenth written again afterwards so a
+            // promotion has something newer above it.
+            for i in (0..records).step_by(5) {
+                assert_eq!(read(&mut s, &key(i)).as_deref(), Some(value(i, 0).as_slice()));
+            }
+            assert!(db.promoted() > 0, "no read reached the tier");
+            for i in (0..records).step_by(10) {
+                s.upsert(&key(i), b"after the promotion").expect("upsert");
+            }
+            drop(s);
+            db.sync().expect("sync");
+            records
+        };
+
+        let db = Db::open(
+            &path,
+            Options {
+                ordered: true,
+                ..options()
+            },
+        )
+        .expect("open");
+        // A promoted key has a record in each tier, so a replay that
+        // counted records rather than keys would put it in the plane
+        // twice and a scan would hand it back twice.
+        assert_eq!(
+            db.ordered_keys(),
+            // The load's keys plus the thousand `lapped` churns.
+            Some(records as usize + 1000),
+            "the plane holds more keys than there are, with checkpoint {checkpoint}"
+        );
+        let mut s = db.session();
+        for i in 0..records {
+            let want = if i % 10 == 0 {
+                b"after the promotion".to_vec()
+            } else {
+                value(i, 0)
+            };
+            assert_eq!(
+                read(&mut s, &key(i)).as_deref(),
+                Some(want.as_slice()),
+                "key {i} came back wrong from a reopen with checkpoint {checkpoint}"
+            );
+        }
+    }
+}

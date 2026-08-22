@@ -119,7 +119,7 @@ fn run_new(
     sip: Sip,
 ) -> Option<exec::QueryResult> {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
     let options = Options {
         threads,
@@ -140,7 +140,7 @@ fn run_old(
     source: &str,
 ) -> exec::QueryResult {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         sip: Sip::On,
@@ -1481,7 +1481,7 @@ shard_tests! {
 /// this query.
 fn zone_skipped(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()
@@ -1528,7 +1528,7 @@ fn a_float_bound_skips_the_chunks_its_integer_bound_skips() {
 /// Chunks the scan decoded and then took rows out of.
 fn zone_thinned(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
     let (query, plan, _) =
-        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema, "/").unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()
@@ -1893,7 +1893,7 @@ fn a_binding_variable_definition_falls_back_and_still_answers() {
     // own and that helper is for the statements that take none.
     {
         let (query, plan, _) =
-            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema).unwrap();
+            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema, "/").unwrap();
         let args = vec![Value::Null; query.params.len()];
         let mut snap = Zu1Snapshot::new(&mut db, catalog.clone());
         let new = zu_exec::try_execute(

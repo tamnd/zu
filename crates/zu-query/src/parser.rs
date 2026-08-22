@@ -22,8 +22,8 @@ use crate::ast::{
     GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
     MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
     Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
-    Repeat, SchemaRef, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
-    TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
+    Repeat, SchemaRef, Selector, SessionReset, SessionStmt, SetInto, SetItem, SetOp, Simple,
+    SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -415,7 +415,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
+const UNIMPLEMENTED: &[&str] = &["CREATE"];
 
 /// Every word that can stand where a query begins once the schema
 /// clause is read: the graph clause, the three that open a binding
@@ -467,6 +467,10 @@ pub fn parse(source: &str) -> Result<Query> {
             codes::C42001,
             "a transaction statement says where a transaction begins or ends and reads nothing, so it runs through the session rather than the query path".to_string(),
         )),
+        Statement::Session(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a session statement changes the session and answers no rows, so it runs through the session rather than the query path".to_string(),
+        )),
         Statement::Block(_) => Err(ZuError::gql(
             codes::C42001,
             "a statement block holds a catalog statement among its parts, so it runs through the session rather than the query path".to_string(),
@@ -475,9 +479,9 @@ pub fn parse(source: &str) -> Result<Query> {
 }
 
 /// Parses one statement: a query, a catalog statement, a transaction
-/// statement, or a block of them chained by `NEXT`. The first word
-/// tells the first three apart, and a `NEXT` handing over to a catalog
-/// statement is what makes it the fourth.
+/// statement, a session statement, or a block of them chained by
+/// `NEXT`. The first word tells the first four apart, and a `NEXT`
+/// handing over to a catalog statement is what makes it the fifth.
 pub fn parse_statement(source: &str) -> Result<Statement> {
     let tokens = lex(source)?;
     let mut parser = Parser {
@@ -499,6 +503,10 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
         return Ok(Statement::Transaction(stmt));
+    }
+    if parser.at_kw("SESSION") {
+        let stmt = parser.parse_session_stmt()?;
+        return Ok(Statement::Session(stmt));
     }
     // GP18, ISO 13.6. A linear statement is all query or all catalog,
     // so a chain that is neither is a statement block, and this is the
@@ -748,6 +756,196 @@ impl Parser<'_> {
             ));
         }
         Ok(stmt)
+    }
+
+    /// `SESSION SET ...` and `SESSION RESET ...` (ISO 7.1 and 7.2, GS01
+    /// through GS16).
+    ///
+    /// The whole family is one word followed by one of two verbs, so
+    /// there is nothing else `SESSION` can open and no lookahead is
+    /// needed to know one is here. What comes after the verb is a small
+    /// matrix rather than fifteen statements: three parameter kinds
+    /// over two value sources, and the schema, the graph and the zone
+    /// beside them.
+    fn parse_session_stmt(&mut self) -> Result<SessionStmt> {
+        self.expect_kw("SESSION")?;
+        let stmt = if self.eat_kw("RESET") {
+            SessionStmt::Reset(self.parse_session_reset()?)
+        } else {
+            self.expect_kw("SET")?;
+            self.parse_session_set()?
+        };
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                token.start,
+                format_args!(
+                    "nothing may follow a session statement, found {}",
+                    token.kind.describe()
+                ),
+            ));
+        }
+        Ok(stmt)
+    }
+
+    /// What a `SESSION SET` sets.
+    ///
+    /// The three parameter clauses and the two clauses that move the
+    /// session itself are told apart by the word after the verb, and
+    /// only the graph is written both ways: `SESSION SET PROPERTY GRAPH
+    /// $p = g` binds a parameter and `SESSION SET PROPERTY GRAPH g`
+    /// moves the session's graph, so the dollar is what decides.
+    fn parse_session_set(&mut self) -> Result<SessionStmt> {
+        if self.at_kw("TIME") && self.kw_at(1, "ZONE") {
+            self.pos += 2;
+            return Ok(SessionStmt::SetTimeZone(self.parse_time_zone()?));
+        }
+        if self.at_kw("SCHEMA") {
+            self.pos += 1;
+            // The same three a schema is named by anywhere else: the
+            // two words and a path. `CURRENT_SCHEMA` moves a session
+            // nowhere and `HOME_SCHEMA` moves it back, which is the
+            // pair a reader needs to write the round trip without
+            // knowing where the session opened.
+            if self.eat_kw("CURRENT_SCHEMA") {
+                return Ok(SessionStmt::SetSchema(SchemaRef::Current));
+            }
+            if self.eat_kw("HOME_SCHEMA") {
+                return Ok(SessionStmt::SetSchema(SchemaRef::Home));
+            }
+            return Ok(SessionStmt::SetSchema(SchemaRef::Path(
+                self.parse_schema_path()?,
+            )));
+        }
+        let kind = if self.at_kw("VALUE") {
+            self.pos += 1;
+            BindingKind::Value
+        } else if self.at_kw("TABLE") || (self.at_kw("BINDING") && self.kw_at(1, "TABLE")) {
+            self.eat_kw("BINDING");
+            self.pos += 1;
+            BindingKind::Table
+        } else if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+            let at = usize::from(self.at_kw("PROPERTY"));
+            let parameter = matches!(
+                self.tokens.get(self.pos + at + 1).map(|t| &t.kind),
+                Some(TokenKind::Param(_))
+            );
+            self.eat_kw("PROPERTY");
+            self.pos += 1;
+            // ISO writes the graph the session works in as a graph
+            // expression behind the word, so the word is eaten here and
+            // what follows is read the way a `USE` reads it: the four
+            // that name a graph, one of them being a name.
+            if !parameter {
+                return Ok(SessionStmt::SetGraph(self.parse_graph_ref()?));
+            }
+            BindingKind::Graph
+        } else {
+            return Err(self.error(
+                "VALUE, BINDING TABLE, PROPERTY GRAPH, SCHEMA or TIME ZONE after SESSION SET",
+            ));
+        };
+        // ISO writes the modifier in front of the name rather than
+        // behind it, `SESSION SET VALUE IF NOT EXISTS $p = 1`, which is
+        // the other way round from the catalog statements.
+        let if_not_exists = self.eat_if_exists(true)?;
+        let def = self.parse_session_param_def(kind)?;
+        Ok(SessionStmt::SetParameter { def, if_not_exists })
+    }
+
+    /// One parameter definition, which is a binding variable definition
+    /// whose name is written with a dollar (ISO 7.1).
+    ///
+    /// The two are the same rule with two spellings of the name, so the
+    /// name is read here and the rest is [`Self::parse_binding_def`]'s.
+    /// That is not a shortcut: a session parameter and a binding
+    /// variable stand for the same three kinds of thing, take the same
+    /// optional type, and are initialized from the same expression or
+    /// the same query in braces, so two readers would be two chances to
+    /// accept different languages under one grammar.
+    fn parse_session_param_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
+        let Some(TokenKind::Param(name)) = self.peek().map(|t| t.kind.clone()) else {
+            return Err(self.error("a session parameter name, written with a dollar"));
+        };
+        self.pos += 1;
+        self.parse_binding_def_body(kind, name)
+    }
+
+    /// The displacement a `SESSION SET TIME ZONE` names (GS15).
+    ///
+    /// ISO writes it as a character string, and what zu takes is a
+    /// displacement and never a zone name (`02 §3.4`): a name is a rule
+    /// the zone database can change, so a session set to one would mean
+    /// a different instant after an upgrade. The string is read here
+    /// rather than at the session, because a string that is not a
+    /// displacement is a fault in the statement.
+    fn parse_time_zone(&mut self) -> Result<i16> {
+        let Some(Token {
+            kind: TokenKind::Str(text),
+            start,
+            ..
+        }) = self.peek().cloned()
+        else {
+            return Err(self.error("a time zone displacement in quotes, such as '+07:00'"));
+        };
+        self.pos += 1;
+        zu_common::temporal::zone_offset(&text).ok_or_else(|| {
+            ZuError::gql_in(
+                codes::C22007,
+                self.source,
+                start,
+                format_args!(
+                    "'{text}' is no time zone displacement: a session takes an offset from UTC, written 'Z' or '+hh', '+hhmm' or '+hh:mm' either way of nought, and never a zone name, since a name is a rule the zone database can change under a session that is holding it"
+                ),
+            )
+        })
+    }
+
+    /// What a `SESSION RESET` puts back (ISO 7.2).
+    ///
+    /// `SESSION RESET` on its own resets everything, which is what the
+    /// standard says a reset with no arguments means and is the same
+    /// thing `ALL CHARACTERISTICS` spells out.
+    fn parse_session_reset(&mut self) -> Result<SessionReset> {
+        let all = self.eat_kw("ALL");
+        if self.eat_kw("CHARACTERISTICS") {
+            return Ok(SessionReset::Characteristics);
+        }
+        if self.eat_kw("PARAMETERS") {
+            return Ok(SessionReset::Parameters);
+        }
+        if all {
+            return Err(self.error("PARAMETERS or CHARACTERISTICS after SESSION RESET ALL"));
+        }
+        if self.eat_kw("SCHEMA") {
+            return Ok(SessionReset::Schema);
+        }
+        if self.at_kw("TIME") && self.kw_at(1, "ZONE") {
+            self.pos += 2;
+            return Ok(SessionReset::TimeZone);
+        }
+        if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+            self.eat_kw("PROPERTY");
+            self.pos += 1;
+            return Ok(SessionReset::Graph);
+        }
+        if self.eat_kw("PARAMETER") {
+            let Some(TokenKind::Param(name)) = self.peek().map(|t| t.kind.clone()) else {
+                return Err(self.error("a session parameter name, written with a dollar"));
+            };
+            self.pos += 1;
+            return Ok(SessionReset::Parameter(name));
+        }
+        // A reset with nothing after it is the widest one, so the end
+        // of the statement is an answer and anything else is not.
+        if self.peek().is_none() || self.at(&TokenKind::Semicolon) {
+            return Ok(SessionReset::Characteristics);
+        }
+        Err(self.error(
+            "ALL CHARACTERISTICS, ALL PARAMETERS, PARAMETER $p, SCHEMA, PROPERTY GRAPH, TIME ZONE, or nothing at all after SESSION RESET",
+        ))
     }
 
     /// Whether this statement changes the catalog rather than reading
@@ -1856,6 +2054,13 @@ impl Parser<'_> {
     /// second rule here.
     fn parse_binding_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
         let name = self.expect_name("a binding variable name")?;
+        self.parse_binding_def_body(kind, name)
+    }
+
+    /// The definition behind the name, which is everything but the
+    /// name: a session parameter is written with a dollar and read the
+    /// same way from here on (ISO 7.1).
+    fn parse_binding_def_body(&mut self, kind: BindingKind, name: String) -> Result<BindingDef> {
         // GP06, the typed definition. ISO writes the separator two
         // ways, `::` and the word `TYPED`, and allows the type to be
         // written with neither, so all three are read here and the
@@ -5649,6 +5854,19 @@ mod tests {
         }
     }
 
+    fn session_stmt(source: &str) -> SessionStmt {
+        match parse_statement(source).expect("parse") {
+            Statement::Session(stmt) => stmt,
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    fn session_err(source: &str) -> String {
+        parse_statement(source)
+            .expect_err("should fail")
+            .to_string()
+    }
+
     fn catalog_err(source: &str) -> String {
         parse_statement(source)
             .expect_err("should fail")
@@ -6035,16 +6253,187 @@ mod tests {
         assert!(parse_err("CREATE (n) RETURN n").contains("CREATE is not implemented yet"));
     }
 
+    /// The three parameter kinds, which are the three a binding
+    /// variable has and are written the same way behind the name (GS01,
+    /// GS02, GS03).
+    #[test]
+    fn a_session_parameter_is_set_in_each_of_its_three_kinds() {
+        let kinds = [
+            ("SESSION SET VALUE $v = 1", BindingKind::Value, "v"),
+            (
+                "SESSION SET BINDING TABLE $t = { MATCH (p) RETURN p AS p }",
+                BindingKind::Table,
+                "t",
+            ),
+            (
+                "SESSION SET PROPERTY GRAPH $g = CURRENT_PROPERTY_GRAPH",
+                BindingKind::Graph,
+                "g",
+            ),
+        ];
+        for (source, kind, name) in kinds {
+            let SessionStmt::SetParameter { def, if_not_exists } = session_stmt(source) else {
+                panic!("{source} is not a parameter");
+            };
+            assert_eq!(def.kind, kind, "{source}");
+            assert_eq!(def.name, name, "{source}");
+            assert!(!if_not_exists, "{source}");
+        }
+        // The long spellings are the short ones. `TABLE` alone is a
+        // binding table and `GRAPH` alone is a property graph, which is
+        // how a binding variable definition reads them too.
+        assert_eq!(
+            session_stmt("SESSION SET TABLE $t = $u"),
+            session_stmt("SESSION SET BINDING TABLE $t = $u")
+        );
+        assert_eq!(
+            session_stmt("SESSION SET GRAPH $g = HOME_GRAPH"),
+            session_stmt("SESSION SET PROPERTY GRAPH $g = HOME_PROPERTY_GRAPH")
+        );
+    }
+
+    /// A definition may be written with a type and may be initialized
+    /// from a query in braces, which is the whole of GS10 and GS11: the
+    /// same two forms a binding variable takes.
+    #[test]
+    fn a_session_parameter_takes_a_type_and_a_query() {
+        let SessionStmt::SetParameter { def, .. } =
+            session_stmt("SESSION SET VALUE $n :: INTEGER = { MATCH (p) RETURN count(*) AS n }")
+        else {
+            panic!("not a parameter");
+        };
+        assert_eq!(
+            def.ty,
+            Some(LogicalType::Nullable(Box::new(
+                value_type::spelled("INTEGER", &[]).expect("a type")
+            )))
+        );
+        assert!(matches!(def.init, BindingInit::Query(_)));
+        let SessionStmt::SetParameter { def, if_not_exists } =
+            session_stmt("SESSION SET VALUE IF NOT EXISTS $n = 1")
+        else {
+            panic!("not a parameter");
+        };
+        assert!(if_not_exists);
+        assert_eq!(def.name, "n");
+    }
+
+    /// `SESSION SET PROPERTY GRAPH` is written two ways and the dollar
+    /// is the whole difference: with one it binds a parameter, without
+    /// one it moves the graph the session works in.
+    #[test]
+    fn the_dollar_tells_a_graph_parameter_from_the_session_graph() {
+        assert_eq!(
+            session_stmt("SESSION SET PROPERTY GRAPH social"),
+            SessionStmt::SetGraph(GraphRef::Named(GraphName {
+                schema: None,
+                name: "social".to_string(),
+            }))
+        );
+        assert_eq!(
+            session_stmt("SESSION SET GRAPH HOME_PROPERTY_GRAPH"),
+            SessionStmt::SetGraph(GraphRef::Home)
+        );
+        let SessionStmt::SetParameter { def, .. } =
+            session_stmt("SESSION SET PROPERTY GRAPH $g = social")
+        else {
+            panic!("not a parameter");
+        };
+        assert_eq!(def.kind, BindingKind::Graph);
+    }
+
+    #[test]
+    fn a_session_takes_a_schema_and_a_zone() {
+        assert_eq!(
+            session_stmt("SESSION SET SCHEMA /app"),
+            SessionStmt::SetSchema(SchemaRef::Path("/app".to_string()))
+        );
+        assert_eq!(
+            session_stmt("SESSION SET SCHEMA /"),
+            SessionStmt::SetSchema(SchemaRef::Path("/".to_string()))
+        );
+        // GS15. Every spelling of a displacement a zoned literal takes,
+        // and nought written either way of the sign is nought.
+        for (source, minutes) in [
+            ("SESSION SET TIME ZONE '+07:00'", 420),
+            ("SESSION SET TIME ZONE '-05:30'", -330),
+            ("SESSION SET TIME ZONE '+0700'", 420),
+            ("SESSION SET TIME ZONE '+07'", 420),
+            ("SESSION SET TIME ZONE 'Z'", 0),
+            ("SESSION SET TIME ZONE '-00:00'", 0),
+        ] {
+            assert_eq!(session_stmt(source), SessionStmt::SetTimeZone(minutes));
+        }
+    }
+
+    /// A zone name is not a displacement, and the refusal says so
+    /// rather than letting the session hold a rule the zone database
+    /// can change (`02 §3.4`).
+    #[test]
+    fn a_zone_name_is_not_a_displacement() {
+        let err = session_err("SESSION SET TIME ZONE 'Europe/Dublin'");
+        assert!(err.contains("no time zone displacement"), "{err}");
+        assert!(session_err("SESSION SET TIME ZONE '+19:00'").contains("displacement"));
+        assert!(session_err("SESSION SET TIME ZONE 7").contains("in quotes"));
+    }
+
+    #[test]
+    fn every_reset_is_read_and_a_bare_one_is_the_widest() {
+        let resets = [
+            ("SESSION RESET", SessionReset::Characteristics),
+            ("SESSION RESET;", SessionReset::Characteristics),
+            (
+                "SESSION RESET ALL CHARACTERISTICS",
+                SessionReset::Characteristics,
+            ),
+            (
+                "SESSION RESET CHARACTERISTICS",
+                SessionReset::Characteristics,
+            ),
+            ("SESSION RESET ALL PARAMETERS", SessionReset::Parameters),
+            ("SESSION RESET PARAMETERS", SessionReset::Parameters),
+            ("SESSION RESET SCHEMA", SessionReset::Schema),
+            ("SESSION RESET GRAPH", SessionReset::Graph),
+            ("SESSION RESET PROPERTY GRAPH", SessionReset::Graph),
+            ("SESSION RESET TIME ZONE", SessionReset::TimeZone),
+            (
+                "SESSION RESET PARAMETER $p",
+                SessionReset::Parameter("p".to_string()),
+            ),
+        ];
+        for (source, reset) in resets {
+            assert_eq!(session_stmt(source), SessionStmt::Reset(reset), "{source}");
+        }
+        assert!(session_err("SESSION RESET ALL SCHEMA").contains("SESSION RESET ALL"));
+        assert!(session_err("SESSION RESET PARAMETER p").contains("with a dollar"));
+        assert!(session_err("SESSION RESET WHAT").contains("after SESSION RESET"));
+    }
+
+    /// A session statement is whole on its own, the way a transaction
+    /// statement is: it has no binding table for anything behind it to
+    /// read, so a `NEXT` after one is a statement with nowhere to go.
+    #[test]
+    fn nothing_follows_a_session_statement() {
+        let err = session_err("SESSION RESET SCHEMA NEXT MATCH (p) RETURN p");
+        assert!(
+            err.contains("nothing may follow a session statement"),
+            "{err}"
+        );
+        assert!(session_err("SESSION SET VALUE 1 = 1").contains("with a dollar"));
+        assert!(session_err("SESSION SET WHAT $p = 1").contains("after SESSION SET"));
+        assert!(session_err("SESSION").contains("expected"));
+    }
+
     /// A statement GQL defines and the v0 core does not parse should be
     /// turned away by name. Being told the parser expected MATCH sends a
     /// reader looking for a typo in a statement they spelled correctly,
     /// which is the wrong place to look and the wrong thing to fix.
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
-        let err = parse_err("SESSION SET VALUE $x = 1");
+        let err = parse_err("CREATE (n) RETURN n");
         assert!(
-            err.contains("SESSION is not implemented yet"),
-            "refused with {err:?}, which does not name SESSION"
+            err.contains("CREATE is not implemented yet"),
+            "refused with {err:?}, which does not name CREATE"
         );
     }
 

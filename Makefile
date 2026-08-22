@@ -2,8 +2,10 @@
 
 # The ISO/IEC 39075:2024 digital artifacts are checked in and the
 # generated tables are derived from them: the status table in zu-common
-# from the conditions artifact, and the Clause 24.5.2 register in zu-cli
-# from the two that list what the standard leaves to the implementation.
+# from the conditions artifact, the Clause 24.5.2 register in zu-cli from
+# the two that list what the standard leaves to the implementation, and
+# the feature table behind the conformance statement from the artifact
+# that lists the 228 optional features.
 # This verifies the bytes are the ones we derived from; the drift tests
 # beside each table verify the table still matches them.
 check-artifacts:

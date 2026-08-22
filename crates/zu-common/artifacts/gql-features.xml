@@ -1,0 +1,944 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+The following XML document is a "digital artifact" containing an XML element ("features") that 
+identifies every optional language feature defined in ("used in") ISO/IEC 39075. 
+An XML DTD is provided that may be used to validate the XML document itself. 
+
+It may be used by implementers to specify the natural-language text that describes the features
+implemented in a particular GQL-implementation.  
+It may also be used by documentation writers and translators to identify those features in the 
+natural languages of users of those GQL-implementations.
+-->
+
+
+ 
+<!DOCTYPE features [
+  
+<!-- The features element defines the features of a standard (part). -->
+<!ELEMENT features ((feature)*)>
+
+<!-- A feature element defines a specific feature. -->
+<!ELEMENT feature (code, description)>
+
+<!-- A code element specifies the unique code for a feature. -->
+<!ELEMENT code (#PCDATA)>
+
+<!-- A description element provides a textual specification of the feature. -->
+<!ELEMENT description (#PCDATA | squote)*>
+
+]>
+
+<features>
+   <feature>
+      <code>G002</code>
+      <description>Different-edges match mode</description>
+   </feature>
+   <feature>
+      <code>G003</code>
+      <description>Explicit REPEATABLE ELEMENTS keyword</description>
+   </feature>
+   <feature>
+      <code>G004</code>
+      <description>Path variables</description>
+   </feature>
+   <feature>
+      <code>G005</code>
+      <description>Path search prefix in a path pattern</description>
+   </feature>
+   <feature>
+      <code>G006</code>
+      <description>Graph pattern KEEP clause: path mode prefix</description>
+   </feature>
+   <feature>
+      <code>G007</code>
+      <description>Graph pattern KEEP clause: path search prefix</description>
+   </feature>
+   <feature>
+      <code>G010</code>
+      <description>Explicit WALK keyword</description>
+   </feature>
+   <feature>
+      <code>G011</code>
+      <description>Advanced path modes: TRAIL</description>
+   </feature>
+   <feature>
+      <code>G012</code>
+      <description>Advanced path modes: SIMPLE</description>
+   </feature>
+   <feature>
+      <code>G013</code>
+      <description>Advanced path modes: ACYCLIC</description>
+   </feature>
+   <feature>
+      <code>G014</code>
+      <description>Explicit PATH/PATHS keywords</description>
+   </feature>
+   <feature>
+      <code>G015</code>
+      <description>All path search: explicit ALL keyword</description>
+   </feature>
+   <feature>
+      <code>G016</code>
+      <description>Any path search</description>
+   </feature>
+   <feature>
+      <code>G017</code>
+      <description>All shortest path search</description>
+   </feature>
+   <feature>
+      <code>G018</code>
+      <description>Any shortest path search</description>
+   </feature>
+   <feature>
+      <code>G019</code>
+      <description>Counted shortest path search</description>
+   </feature>
+   <feature>
+      <code>G020</code>
+      <description>Counted shortest group search</description>
+   </feature>
+   <feature>
+      <code>G030</code>
+      <description>Path multiset alternation</description>
+   </feature>
+   <feature>
+      <code>G031</code>
+      <description>Path multiset alternation: variable length path operands</description>
+   </feature>
+   <feature>
+      <code>G032</code>
+      <description>Path pattern union</description>
+   </feature>
+   <feature>
+      <code>G033</code>
+      <description>Path pattern union: variable length path operands</description>
+   </feature>
+   <feature>
+      <code>G035</code>
+      <description>Quantified paths</description>
+   </feature>
+   <feature>
+      <code>G036</code>
+      <description>Quantified edges</description>
+   </feature>
+   <feature>
+      <code>G037</code>
+      <description>Questioned paths</description>
+   </feature>
+   <feature>
+      <code>G038</code>
+      <description>Parenthesized path pattern expression</description>
+   </feature>
+   <feature>
+      <code>G039</code>
+      <description>Simplified path pattern expression: full defaulting</description>
+   </feature>
+   <feature>
+      <code>G041</code>
+      <description>Non-local element pattern predicates</description>
+   </feature>
+   <feature>
+      <code>G043</code>
+      <description>Complete full edge patterns</description>
+   </feature>
+   <feature>
+      <code>G044</code>
+      <description>Basic abbreviated edge patterns</description>
+   </feature>
+   <feature>
+      <code>G045</code>
+      <description>Complete abbreviated edge patterns</description>
+   </feature>
+   <feature>
+      <code>G046</code>
+      <description>Relaxed topological consistency: adjacent vertex patterns</description>
+   </feature>
+   <feature>
+      <code>G047</code>
+      <description>Relaxed topological consistency: concise edge patterns</description>
+   </feature>
+   <feature>
+      <code>G048</code>
+      <description>Parenthesized path pattern: subpath variable declaration</description>
+   </feature>
+   <feature>
+      <code>G049</code>
+      <description>Parenthesized path pattern: path mode prefix</description>
+   </feature>
+   <feature>
+      <code>G050</code>
+      <description>Parenthesized path pattern: WHERE clause</description>
+   </feature>
+   <feature>
+      <code>G051</code>
+      <description>Parenthesized path pattern: non-local predicates</description>
+   </feature>
+   <feature>
+      <code>G060</code>
+      <description>Bounded graph pattern quantifiers</description>
+   </feature>
+   <feature>
+      <code>G061</code>
+      <description>Unbounded graph pattern quantifiers</description>
+   </feature>
+   <feature>
+      <code>G074</code>
+      <description>Label expression: wildcard label</description>
+   </feature>
+   <feature>
+      <code>G080</code>
+      <description>Simplified path pattern expression: basic defaulting</description>
+   </feature>
+   <feature>
+      <code>G081</code>
+      <description>Simplified path pattern expression: full overrides</description>
+   </feature>
+   <feature>
+      <code>G082</code>
+      <description>Simplified path pattern expression: basic overrides</description>
+   </feature>
+   <feature>
+      <code>G100</code>
+      <description>ELEMENT_ID function</description>
+   </feature>
+   <feature>
+      <code>G110</code>
+      <description>IS DIRECTED predicate</description>
+   </feature>
+   <feature>
+      <code>G111</code>
+      <description>IS LABELED predicate</description>
+   </feature>
+   <feature>
+      <code>G112</code>
+      <description>IS SOURCE and IS DESTINATION predicate</description>
+   </feature>
+   <feature>
+      <code>G113</code>
+      <description>ALL_DIFFERENT predicate</description>
+   </feature>
+   <feature>
+      <code>G114</code>
+      <description>SAME predicate</description>
+   </feature>
+   <feature>
+      <code>G115</code>
+      <description>PROPERTY_EXISTS predicate</description>
+   </feature>
+   <feature>
+      <code>GA01</code>
+      <description>IEEE 754 floating point operations</description>
+   </feature>
+   <feature>
+      <code>GA03</code>
+      <description>Explicit ordering of nulls</description>
+   </feature>
+   <feature>
+      <code>GA04</code>
+      <description>Universal comparison</description>
+   </feature>
+   <feature>
+      <code>GA05</code>
+      <description>Cast specification</description>
+   </feature>
+   <feature>
+      <code>GA06</code>
+      <description>Value type predicate</description>
+   </feature>
+   <feature>
+      <code>GA07</code>
+      <description>Ordering by discarded binding variables</description>
+   </feature>
+   <feature>
+      <code>GA08</code>
+      <description>GQL-status objects with diagnostic records</description>
+   </feature>
+   <feature>
+      <code>GA09</code>
+      <description>Comparison of paths</description>
+   </feature>
+   <feature>
+      <code>GB01</code>
+      <description>Long identifiers</description>
+   </feature>
+   <feature>
+      <code>GB02</code>
+      <description>Double minus sign comments</description>
+   </feature>
+   <feature>
+      <code>GB03</code>
+      <description>Double solidus comments</description>
+   </feature>
+   <feature>
+      <code>GC01</code>
+      <description>Graph schema management</description>
+   </feature>
+   <feature>
+      <code>GC02</code>
+      <description>Graph schema management: IF [ NOT ] EXISTS</description>
+   </feature>
+   <feature>
+      <code>GC03</code>
+      <description>Graph type: IF [ NOT ] EXISTS</description>
+   </feature>
+   <feature>
+      <code>GC04</code>
+      <description>Graph management</description>
+   </feature>
+   <feature>
+      <code>GC05</code>
+      <description>Graph management: IF [ NOT ] EXISTS</description>
+   </feature>
+   <feature>
+      <code>GD01</code>
+      <description>Updatable graphs</description>
+   </feature>
+   <feature>
+      <code>GD02</code>
+      <description>Graph label set changes</description>
+   </feature>
+   <feature>
+      <code>GD03</code>
+      <description>DELETE statement: subquery support</description>
+   </feature>
+   <feature>
+      <code>GD04</code>
+      <description>DELETE statement: simple expression support</description>
+   </feature>
+   <feature>
+      <code>GE01</code>
+      <description>Graph reference value expressions</description>
+   </feature>
+   <feature>
+      <code>GE02</code>
+      <description>Binding table reference value expressions</description>
+   </feature>
+   <feature>
+      <code>GE03</code>
+      <description>Let-binding of variables in expressions</description>
+   </feature>
+   <feature>
+      <code>GE04</code>
+      <description>Graph parameters</description>
+   </feature>
+   <feature>
+      <code>GE05</code>
+      <description>Binding table parameters</description>
+   </feature>
+   <feature>
+      <code>GE06</code>
+      <description>Path value construction</description>
+   </feature>
+   <feature>
+      <code>GE07</code>
+      <description>Boolean XOR</description>
+   </feature>
+   <feature>
+      <code>GE08</code>
+      <description>Reference parameters</description>
+   </feature>
+   <feature>
+      <code>GE09</code>
+      <description>Horizontal aggregation</description>
+   </feature>
+   <feature>
+      <code>GF01</code>
+      <description>Enhanced numeric functions</description>
+   </feature>
+   <feature>
+      <code>GF02</code>
+      <description>Trigonometric functions</description>
+   </feature>
+   <feature>
+      <code>GF03</code>
+      <description>Logarithmic functions</description>
+   </feature>
+   <feature>
+      <code>GF04</code>
+      <description>Enhanced path functions</description>
+   </feature>
+   <feature>
+      <code>GF05</code>
+      <description>Multi-character TRIM function</description>
+   </feature>
+   <feature>
+      <code>GF06</code>
+      <description>Explicit TRIM function</description>
+   </feature>
+   <feature>
+      <code>GF07</code>
+      <description>Byte string TRIM function</description>
+   </feature>
+   <feature>
+      <code>GF10</code>
+      <description>Advanced aggregate functions: general set functions</description>
+   </feature>
+   <feature>
+      <code>GF11</code>
+      <description>Advanced aggregate functions: binary set functions</description>
+   </feature>
+   <feature>
+      <code>GF12</code>
+      <description>CARDINALITY function</description>
+   </feature>
+   <feature>
+      <code>GF13</code>
+      <description>SIZE function</description>
+   </feature>
+   <feature>
+      <code>GF20</code>
+      <description>Aggregate functions in sort keys</description>
+   </feature>
+   <feature>
+      <code>GG01</code>
+      <description>Graph with an open graph type</description>
+   </feature>
+   <feature>
+      <code>GG02</code>
+      <description>Graph with a closed graph type</description>
+   </feature>
+   <feature>
+      <code>GG03</code>
+      <description>Graph type inline specification</description>
+   </feature>
+   <feature>
+      <code>GG04</code>
+      <description>Graph type like a graph</description>
+   </feature>
+   <feature>
+      <code>GG05</code>
+      <description>Graph from a graph source</description>
+   </feature>
+   <feature>
+      <code>GG20</code>
+      <description>Explicit element type names</description>
+   </feature>
+   <feature>
+      <code>GG21</code>
+      <description>Explicit element type key label sets</description>
+   </feature>
+   <feature>
+      <code>GG22</code>
+      <description>Element type key label set inference</description>
+   </feature>
+   <feature>
+      <code>GG23</code>
+      <description>Optional element type key label sets</description>
+   </feature>
+   <feature>
+      <code>GG24</code>
+      <description>Relaxed structural consistency</description>
+   </feature>
+   <feature>
+      <code>GG25</code>
+      <description>Relaxed key label set uniqueness for edge types</description>
+   </feature>
+   <feature>
+      <code>GG26</code>
+      <description>Relaxed property value type consistency</description>
+   </feature>
+   <feature>
+      <code>GH01</code>
+      <description>External object references</description>
+   </feature>
+   <feature>
+      <code>GH02</code>
+      <description>Undirected edge patterns</description>
+   </feature>
+   <feature>
+      <code>GL01</code>
+      <description>Hexadecimal literals</description>
+   </feature>
+   <feature>
+      <code>GL02</code>
+      <description>Octal literals</description>
+   </feature>
+   <feature>
+      <code>GL03</code>
+      <description>Binary literals</description>
+   </feature>
+   <feature>
+      <code>GL04</code>
+      <description>Exact number in common notation without suffix</description>
+   </feature>
+   <feature>
+      <code>GL05</code>
+      <description>Exact number in common notation or as decimal integer with suffix</description>
+   </feature>
+   <feature>
+      <code>GL06</code>
+      <description>Exact number in scientific notation with suffix</description>
+   </feature>
+   <feature>
+      <code>GL07</code>
+      <description>Approximate number in common notation or as decimal integer with suffix</description>
+   </feature>
+   <feature>
+      <code>GL08</code>
+      <description>Approximate number in scientific notation with suffix</description>
+   </feature>
+   <feature>
+      <code>GL09</code>
+      <description>Optional float number suffix</description>
+   </feature>
+   <feature>
+      <code>GL10</code>
+      <description>Optional double number suffix</description>
+   </feature>
+   <feature>
+      <code>GL11</code>
+      <description>Opt-out character escaping</description>
+   </feature>
+   <feature>
+      <code>GL12</code>
+      <description>SQL datetime and interval formats</description>
+   </feature>
+   <feature>
+      <code>GP01</code>
+      <description>Inline procedure</description>
+   </feature>
+   <feature>
+      <code>GP02</code>
+      <description>Inline procedure with implicit nested variable scope</description>
+   </feature>
+   <feature>
+      <code>GP03</code>
+      <description>Inline procedure with explicit nested variable scope</description>
+   </feature>
+   <feature>
+      <code>GP04</code>
+      <description>Named procedure calls</description>
+   </feature>
+   <feature>
+      <code>GP05</code>
+      <description>Procedure-local value variable definitions</description>
+   </feature>
+   <feature>
+      <code>GP06</code>
+      <description>Procedure-local value variable definitions: value variables based on simple expressions</description>
+   </feature>
+   <feature>
+      <code>GP07</code>
+      <description>Procedure-local value variable definitions: value variable based on subqueries</description>
+   </feature>
+   <feature>
+      <code>GP08</code>
+      <description>Procedure-local binding table variable definitions</description>
+   </feature>
+   <feature>
+      <code>GP09</code>
+      <description>Procedure-local binding table variable definitions: binding table variables based on simple expressions or references</description>
+   </feature>
+   <feature>
+      <code>GP10</code>
+      <description>Procedure-local binding table variable definitions: binding table variables based on subqueries</description>
+   </feature>
+   <feature>
+      <code>GP11</code>
+      <description>Procedure-local graph variable definitions</description>
+   </feature>
+   <feature>
+      <code>GP12</code>
+      <description>Procedure-local graph variable definitions: graph variables based on simple expressions or references</description>
+   </feature>
+   <feature>
+      <code>GP13</code>
+      <description>Procedure-local graph variable definitions: graph variables based on subqueries</description>
+   </feature>
+   <feature>
+      <code>GP14</code>
+      <description>Binding tables as procedure arguments</description>
+   </feature>
+   <feature>
+      <code>GP15</code>
+      <description>Graphs as procedure arguments</description>
+   </feature>
+   <feature>
+      <code>GP16</code>
+      <description>AT schema clause</description>
+   </feature>
+   <feature>
+      <code>GP17</code>
+      <description>Binding variable definition block</description>
+   </feature>
+   <feature>
+      <code>GP18</code>
+      <description>Catalog and data statement mixing</description>
+   </feature>
+   <feature>
+      <code>GQ01</code>
+      <description>USE graph clause</description>
+   </feature>
+   <feature>
+      <code>GQ02</code>
+      <description>Composite query: OTHERWISE</description>
+   </feature>
+   <feature>
+      <code>GQ03</code>
+      <description>Composite query: UNION</description>
+   </feature>
+   <feature>
+      <code>GQ04</code>
+      <description>Composite query: EXCEPT DISTINCT</description>
+   </feature>
+   <feature>
+      <code>GQ05</code>
+      <description>Composite query: EXCEPT ALL</description>
+   </feature>
+   <feature>
+      <code>GQ06</code>
+      <description>Composite query: INTERSECT DISTINCT</description>
+   </feature>
+   <feature>
+      <code>GQ07</code>
+      <description>Composite query: INTERSECT ALL</description>
+   </feature>
+   <feature>
+      <code>GQ08</code>
+      <description>FILTER statement</description>
+   </feature>
+   <feature>
+      <code>GQ09</code>
+      <description>LET statement</description>
+   </feature>
+   <feature>
+      <code>GQ10</code>
+      <description>FOR statement: list value support</description>
+   </feature>
+   <feature>
+      <code>GQ11</code>
+      <description>FOR statement: WITH ORDINALITY</description>
+   </feature>
+   <feature>
+      <code>GQ12</code>
+      <description>ORDER BY and page statement: OFFSET clause</description>
+   </feature>
+   <feature>
+      <code>GQ13</code>
+      <description>ORDER BY and page statement: LIMIT clause</description>
+   </feature>
+   <feature>
+      <code>GQ14</code>
+      <description>Complex expressions in sort keys</description>
+   </feature>
+   <feature>
+      <code>GQ15</code>
+      <description>GROUP BY clause</description>
+   </feature>
+   <feature>
+      <code>GQ16</code>
+      <description>Pre-projection aliases in sort keys</description>
+   </feature>
+   <feature>
+      <code>GQ17</code>
+      <description>Element-wise group variable operations</description>
+   </feature>
+   <feature>
+      <code>GQ18</code>
+      <description>Scalar subqueries</description>
+   </feature>
+   <feature>
+      <code>GQ19</code>
+      <description>Graph pattern YIELD clause</description>
+   </feature>
+   <feature>
+      <code>GQ20</code>
+      <description>Advanced linear composition with NEXT</description>
+   </feature>
+   <feature>
+      <code>GQ21</code>
+      <description>OPTIONAL: Multiple MATCH statements</description>
+   </feature>
+   <feature>
+      <code>GQ22</code>
+      <description>EXISTS predicate: multiple MATCH statements</description>
+   </feature>
+   <feature>
+      <code>GQ23</code>
+      <description>FOR statement: binding table support</description>
+   </feature>
+   <feature>
+      <code>GQ24</code>
+      <description>FOR statement: WITH OFFSET</description>
+   </feature>
+   <feature>
+      <code>GS01</code>
+      <description>SESSION SET command: session-local graph parameters</description>
+   </feature>
+   <feature>
+      <code>GS02</code>
+      <description>SESSION SET command: session-local binding table parameters</description>
+   </feature>
+   <feature>
+      <code>GS03</code>
+      <description>SESSION SET command: session-local value parameters</description>
+   </feature>
+   <feature>
+      <code>GS04</code>
+      <description>SESSION RESET command: reset all characteristics</description>
+   </feature>
+   <feature>
+      <code>GS05</code>
+      <description>SESSION RESET command: reset session schema</description>
+   </feature>
+   <feature>
+      <code>GS06</code>
+      <description>SESSION RESET command: reset session graph</description>
+   </feature>
+   <feature>
+      <code>GS07</code>
+      <description>SESSION RESET command: reset time zone displacement</description>
+   </feature>
+   <feature>
+      <code>GS08</code>
+      <description>SESSION RESET command: reset all session parameters</description>
+   </feature>
+   <feature>
+      <code>GS10</code>
+      <description>SESSION SET command: session-local binding table parameters based on subqueries</description>
+   </feature>
+   <feature>
+      <code>GS11</code>
+      <description>SESSION SET command: session-local value parameters based on subqueries</description>
+   </feature>
+   <feature>
+      <code>GS12</code>
+      <description>SESSION SET command: session-local graph parameters based on simple expressions or references</description>
+   </feature>
+   <feature>
+      <code>GS13</code>
+      <description>SESSION SET command: session-local binding table parameters based on simple expressions or references</description>
+   </feature>
+   <feature>
+      <code>GS14</code>
+      <description>SESSION SET command: session-local value parameters based on simple expressions</description>
+   </feature>
+   <feature>
+      <code>GS15</code>
+      <description>SESSION SET command: set time zone displacement</description>
+   </feature>
+   <feature>
+      <code>GS16</code>
+      <description>SESSION RESET command: reset individual session parameters</description>
+   </feature>
+   <feature>
+      <code>GT01</code>
+      <description>Explicit transaction commands</description>
+   </feature>
+   <feature>
+      <code>GT02</code>
+      <description>Specified transaction characteristics</description>
+   </feature>
+   <feature>
+      <code>GT03</code>
+      <description>Use of multiple graphs in a transaction</description>
+   </feature>
+   <feature>
+      <code>GV01</code>
+      <description>8 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV02</code>
+      <description>8 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV03</code>
+      <description>16 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV04</code>
+      <description>16 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV05</code>
+      <description>Small unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV06</code>
+      <description>32 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV07</code>
+      <description>32 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV08</code>
+      <description>Regular unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV09</code>
+      <description>Specified integer number precision</description>
+   </feature>
+   <feature>
+      <code>GV10</code>
+      <description>Big unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV11</code>
+      <description>64 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV12</code>
+      <description>64 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV13</code>
+      <description>128 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV14</code>
+      <description>128 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV15</code>
+      <description>256 bit unsigned integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV16</code>
+      <description>256 bit signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV17</code>
+      <description>Decimal numbers</description>
+   </feature>
+   <feature>
+      <code>GV18</code>
+      <description>Small signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV19</code>
+      <description>Big signed integer numbers</description>
+   </feature>
+   <feature>
+      <code>GV20</code>
+      <description>16 bit floating point numbers</description>
+   </feature>
+   <feature>
+      <code>GV21</code>
+      <description>32 bit floating point numbers</description>
+   </feature>
+   <feature>
+      <code>GV22</code>
+      <description>Specified floating point number precision</description>
+   </feature>
+   <feature>
+      <code>GV23</code>
+      <description>Floating point type name synonyms</description>
+   </feature>
+   <feature>
+      <code>GV24</code>
+      <description>64 bit floating point numbers</description>
+   </feature>
+   <feature>
+      <code>GV25</code>
+      <description>128 bit floating point numbers</description>
+   </feature>
+   <feature>
+      <code>GV26</code>
+      <description>256 bit floating point numbers</description>
+   </feature>
+   <feature>
+      <code>GV30</code>
+      <description>Specified character string minimum length</description>
+   </feature>
+   <feature>
+      <code>GV31</code>
+      <description>Specified character string maximum length</description>
+   </feature>
+   <feature>
+      <code>GV32</code>
+      <description>Specified character string fixed length</description>
+   </feature>
+   <feature>
+      <code>GV35</code>
+      <description>Byte string types</description>
+   </feature>
+   <feature>
+      <code>GV36</code>
+      <description>Specified byte string minimum length</description>
+   </feature>
+   <feature>
+      <code>GV37</code>
+      <description>Specified byte string maximum length</description>
+   </feature>
+   <feature>
+      <code>GV38</code>
+      <description>Specified byte string fixed length</description>
+   </feature>
+   <feature>
+      <code>GV39</code>
+      <description>Temporal types: date, local datetime and local time support</description>
+   </feature>
+   <feature>
+      <code>GV40</code>
+      <description>Temporal types: zoned datetime and zoned time support</description>
+   </feature>
+   <feature>
+      <code>GV41</code>
+      <description>Temporal types: duration support</description>
+   </feature>
+   <feature>
+      <code>GV45</code>
+      <description>Record types</description>
+   </feature>
+   <feature>
+      <code>GV46</code>
+      <description>Closed record types</description>
+   </feature>
+   <feature>
+      <code>GV47</code>
+      <description>Open record types</description>
+   </feature>
+   <feature>
+      <code>GV48</code>
+      <description>Nested record types</description>
+   </feature>
+   <feature>
+      <code>GV50</code>
+      <description>List value types</description>
+   </feature>
+   <feature>
+      <code>GV55</code>
+      <description>Path value types</description>
+   </feature>
+   <feature>
+      <code>GV60</code>
+      <description>Graph reference value types</description>
+   </feature>
+   <feature>
+      <code>GV61</code>
+      <description>Binding table reference value types</description>
+   </feature>
+   <feature>
+      <code>GV65</code>
+      <description>Dynamic union types</description>
+   </feature>
+   <feature>
+      <code>GV66</code>
+      <description>Open dynamic union types</description>
+   </feature>
+   <feature>
+      <code>GV67</code>
+      <description>Closed dynamic union types</description>
+   </feature>
+   <feature>
+      <code>GV68</code>
+      <description>Dynamic property value types</description>
+   </feature>
+   <feature>
+      <code>GV70</code>
+      <description>Immaterial value types</description>
+   </feature>
+   <feature>
+      <code>GV71</code>
+      <description>Immaterial value types: null type support</description>
+   </feature>
+   <feature>
+      <code>GV72</code>
+      <description>Immaterial value types: empty type support</description>
+   </feature>
+   <feature>
+      <code>GV90</code>
+      <description>Explicit value type nullability</description>
+   </feature>
+</features>

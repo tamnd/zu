@@ -153,6 +153,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         synopsis: &[
             "zu conformance --declare [--format toml|json]",
             "zu conformance --implementation-defined",
+            "zu conformance --statement <tally.json>",
             "zu conformance --verify <report.json>",
             "zu conformance --tally <report.json>",
             "zu conformance --scoreboard <tally.json>...",
@@ -161,6 +162,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         examples: &[
             "zu conformance --declare --format json > report.json",
             "zu conformance --implementation-defined > register.md",
+            "zu conformance --statement docs/conformance/zu.json",
             "zu conformance --regressed report.json baseline.json",
         ],
         see_also: &["corpus"],

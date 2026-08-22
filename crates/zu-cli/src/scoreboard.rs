@@ -28,7 +28,7 @@ use zu_json::{self as json, Json};
 /// them. Fixed here rather than taken from the report so a new kind
 /// appearing upstream is a visible failure instead of a column that
 /// silently goes missing.
-const KINDS: [&str; 5] = [
+pub(crate) const KINDS: [&str; 5] = [
     "mandatory",
     "optional",
     "condition",
@@ -38,27 +38,76 @@ const KINDS: [&str; 5] = [
 
 /// One engine's counts, everything the scoreboard prints and nothing
 /// that changes between two runs of the same code.
-struct Tally {
-    engine: String,
-    version: String,
-    tool: String,
-    host: String,
-    taken: String,
-    selector: String,
-    cases: u64,
-    pass: u64,
-    fail: u64,
-    skip: u64,
-    error: u64,
+pub(crate) struct Tally {
+    pub(crate) engine: String,
+    pub(crate) version: String,
+    pub(crate) tool: String,
+    pub(crate) host: String,
+    pub(crate) taken: String,
+    pub(crate) selector: String,
+    pub(crate) cases: u64,
+    pub(crate) pass: u64,
+    pub(crate) fail: u64,
+    pub(crate) skip: u64,
+    pub(crate) error: u64,
     /// Per kind, in `KINDS` order: cases, pass, fail, skip, error.
-    by_kind: Vec<[u64; 5]>,
+    pub(crate) by_kind: Vec<[u64; 5]>,
     /// ISO features with at least one passing case, and the number of
     /// features the corpus touches at all.
-    features_passing: u64,
-    features_touched: u64,
+    pub(crate) features_passing: u64,
+    pub(crate) features_touched: u64,
     /// Distinct GQLSTATUS values the engine actually produced on a case
     /// that was graded on one.
-    conditions_seen: u64,
+    pub(crate) conditions_seen: u64,
+    /// The codes of the features with a passing case, in code order.
+    ///
+    /// The counts above are what the scoreboard prints; this is what the
+    /// conformance statement is made of, since Clause 24.3 makes every
+    /// optional feature a claim of its own and a claim is a code. It is
+    /// the one list here rather than a count because a statement that
+    /// said "224 features" and named none of them would be unusable by
+    /// the reader it is written for.
+    pub(crate) features_claimed: Vec<String>,
+    /// Features of the standard the corpus can write no portable case
+    /// for, each with the harness's one word reason, in code order.
+    ///
+    /// These are the difference between the features the corpus touches
+    /// and the 228 the standard defines. A statement that quietly
+    /// dropped them would be claiming a denominator it had not measured.
+    pub(crate) features_unwritable: Vec<(String, String)>,
+    /// Every optional feature the standard defines, which is the
+    /// denominator both of the two lists above are read against.
+    pub(crate) features_total: u64,
+    /// GQLSTATUS conditions with a passing case, and the number the
+    /// standard defines.
+    pub(crate) conditions_passing: u64,
+    pub(crate) conditions_total: u64,
+    /// Normative subclauses with a passing case, and the number the
+    /// standard has. This pair and the next are corpus reach rather than
+    /// engine behaviour: a subclause no case cites is one nobody has
+    /// written a case for yet, not one the engine failed.
+    pub(crate) subclauses_passing: u64,
+    pub(crate) subclauses_total: u64,
+    /// Grammar productions with a passing case, and the number the
+    /// published BNF holds.
+    pub(crate) productions_passing: u64,
+    pub(crate) productions_total: u64,
+}
+
+impl Tally {
+    /// The five counts for one kind of case, by name.
+    ///
+    /// By name rather than by index because `KINDS` is this file's
+    /// private order and a reader of the statement next door has no way
+    /// to know that mandatory happens to be first, nor any reason to
+    /// break when it stops being.
+    pub(crate) fn kind(&self, name: &str) -> [u64; 5] {
+        KINDS
+            .iter()
+            .position(|k| *k == name)
+            .and_then(|i| self.by_kind.get(i).copied())
+            .unwrap_or([0; 5])
+    }
 }
 
 fn u(v: Option<&Json>) -> u64 {
@@ -102,14 +151,39 @@ fn distil(report: &Json) -> Result<Tally, String> {
     // headline percentage blurs.
     let mut features_passing = 0;
     let mut features_touched = 0;
+    let mut features_claimed: Vec<String> = Vec::new();
     if let Some(Json::Obj(fs)) = report.get("coverage").and_then(|c| c.get("features")) {
-        for (_, f) in fs {
+        for (code, f) in fs {
             features_touched += 1;
             if u(f.get("pass")) > 0 {
                 features_passing += 1;
+                features_claimed.push(code.clone());
             }
         }
     }
+    features_claimed.sort();
+
+    // The features the corpus itself cannot reach, which the harness
+    // names rather than leaving to be inferred from a gap in the
+    // numbers.
+    let mut features_unwritable: Vec<(String, String)> = Vec::new();
+    if let Some(Json::Arr(us)) = report.get("coverage").and_then(|c| c.get("unwritable")) {
+        for entry in us {
+            features_unwritable.push((s(entry.get("feature")), s(entry.get("reason"))));
+        }
+    }
+    features_unwritable.sort();
+
+    // Conditions, subclauses and productions are counted the same way
+    // features are: one of them is reached when a case citing it passed.
+    let reached = |name: &str| -> u64 {
+        match report.get("coverage").and_then(|c| c.get(name)) {
+            Some(Json::Obj(entries)) => {
+                entries.iter().filter(|(_, e)| u(e.get("pass")) > 0).count() as u64
+            }
+            _ => 0,
+        }
+    };
 
     // Distinct codes the engine produced, counted off the cases rather
     // than off a summary, because a code the engine emitted once is the
@@ -149,6 +223,21 @@ fn distil(report: &Json) -> Result<Tally, String> {
         features_passing,
         features_touched,
         conditions_seen: codes.len() as u64,
+        features_claimed,
+        features_unwritable,
+        features_total: u(report.get("coverage").and_then(|c| c.get("features_total"))),
+        conditions_passing: reached("conditions"),
+        conditions_total: u(report
+            .get("coverage")
+            .and_then(|c| c.get("conditions_total"))),
+        subclauses_passing: reached("subclauses"),
+        subclauses_total: u(report
+            .get("coverage")
+            .and_then(|c| c.get("subclauses_total"))),
+        productions_passing: reached("productions"),
+        productions_total: u(report
+            .get("coverage")
+            .and_then(|c| c.get("productions_total"))),
     })
 }
 
@@ -176,6 +265,49 @@ fn render_tally(t: &Tally) -> String {
         t.features_touched
     ));
     out.push_str(&format!("  \"conditions_seen\": {},\n", t.conditions_seen));
+    out.push_str(&format!("  \"features_total\": {},\n", t.features_total));
+    out.push_str(&format!(
+        "  \"conditions_passing\": {},\n",
+        t.conditions_passing
+    ));
+    out.push_str(&format!(
+        "  \"conditions_total\": {},\n",
+        t.conditions_total
+    ));
+    out.push_str(&format!(
+        "  \"subclauses_passing\": {},\n",
+        t.subclauses_passing
+    ));
+    out.push_str(&format!(
+        "  \"subclauses_total\": {},\n",
+        t.subclauses_total
+    ));
+    out.push_str(&format!(
+        "  \"productions_passing\": {},\n",
+        t.productions_passing
+    ));
+    out.push_str(&format!(
+        "  \"productions_total\": {},\n",
+        t.productions_total
+    ));
+    out.push_str("  \"features_claimed\": [");
+    for (i, code) in t.features_claimed.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{code}\""));
+    }
+    out.push_str("],\n");
+    out.push_str("  \"features_unwritable\": [");
+    for (i, (code, reason)) in t.features_unwritable.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!(
+            "{{\"feature\": \"{code}\", \"reason\": \"{reason}\"}}"
+        ));
+    }
+    out.push_str("],\n");
     out.push_str("  \"by_kind\": {\n");
     for (i, kind) in KINDS.iter().enumerate() {
         let k = &t.by_kind[i];
@@ -236,7 +368,32 @@ fn load_tally(text: &str) -> Result<Tally, String> {
         features_passing: u(j.get("features_passing")),
         features_touched: u(j.get("features_touched")),
         conditions_seen: u(j.get("conditions_seen")),
+        features_claimed: match j.get("features_claimed") {
+            Some(Json::Arr(codes)) => codes.iter().map(|c| s(Some(c))).collect(),
+            _ => Vec::new(),
+        },
+        features_unwritable: match j.get("features_unwritable") {
+            Some(Json::Arr(entries)) => entries
+                .iter()
+                .map(|e| (s(e.get("feature")), s(e.get("reason"))))
+                .collect(),
+            _ => Vec::new(),
+        },
+        features_total: u(j.get("features_total")),
+        conditions_passing: u(j.get("conditions_passing")),
+        conditions_total: u(j.get("conditions_total")),
+        subclauses_passing: u(j.get("subclauses_passing")),
+        subclauses_total: u(j.get("subclauses_total")),
+        productions_passing: u(j.get("productions_passing")),
+        productions_total: u(j.get("productions_total")),
     })
+}
+
+/// Reads a checked-in tally from a file, for the statement renderer next
+/// door, which is made of one engine's tally rather than of a set.
+pub(crate) fn tally_from_file(path: &str) -> Result<Tally, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    load_tally(&text)
 }
 
 /// A percentage of judged cases, to one decimal place, without floats in
@@ -256,6 +413,25 @@ fn pct(pass: u64, judged: u64) -> String {
     format!("{}.{}%", tenths / 10, tenths % 10)
 }
 
+/// Whether every column of the page came out of one sitting.
+///
+/// Four things have to agree for a set of columns to be a comparison
+/// rather than a collection: the day, the machine, the harness build and
+/// the slice of the corpus that was run. A single column is trivially
+/// all of those and no column at all makes no claim either way, so both
+/// count as taken together.
+fn together(tallies: &[Tally]) -> bool {
+    let Some(first) = tallies.first() else {
+        return true;
+    };
+    tallies.iter().all(|t| {
+        t.taken == first.taken
+            && t.host == first.host
+            && t.tool == first.tool
+            && t.selector == first.selector
+    })
+}
+
 /// Renders the scoreboard page.
 fn render_scoreboard(tallies: &[Tally]) -> String {
     let mut out = String::new();
@@ -264,8 +440,24 @@ fn render_scoreboard(tallies: &[Tally]) -> String {
         "Generated by `zu conformance --scoreboard docs/conformance/*.json`. Do not edit by hand: a test regenerates it and fails on drift.\n\n",
     );
     out.push_str(
-        "Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) corpus against one engine, distilled to counts by `zu conformance --tally`. The columns are not measured together and are not meant to be read as a race. They are dated and they name the machine because a number taken somewhere else in another month is worth something, just not the same thing as the one taken this morning. What the table is for is the shape of the gap: which kinds of case an engine answers, which it refuses, and which it never gets to.\n\n",
+        "Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) corpus against one engine, distilled to counts by `zu conformance --tally`. The columns are dated and they name the machine, because a number taken somewhere else in another month is worth something, just not the same thing as the one taken this morning. What the table is for is the shape of the gap: which kinds of case an engine answers, which it refuses, and which it never gets to.\n\n",
     );
+    // Whether the columns were taken together is the first thing a
+    // reader of a comparison wants to know and the last thing they can
+    // work out for themselves, so the page says it rather than leaving
+    // it to be inferred from four rows that happen to match.
+    if tallies.len() < 2 {
+        // One column is not a comparison and no column is not a page,
+        // so there is nothing here to say either way.
+    } else if together(tallies) {
+        out.push_str(
+            "These columns were taken together: same corpus, same harness build, same machine, same day, one engine after another. That is what makes them comparable to each other, and it is a property of this set rather than of the page, which will say so or not say so depending on the tallies it was given.\n\n",
+        );
+    } else {
+        out.push_str(
+            "These columns were not all taken together, so they are not a race. Read the dates and the machines first: two of them measured months apart on different hardware say something about each engine and very little about the difference between them.\n\n",
+        );
+    }
 
     out.push_str("## Where each engine stands\n\n");
     out.push_str("| |");
@@ -641,5 +833,21 @@ mod tests {
         let page = render_scoreboard(&[]);
         assert!(page.contains("# GQL conformance"));
         assert!(page.contains("Drop a `docs/conformance/"));
+    }
+
+    /// One column moving to another day is enough to stop the page
+    /// calling itself a comparison.
+    #[test]
+    fn columns_are_taken_together_only_when_all_four_agree() {
+        let a = sample();
+        let mut b = sample();
+        assert!(together(&[]), "no columns claim nothing either way");
+        assert!(together(std::slice::from_ref(&a)));
+        b.taken = "2026-01-01".to_string();
+        let page = render_scoreboard(&[a, b]);
+        assert!(
+            page.contains("were not all taken together"),
+            "a column from another day still read as a race"
+        );
     }
 }

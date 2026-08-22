@@ -17,10 +17,11 @@
 //! Run: cargo bench -p xtask --bench artifacts
 
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use xtask::artifacts::{PATH, Table, tier1};
+use xtask::scratch::Scratch;
 
 fn main() {
     println!("{:>9}  {:>9}  {:>9}", "rows", "parse ms", "us/row");
@@ -73,7 +74,6 @@ fn main() {
             );
         }
         per_file = Some((rows, us));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Cargo runs a bench from the package directory, so the tree is two
@@ -114,11 +114,8 @@ fn table(rows: usize) -> String {
 /// A release directory holding exactly what that table publishes, which
 /// is the case with no faults in it and therefore the one that does the
 /// most work before answering.
-fn release(table: &Table, rows: usize) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("zu-artifacts-bench-{}-{rows}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the scratch dir is writable");
+fn release(table: &Table, rows: usize) -> Scratch {
+    let dir = Scratch::new(&format!("artifacts-bench-{rows}"));
     for name in table.names("0.5.0", &[]) {
         std::fs::write(dir.join(name), b"{}\n").expect("writes");
     }

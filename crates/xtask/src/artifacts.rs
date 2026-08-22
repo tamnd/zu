@@ -687,6 +687,8 @@ mod tests {
 
     use std::path::PathBuf;
 
+    use crate::scratch::Scratch;
+
     const TABLE: &str = concat!(
         "schema = 1\n",
         "doc = \"What a release publishes.\"\n",
@@ -734,7 +736,7 @@ mod tests {
 
     /// A release of the `summed` table, assembled into a fresh
     /// directory, which is what the digest tests all start from.
-    fn released(name: &str) -> (PathBuf, PathBuf, Vec<String>) {
+    fn released(name: &str) -> (Scratch, PathBuf, Vec<String>) {
         let dir = scratch(name);
         let root = dir.join("tree");
         let built = dir.join("built");
@@ -755,11 +757,8 @@ mod tests {
     }
 
     /// A scratch tree, so a test can assemble into something.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zu-artifacts-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("artifacts-{name}"))
     }
 
     #[test]
@@ -862,7 +861,6 @@ mod tests {
             notes.iter().any(|n| matches!(n, Note::Unheld { .. })),
             "a tree with no release workflow holds the table to nothing: {notes:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -899,7 +897,6 @@ mod tests {
         let tar = zstd::bulk::decompress(&archive, 1 << 20).expect("unpacks");
         let names: Vec<String> = tarball::entries(&tar).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["libzu-x86_64-apple-darwin/libzu.dylib"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The install check assembles the release of the one platform its
@@ -937,7 +934,6 @@ mod tests {
                 name: "libzu-x86_64-apple-darwin.tar.zst".to_string()
             }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -958,7 +954,6 @@ mod tests {
             }),
             "{faults:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -979,7 +974,6 @@ mod tests {
             )
             .expect_err("an empty build directory");
         assert!(error.contains("built nothing"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -993,7 +987,6 @@ mod tests {
                 "{version:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The digest list is the file an installer reads before it reads
@@ -1002,7 +995,10 @@ mod tests {
     /// no line for itself, which nothing could check.
     #[test]
     fn the_release_carries_the_digest_of_everything_it_publishes() {
-        let (dir, out, targets) = released("sums");
+        // Bound and not dropped: the scratch owns the tree `out` is
+        // in, and `_` rather than `_dir` would take it away before
+        // the check runs.
+        let (_dir, out, targets) = released("sums");
         let text = std::fs::read_to_string(out.join("SHA256SUMS")).expect("reads");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
@@ -1021,7 +1017,6 @@ mod tests {
         let (shipped, faults) = summed().verify(&out, "0.5.0", &targets).expect("verifies");
         assert_eq!(faults, [] as [Fault; 0]);
         assert_eq!(shipped.len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The failure this check exists for: an artifact rebuilt after the
@@ -1029,7 +1024,10 @@ mod tests {
     /// release should catch here instead.
     #[test]
     fn a_file_that_is_not_what_its_digest_says_stops_the_release() {
-        let (dir, out, targets) = released("mismatch");
+        // Bound and not dropped: the scratch owns the tree `out` is
+        // in, and `_` rather than `_dir` would take it away before
+        // the check runs.
+        let (_dir, out, targets) = released("mismatch");
         std::fs::write(out.join("zu.h"), "#define ZU 2\n").expect("writes");
         let (_, faults) = summed().verify(&out, "0.5.0", &targets).expect("verifies");
         assert_eq!(
@@ -1056,7 +1054,6 @@ mod tests {
                 name: "zu.h".to_string()
             }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

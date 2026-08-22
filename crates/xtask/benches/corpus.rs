@@ -27,10 +27,11 @@
 //! Run: cargo bench -p xtask --bench corpus
 
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use xtask::corpus;
+use xtask::scratch::Scratch;
 
 fn main() {
     println!(
@@ -63,7 +64,6 @@ fn main() {
             );
         }
         previous = Some((cases, us));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -88,10 +88,8 @@ fn main() {
 /// more than one file to walk. The text repeats far more than real
 /// cases do, which is what inflates the ratio and is why only the
 /// timing column of this fixture is worth reading.
-fn fixture(cases: usize) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zu-pack-bench-{}-{cases}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+fn fixture(cases: usize) -> Scratch {
+    let dir = Scratch::new(&format!("pack-bench-{cases}"));
     let suites = 10;
     for suite in 0..suites {
         let mut text = format!(

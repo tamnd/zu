@@ -8,6 +8,7 @@
 
 use xtask::model;
 use xtask::rustdoc::{CrateDoc, FORMAT_VERSION};
+use xtask::scratch::Scratch;
 
 /// Builds a rustdoc document out of an id-to-item map and a path table,
 /// so a fixture below is just the items it is about.
@@ -495,8 +496,7 @@ fn entities_come_out_sorted_and_the_bytes_do_not_move() {
 
 #[test]
 fn a_rustdoc_format_we_do_not_know_is_refused_rather_than_half_read() {
-    let dir = std::env::temp_dir().join("zu-xtask-format");
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = Scratch::new("xtask-format");
     let path = dir.join("future.json");
     std::fs::write(
         &path,

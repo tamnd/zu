@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use xtask::scratch::Scratch;
 use xtask::{sha256, tarball};
 
 /// The triple this test binary was built for, which is the triple the
@@ -41,17 +42,10 @@ fn target() -> String {
     }
 }
 
-/// A directory nothing else is writing to. The same argument the CLI's
-/// corpus command makes: `tempfile` is not a dependency of this crate
-/// and one process id and one counter are enough.
-fn tempdir(what: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("zu-install-{what}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("a temp dir");
-    path
+/// A directory nothing else is writing to, gone when the test that made
+/// it is done with it.
+fn tempdir(what: &str) -> Scratch {
+    Scratch::new(&format!("install-{what}"))
 }
 
 fn root() -> PathBuf {
@@ -69,7 +63,7 @@ fn root() -> PathBuf {
 /// one, because what is under test is the installing and not the
 /// program: a real binary would make this test cost a release build and
 /// tell it nothing it does not already learn from four lines of sh.
-fn release(target: &str) -> PathBuf {
+fn release(target: &str) -> Scratch {
     let dir = tempdir("release");
     let archive = format!("libzu-{target}.tar.zst");
     let files = vec![

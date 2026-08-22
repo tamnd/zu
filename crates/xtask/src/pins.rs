@@ -559,6 +559,8 @@ fn strip_comment(line: &str) -> &str {
 mod tests {
     use super::*;
 
+    use crate::scratch::Scratch;
+
     const TABLE: &str = concat!(
         "schema = 1\n",
         "doc = \"The versions zu builds against.\"\n",
@@ -586,9 +588,8 @@ mod tests {
     /// A tree with these files in it, plus the workflow directory the
     /// backward check reads. The name keeps two tests running at once
     /// out of one directory.
-    fn tree(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("zu-pins-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn tree(name: &str, files: &[(&str, &str)]) -> Scratch {
+        let dir = Scratch::new(&format!("pins-{name}"));
         std::fs::create_dir_all(dir.join(".github/workflows"))
             .expect("the scratch dir is writable");
         for (name, text) in files {
@@ -608,7 +609,6 @@ mod tests {
             &[("rust-toolchain.toml", "[toolchain]\nchannel = \"1.97.1\"\n")],
         );
         assert_eq!(table().check(&dir).expect("checks"), []);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -624,7 +624,6 @@ mod tests {
             "{}",
             notes[0]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -640,7 +639,6 @@ mod tests {
             "{}",
             notes[0]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -662,7 +660,6 @@ mod tests {
             "{}",
             notes[0]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -678,7 +675,6 @@ mod tests {
             ],
         );
         assert_eq!(table().check(&dir).expect("checks"), []);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -695,7 +691,6 @@ mod tests {
             ],
         );
         assert_eq!(table().check(&dir).expect("checks"), []);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -716,7 +711,6 @@ mod tests {
             "{}",
             notes[0]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -731,7 +725,6 @@ mod tests {
             &[("rust-toolchain.toml", "channel = \"1.97.1\"\n")],
         );
         assert_eq!(table.check(&dir).expect("checks"), []);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

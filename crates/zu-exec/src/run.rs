@@ -3898,32 +3898,55 @@ impl<'a> Worker<'a> {
             SinkSpec::Rows { items, .. } if self.sink.cols.is_some() => {
                 self.push_columns(items, set)
             }
-            SinkSpec::Rows { items, .. } => {
+            // Under a LIMIT the buffer judges a row on its sort keys
+            // alone, and no row is built until the chunk is over: a
+            // loser is rejected on one compare and a winner the rest of
+            // the chunk beats is dropped before anything materializes
+            // it. What is left to build is k rows per chunk.
+            SinkSpec::Rows { items, .. } if self.sink.top.is_some() => {
                 let plan = self.plan;
                 let last = set.chunks.len() - 1;
                 for pos in active_positions(&set.chunks[last]) {
                     let at = (self.morsel as u32, self.local_rows as u32);
                     self.local_rows += 1;
-                    // Under a LIMIT the buffer judges the row on its
-                    // sort keys alone, and a row that loses to the k it
-                    // already holds is never built.
-                    if let Some(top) = self.sink.top.as_mut() {
-                        self.keybuf.clear();
-                        for key in top.keys() {
-                            self.keybuf.push(scalar(plan, set, items[key.expr], pos)?);
-                        }
-                        if !top.wants(&self.keybuf) {
-                            continue;
-                        }
+                    let top = self.sink.top.as_mut().expect("matched above");
+                    self.keybuf.clear();
+                    for key in top.keys() {
+                        self.keybuf.push(scalar(plan, set, items[key.expr], pos)?);
                     }
+                    let top = self.sink.top.as_mut().expect("matched above");
+                    if top.wants(&self.keybuf) {
+                        top.stage(&self.keybuf, at, pos as u32);
+                    }
+                }
+                let owed = self
+                    .sink
+                    .top
+                    .as_mut()
+                    .expect("matched above")
+                    .settle()
+                    .len();
+                for nth in 0..owed {
+                    let top = self.sink.top.as_mut().expect("matched above");
+                    let pos = top.owed_at(nth);
+                    let mut row = top.row_buffer(items.len());
+                    for &r in items {
+                        row.push(scalar(plan, set, r, pos)?);
+                    }
+                    self.sink.top.as_mut().expect("matched above").owe(nth, row);
+                }
+                Ok(())
+            }
+            SinkSpec::Rows { items, .. } => {
+                let plan = self.plan;
+                let last = set.chunks.len() - 1;
+                for pos in active_positions(&set.chunks[last]) {
+                    self.local_rows += 1;
                     let mut row = Vec::with_capacity(items.len());
                     for &r in items {
                         row.push(scalar(plan, set, r, pos)?);
                     }
-                    match self.sink.top.as_mut() {
-                        Some(top) => top.keep(&self.keybuf, at, row),
-                        None => self.sink.rows.push(row),
-                    }
+                    self.sink.rows.push(row);
                 }
                 Ok(())
             }

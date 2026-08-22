@@ -1751,14 +1751,14 @@ impl RowPatch {
             let full = std::mem::replace(&mut self.tail, Arc::new(Vec::with_capacity(PATCH_CHUNK)));
             if let Some(col) = self.key {
                 // Built once, as the chunk is sealed, rather than on
-                // the lookups that read it. The first row wins where
-                // two hold the same word, which is the row the walk
-                // this replaces would have stopped at.
+                // the lookups that read it. The last row wins where two
+                // hold the same word, for the reason [`Self::row_with`]
+                // reads the run backwards.
                 let first = self.base + (self.chunks.len() * PATCH_CHUNK) as u64;
                 let mut index = HashMap::with_capacity(full.len());
                 for (at, cells) in full.iter().enumerate() {
                     if let Some(Cell::Int(word)) = cells.get(col) {
-                        index.entry(*word).or_insert(first + at as u64);
+                        index.insert(*word, first + at as u64);
                     }
                 }
                 Arc::make_mut(&mut self.keyed).push(Arc::new(index));
@@ -1835,7 +1835,7 @@ impl RowPatch {
         }
     }
 
-    /// The row whose `col` holds `word`, `None` when none of them
+    /// The last row whose `col` holds `word`, `None` when none of them
     /// does.
     ///
     /// This is the key index for the rows nothing has folded yet. A
@@ -1843,6 +1843,13 @@ impl RowPatch {
     /// so the rows in here are in no index, and what the fold would
     /// have put in one is the value each of them holds in the table's
     /// `id` column.
+    ///
+    /// The last rather than the first, because a run of deferred
+    /// commits can hold one key twice: a row takes a key, goes away,
+    /// and a row after it takes the key the first one left free. Only
+    /// one of them is a row that is still there, and it is the last,
+    /// because a key is only free to be taken again once the row
+    /// holding it has gone and a row that has gone does not come back.
     ///
     /// The sealed chunks answer out of the index each of them built as
     /// it was sealed, and the chunk being filled is walked, so what a
@@ -1852,19 +1859,28 @@ impl RowPatch {
     /// what the fold's own index is for.
     pub fn row_with(&self, col: usize, word: u64) -> Option<u64> {
         if self.key != Some(col) {
-            return self
-                .all()
-                .position(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
-                .map(|at| self.base + at as u64);
-        }
-        if let Some(row) = self.keyed.iter().find_map(|index| index.get(&word)) {
-            return Some(*row);
+            let mut found = None;
+            for (at, cells) in self.all().enumerate() {
+                if matches!(cells.get(col), Some(Cell::Int(held)) if *held == word) {
+                    found = Some(self.base + at as u64);
+                }
+            }
+            return found;
         }
         let first = self.base + (self.chunks.len() * PATCH_CHUNK) as u64;
-        self.tail
+        let tail = self
+            .tail
             .iter()
-            .position(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
-            .map(|at| first + at as u64)
+            .rposition(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
+            .map(|at| first + at as u64);
+        if tail.is_some() {
+            return tail;
+        }
+        self.keyed
+            .iter()
+            .rev()
+            .find_map(|index| index.get(&word))
+            .copied()
     }
 
     /// The rows of this patch that fall in `lo..hi`, which is what a
@@ -2690,16 +2706,16 @@ mod tests {
         assert_eq!(patch.row_with(0, 1000 + rows as u64), None);
 
         // A column that is not the key one is walked, and a word every
-        // row holds answers with the first of them either way.
-        assert_eq!(patch.row_with(1, 7), Some(100));
+        // row holds answers with the last of them either way.
+        assert_eq!(patch.row_with(1, 7), Some(100 + rows as u64 - 1));
         assert_eq!(patch.row_with(1, 8), None);
     }
 
-    /// Two rows under one key answer with the first, which is where a
-    /// walk of them would have stopped, whichever side of a seal the
-    /// pair falls.
+    /// Two rows under one key answer with the second, which is the only
+    /// one that can still be there, whichever side of a seal the pair
+    /// falls.
     #[test]
-    fn a_repeated_key_answers_with_the_row_that_took_it_first() {
+    fn a_repeated_key_answers_with_the_row_that_took_it_last() {
         let mut words: Vec<u64> = (0..PATCH_CHUNK * 2 + 3)
             .map(|at| 1000 + at as u64)
             .collect();
@@ -2713,14 +2729,14 @@ mod tests {
         for word in &words {
             patch.push(vec![Cell::Int(*word)]);
         }
-        assert_eq!(patch.row_with(0, words[0]), Some(0));
+        assert_eq!(patch.row_with(0, words[0]), Some(1));
         assert_eq!(
             patch.row_with(0, words[PATCH_CHUNK]),
-            Some(PATCH_CHUNK as u64 - 1)
+            Some(PATCH_CHUNK as u64)
         );
         assert_eq!(
             patch.row_with(0, words[PATCH_CHUNK * 2 + 1]),
-            Some(PATCH_CHUNK as u64 + 2)
+            Some(PATCH_CHUNK as u64 * 2 + 1)
         );
     }
 

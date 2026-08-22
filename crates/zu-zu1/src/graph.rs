@@ -1629,10 +1629,18 @@ impl EdgePatch {
     }
 
     /// Takes one edge and answers with the ordinal it was given.
+    ///
+    /// A pair the dead set holds comes out of it, so that a pair is
+    /// ever only in one of the two. The file holds no copy of one that
+    /// gets this far, because a pair it does hold is refused before it
+    /// is added, so there is nothing in the dead set for a reader still
+    /// to want.
     pub fn add(&mut self, src: u64, dst: u64) -> u64 {
         let ord = self.base + self.added;
         put(&mut self.fwd, src, dst, ord);
         put(&mut self.bwd, dst, src, ord);
+        self.dead.remove(&(src, dst));
+        self.dead_bwd.remove(&(dst, src));
         self.added += 1;
         ord
     }
@@ -1645,7 +1653,21 @@ impl EdgePatch {
 
     /// Takes one edge away, by the pair it runs between, which is every
     /// copy of it the file holds.
+    ///
+    /// A pair this patch added itself comes out of the lists instead of
+    /// going into the dead set, because the file holds no copy of it to
+    /// be told about: a pair the file already runs through is refused
+    /// before it is ever added here. The ordinal it took stays spent,
+    /// and so does the row of edge properties that went with it. Both
+    /// are only ever reached through the lists this drops it from, and
+    /// the next edge takes the next ordinal either way, so what is left
+    /// behind is a row nothing reads rather than a hole in a run
+    /// something counts on.
     pub fn remove(&mut self, src: u64, dst: u64) {
+        if take(&mut self.fwd, src, dst) {
+            take(&mut self.bwd, dst, src);
+            return;
+        }
         self.dead.insert((src, dst));
         self.dead_bwd.insert((dst, src));
     }
@@ -1675,6 +1697,15 @@ impl EdgePatch {
         let list = self.of(src, Direction::Fwd);
         let at = list.partition_point(|&(n, _)| n < dst);
         list.get(at).is_some_and(|&(n, _)| n == dst)
+    }
+
+    /// The neighbors `node` has in `dir` that this patch put there,
+    /// which are exactly the ones no read of the file turns up. A
+    /// writer deciding whether a row can go asks this beside the file's
+    /// own list, because between the two is the whole list a fold would
+    /// have found on the row.
+    pub fn adds_on(&self, node: u64, dir: Direction) -> impl Iterator<Item = u64> + '_ {
+        self.of(node, dir).iter().map(|&(other, _)| other)
     }
 
     /// Whether this has taken away the edges between `node` and `other`,
@@ -1733,6 +1764,24 @@ fn put(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64, ord: u6
     let list = side.entry(node).or_default();
     let at = list.partition_point(|&(n, o)| (n, o) < (other, ord));
     list.insert(at, (other, ord));
+}
+
+/// Takes every copy of a pair back out of one side's list, and answers
+/// whether there was one, which is what says the pair was this patch's
+/// own rather than the file's. The node's entry goes when its list
+/// empties, because an entry that is there at all is what the reads
+/// take to mean the patch has something to say about that list.
+fn take(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64) -> bool {
+    let Some(list) = side.get_mut(&node) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|&(n, _)| n != other);
+    let took = list.len() < before;
+    if list.is_empty() {
+        side.remove(&node);
+    }
+    took
 }
 
 /// Copies a stretch of `node`'s list onto the end of a group being
@@ -1860,9 +1909,10 @@ impl GraphReader {
     /// the id is allowed to be.
     ///
     /// `None` is a row appended since the CSR was built, which is a
-    /// real row of a real table with nowhere in the CSR to be. It has
-    /// no edges, because an edge onto it is a fold, so every caller
-    /// answers it with the empty list its own return shape spells.
+    /// real row of a real table with nowhere in the CSR to be. The file
+    /// holds none of its edges, so every caller answers it out of the
+    /// patch alone, which for a row nothing has been linked to is the
+    /// empty list its own return shape spells.
     fn locate(&self, node: u64, dir: Direction) -> Result<Option<(usize, usize)>> {
         let rows = self.directory.rows(dir);
         if node >= rows {
@@ -2188,7 +2238,11 @@ impl GraphReader {
     /// the neighbor values never decode for a count.
     pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
         let Some((g, row)) = self.locate(node, dir)? else {
-            return Ok(0);
+            // A row appended since the CSR was built is in no group, so
+            // its whole degree is what the patch put on it. Nothing can
+            // have been taken off it, because nothing but the patch ever
+            // put anything on.
+            return Ok(self.added(node, dir) as u64);
         };
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
@@ -2317,14 +2371,16 @@ impl GraphReader {
         dir: Direction,
         out: &mut Vec<u64>,
     ) -> Result<()> {
-        let Some((g, row)) = self.locate(node, dir)? else {
-            return Ok(());
-        };
-        let meta = self.directory.groups[g].dir(dir);
-        let mut offs = Vec::with_capacity(2);
-        read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
         let from = out.len();
-        read_range(db, &meta.neighbors, offs[0], offs[1], out)?;
+        // A row appended since the CSR was built is in no group and the
+        // file holds none of its edges, so the read below is skipped and
+        // the merge that follows is the whole answer.
+        if let Some((g, row)) = self.locate(node, dir)? {
+            let meta = self.directory.groups[g].dir(dir);
+            let mut offs = Vec::with_capacity(2);
+            read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
+            read_range(db, &meta.neighbors, offs[0], offs[1], out)?;
+        }
         // The unfolded edges go into the list they belong in rather than
         // on the end of it, because the caller is owed a sorted list and
         // reads it as one. Each goes after the run of its own value, so

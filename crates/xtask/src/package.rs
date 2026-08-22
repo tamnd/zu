@@ -707,13 +707,19 @@ mod tests {
         sorted.sort();
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
-        // dx/02 §8 is the v0.5 restructure, and the error model, the
+        // The number a binding tests for when it wants to know whether
+        // a call it needs is there. dx/02 §8 is the v0.5 restructure,
+        // and everything since has been additive: the error model, the
         // cancellation calls, the transaction boundaries, the appender,
-        // the diagnostics and the frames added to it are all additive,
-        // so this is 0.12: the number a binding tests for when it wants
-        // to know whether zu_result_arrow is there. The two parts are
-        // counts rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.13".to_string(), "0.13".to_string()));
+        // the diagnostics, the frames, the table a node came out of, and
+        // at 0.14 the byte string. The two parts are counts and not a
+        // decimal, so 0.10 is the one after 0.9.
+        //
+        // Written out rather than read from the constant the header is
+        // generated from, which would agree with itself whatever it
+        // said. Moving the ABI is a deliberate act and this is the line
+        // that makes it one.
+        assert_eq!(abi.revision, ("0.14".to_string(), "0.14".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

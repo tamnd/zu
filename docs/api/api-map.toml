@@ -247,6 +247,11 @@ tier = 3
 reason = "where a row writes its fields on the way into the column buffers, an implementation detail of that trait and never named by a caller"
 
 [[group]]
+prefix = "zu::bytes"
+tier = 2
+reason = "how a byte string is written down and read back, X'00AB' by ISO 21.3. A binding that hands its user the octets never needs it, and one that renders a result as text does: the spelling is the same in every language and a client that invented its own would print a value no other client reads back"
+
+[[group]]
 prefix = "zu::catalog_stmt"
 tier = 3
 reason = "applying a catalog statement to an open file, which a caller reaches by running the statement"

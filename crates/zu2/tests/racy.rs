@@ -12,9 +12,12 @@
 //! disagrees is the engine losing a write, not a race in the test.
 //!
 //! `ZU2_RACY_OPS` sets how many operations a thread does. The default is
-//! what a run on a laptop gets through without the writers outrunning
-//! compaction, and at 100000 they do outrun it and the run fails with
-//! `LogFull`, which is #566 and not a correctness failure.
+//! what a run on a laptop gets through quickly, and it is a floor rather
+//! than a ceiling now: a writer that outran compaction used to end the
+//! run with `LogFull` at 100000, which was #566, and every write path
+//! makes room and goes round again since #566 and #593. A soak at
+//! 1000000 a thread passes in ten seconds in release, which is the run
+//! worth doing after anything touches the log or a pass.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

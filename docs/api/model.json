@@ -9199,7 +9199,7 @@
       "name": "add",
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn add(&mut self, src: u64, dst: u64) -> u64",
-      "doc": "Takes one edge and answers with the ordinal it was given."
+      "doc": "Takes one edge and answers with the ordinal it was given.\n\nA pair the dead set holds comes out of it, so that a pair is\never only in one of the two. The file holds no copy of one that\ngets this far, because a pair it does hold is refused before it\nis added, so there is nothing in the dead set for a reader still\nto want."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::adds",
@@ -9208,6 +9208,14 @@
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn adds(&self) -> u64",
       "doc": "How many edges this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::adds_on",
+      "kind": "method",
+      "name": "adds_on",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn adds_on(&self, node: u64, dir: Direction) -> impl Iterator",
+      "doc": "The neighbors `node` has in `dir` that this patch put there,\nwhich are exactly the ones no read of the file turns up. A\nwriter deciding whether a row can go asks this beside the file's\nown list, because between the two is the whole list a fold would\nhave found on the row."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::base",
@@ -9255,7 +9263,7 @@
       "name": "remove",
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn remove(&mut self, src: u64, dst: u64)",
-      "doc": "Takes one edge away, by the pair it runs between, which is every\ncopy of it the file holds."
+      "doc": "Takes one edge away, by the pair it runs between, which is every\ncopy of it the file holds.\n\nA pair this patch added itself comes out of the lists instead of\ngoing into the dead set, because the file holds no copy of it to\nbe told about: a pair the file already runs through is refused\nbefore it is ever added here. The ordinal it took stays spent,\nand so does the row of edge properties that went with it. Both\nare only ever reached through the lists this drops it from, and\nthe next edge takes the next ordinal either way, so what is left\nbehind is a row nothing reads rather than a hole in a run\nsomething counts on."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::removed",
@@ -10437,7 +10445,7 @@
       "name": "row_with",
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn row_with(&self, col: usize, word: u64) -> Option<u64>",
-      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column.\n\nThe sealed chunks answer out of the index each of them built as\nit was sealed, and the chunk being filled is walked, so what a\nlookup costs is a probe per sealed chunk and a walk of at most\n[`PATCH_CHUNK`] rows. Asked about any other column it walks the\nwhole run, which is what it used to do for every column and is\nwhat the fold's own index is for."
+      "doc": "The last row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column.\n\nThe last rather than the first, because a run of deferred\ncommits can hold one key twice: a row takes a key, goes away,\nand a row after it takes the key the first one left free. Only\none of them is a row that is still there, and it is the last,\nbecause a key is only free to be taken again once the row\nholding it has gone and a row that has gone does not come back.\n\nThe sealed chunks answer out of the index each of them built as\nit was sealed, and the chunk being filled is walked, so what a\nlookup costs is a probe per sealed chunk and a walk of at most\n[`PATCH_CHUNK`] rows. Asked about any other column it walks the\nwhole run, which is what it used to do for every column and is\nwhat the fold's own index is for."
     },
     {
       "id": "zu::zu1::props::list_elements",

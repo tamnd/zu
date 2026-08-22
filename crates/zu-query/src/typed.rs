@@ -14,12 +14,10 @@
 //! so `NULL IS TYPED NOTHING` is false even though every other type
 //! written without `NOT NULL` admits a null.
 //!
-//! What is missing here is missing from the value model rather than
-//! from this module. zu has no byte string value, so a byte string
-//! type is inhabited by nothing at runtime and the predicate says
-//! false rather than pretending. That answer changes when the value
-//! arrives, and the corpus cases that ask it are written over integers
-//! so they stay honest either way.
+//! A byte string is answered the way a character string is, by the
+//! length rather than by the contents, and `BINARY(n)` is the pair of
+//! bounds `n` and `n` the same way `CHAR(n)` is. The length is counted
+//! in octets, which is the unit the type is declared in.
 
 use zu_common::{IntBits, LogicalType};
 
@@ -53,10 +51,16 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
         LogicalType::Union(members) => members.iter().any(|m| material(v, m)),
         LogicalType::Any => true,
         // GV68. A property holds a scalar, and the reference and
-        // constructed types are the ones it cannot hold.
+        // constructed types are the ones it cannot hold. A byte string
+        // is on the list because a property may be stored as one.
         LogicalType::AnyProperty => matches!(
             v,
-            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Temporal(_)
+            Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Str(_)
+                | Value::Bytes(_)
+                | Value::Temporal(_)
         ),
         // GV71 and GV72. The null type has one value and this is not
         // it, and the empty type has none.
@@ -83,7 +87,13 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
             Value::Str(s) => within(s.chars().count(), *min, *max),
             _ => false,
         },
-        LogicalType::Bytes { .. } => false,
+        // The length of a byte string is its octet count, so a fixed
+        // `BINARY(n)` admits exactly the strings of that many octets
+        // and `BYTES(n)` admits the shorter ones too.
+        LogicalType::Bytes { min, max, .. } => match v {
+            Value::Bytes(b) => within(b.len(), *min, *max),
+            _ => false,
+        },
 
         // A temporal value knows which of the six it is, and the two
         // duration kinds are two types rather than one, so a day time
@@ -256,6 +266,36 @@ mod tests {
                 fixed: false,
             })
         ));
+    }
+
+    /// A byte string and a character string are two types and neither
+    /// admits the other's values, which is the answer `X'01AF'` needs
+    /// and the one it did not get while the predicate was written
+    /// before the value existed.
+    #[test]
+    fn a_byte_string_belongs_to_a_byte_string_type_and_to_no_other() {
+        let bytes = |min, max, fixed| LogicalType::Bytes { min, max, fixed };
+        let two = Value::Bytes(vec![0x01, 0xAF]);
+        assert!(is_of(&two, &bytes(None, None, false)));
+        assert!(is_of(&two, &bytes(Some(2), Some(2), true)));
+        assert!(is_of(&two, &bytes(None, Some(4), false)));
+        assert!(!is_of(&two, &bytes(Some(3), Some(3), true)));
+        assert!(!is_of(&two, &bytes(None, Some(1), false)));
+        assert!(!is_of(
+            &two,
+            &LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            }
+        ));
+        assert!(!is_of(
+            &Value::Str("01AF".into()),
+            &bytes(None, None, false)
+        ));
+        // A property may be stored as a byte string, so the type that
+        // admits every property value admits this one.
+        assert!(is_of(&two, &LogicalType::AnyProperty));
     }
 
     #[test]

@@ -141,7 +141,13 @@ fn run(what: &str, promote: bool, draw: Draw, preheat: bool) {
     }
     // Everything that was going to move has moved, so the two rows are
     // over the same file rather than over whatever a pass had reached.
-    std::thread::sleep(Duration::from_secs(20));
+    // A sleep is not that: it gives the background thread time and no
+    // guarantee, and the share of the file that ends up in the tier then
+    // varies from 2 to 35 percent across identical runs, which is more
+    // than anything measured here. `compact` runs both passes until
+    // neither moves anything, so it is the fixed point a measurement
+    // wants to start from. #600.
+    db.compact().expect("settle the tier");
 
     let mut heated = 0;
     if preheat {

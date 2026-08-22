@@ -53,7 +53,7 @@ use zu::zu1::graph::{
     Direction, GraphReader, bulk_load_keyed, densify_keyed, read_key_edge_list, read_key_list,
 };
 use zu::zu1::props::{PropValues, store_props};
-use zu_query::exec::Value;
+use zu_query::exec::{Engine, Options, Value, Wcoj};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -394,16 +394,23 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
     // The default path above is the WCOJ intersection now that the
     // optimizer marks the cyclic close, so the gate rides it. The
     // binary join stays measured as the regression reference, pinned
-    // with ZU_WCOJ=0. The bench runs single threaded through main, so
-    // the process-global variable is safe.
-    unsafe { std::env::set_var("ZU_WCOJ", "0") };
+    // per call rather than through ZU_WCOJ: what a bench measures
+    // should not depend on what else is in the environment when it
+    // runs, and the two numbers printed here differ by the join and
+    // nothing else (#513).
+    let pinned = Options {
+        engine: Engine::Pipeline,
+        wcoj: Wcoj::Off,
+        ..Options::default()
+    };
+    let binary = |db: &mut _| zu::query::run_with(source, db, &[], &pinned);
     for _ in 0..3 {
-        zu::query::run(source, &mut db, &[]).expect("binary warmup run");
+        binary(&mut db).expect("binary warmup run");
     }
     let mut blat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("binary triangle count");
+        let r = binary(&mut db).expect("binary triangle count");
         blat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -411,7 +418,6 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
             "binary triangle count disagrees with the edge list reference"
         );
     }
-    unsafe { std::env::remove_var("ZU_WCOJ") };
     blat.sort_unstable();
     println!(
         "sf1 triangle count (binary): p50 {:.3} ms, max {:.3} ms over {runs} runs",

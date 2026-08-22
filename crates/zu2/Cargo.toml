@@ -1,0 +1,33 @@
+[package]
+name = "zu2"
+description = "Record plane for zu: a hash index over a hybrid log"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+# For the storage column in the ycsb bench: zu1 is the engine zu2 has to
+# beat on bytes as well as on operations. A dev dependency only, and it
+# is not a cycle because zu1 knows nothing about zu2.
+zu-zu1.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "ycsb"
+harness = false
+
+[[bench]]
+name = "traverse"
+harness = false

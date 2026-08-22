@@ -13,22 +13,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The two jobs that read the source rather than run it, and the two
+  # that install no toolchain of their own. rust-toolchain.toml names
+  # the version and names rustfmt and clippy beside it, so cargo's
+  # first call here installs exactly that and these jobs say what a
+  # developer's own checkout says. The rust action would set
+  # RUSTUP_TOOLCHAIN, which wins over that file, and its default is the
+  # floating stable. That is what turned somebody else's release day
+  # into a red main: 1.98 added chunks_exact_to_as_chunks and failed
+  # five sites in zu-vector that nobody had touched, and the fix it
+  # asked for is a method that is not stable on the version this
+  # workspace builds with. What rustfmt and clippy say is part of the
+  # toolchain, so it moves when the pin moves and not before (#489).
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust
-        with:
-          components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -68,6 +74,16 @@ jobs:
         with:
           toolchain: nightly-2026-08-14
       - uses: Swatinem/rust-cache@v2
+      # The generator reads the JSON rustdoc leaves in target/doc, and
+      # the cache above restores that directory after the checkout, so
+      # its files carry a newer timestamp than the sources they were
+      # built from and cargo calls them fresh. rustdoc then never runs
+      # and the model is checked against whatever the API looked like
+      # when the cache was filled. That is not hypothetical: fifty
+      # public names from #405 lived outside the model for weeks with
+      # this job green. Taking the directory away costs one rustdoc run
+      # and is the difference between a gate and a decoration (#488).
+      - run: rm -rf target/doc
       # docs/api/model.json is what the reference pages, the SDK
       # feature matrix, zu.h and the api-map.toml completeness check
       # are all generated from, so it is committed and this job holds

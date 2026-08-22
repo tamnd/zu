@@ -372,6 +372,39 @@ static void a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a
 /* A node and an edge carry a name and the rows they are, which is what
  * a case can assert about them: the id in the value is a number the
  * file decided and every client builds its own file. */
+/* A byte string is the octets its hexits name and not the text of the
+ * hexits, which is the misread the cases are written to catch. */
+static void a_byte_string_is_decoded_into_octets_and_not_kept_as_its_hexits(void) {
+    cv b = ok("type: BYTES\nvalue: \"00AB00\"\n");
+    check(b.kind == CV_BYTES && b.as.bytes.len == 3, "three octets");
+    check(b.as.bytes.ptr[0] == 0 && (unsigned char)b.as.bytes.ptr[1] == 0xAB &&
+              b.as.bytes.ptr[2] == 0,
+          "the octets the hexits name, zeros and all");
+    check_show(&b, "BYTES \"00AB00\"", "printed back as upper case hexits");
+    /* Both cases of hexit spell the same octets, so the two decode to
+     * one value. A reader that kept the source text would answer that
+     * they are two, which is the whole of the case above at line 966 of
+     * conformance/cases/string.yaml. */
+    {
+        cv lower = ok("type: BYTES\nvalue: \"00ab\"\n");
+        cv upper = ok("type: BYTES\nvalue: \"00AB\"\n");
+        check(cv_same(&lower, &upper), "either case of hexit is one value");
+        check(!cv_same(&lower, &b), "and different octets are not");
+    }
+    /* The empty byte string is a value the way the empty string is. */
+    b = ok("type: BYTES\nvalue: \"\"\n");
+    check(b.kind == CV_BYTES && b.as.bytes.len == 0, "no octets is still a byte string");
+    /* Half an octet is not an octet, and a character outside the hexits
+     * names nothing at all. */
+    refused("type: BYTES\nvalue: \"0\"\n", "is not a BYTES");
+    refused("type: BYTES\nvalue: \"00A\"\n", "is not a BYTES");
+    refused("type: BYTES\nvalue: \"00GG\"\n", "is not a BYTES");
+    /* Written bare it is a number in some reader of this file, and the
+     * empty one is nothing at all, so the quotes are the rule here for
+     * the same reason they are the rule for an INT64. */
+    refused("type: BYTES\nvalue: 00AB\n", "written in quotes");
+}
+
 static void a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are(void) {
     static const char *const wrong[] = {"type: NODE\nvalue: \"person\"\n",
                                         "type: NODE\nvalue: \"#1\"\n",
@@ -690,6 +723,7 @@ int main(int argc, char **argv) {
     a_list_holds_encoded_values_and_not_bare_ones();
     a_byte_string_is_the_octets_and_not_the_text_of_them();
     a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo();
+    a_byte_string_is_decoded_into_octets_and_not_kept_as_its_hexits();
     a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are();
     a_path_is_a_walk_and_a_sequence_that_is_not_one_is_refused();
     a_mapping_that_is_not_a_value_is_refused_with_its_line();

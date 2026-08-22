@@ -1,0 +1,31 @@
+[package]
+name = "zu2-capi"
+description = "C API for zu2: libzu2, the in-process storage and graph surface"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The artifact is libzu2.{a,so,dylib} and zu2.{lib,dll}; the lib target
+# takes the name `zu2`, so the engine crate (also `zu2`) comes in under
+# another name, the same arrangement zu-capi has with `zudb`.
+#
+# Both library forms for the same reason zu-capi ships both: a shared
+# library is what several processes share a copy of, and a static
+# archive is what a binding links into itself so its users install one
+# file, and what a build with no loader at all has to use.
+[lib]
+name = "zu2"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+zu2db = { package = "zu2", path = "../zu2" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

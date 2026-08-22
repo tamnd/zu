@@ -279,7 +279,7 @@ fn lay_out(out: &mut Vec<u8>, comp_ends: &[u64], raw_ends: &[u64], body: &[u8]) 
     out.extend_from_slice(body);
 }
 
-/// Checksums a payload and writes it across freshly allocated blocks.
+/// Checksums a payload and hands it to the file to place.
 fn store(
     db: &mut Zu1File,
     payload: &[u8],
@@ -287,15 +287,7 @@ fn store(
     value_bytes: u64,
 ) -> Result<SegmentMeta> {
     let crc = crc32c::crc32c(payload);
-    let mut blocks = Vec::new();
-    let mut block = vec![0u8; BLOCK_SIZE as usize];
-    for part in payload.chunks(BLOCK_SIZE as usize) {
-        let ptr = db.allocate_block();
-        block[..part.len()].copy_from_slice(part);
-        block[part.len()..].fill(0);
-        db.write_block(ptr, &block)?;
-        blocks.push(ptr);
-    }
+    let (blocks, start) = db.pack_bytes(payload)?;
     Ok(SegmentMeta {
         value_count,
         payload_len: payload.len() as u64,
@@ -305,12 +297,13 @@ fn store(
         crc,
         structural: Structural::FullZip,
         sorted: false,
+        start,
         blocks,
     })
 }
 
-/// Encodes `values` chunk by chunk and writes the FullZip payload across
-/// freshly allocated blocks.
+/// Encodes `values` chunk by chunk and writes the FullZip payload out
+/// through the file's placer.
 pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentMeta> {
     let mut payload = Vec::new();
     let value_bytes = encode_payload(values, &mut payload)?;
@@ -675,10 +668,12 @@ fn read_payload(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Vec<u8>> {
     // The claimed length only seeds the reservation; growth past the cap
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
+    let mut at = meta.start as usize;
     for &ptr in &meta.blocks {
         let block = db.pin_block(ptr)?;
-        let want = (meta.payload_len as usize - payload.len()).min(block.len());
-        payload.extend_from_slice(&block[..want]);
+        let want = (meta.payload_len as usize - payload.len()).min(block.len() - at);
+        payload.extend_from_slice(&block[at..at + want]);
+        at = 0;
     }
     if payload.len() != meta.payload_len as usize {
         return Err(corrupt("payload shorter than meta claims"));

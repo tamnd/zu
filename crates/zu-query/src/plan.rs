@@ -1539,7 +1539,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 expr_text(body, query)
             )
         }
-        BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
+        BoundExpr::Cast { expr, ty, .. } => format!("CAST({} AS {ty})", expr_text(expr, query)),
         BoundExpr::Case {
             subject,
             branches,

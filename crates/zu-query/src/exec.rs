@@ -75,7 +75,8 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::binder::{
-    BoundExpr, BoundItem, BoundQuery, Deviation, Func, PathPart, Percentile, Schema, TableFunc,
+    BoundExpr, BoundItem, BoundQuery, Constrained, Deviation, Func, PathPart, Percentile, Schema,
+    TableFunc,
 };
 use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
@@ -6942,9 +6943,16 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             }
             Value::path(out)
         }
-        BoundExpr::Cast { expr, ty } => {
+        BoundExpr::Cast {
+            expr,
+            ty,
+            constrained,
+        } => {
             let v = eval(ctx, expr)?;
-            crate::cast::cast_noting(v, ty, &mut ctx.notices)
+            match constrained {
+                Some(wants) => constrained_reference(ctx, v, ty, wants),
+                None => crate::cast::cast_noting(v, ty, &mut ctx.notices),
+            }
         }
         // GE01. The branches are asked in the order they were written
         // and the walk stops at the first that says yes, so a branch
@@ -6996,6 +7004,56 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             })
         }
     }
+}
+
+/// A cast to a closed node or edge reference value type, GV56 and
+/// GV57: `CAST(p AS NODE :Person)`.
+///
+/// The two conditions the standard gives this are asked in the order
+/// they can be answered. 22G0V is the base type, and it is the same
+/// answer an open reference type would give, so the value goes through
+/// the ordinary cast first and a node handed to `EDGE :T` is refused
+/// there. 22G0W is the constraint, and it is only a question once the
+/// value is known to be of the right kind: a Person is a node, and it
+/// is not a Company.
+///
+/// A null casts to null, the way it does for every other type, so a
+/// missing optional match does not turn into a condition.
+fn constrained_reference(
+    ctx: &mut StageCtx,
+    v: Value,
+    ty: &zu_common::LogicalType,
+    wants: &Constrained,
+) -> Result<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let base = match ty.base() {
+        zu_common::LogicalType::Node(_) => zu_common::LogicalType::Node(None),
+        _ => zu_common::LogicalType::Edge(None),
+    };
+    let v = crate::cast::cast_noting(v, &base, &mut ctx.notices)?;
+    let wears = match &v {
+        Value::Node { table, offset } => wants.node.matches(ctx.graph.labels(*table, *offset)?),
+        Value::Rel { table, .. } => wants.rels.binary_search(table).is_ok(),
+        other => {
+            return Err(invalid(format!(
+                "a reference type asks about a node or an edge, got {other:?}"
+            )));
+        }
+    };
+    if wears {
+        return Ok(v);
+    }
+    Err(ZuError::gql(
+        codes::C22G0W,
+        format!(
+            "this {} does not wear the label '{}' that '{}' asks for",
+            if wants.over_nodes { "node" } else { "edge" },
+            wants.wanted,
+            ty.base()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------

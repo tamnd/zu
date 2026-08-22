@@ -84,6 +84,10 @@ fn round(value: &[u8]) -> u64 {
 const GROUP: u64 = 16;
 const GROUPS: u64 = 400;
 
+/// How many nodes the graph child cycles over. Small, so it laps and
+/// the hub's neighbourhood block doubles several times before the kill.
+const NODES: u64 = 512;
+
 /// The key `j` of group `g`. Laid out so a group is contiguous in the
 /// key order and so the groups together cover the same sort of key space
 /// the other children use.
@@ -113,6 +117,24 @@ fn writes_until_it_is_killed() {
             }
             txn.commit().expect("commit");
             println!("{t}");
+        }
+    }
+    if std::env::var_os("ZU2_CRASH_GRAPH").is_some() {
+        // A node and its two edges at a time, printed after the second
+        // edge returns. The ring edge keeps every neighbourhood small
+        // and the hub edge makes one of them double over and over,
+        // which are the two shapes the block has.
+        for i in 0..NODES {
+            let id = session.add_node(&key(i)).expect("node");
+            assert_eq!(id, i as u32, "ids are handed out in creation order");
+        }
+        for i in 0..=u64::MAX {
+            let n = i % NODES;
+            session
+                .add_edge(n as u32, ((n + 1) % NODES) as u32)
+                .expect("ring edge");
+            session.add_edge(0, n as u32).expect("hub edge");
+            println!("{i}");
         }
     }
     // Until it is killed, which at these rates is somewhere in the first
@@ -413,6 +435,67 @@ fn a_transaction_is_all_of_it_or_none_of_it_in_the_key_order_too() {
         assert!(
             round >= *t && round % GROUPS == g,
             "transaction {t} committed and the key order gave back {round} for group {g}"
+        );
+    }
+}
+
+/// The graph plane after a kill.
+///
+/// An edge is not a record with a key. It is a bit in a neighbourhood
+/// block that another edge to the same node rewrites, and the block
+/// doubles in place as a node collects neighbours, so what a crash can
+/// leave behind is a half doubled block rather than a half written
+/// value. The reopen rebuilds the whole plane from the log, and nothing
+/// so far has asked it to do that over a log a crash ended in the
+/// middle of.
+#[test]
+fn a_graph_survives_a_kill_with_its_edges() {
+    if std::env::var_os("ZU2_CRASH_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, acknowledged) = kill_a_writer(dir.path(), &["ZU2_CRASH_GRAPH"]);
+    let acknowledged = last_per_key(acknowledged, NODES);
+
+    let db = Db::open(&path, options(false)).expect("reopen");
+    let mut session = db.session();
+    let mut scratch = Vec::new();
+    assert_eq!(
+        db.core().graph().nodes(),
+        NODES as u32,
+        "the id counter did not survive the kill"
+    );
+    let hub = session.neighbours(zu2::Direction::Out, 0, |n| n.to_vec());
+    for i in &acknowledged {
+        let n = (i % NODES) as u32;
+        assert_eq!(
+            session
+                .node_of(&key(u64::from(n)), &mut scratch)
+                .expect("node_of"),
+            Some(n),
+            "the key of node {n} did not survive the kill"
+        );
+        // The ring edge, which is the one written first, so an
+        // acknowledged round means both of that round's edges landed.
+        let out = session.neighbours(zu2::Direction::Out, n, |v| v.to_vec());
+        let next = (n + 1) % NODES as u32;
+        assert!(
+            out.contains(&next),
+            "node {n} acknowledged its ring edge and came back without it"
+        );
+        assert!(
+            out.windows(2).all(|w| w[0] < w[1]),
+            "node {n} came back with its neighbours out of order"
+        );
+        // And the reverse, which is what an in-hop reads.
+        let back = session.neighbours(zu2::Direction::In, next, |v| v.to_vec());
+        assert!(
+            back.contains(&n),
+            "node {n} acknowledged its ring edge and the reverse is gone"
+        );
+        assert!(
+            hub.contains(&n) || n == 0,
+            "node {n} acknowledged its hub edge and the hub came back without it"
         );
     }
 }

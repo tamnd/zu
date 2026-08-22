@@ -165,6 +165,30 @@ pub struct Options {
     /// Off is for a run that is about to throw the file away, and for
     /// measuring what recovery costs without one.
     pub checkpoint_on_close: bool,
+    /// Whether a point read of a cold record puts it back in the log.
+    ///
+    /// On. The cold tier's rule for what is cold is that a record went a
+    /// whole lap of the log without being written, and a workload that
+    /// reads far more than it writes has records that are hot by any
+    /// reasonable meaning of the word and cold by that one. Without this
+    /// they stay in the tier for the life of the data and every read of
+    /// them is a read of the device, which is what made the read tail at
+    /// ten million records twenty times the median. With it the first
+    /// read of such a record pays the device once and the reads after it
+    /// are reads of a page in memory, which is the promotion F2 does for
+    /// the same reason (PVLDB 18(12), 2025).
+    ///
+    /// The copy carries the version of the record it copies and swings
+    /// the index entry with the same compare and swap compaction uses,
+    /// so a write that lands in between wins and the promotion is
+    /// dropped. Nothing waits for the device: the cold record stays
+    /// where it is, so a promotion lost in a crash costs a read and not
+    /// a value.
+    ///
+    /// A range scan does not promote, whatever this says. A scan of a
+    /// cold range would otherwise rewrite the range into the log, and
+    /// the next pass would put it straight back.
+    pub promote_reads: bool,
     /// Whether the scan plane is kept, which is what a range scan runs
     /// on. See [`crate::scan`].
     ///
@@ -196,6 +220,7 @@ impl Default for Options {
             cold_target_percent: 200,
             salvage: false,
             checkpoint_on_close: true,
+            promote_reads: true,
             ordered: false,
         }
     }
@@ -511,6 +536,12 @@ pub struct Core {
     /// arrangement `compact_at` is for the log.
     cold_at: AtomicU64,
     compaction: Compaction,
+    /// Whether a cold record a point read touched goes back to the log.
+    /// See [`Options::promote_reads`].
+    promote: bool,
+    /// Records promoted out of the cold tier by a read, which is how
+    /// much writing the option above has done.
+    promoted: AtomicU64,
     pub(crate) recovered: Recovered,
     /// Held by the jobs that move the log or the index out from under a
     /// reader of the whole of either: a compaction pass, an index
@@ -592,7 +623,15 @@ impl Core {
             slot,
             durability: self.durability,
             scratch: Vec::new(),
+            promoting: self.promote,
+            promote: None,
         }
+    }
+
+    /// Records a read has moved out of the cold tier since the database
+    /// was opened. See [`Options::promote_reads`].
+    pub fn promoted(&self) -> u64 {
+        self.promoted.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -749,6 +788,8 @@ impl Db {
             durability: options.durability,
             compact_at: AtomicU64::new(options.compact_below),
             compaction: Compaction::default(),
+            promote: options.promote_reads && options.cold_tier,
+            promoted: AtomicU64::new(0),
             recovered: Recovered::default(),
             maintenance: Mutex::new(()),
             committing: Mutex::new(()),
@@ -818,6 +859,12 @@ impl Db {
     /// Addresses the log still spans, tail minus begin.
     pub fn log_span(&self) -> u64 {
         self.core.log.span()
+    }
+
+    /// Records a read has moved out of the cold tier and back into the
+    /// log. See [`Options::promote_reads`].
+    pub fn promoted(&self) -> u64 {
+        self.core.promoted()
     }
 
     /// Addresses the cold tier still spans, or zero when there is none.
@@ -1388,6 +1435,14 @@ pub struct Session<'a> {
     durability: Durability,
     /// 8 byte aligned buffer for records that have left memory.
     scratch: Vec<u64>,
+    /// Whether a read on this session promotes what it finds in the cold
+    /// tier. It is the core's setting to start with, and a scan turns it
+    /// off for the length of the scan. See [`Options::promote_reads`].
+    promoting: bool,
+    /// The cold record the last read found, kept until the read is out
+    /// of its epoch and free to write. The version and kind are the
+    /// record's own, because a promotion is a copy and not a new write.
+    promote: Option<(Address, u64, u32)>,
 }
 
 impl<'a> Session<'a> {
@@ -1824,11 +1879,34 @@ impl<'a> Session<'a> {
     pub fn read(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool> {
         let hash = index::hash(key);
         let tag = Index::tag(hash);
+        self.promote = None;
         self.slot.protect();
         let answer = self
             .bucket_of(hash)
             .and_then(|bucket| self.read_protected(bucket, tag, key, out));
         self.slot.unprotect();
+        // Outside the epoch, because the copy takes one of its own and a
+        // session holds one at a time. The value it writes is the one
+        // just read, so the promotion costs an append and no second read
+        // of the device. A promotion that fails is not the read's
+        // problem: the answer is already in `out` and correct, and the
+        // record is still where it was.
+        if let Some((from, version, kind)) = self.promote.take() {
+            let carried = Carried {
+                key,
+                value: out.as_slice(),
+                tombstone: false,
+                kind,
+                version,
+            };
+            let restore = self.durability;
+            self.durability = Durability::Async;
+            let moved = self.copy_forward(&carried, from, false);
+            self.durability = restore;
+            if let Ok(Placement::Hot) = moved {
+                self.core.promoted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         answer
     }
 
@@ -1850,6 +1928,9 @@ impl<'a> Session<'a> {
                 false
             } else {
                 r.read_value(out);
+                if self.promoting && cold::is_cold(address) {
+                    self.promote = Some((address, r.version(), r.kind()));
+                }
                 true
             }
         };
@@ -1899,16 +1980,24 @@ impl<'a> Session<'a> {
             });
         };
         let mut cursor = ordered.seek(start);
-        while done < count {
-            let Some(key) = cursor.key() else { break };
-            cursor.step();
-            value.clear();
-            if self.read(key, &mut value)? {
-                each(key, &value);
-                done += 1;
+        // A scan reads a range once and moves on, so promoting what it
+        // touches would rewrite the range into the log for nobody. See
+        // [`Options::promote_reads`].
+        let promoting = std::mem::replace(&mut self.promoting, false);
+        let outcome = (|| -> Result<usize> {
+            while done < count {
+                let Some(key) = cursor.key() else { break };
+                cursor.step();
+                value.clear();
+                if self.read(key, &mut value)? {
+                    each(key, &value);
+                    done += 1;
+                }
             }
-        }
-        Ok(done)
+            Ok(done)
+        })();
+        self.promoting = promoting;
+        outcome
     }
 
     /// Writes `value` under `key`, whether or not it was there.

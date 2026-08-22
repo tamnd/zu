@@ -479,3 +479,85 @@ fn a_scan_after_a_reopen_finds_the_keys_that_only_the_cold_tier_holds() {
         assert_eq!(seen, want, "with checkpoint {checkpoint}");
     }
 }
+
+#[test]
+fn a_read_puts_a_cold_record_back_in_the_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(&dir.path().join("z.zu2"), options()).expect("create");
+    lapped(&db, 3000);
+    assert!(db.cold_span() > 0, "nothing migrated");
+
+    let mut s = db.session();
+    assert_eq!(
+        read(&mut s, &key(7)).as_deref(),
+        Some(value(7, 0).as_slice()),
+        "the first read of a cold key is still a read of the value"
+    );
+    assert_eq!(db.promoted(), 1, "and it should have moved the record");
+
+    // The second read finds it in the log, so there is nothing left to
+    // promote and the count stays where it is.
+    assert_eq!(
+        read(&mut s, &key(7)).as_deref(),
+        Some(value(7, 0).as_slice()),
+        "and the promoted copy reads as the same value"
+    );
+    assert_eq!(db.promoted(), 1, "a hot record is not promoted again");
+
+    // The version came with the copy, so a replay of both records still
+    // knows which one is newer. What that shows here is that the newer
+    // write wins over the promotion rather than the other way round.
+    s.upsert(&key(7), b"newer").expect("upsert");
+    assert_eq!(read(&mut s, &key(7)).as_deref(), Some(b"newer".as_slice()));
+}
+
+#[test]
+fn a_scan_does_not_promote_what_it_walks_past() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("z.zu2"),
+        Options {
+            ordered: true,
+            ..options()
+        },
+    )
+    .expect("create");
+    let records = lapped(&db, 3000);
+    assert!(db.cold_span() > 0, "nothing migrated");
+
+    let mut s = db.session();
+    let mut seen = 0;
+    s.scan(&key(0), records as usize, |_, _| seen += 1)
+        .expect("scan");
+    assert_eq!(seen, records as usize, "the scan came back short");
+    assert_eq!(db.promoted(), 0, "a scan rewrote the range it walked");
+
+    // And the session it turned promotion off on has it back on after.
+    assert!(read(&mut s, &key(11)).is_some());
+    assert_eq!(db.promoted(), 1, "the scan left promotion off");
+}
+
+#[test]
+fn promotion_can_be_turned_off() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("z.zu2"),
+        Options {
+            promote_reads: false,
+            ..options()
+        },
+    )
+    .expect("create");
+    let records = lapped(&db, 3000);
+    assert!(db.cold_span() > 0, "nothing migrated");
+
+    let mut s = db.session();
+    for i in 0..records {
+        assert_eq!(
+            read(&mut s, &key(i)).as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i} came back wrong with promotion off"
+        );
+    }
+    assert_eq!(db.promoted(), 0, "promotion was off and it promoted anyway");
+}

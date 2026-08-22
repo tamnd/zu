@@ -2238,3 +2238,90 @@ write_cpu_nosync_shared_us = 60.0
 # because two readings on a loaded box is all it has been read off.
 # Raise this floor, never lower it.
 exec_temporal_mrows_s_core = 70.0
+
+# What a burst of eight writers sees at the tail, on a store whose
+# syncs return without asking a disk (zu#78, crates/zu/benches/commit.rs).
+#
+# The durable columns of that bench cannot carry this. They report
+# ratios, and ratios are all they can report: a laptop pays four
+# milliseconds a commit to fcntl and a runner on a memory filesystem
+# pays none, so the same engine reads two orders of magnitude apart and
+# an absolute ceiling over them would be a ceiling on whichever disk
+# the run happened to land on. The unsynced pass is the same burst with
+# the storage taken out from under it, and what is left is the part
+# this repository owns: the queue in front of the write side, and the
+# fold that runs while a writer is holding it.
+#
+# The number is the fold. Six runs on a quiet thirty two core box put
+# it between 3450 and 3645, with the median statement at 281, and
+# 3.9 percent of statements over a millisecond against 0.58 percent at
+# one writer. Those three read together: a fold lands every 257
+# statements and costs about three and a half milliseconds, and it
+# holds the write side while it runs, so the seven writers behind it
+# wait it out too. That is why the share over a millisecond goes up
+# with the width and the tail does not go down.
+#
+# So the P5 target of 2000 is not met and this is not it. This is set
+# where the measurement is, to hold the ground already taken: it went
+# from 3905 to 3455 when the write side stopped waking every waiter to
+# hand over to one of them. Getting under the target means the fold
+# not being on the statement's path at all, which is a change to when
+# folds run rather than to what they cost.
+#
+# Loose, because a fold is processor work and a box with somebody
+# else's build on it stretches processor work. The same commit read
+# 2121 on a quiet laptop, 3450 to 3645 over six runs on a quiet thirty
+# two core box, and 4825 on the laptop at load 20. The ceiling is over
+# the worst of those and still catches a doubling. The share below is
+# the tighter of the two gates and the one to watch.
+#
+# Both of these are held only where the level's own median leaves room
+# under a millisecond. On two shared cores eight writers queue for
+# long enough that a tail in milliseconds is reading the box, and the
+# bench says so and reports rather than failing.
+commit_p99_nosync_us = 6000.0
+
+# How many statements a fold makes slow, at eight writers on the
+# unsynced store.
+#
+# The tail above says how slow and moves with the box. This says how
+# many, and does not: a fold costs milliseconds on any machine that
+# runs this, so which statements land over a millisecond is which ones
+# a fold was holding the write side through, whether the box is quick
+# or busy. It read 3.21 percent on a quiet laptop and 3.77 to 3.99 over
+# six runs on the thirty two core box, against 0.58 percent at one
+# writer, and the gap between those two is the whole point: one fold is
+# one slow statement when one writer is waiting for the side and eight
+# when eight are.
+#
+# So this is the number that goes down when folds come off the
+# statement's path, and the number that goes up if anything else moves
+# onto it.
+commit_slow_share = 0.06
+
+# What eight writers get through against one, on the same unsynced
+# store.
+#
+# One is the ceiling and not the floor: a store has one write side, so
+# eight writers take turns at it and the best a wide level can do is
+# lose nothing to the taking of turns. What this catches is the turns
+# costing more than the work. It read 0.40 before the write side began
+# handing over to one waiter instead of waking all of them, and 0.53
+# after, on the same box in the same hour.
+commit_stmt_nosync_x = 0.45
+
+# What an append costs at ten times the table
+# (crates/zu/benches/write.rs).
+#
+# A fold rewrites the columns a statement touched, and an append
+# touches every column of its table because it adds a row past the end
+# of each of them. Whether that means rewriting a column or extending
+# one is the difference between an insert rate that holds as a table
+# fills and one that falls off, and nothing here asked: the bench
+# priced SET at two table sizes and INSERT at one.
+#
+# It extends. Ten times the rows costs 1.11x the processor time, which
+# is the fold copying the encoded bytes of the chunks it did not
+# change rather than putting them back through the encoder. The ceiling
+# is where a real rewrite would show up long before it reached ten.
+insert_fold_x = 2.0

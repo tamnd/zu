@@ -51,6 +51,29 @@
 //! ceilings are set against the quiet measurement rather than the loud
 //! one and the numbers to read are the columns.
 //!
+//! Then the same widths again over a store whose syncs return without
+//! asking a disk, which is the pass the P5 latency ceiling is read
+//! off. Ratios are as far as the durable pass can go, because the
+//! thing they are ratios of is four milliseconds on a laptop and
+//! nothing at all on a runner whose temporary directory is memory, and
+//! an absolute ceiling over that would be a ceiling on the disk rather
+//! than on the engine. Take the storage away and what is left is the
+//! two things this repository decides: what it costs a writer to get
+//! in and out of the queue in front of the write side, and the fold
+//! that runs while one of them is holding it.
+//!
+//! The second of those is the whole tail. A fold lands every couple of
+//! hundred statements and costs milliseconds where a statement costs
+//! microseconds, and it holds the write side while it runs, so the
+//! writers behind it wait it out as well. That is why the share of
+//! statements over a millisecond goes up with the width while the
+//! median only goes up with the queue: one fold is one slow statement
+//! at one writer and eight at eight. It is also why the unsynced pass
+//! writes a great many more statements than the durable one, which it
+//! can afford to: a tail that is one statement in a couple of hundred
+//! needs more than a couple of hundred of them before which
+//! percentile it lands in stops being luck.
+//!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench commit
 
 use std::path::Path;
@@ -103,6 +126,18 @@ const GATE_WIDTH: usize = 8;
 /// so rather than go red.
 const SYNC_US: f64 = 1000.0;
 
+/// What counts as a slow statement, in microseconds.
+///
+/// A fold is milliseconds and a statement is microseconds, so anything
+/// over this is a statement that was waiting for one. That holds while
+/// the two are that far apart, and on a box slow enough for an ordinary
+/// statement to approach it they are not: eight writers on two shared
+/// cores queue for long enough that the threshold stops telling the
+/// fold from the queue. So the share is gated only where the level's
+/// own median leaves it room, and reported either way with the reason
+/// said out loud.
+const SLOW_US: f64 = 1000.0;
+
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
     for line in std::fs::read_to_string(path).ok()?.lines() {
@@ -138,7 +173,12 @@ impl Level {
     fn report(&self) {
         println!(
             "{:<8} {:>8.0} us {:>8.0} us {:>8.0} us {:>8.2}% {:>6.0} stmt/s",
-            self.writers, self.p50, self.p99, self.max, self.over * 100.0, self.stmts
+            self.writers,
+            self.p50,
+            self.p99,
+            self.max,
+            self.over * 100.0,
+            self.stmts
         );
     }
 }
@@ -396,16 +436,43 @@ fn main() {
          writers, with no sync in it",
         at_gate.stmts / unsynced[0].stmts.max(0.001)
     );
+    println!(
+        "commit_slow_share: {:.2}% of statements over a millisecond at {GATE_WIDTH} writers, \
+         against {:.2}% at one",
+        at_gate.over * 100.0,
+        unsynced[0].over * 100.0
+    );
 
     let mut engine_failed = false;
+    // Room between an ordinary statement here and what this calls slow.
+    // Without it the share is counting the queue rather than the folds
+    // in it, and says so rather than failing on a slow box.
+    let separated = at_gate.p50 < SLOW_US / 2.0;
+    if let Some(ceiling) = budget("commit_slow_share") {
+        let ok = at_gate.over <= ceiling;
+        let verdict = match (ok, separated) {
+            (_, false) => "the median is too near a millisecond here to tell a fold from a queue",
+            (true, true) => "ok",
+            (false, true) => "over",
+        };
+        println!(
+            "commit_slow_share: {:.4} against a ceiling of {ceiling:.4} ({verdict})",
+            at_gate.over
+        );
+        engine_failed |= !ok && separated;
+    }
     if let Some(ceiling) = budget("commit_p99_nosync_us") {
         let ok = at_gate.p99 <= ceiling;
-        let verdict = if ok { "ok" } else { "over" };
+        let verdict = match (ok, separated) {
+            (_, false) => "the box and not the engine is what a tail in milliseconds reads here",
+            (true, true) => "ok",
+            (false, true) => "over",
+        };
         println!(
             "commit_p99_nosync_us: {:.0} against a ceiling of {ceiling:.0} ({verdict})",
             at_gate.p99
         );
-        engine_failed |= !ok;
+        engine_failed |= !ok && separated;
     }
     if let Some(floor) = budget("commit_stmt_nosync_x") {
         let got = at_gate.stmts / unsynced[0].stmts.max(0.001);

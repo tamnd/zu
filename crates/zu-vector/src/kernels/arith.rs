@@ -1,9 +1,9 @@
 //! Binary arithmetic kernels.
 //!
 //! The answers are the row engine's answers, conditions included: an
-//! integer answer that does not fit raises, and a divisor of nought
-//! raises `22012` whatever the numeric type, rather than answering the
-//! infinity the hardware would. A kernel that quietly answered the
+//! integer answer that does not fit raises `22003`, and a divisor of
+//! nought raises `22012` whatever the numeric type, rather than
+//! answering the infinity the hardware would. A kernel that quietly answered the
 //! wrapped number or a null would be giving a wrong answer where the
 //! standard asks for a condition, and which of the two a query got
 //! would depend on which engine took its plan.
@@ -218,12 +218,17 @@ fn divide_by_zero(op: BinOp) -> ZuError {
     ZuError::gql(codes::C22012, format!("{what} by zero"))
 }
 
-/// An integer answer that does not fit in an integer, which is the
-/// other thing arithmetic can fail at and is not a GQL condition: the
-/// standard's numeric conditions are about the value the statement
-/// wrote, and this is about the width of the type holding it.
+/// `22003 data exception, numeric value out of range`, for the other
+/// thing arithmetic can fail at: an answer that does not fit the type
+/// holding it.
+///
+/// The float half of the library has always raised this for an answer
+/// that left the range a double holds, and an integer answer that left
+/// the range an i64 holds is the same sentence about a different width.
+/// A statement that got a bare refusal instead was told the engine
+/// would not answer without being told what the standard calls it.
 fn overflow() -> ZuError {
-    ZuError::InvalidArgument("integer overflow".into())
+    ZuError::gql(codes::C22003, "integer overflow".to_string())
 }
 
 /// Raises what the row engine raises for the first row of the selection
@@ -443,28 +448,29 @@ mod tests {
         assert!(!out.is_valid(1), "null in, null out");
     }
 
-    /// An answer too wide for the type is the row engine's `integer
-    /// overflow`, and the fold that finds it looks at the operands
-    /// rather than at the answer, so a chunk of ordinary numbers never
-    /// reaches the walk that builds the condition.
+    /// An answer too wide for the type is `22003 numeric value out of
+    /// range`, the same condition the row engine raises for it, and the
+    /// fold that finds it looks at the operands rather than at the
+    /// answer, so a chunk of ordinary numbers never reaches the walk
+    /// that builds the condition.
     #[test]
     fn an_integer_answer_that_does_not_fit_raises() {
         let mut arena = MorselArena::new();
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, i64::MAX]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, 1i64, 2);
         let out = binary(&mut arena, BinOp::Add, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
 
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[1i64, 1 << 40]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, 1i64 << 40, 2);
         let out = binary(&mut arena, BinOp::Mul, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
 
         // The one dividend a divisor of minus one has no answer for.
         let l = ValueVector::flat_from(&mut arena, PhysType::Int64, &[i64::MIN]);
         let r = ValueVector::constant(&mut arena, PhysType::Int64, -1i64, 1);
         let out = binary(&mut arena, BinOp::Div, &l, &r, None);
-        assert_eq!(raised(out), "invalid argument: integer overflow");
+        assert_eq!(raised(out), "22003: integer overflow");
     }
 
     /// The approximate numbers raise on a divisor of nought too, which

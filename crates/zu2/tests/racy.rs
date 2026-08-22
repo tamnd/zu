@@ -109,6 +109,7 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
                 let mut session = db.session();
                 let mut state = 0x9e37_79b9_7f4a_7c15 ^ u64::from(t) << 32;
                 let mut out = Vec::new();
+                let prefix = format!("t{t:02}_").into_bytes();
                 for i in 0..RESIDENT {
                     session
                         .upsert(&resident(t, i), &value(t, i, 0))
@@ -133,6 +134,42 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
                                 value(t, i, 0).as_slice(),
                                 "thread {t} resident key {i} at op {op}: wrong value"
                             );
+                        }
+                        90..=94 => {
+                            // A scan over this thread's own stretch of
+                            // the key order. Nobody else writes into it,
+                            // so what comes back has to be exactly what
+                            // this thread believes is live, in order,
+                            // with the values it last wrote. The walk
+                            // stops at the first key outside the prefix,
+                            // since the order is global and the next
+                            // thread's keys sit right after these.
+                            let mut seen = Vec::new();
+                            session
+                                .scan(&k, 16, |k, v| seen.push((k.to_vec(), v.to_vec())))
+                                .expect("scan");
+                            let mut want = (i..KEYS).filter_map(|j| {
+                                held[j as usize].as_ref().map(|v| (key(t, j), v.clone()))
+                            });
+                            for (got_key, got_value) in seen {
+                                if !got_key.starts_with(&prefix) {
+                                    break;
+                                }
+                                let (want_key, want_value) =
+                                    want.next().unwrap_or_else(|| {
+                                        panic!(
+                                            "thread {t} at op {op}: scan gave back a key it should have run out at"
+                                        )
+                                    });
+                                assert_eq!(
+                                    got_key, want_key,
+                                    "thread {t} at op {op}: scan is out of order or skipped a key"
+                                );
+                                assert_eq!(
+                                    got_value, want_value,
+                                    "thread {t} at op {op}: scan gave a stale value"
+                                );
+                            }
                         }
                         0..=49 => {
                             let v = value(t, i, op);
@@ -195,16 +232,21 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
         db.promoted(),
     );
     assert!(db.index_grows() > 0, "the index never doubled");
-    // What migrated rather than what is down there now, since a cold
-    // pass can take back everything it was given and leave the span at
-    // zero on a run where the tier did its whole job.
-    assert!(
+    // Migrated rather than what is down there now, since a cold pass can
+    // take back everything it was given and leave the span at zero on a
+    // run where the tier did its whole job. A pass at rest first: which
+    // of them the threads managed between them depends on how fast the
+    // machine got through the operations, and the tier has to be on the
+    // path of every run rather than of most of them.
+    let migrated = || {
         db.compaction()
             .migrated
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0,
-        "nothing ever reached the cold tier"
-    );
+    };
+    if migrated() == 0 {
+        db.compact().expect("compact");
+    }
+    assert!(migrated() > 0, "nothing ever reached the cold tier");
 
     // And the whole of it is still there once the threads are done and
     // nothing is moving, which is what says a lost write was lost rather

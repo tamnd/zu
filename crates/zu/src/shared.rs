@@ -26,7 +26,7 @@
 //! also what makes a commit by one connection visible to the next
 //! statement on another, which before this needed a reconnect.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
@@ -283,9 +283,6 @@ impl Drop for Lease {
 pub struct FileHandle {
     key: Key,
     gate: Mutex<Gate>,
-    /// Woken when the side goes back, which is also when a ticket
-    /// ahead of the waiters is served.
-    freed: Condvar,
     published: RwLock<Published>,
     /// How many statements are reading each epoch. Taken with the
     /// published state in one lock, so a reader is counted before it
@@ -308,15 +305,37 @@ pub struct FileHandle {
 
 /// The queue in front of the write side.
 ///
-/// Tickets rather than a bare mutex, because a condvar wakes whoever
-/// the operating system feels like and docs/08 §1 asks for a queue in
-/// order. A writer draws a number on the way in and waits for it to
-/// come up, so a session that has been waiting is served before one
-/// that has just arrived.
+/// A line of waiters rather than a bare mutex, because a condvar wakes
+/// whoever the operating system feels like and docs/08 §1 asks for a
+/// queue in order. A writer that finds the side gone joins the back of
+/// the line, and the writer giving the side back hands it to whoever is
+/// at the front.
+///
+/// The line is of places to be woken rather than of numbers to wait
+/// for, and the difference is what it costs to hand the side over. A
+/// number has to be published to everybody, since none of them knows
+/// whose turn it is until they look, so every handoff wakes the whole
+/// line and all but one of them go back to sleep having done nothing
+/// but contend for this lock on the way in and on the way out. That is
+/// most of a burst's work at eight writers and all of it at thirty two,
+/// and it is worse than wasted: a writer at the front that gets
+/// descheduled in the scrum holds up everyone behind it, which is where
+/// the tail comes from. Handing the side to one waiter wakes one
+/// thread.
 struct Gate {
     side: Option<WriteSide>,
-    next: u64,
-    serving: u64,
+    /// The writers waiting, in the order they arrived. Non empty only
+    /// when `side` is `None`: a writer joins the line because the side
+    /// was gone, and [`FileHandle::put`] gives the side to the front of
+    /// the line rather than putting it back when anyone is waiting.
+    waiting: VecDeque<Arc<Slot>>,
+}
+
+/// One waiter's own place to be woken, and where the side it was
+/// waiting for arrives.
+struct Slot {
+    side: Mutex<Option<WriteSide>>,
+    filled: Condvar,
 }
 
 /// What two connections have to agree on to be sharing a write side:
@@ -397,10 +416,8 @@ impl FileHandle {
             vfs,
             gate: Mutex::new(Gate {
                 side: Some(WriteSide { file, writer: None }),
-                next: 0,
-                serving: 0,
+                waiting: VecDeque::new(),
             }),
-            freed: Condvar::new(),
             published: RwLock::new(published),
             readers: Mutex::new(BTreeMap::new()),
             staged: AtomicU64::new(0),
@@ -415,23 +432,41 @@ impl FileHandle {
     /// in the same scope.
     pub fn take(&self) -> WriteSide {
         let mut gate = self.gate.lock().expect("write gate");
-        let ticket = gate.next;
-        gate.next += 1;
-        loop {
-            if gate.serving == ticket && gate.side.is_some() {
-                return gate.side.take().expect("held just above");
-            }
-            gate = self.freed.wait(gate).expect("write gate");
+        // Nobody waiting and the side is here: this writer is the line.
+        if gate.waiting.is_empty()
+            && let Some(side) = gate.side.take()
+        {
+            return side;
         }
+        let slot = Arc::new(Slot {
+            side: Mutex::new(None),
+            filled: Condvar::new(),
+        });
+        gate.waiting.push_back(Arc::clone(&slot));
+        drop(gate);
+        let mut side = slot.side.lock().expect("write slot");
+        // A `put` that ran between dropping the gate and taking this
+        // lock has already left the side here, and then there is
+        // nothing to wait for.
+        while side.is_none() {
+            side = slot.filled.wait(side).expect("write slot");
+        }
+        side.take().expect("the wait ended because it arrived")
     }
 
-    /// Gives the write side back and serves the next ticket.
+    /// Gives the write side back, to the writer at the front of the line
+    /// if anyone is waiting.
     pub fn put(&self, side: WriteSide) {
         let mut gate = self.gate.lock().expect("write gate");
-        gate.side = Some(side);
-        gate.serving += 1;
+        let Some(slot) = gate.waiting.pop_front() else {
+            gate.side = Some(side);
+            return;
+        };
+        // Out of the gate before waking anybody, so the thread this
+        // hands to does not wake into a lock this one is still holding.
         drop(gate);
-        self.freed.notify_all();
+        *slot.side.lock().expect("write slot") = Some(side);
+        slot.filled.notify_one();
     }
 
     /// A reading handle on this file: its own descriptor, the roots the

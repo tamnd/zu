@@ -766,6 +766,7 @@ impl Db {
     /// Creates a database, failing if the file is already there.
     pub fn create(path: &Path, options: Options) -> Result<Self> {
         let handle = file::create_new(path)?;
+        Self::scrub(path, options);
         let core = Self::assemble(handle, path, options, true)?;
         // A file that never compacts never writes its marker word
         // otherwise, and a marker of zeros is how a file written before
@@ -774,6 +775,38 @@ impl Db {
         // forgiving rule, which is the rule #472 is about.
         core.log.stamp()?;
         Ok(Self::start(core, options))
+    }
+
+    /// Takes the sidecars of whatever used to live at this path away.
+    ///
+    /// [`Db::create`] has already made the log file, and it fails if one
+    /// was there, so reaching here means this path holds a database that
+    /// is one word old. Anything beside it belongs to a database that no
+    /// longer exists, and every one of those files names addresses in a
+    /// log that is gone: a checkpoint is a whole index at a boundary, and
+    /// a relink journal is a repair to a record. The checkpoint's own
+    /// guards do not catch it, because a second database at the same path
+    /// begins where the first did and carries the same planes, so the
+    /// only thing that separates them is that the file underneath was
+    /// replaced, which is exactly what this knows and the guards do not.
+    ///
+    /// The cold tier already worked this way, for the same reason and in
+    /// its own words: see [`Cold::create`]. It only does so when the tier
+    /// is asked for, so a database created without one takes its stale
+    /// cold file away here instead, since a later open with a tier would
+    /// otherwise read records out of it.
+    ///
+    /// Removing is best effort. A sidecar that cannot be removed is not
+    /// a reason to refuse to create a database, and the failure it leads
+    /// to is the one this is preventing, which is loud.
+    fn scrub(path: &Path, options: Options) {
+        let (checkpoint, writing) = log::checkpoint_path_beside(path);
+        let _ = std::fs::remove_file(checkpoint);
+        let _ = std::fs::remove_file(writing);
+        let _ = std::fs::remove_file(log::journal_path_beside(path));
+        if !options.cold_tier {
+            let _ = std::fs::remove_file(cold::path_beside(path));
+        }
     }
 
     /// Opens a database and replays its log into the index.

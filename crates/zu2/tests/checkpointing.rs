@@ -438,3 +438,101 @@ fn a_damaged_checkpoint_is_ignored_rather_than_believed() {
     );
     assert_eq!(checked(&db), 0, "the fall back to the scan lost keys");
 }
+
+/// A checkpoint belongs to the database it was taken of, and none of the
+/// guards above is about which database that was. Two databases in turn
+/// at one path, with the log removed between them and the sidecar left
+/// where it lay, is a shape a benchmark harness produces by hand: the
+/// second log begins where the first did, its file is as long, and both
+/// carry the same planes, so every guard passes and the reopen installs
+/// the first database's index over the second one's records.
+///
+/// The first one here is the shorter of the two, so its boundary sits
+/// inside what the second wrote and the length guard has nothing to say.
+/// The second holds the same keys under different values at different
+/// addresses, so adopting the first one's index means reading the wrong
+/// record or no record at all for every key below the boundary, and it
+/// failed to open at all: the replay started above a boundary the new
+/// log had never written and hit a hole.
+///
+/// The guards cannot tell these apart, so the create does it instead. A
+/// log file that was made rather than opened is a database one word old,
+/// and every sidecar beside it belongs to one that is gone.
+#[test]
+fn a_checkpoint_does_not_outlive_the_database_it_was_taken_of() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("reused.zu2");
+    let sidecar = sidecar(&path);
+    // Longer than `value`, and written in the other order, so the second
+    // database's records are nowhere near the addresses the first one's
+    // index names. Equal records in equal order would make the stale
+    // index accidentally right and prove nothing.
+    let long = |i: u32| {
+        let mut v = format!("field0=value{i:09}").into_bytes();
+        v.resize(256, b'x');
+        v
+    };
+    let checked_long = |db: &Db| {
+        let mut session = db.session();
+        let mut out = Vec::new();
+        let mut wrong = 0;
+        for i in 0..N {
+            if !session.read(&key(i), &mut out).expect("read") || out != long(i) {
+                wrong += 1;
+            }
+        }
+        wrong
+    };
+
+    {
+        let db = Db::create(&path, options()).expect("create the first database");
+        let mut session = db.session();
+        for i in 0..N {
+            session.upsert(&key(i), &value(i)).expect("upsert");
+        }
+        drop(session);
+        db.sync().expect("sync");
+        db.checkpoint().expect("checkpoint");
+    }
+    assert!(sidecar.exists(), "the first database took no checkpoint");
+
+    // What a harness that removes the log and leaves the sidecars does.
+    std::fs::remove_file(&path).expect("remove the log");
+
+    {
+        // No checkpoint of its own, which is the run that was killed
+        // before it closed, or simply a run with the option off.
+        let db = Db::create(
+            &path,
+            Options {
+                checkpoint_on_close: false,
+                ..options()
+            },
+        )
+        .expect("create the second database");
+        let mut session = db.session();
+        for i in (0..N).rev() {
+            session.upsert(&key(i), &long(i)).expect("upsert");
+        }
+        drop(session);
+        db.sync().expect("sync");
+    }
+    assert!(
+        !sidecar.exists(),
+        "the create left the previous database's checkpoint beside the new log"
+    );
+
+    let db = Db::open(
+        &path,
+        Options {
+            checkpoint_on_close: false,
+            ..options()
+        },
+    )
+    .expect("reopen");
+    assert_eq!(
+        checked_long(&db),
+        0,
+        "the reopen read the second database through the first one's index"
+    );
+}

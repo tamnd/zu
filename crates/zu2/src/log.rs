@@ -97,6 +97,25 @@ const FORMAT_SHIFT: u32 = 56;
 /// The part of the marker word that is the address.
 const ADDRESS_MASK: u64 = (1 << FORMAT_SHIFT) - 1;
 
+/// Where recovery's link repairs live beside a log at this path. Free
+/// standing because a database being created has to be able to name its
+/// sidecars before it has a log to ask. See [`Log::journal_path`].
+pub fn journal_path_beside(path: &Path) -> PathBuf {
+    let mut beside = path.to_path_buf().into_os_string();
+    beside.push(".relink");
+    PathBuf::from(beside)
+}
+
+/// The checkpoint beside a log at this path, and the name it is written
+/// under before the rename. See [`Log::checkpoint_path`].
+pub fn checkpoint_path_beside(path: &Path) -> (PathBuf, PathBuf) {
+    let mut beside = path.to_path_buf().into_os_string();
+    beside.push(".ckpt");
+    let mut writing = beside.clone();
+    writing.push(".writing");
+    (PathBuf::from(beside), PathBuf::from(writing))
+}
+
 /// Pages per chunk of the page table.
 ///
 /// A chunk is 4096 pointers, so 32 KiB of memory covering 16 GiB of
@@ -1196,9 +1215,7 @@ impl Log {
     /// after it and there is nowhere in it to put a slot. See
     /// [`crate::recover`].
     pub fn journal_path(&self) -> PathBuf {
-        let mut path = self.path.clone().into_os_string();
-        path.push(".relink");
-        PathBuf::from(path)
+        journal_path_beside(&self.path)
     }
 
     /// Where the checkpoint of the two planes lives, and the name it is
@@ -1206,11 +1223,7 @@ impl Log {
     /// the same reason the relink journal is: there is nowhere in the
     /// log to put it. See [`crate::checkpoint`].
     pub fn checkpoint_path(&self) -> (PathBuf, PathBuf) {
-        let mut path = self.path.clone().into_os_string();
-        path.push(".ckpt");
-        let mut writing = path.clone();
-        writing.push(".writing");
-        (PathBuf::from(path), PathBuf::from(writing))
+        checkpoint_path_beside(&self.path)
     }
 
     /// Commits the log file's bytes to the device outside the flusher's

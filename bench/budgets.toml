@@ -2224,39 +2224,18 @@ sustained_file_x = 3.0
 # supposed to fail it rather than have it raised.
 write_cpu_nosync_us = 30.0
 
-# The same measurement on a shared runner, which is where CI runs it.
+# There is no second key for a shared runner any more. There used to be
+# one, because the ceiling above is a product target rather than a number
+# fitted to a box and a hosted runner cannot meet it, and a per box class
+# key drifts: it was fitted at 60 off two readings, went red on every run
+# for a day, and had to be refitted to 100 off twelve. That is #648.
 #
-# The key above is a target and not a fitted ceiling, so it does not
-# move: 30 us is what docs/12 asks of the write path and the laptop
-# reads 19.7 against it. A hosted runner is two shared vCPUs, which is
-# the box and not the write path, and gating the target there would
-# either fail forever or drag the target up behind it. So the target
-# stays where it is and is enforced on a machine with its cores to
-# itself, and the shared box gets a ceiling of its own. The bench prints
-# which of the two it enforced.
-#
-# Refitted, because the first fit was taken from two readings the runner
-# class does not reproduce. It was set at 60 off readings of 35.6 and
-# 40.7, and the job has been red on every run since. Every reading CI
-# has produced on this key, oldest first over the day after the fit:
-# 68.6, 49.3, 72.3, 65.0, 72.5, 75.9, 77.2, 64.5, 67.5, 67.2, 64.7,
-# 74.2. Median 68, worst 77.2, and the laptop reads 23.4 to 30.0 in the
-# same hours against the 19.7 the fit was written from, so about a fifth
-# of the gap is this laptop being busier and the rest is the runner.
-# Two samples at 35 to 40 are not what that box does.
-#
-# 100 is over the worst of the twelve with room for a bad minute, and
-# well under the 136 that would be a doubling of what the runner itself
-# reads today. That is the same rule the first fit stated, applied to a
-# sample large enough to state it from.
-#
-# The real fix is not a fitted number at all. refuse.rs measures how
-# fast the host is on a proxy loop shaped like the work it gates and
-# scales its ceiling by that, clamped, so it needs no per box class key.
-# This gate wants the same treatment and it is tamnd/zu#648.
-#
-# Lower this ceiling, never raise it.
-write_cpu_nosync_shared_us = 100.0
+# write.rs now does what refuse.rs does. It times a proxy loop shaped
+# like a write, divides by what that loop costs on the host the target
+# was written for, and reads the ceiling at that ratio, clamped to three.
+# So the target above is enforced everywhere, at 30 us on a machine with
+# its cores to itself and at whatever multiple of 30 the box has earned
+# on a slower one, and there is nothing here to keep current.
 
 # A bound on a stored date at one worker, M rows/s (docs/07): two
 # million people with a birthday strided over forty years, so

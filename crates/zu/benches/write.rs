@@ -151,6 +151,102 @@ const SAMPLE: u64 = 25;
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
+/// What one round of [`calibrate`] costs on the machine the target was
+/// written for, in nanoseconds. A laptop M4 with its cores to itself.
+///
+/// Three consecutive runs on that host read 288, 330 and 343, so the
+/// middle one is the figure and the spread is about fifteen percent,
+/// which the floor of the clamp absorbs: a host at or under the
+/// reference reads the target exactly and never anything tighter.
+///
+/// This is not a number to tune. It is a property of one host, and the
+/// only reason to change it is that the host it was taken on has been
+/// replaced.
+const CALIBRATION_REFERENCE_NS: f64 = 330.0;
+
+/// The most the host calibration is allowed to relax the write ceiling.
+///
+/// A hosted runner reads about two and a half times the reference and a
+/// bad minute on one reads more, so three leaves room for the bad
+/// minute. Past that the box is not slow, it is broken or it is
+/// swapping, and a gate that keeps stretching for it stops being a gate.
+const CALIBRATION_CAP: f64 = 3.0;
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// How fast this host is on a loop shaped like the work the write gate
+/// measures, in nanoseconds a round.
+///
+/// The write ceiling below is a product target and not a number fitted
+/// to a box, so it cannot simply be raised until the runners pass. The
+/// alternative used to be a second ceiling written for the shared runner
+/// class, which drifted out of date without anyone noticing and had to
+/// be refitted twice, and that is what #648 asked to remove.
+///
+/// This is what `refuse.rs` does instead: measure the host on a proxy,
+/// divide by what the proxy costs on the box the target was written
+/// for, and scale the ceiling by the ratio. A box twice as slow gets
+/// twice the ceiling and nothing else changes, so there is no per box
+/// class key to keep current.
+///
+/// The proxy has to be shaped like the write path or the ratio means
+/// nothing, and a write statement is three things: it formats a key and
+/// a value, it copies them into a buffer that grows, and it puts an
+/// entry in a map. So that is the round. No file and no syscall, on
+/// purpose, because a fitted ceiling for the disk is a different
+/// argument and the sync cost is already reported separately.
+fn calibrate() -> f64 {
+    const ROUNDS: usize = 20_000;
+    const KEYS: usize = 64;
+    const VALUE: usize = 256;
+    let mut rng = 0x2064u64;
+    let mut sink = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let round = |rng: &mut u64,
+                 sink: &mut usize,
+                 buf: &mut Vec<u8>,
+                 seen: &mut std::collections::HashMap<u64, usize>| {
+        // The buffer is cleared and not freed, which is what an append
+        // to a log frame does: the capacity is reached once and then the
+        // cost is the copy.
+        buf.clear();
+        for _ in 0..4 {
+            let k = xorshift(rng) % KEYS as u64;
+            let key = format!("person:{k:012}");
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&[b'v'; VALUE]);
+            let n = seen.len();
+            seen.insert(k, n);
+            *sink += buf.len();
+        }
+        // A fold reads back what it just wrote, so the round does too.
+        for _ in 0..4 {
+            let k = xorshift(rng) % KEYS as u64;
+            *sink += seen.get(&k).copied().unwrap_or(0);
+        }
+        if seen.len() > KEYS {
+            seen.clear();
+        }
+    };
+    for _ in 0..ROUNDS / 10 {
+        round(&mut rng, &mut sink, &mut buf, &mut seen);
+    }
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        round(&mut rng, &mut sink, &mut buf, &mut seen);
+    }
+    let ns = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+    std::hint::black_box(sink);
+    std::hint::black_box(&buf);
+    ns
+}
+
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
     for line in std::fs::read_to_string(path).ok()?.lines() {
@@ -1435,14 +1531,24 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
 
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
-    // Whether the box this is running on is a shared runner rather than
-    // a machine with its cores to itself. One ceiling here is a product
-    // target rather than a number fitted to what was measured, and a
-    // target is about the product and not about whatever vCPU a hosted
-    // runner handed out, so on a shared box that key is enforced against
-    // a second ceiling written for a shared box. Both are ceilings and
-    // both are enforced; neither is the other's excuse.
-    let shared = std::env::var("ZU_GATE_SHARED").is_ok_and(|v| v == "1");
+    // How fast this box is, on a proxy shaped like a write. One ceiling
+    // here is a product target rather than a number fitted to a box, and
+    // this is what lets that one target be enforced everywhere: it is
+    // read at what the target says on the reference host and at the
+    // ratio above it on a slower one. See #648 for what this replaced.
+    let cal_ns = calibrate();
+    let raw = cal_ns / CALIBRATION_REFERENCE_NS;
+    let scale = raw.clamp(1.0, CALIBRATION_CAP);
+    println!(
+        "host calibration: {cal_ns:.0} ns per round, {raw:.2}x the reference \
+         {CALIBRATION_REFERENCE_NS:.0} ns"
+    );
+    if raw > scale {
+        println!(
+            "host calibration: {raw:.2}x is past the {CALIBRATION_CAP:.0}x cap, the write \
+             ceiling is read at {CALIBRATION_CAP:.0}x"
+        );
+    }
     let root = tempfile::tempdir().expect("tempdir");
     let sync = sync_cpu(root.path());
     println!("one sync costs this machine {sync:.0} us of processor time");
@@ -1729,18 +1835,21 @@ fn main() {
         ("write_cpu_nosync_us", unsynced.cost.cpu),
     ];
     for (key, got) in checks {
-        // The one key with a ceiling per box class. On a shared runner
-        // the target below it is not the question being asked, so the
-        // shared ceiling is read instead, and the line says which one
-        // was enforced so a log is not quietly measuring the other.
-        let key = match (key, shared) {
-            ("write_cpu_nosync_us", true) => "write_cpu_nosync_shared_us",
-            (key, _) => key,
+        let Some(written) = budget(key) else { continue };
+        // The one key that is a product target rather than a number
+        // fitted to what was measured, so it is the one that has to be
+        // read against the host rather than against a box class. Every
+        // other ceiling here is either a ratio, which a slow box cannot
+        // move, or was fitted on the box class that enforces it.
+        let ceiling = match key {
+            "write_cpu_nosync_us" => written * scale,
+            _ => written,
         };
-        if let Some(ceiling) = budget(key)
-            && got > ceiling
-        {
-            println!("GATE FAIL {key}: {got:.2} > ceiling {ceiling}");
+        if key == "write_cpu_nosync_us" {
+            println!("write ceiling: {written:.1} us written, {ceiling:.1} us on this host");
+        }
+        if got > ceiling {
+            println!("GATE FAIL {key}: {got:.2} > ceiling {ceiling:.2}");
             failed = true;
         }
     }

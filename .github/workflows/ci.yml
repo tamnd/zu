@@ -450,11 +450,11 @@ jobs:
       # runner cannot move those; the absolute ones are set for a box
       # whose fdatasync is several times slower than a laptop's.
       #
-      # ZU_GATE_SHARED says this box shares its cores, which swaps the
-      # one ceiling that is a product target rather than a fitted number
-      # for the shared box's own ceiling. Everything else is enforced
-      # here exactly as it is anywhere.
-      - run: ZU_GATE=1 ZU_GATE_SHARED=1 cargo bench -p zu --bench write
+      # The one ceiling that is a product target rather than a fitted
+      # number is read against this host's own speed on a proxy loop, so
+      # there is nothing to tell the bench about the box it is on. It
+      # prints the calibration and the ceiling it enforced.
+      - run: ZU_GATE=1 cargo bench -p zu --bench write
 
   commit:
     runs-on: ubuntu-latest

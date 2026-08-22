@@ -1416,28 +1416,17 @@ impl Session {
     }
 
     /// The pin one held parameter is, or nothing when it holds a value.
+    ///
+    /// This is the reporting form and it builds strings, so it is for
+    /// the caller that asked rather than for the statement path. What
+    /// the statement path wants is [`Session::stale_of`], which answers
+    /// the same question and allocates nothing.
     fn pin_of(&self, name: &str, param: &SessionParam) -> Option<Pin> {
-        let (epoch, what, stale) = match &param.value {
-            Value::Graph(g) => (
-                g.epoch,
-                g.label(),
-                match self.graph.catalog().graph_by_id(g.id) {
-                    Some(_) => Stale::Fresh,
-                    None => Stale::Gone,
-                },
-            ),
+        let (epoch, what) = match &param.value {
+            Value::Graph(g) => (g.epoch, g.label()),
             Value::BindingTable(t) => (
                 t.epoch(),
                 format!("BINDING TABLE of {} rows", t.rows().len()),
-                if t.epoch() == self.epoch {
-                    Stale::Fresh
-                } else if t.holds_elements() {
-                    Stale::Gone
-                } else if self.epoch - t.epoch() > self.stale_bound {
-                    Stale::Old
-                } else {
-                    Stale::Fresh
-                },
             ),
             _ => return None,
         };
@@ -1446,8 +1435,37 @@ impl Session {
             kind: param.kind.word(),
             epoch,
             what,
-            stale,
+            stale: self.stale_of(param)?,
         })
+    }
+
+    /// What has become of what one held parameter names, or nothing
+    /// when it holds a value, a value being the same value at every
+    /// epoch and so never pinned to one.
+    ///
+    /// Every statement on a session holding parameters asks this once
+    /// per parameter, so it costs a catalog lookup for a graph and, for
+    /// a table that is not at the session's epoch, the walk that says
+    /// whether the rows name elements. Nothing here allocates: a
+    /// session that is holding nothing stale pays the comparison and
+    /// stops.
+    fn stale_of(&self, param: &SessionParam) -> Option<Stale> {
+        match &param.value {
+            Value::Graph(g) => Some(match self.graph.catalog().graph_by_id(g.id) {
+                Some(_) => Stale::Fresh,
+                None => Stale::Gone,
+            }),
+            Value::BindingTable(t) => Some(if t.epoch() == self.epoch {
+                Stale::Fresh
+            } else if t.holds_elements() {
+                Stale::Gone
+            } else if self.epoch - t.epoch() > self.stale_bound {
+                Stale::Old
+            } else {
+                Stale::Fresh
+            }),
+            _ => None,
+        }
     }
 
     /// How many epochs a held binding table may fall behind before the
@@ -1471,6 +1489,14 @@ impl Session {
     /// pays nothing.
     fn warn_stale(&self, held: &HashMap<String, SessionParam>, result: &mut QueryResult) {
         for (name, param) in held {
+            // The cheap question first, and the strings only for a
+            // parameter that has an answer worth hearing. A session
+            // whose parameters are all fresh, which is nearly every
+            // session nearly all of the time, allocates nothing here.
+            match self.stale_of(param) {
+                None | Some(Stale::Fresh) => continue,
+                Some(_) => {}
+            }
             let Some(pin) = self.pin_of(name, param) else {
                 continue;
             };

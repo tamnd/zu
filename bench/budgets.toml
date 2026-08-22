@@ -388,6 +388,21 @@ open_p99_ms = 10.0
 session_plan_hit_us = 5.0
 session_point_us = 10.0
 
+# G8 (zu#123). The same point read on a session holding three session
+# parameters, one of each kind, none of which the query reads. What it
+# gates is the price of a session having state at all: the held map is
+# folded over what the caller passed and the references among them are
+# checked, once per statement. A session that has set nothing does not
+# even clone the pointer, so it is the empty path above that the P0
+# gate covers and this one that covers the rest.
+#
+# The ceiling is the same 10 the empty read gets, deliberately, because
+# the fold is over a map of three and a session that has set three
+# parameters should not be measurably slower than one that has set
+# none. If this ever needs its own looser number, the thing to fix is
+# the fold and not the number.
+session_point_held_us = 10.0
+
 # P1 vector kernel gates (Spec/2064g/perf/02 and perf/11, zu#74),
 # benches/kernels.rs, single core, all inputs cache resident. The spec
 # targets print next to every measurement; floors sit under the worst

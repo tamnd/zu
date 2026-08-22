@@ -124,6 +124,19 @@ fn chunk_layout() -> Layout {
 /// megabyte is the point where the syscall has stopped mattering.
 pub const PROVISION_CHUNK: u64 = 1 << 20;
 
+/// How much log the engine's own copies may use above `max_pages`.
+///
+/// An eighth of the cap, and never less than two pages. Compaction has
+/// to take a live record to the tail before it can free the space the
+/// record was in, so a cap that binds the pass as tightly as it binds
+/// the writers is a cap the log cannot get out from under. The reserve
+/// is what a pass copies into, and it comes back the moment the pass
+/// reclaims, so the steady state is the cap and not the cap plus this.
+/// See [`Log::allocate`]. #566.
+fn reserve_pages(max_pages: usize) -> usize {
+    (max_pages / 8).max(2)
+}
+
 /// What the thread doing the device write owns while it does it.
 ///
 /// Only the leader of a group ever holds this, and leadership is decided
@@ -660,7 +673,14 @@ impl Log {
     /// and a commit both take as their target, so a tail sitting in a
     /// page that cannot exist is not a full log, it is a database that
     /// can no longer be made durable at all.
-    fn allocate(&self, slot: &Slotted, size: usize) -> Result<Address> {
+    /// `reserved` is for the engine's own copies. Compaction takes a
+    /// record back to the tail before it can reclaim the space the
+    /// record was in, so a log held to exactly `max_pages` for everyone
+    /// has no way out of being full: the writers stop, the pass that
+    /// would free their space needs room to copy into, and there is
+    /// none. The reserve is the way out, and only maintenance sessions
+    /// can spend it. #566.
+    fn allocate(&self, slot: &Slotted, size: usize, reserved: bool) -> Result<Address> {
         if size > PAGE_SIZE {
             return Err(Error::RecordTooLarge {
                 size,
@@ -686,7 +706,12 @@ impl Log {
             // on, rather than a count of every page the database has
             // ever touched (#470).
             let span = page_of(start) - page_of(self.begin()) + 1;
-            if span > self.max_pages {
+            let cap = if reserved {
+                self.max_pages + reserve_pages(self.max_pages)
+            } else {
+                self.max_pages
+            };
+            if span > cap {
                 return Err(Error::LogFull {
                     span,
                     max: self.max_pages,
@@ -899,7 +924,7 @@ impl Log {
     ) -> Result<Address> {
         let size = record::size_of(key.len(), value.len());
         let outcome = (|| -> Result<Address> {
-            let address = self.allocate(slot, size)?;
+            let address = self.allocate(slot, size, slot.is_engine())?;
             let page = self.ensure_page(page_of(address))?;
             // SAFETY: the range came back from the tail allocator, so no
             // other thread owns it, and it lies inside the page because

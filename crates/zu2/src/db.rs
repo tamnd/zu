@@ -2293,13 +2293,72 @@ impl<'a> Session<'a> {
     ) -> Result<()> {
         let hash = index::hash(key);
         let tag = Index::tag(hash);
-        self.slot.protect();
-        let outcome = self
-            .bucket_of(hash)
-            .and_then(|bucket| self.install(bucket, tag, key, value, tombstone, kind));
-        self.slot.unprotect();
-        let end = outcome?;
-        self.finish(end)
+        loop {
+            self.slot.protect();
+            let outcome = self
+                .bucket_of(hash)
+                .and_then(|bucket| self.install(bucket, tag, key, value, tombstone, kind));
+            self.slot.unprotect();
+            match outcome {
+                // The log is over its span and this writer is what is
+                // filling it, so it pays for a pass and goes round again
+                // rather than handing the caller a failure it can only
+                // answer by sleeping and trying the same write. Outside
+                // the epoch, because a pass reclaims through quiescence
+                // and a writer parked inside its epoch is what a pass
+                // cannot get past, and safe to restart from here for the
+                // reason [`bucket_of`](Self::bucket_of) gives: a failed
+                // append leaves nothing behind. #566.
+                Err(Error::LogFull { span, max }) => {
+                    if !self.make_room()? {
+                        return Err(Error::LogFull { span, max });
+                    }
+                }
+                outcome => return self.finish(outcome?),
+            }
+        }
+    }
+
+    /// Runs one compaction pass and says whether it moved the floor.
+    ///
+    /// False is the answer that means waiting will not help: the live
+    /// set is the span, and the caller's [`Error::LogFull`] is the truth
+    /// rather than a writer that got ahead of the maintenance thread.
+    ///
+    /// The caller must be out of its epoch. See [`write`](Self::write).
+    fn make_room(&mut self) -> Result<bool> {
+        let before = self.core.log.begin();
+        let _maintenance = self.core.maintenance.lock().expect("zu2 maintenance");
+        // Somebody else's pass, either the maintenance thread or another
+        // writer in the same place, ran while this one waited for the
+        // lock. Then the room is already there and a second pass over
+        // what it left would find it all live.
+        if self.core.log.begin() > before {
+            return Ok(true);
+        }
+        let mut session = self.core.maintenance_session()?;
+        for attempt in 0..2 {
+            let upto = compact::ceiling(&session).min(page_start(page_of(self.core.log.tail())));
+            let pass = compact::compact(&mut session, upto)?;
+            self.core.compaction.note(&pass);
+            if pass.scanned > 0 {
+                checkpoint::discard(self.core);
+            }
+            if self.core.log.begin() > before {
+                return Ok(true);
+            }
+            if attempt == 0 {
+                // The pass found nothing to do, which under a set of
+                // writers this size usually means the log it would have
+                // read is still above the read-only boundary and the
+                // flusher is what is behind. Waiting for the device is
+                // the honest answer to that, and it is a wait the caller
+                // would rather have than a failure.
+                let tail = self.core.log.tail();
+                self.core.log.make_durable(tail, Durability::Durable)?;
+            }
+        }
+        Ok(false)
     }
 
     fn finish(&self, end: Option<Address>) -> Result<()> {
@@ -3127,12 +3186,21 @@ mod tests {
             let value = vec![b'x'; 1000 + (i % 2) * 8];
             session.upsert(b"churn", &value).expect("churn");
         }
+        // A durable write to end on, for the reason tests/coldtier.rs
+        // gives: a pass takes pages below the read-only boundary, and
+        // where that boundary is depends on what the flusher has got
+        // through, so a pass over an unflushed log races it and takes
+        // nothing.
+        session.set_durability(Durability::Durable);
+        session.upsert(b"churn", &[b'x'; 1000]).expect("churn");
         drop(session);
         db.compact().expect("compact");
         let mut session = db.session();
         assert!(
             at < db.core.log.begin(),
-            "the compaction did not reach the record, so there is nothing to walk off"
+            "the compaction did not reach the record at {at}, begin {}, tail {}",
+            db.core.log.begin(),
+            db.core.log.tail(),
         );
 
         // The bucket as the losing reader saw it: the key's entry still
@@ -3153,5 +3221,66 @@ mod tests {
             session.truncated,
             "the walk ran off the floor and called it an absent key"
         );
+    }
+
+    #[test]
+    fn a_writer_that_fills_the_log_waits_for_a_pass() {
+        // #566. Four times the cap written over one key, with the
+        // background thread turned off, so the only thing that can free
+        // space is the writer itself. It used to get `LogFull` at the
+        // cap and stop.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = Options {
+            compact_below: 0,
+            // Room for the mutable window and something below it for a
+            // pass to read, which two pages is not: the whole log is
+            // then inside the window and there is nothing to compact.
+            max_pages: 4,
+            ..one_bucket()
+        };
+        let db = Db::create(&dir.path().join("f.zu2"), options).expect("create");
+        let mut session = db.session();
+        let cap = options.max_pages * PAGE_SIZE;
+        for i in 0..(4 * cap / 1000) {
+            let value = vec![b'x'; 1000 + (i % 2) * 8];
+            session
+                .upsert(b"churn", &value)
+                .unwrap_or_else(|e| panic!("write {i} of {}: {e:?}", 4 * cap / 1000));
+        }
+        // And the key still reads back, since making room is a
+        // compaction and not a way of dropping the oldest writes.
+        let mut out = Vec::new();
+        assert!(session.read(b"churn", &mut out).expect("read"));
+        assert_eq!(out.len(), 1000 + ((4 * cap / 1000) - 1) % 2 * 8);
+        assert!(
+            db.core.log.span() <= (options.max_pages + 2) as u64 * PAGE_SIZE as u64,
+            "the log ran past its cap and the reserve"
+        );
+    }
+
+    #[test]
+    fn a_log_the_live_set_fills_still_says_so() {
+        // The other half of #566: waiting only helps when a pass has
+        // something to give back, and a live set the size of the cap
+        // gives back nothing. Then `LogFull` is the truth and the write
+        // has to see it rather than spin.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = Options {
+            compact_below: 0,
+            max_pages: 2,
+            ..one_bucket()
+        };
+        let db = Db::create(&dir.path().join("l.zu2"), options).expect("create");
+        let mut session = db.session();
+        let cap = options.max_pages * PAGE_SIZE;
+        let mut failed = false;
+        for i in 0..(2 * cap / 1000) {
+            let key = format!("key {i:07}").into_bytes();
+            if session.upsert(&key, &[b'x'; 1000]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "a live set twice the cap fitted in the log");
     }
 }

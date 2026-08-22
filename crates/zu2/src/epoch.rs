@@ -368,6 +368,14 @@ impl<'a> Slotted<'a> {
         })
     }
 
+    /// Whether this slot belongs to the engine rather than to the host.
+    /// The log lets these spend the compaction reserve, since a pass has
+    /// to copy a record forward before it can free the space behind it.
+    /// See [`crate::log::Log::allocate`].
+    pub fn is_engine(&self) -> bool {
+        self.engine
+    }
+
     /// A slot for the engine's own flushing and compaction, which the
     /// host cannot take.
     pub fn reserved(epochs: &'a Epochs) -> Option<Self> {

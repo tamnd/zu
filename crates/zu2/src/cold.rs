@@ -69,6 +69,13 @@ use crate::{file, log};
 /// entry can name.
 pub const BASE: Address = 1 << 47;
 
+/// How much of a cold record a read asks for before it knows how long
+/// the record is. A YCSB record is ten fields of a hundred bytes and is
+/// the largest thing this has to cover in one go, and the read is a
+/// syscall whose cost is in reaching the device rather than in the bytes
+/// it hands back, so this is generous on purpose.
+const SPECULATE: usize = 1152;
+
 /// Whether an address names a record in the cold tier.
 #[inline]
 pub const fn is_cold(address: Address) -> bool {
@@ -355,7 +362,7 @@ impl Cold {
                 why: "outside the cold tier",
             });
         }
-        {
+        let written = {
             // The page being filled is not in the file yet, and a record
             // that has just been migrated is read the moment somebody
             // looks the key up.
@@ -364,15 +371,25 @@ impl Cold {
                 let from = (address - buffer.base) as usize;
                 return buffer.read(from, address, into);
             }
-        }
-        into.clear();
-        into.resize(record::HEADER / 8, 0);
-        // SAFETY: the buffer is a whole header and 8 byte aligned.
-        let header = unsafe {
-            std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), record::HEADER)
+            buffer.base
         };
-        file::read_exact_at(&self.file, header, self.at(address))?;
-        // SAFETY: as above, and the lengths are only used to size the
+        // One read where the obvious two would be a header and then the
+        // record it describes. A cold read is the slowest thing in the
+        // read path, because there are no resident pages down here and
+        // every one of these is a syscall that may go to the device, so
+        // paying two of them for a record that nearly always fits in the
+        // first is the wrong trade. SPECULATE covers the YCSB record and
+        // everything smaller, and a record longer than it costs the
+        // second read it would have cost anyway. #557.
+        let ceiling = (written - address) as usize;
+        let have = SPECULATE.min(ceiling).max(record::HEADER);
+        into.clear();
+        into.resize(have.div_ceil(8), 0);
+        // SAFETY: the buffer is `have` bytes and 8 byte aligned.
+        let speculated =
+            unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), have) };
+        file::read_exact_at(&self.file, speculated, self.at(address))?;
+        // SAFETY: as above, and the lengths are only used to size a
         // second read.
         let size = unsafe {
             let r = RecordRef::new(into.as_ptr().cast());
@@ -384,10 +401,15 @@ impl Cold {
                 why: "a cold record longer than a page",
             });
         }
-        into.resize(size.div_ceil(8), 0);
-        // SAFETY: the buffer is size bytes and 8 byte aligned.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), size) };
-        file::read_exact_at(&self.file, bytes, self.at(address))?;
+        if size > have {
+            into.resize(size.div_ceil(8), 0);
+            // SAFETY: the buffer is size bytes and 8 byte aligned, and
+            // the first `have` of them are already the record's.
+            let rest = unsafe {
+                std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>().add(have), size - have)
+            };
+            file::read_exact_at(&self.file, rest, self.at(address) + have as u64)?;
+        }
         // SAFETY: as above, and a whole record is there now.
         let intact = unsafe { RecordRef::new(into.as_ptr().cast()).intact() };
         if !intact {

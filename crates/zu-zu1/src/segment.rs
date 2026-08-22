@@ -175,8 +175,37 @@ impl SegmentMeta {
         if start >= BLOCK_SIZE {
             return Err(corrupt("payload starts past the end of its block"));
         }
-        if (u64::from(start) + payload_len).div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
+        // Checked, because `payload_len` is a word off the disk and a
+        // file that claims one near u64::MAX makes this addition wrap.
+        // The wrapped sum then passes the block count check for some
+        // small count and the decode carries on with a length nothing
+        // in the file backs. libFuzzer found it as a panic under the
+        // overflow checks the fuzz profile turns on, which is the same
+        // arithmetic failing loudly in a build that watches for it.
+        let span = u64::from(start)
+            .checked_add(payload_len)
+            .ok_or_else(|| corrupt("payload length runs off the end of the address space"))?;
+        if span.div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
             return Err(corrupt("payload length disagrees with block count"));
+        }
+        // `value_count` is a word off the disk too, and it reaches an
+        // allocation before anything has looked at it: `read_segment_pooled`
+        // reserves that many `u64` up front, and the CSR read path in
+        // graph.rs calls it with a meta straight out of this decoder. A
+        // file claiming u64::MAX aborts the process on the reservation.
+        // The two `payload_len` reservations are already capped at 4 MiB
+        // for exactly this reason and this one was missed.
+        //
+        // The payload bounds it, and tightly. Every chunk carries a chunk
+        // index entry and a fence, four and eight bytes in MiniBlock and
+        // eight and eight in FullZip, after a four byte chunk count, so a
+        // payload of n bytes cannot describe more than (n - 4) / 12
+        // chunks in either layout. `index_and_body` makes the same
+        // deduction later, but later is after the allocation.
+        if value_count.div_ceil(CHUNK_ROWS as u64) > payload_len.saturating_sub(4) / 12 {
+            return Err(corrupt(
+                "value count needs more chunks than the payload holds",
+            ));
         }
         // The claimed count must fit in the bytes actually present before
         // it sizes an allocation.
@@ -458,7 +487,13 @@ pub fn read_segment_pooled(
     if let Some(values) = pool.get(key) {
         return Ok(values);
     }
-    let mut values = Vec::with_capacity(meta.value_count as usize);
+    // Capped like the two payload reservations. `decode_at` holds
+    // `value_count` to what the payload can describe, so a meta off the
+    // disk cannot get here with a wild one, but this function takes a
+    // `&SegmentMeta` from anywhere and the reservation is only a hint.
+    // Growth past the cap is bounded by the decode, which fails on the
+    // first chunk the payload does not back.
+    let mut values = Vec::with_capacity((meta.value_count as usize).min(1 << 20));
     read_segment(db, meta, &mut values)?;
     let values = Arc::new(values);
     pool.insert(key, Arc::clone(&values));
@@ -1315,6 +1350,108 @@ mod tests {
         meta.encode(&mut bytes);
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(format!("{err}").contains("zone min above max"));
+    }
+
+    /// A payload length near the top of the word is rejected rather
+    /// than added to the start and wrapped.
+    ///
+    /// The header carries the length as a plain `u64` and nothing has
+    /// checked it by the time the block count is compared against it,
+    /// so a file that says u64::MAX used to wrap the sum round to a
+    /// small number and take the comparison with it.
+    #[test]
+    fn hostile_payload_length_near_the_top_of_the_word_rejected() {
+        let meta = SegmentMeta {
+            value_count: 10,
+            payload_len: u64::MAX,
+            uncompressed_bytes: 80,
+            min: 0,
+            max: 10,
+            crc: 0,
+            structural: Structural::MiniBlock,
+            sorted: false,
+            start: 8,
+            blocks: vec![3],
+        };
+        let mut bytes = Vec::new();
+        meta.encode(&mut bytes);
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("runs off the end of the address space"),
+            "{err}"
+        );
+    }
+
+    /// A value count the payload cannot possibly hold is rejected at
+    /// decode, before it sizes a reservation.
+    ///
+    /// `read_segment_pooled` reserves `value_count` u64 up front and the
+    /// CSR read path hands it a meta straight off the disk, so a file
+    /// claiming u64::MAX values used to abort the process on the
+    /// reservation rather than fail the read.
+    #[test]
+    fn hostile_value_count_beyond_what_the_payload_can_hold_rejected() {
+        let meta = SegmentMeta {
+            value_count: u64::MAX,
+            payload_len: 80,
+            uncompressed_bytes: 80,
+            min: 0,
+            max: 10,
+            crc: 0,
+            structural: Structural::MiniBlock,
+            sorted: false,
+            start: 0,
+            blocks: vec![3],
+        };
+        let mut bytes = Vec::new();
+        meta.encode(&mut bytes);
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("more chunks than the payload holds"),
+            "{err}"
+        );
+
+        // And one just over the line, which is where an off by one in
+        // the bound would hide. An 80 byte payload holds a four byte
+        // chunk count and six chunks of index and fence, so 6 * 1024
+        // values fit and 6 * 1024 + 1 do not.
+        for (count, ok) in [(6 * 1024u64, true), (6 * 1024 + 1, false)] {
+            let mut m = meta.clone();
+            m.value_count = count;
+            let mut bytes = Vec::new();
+            m.encode(&mut bytes);
+            assert_eq!(SegmentMeta::decode(&bytes, 0).is_ok(), ok, "{count}");
+        }
+    }
+
+    /// Every real segment survives the value count bound, at the sizes
+    /// where a chunk boundary falls, because a check derived from the
+    /// layout is worth nothing if it rejects what the writer produces.
+    #[test]
+    fn the_value_count_bound_admits_every_segment_the_writer_makes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        for n in [0usize, 1, 1023, 1024, 1025, 5000, 8192] {
+            let values: Vec<u64> = (0..n as u64).map(|i| i * 7).collect();
+            let meta = write_segment(&mut db, &values).unwrap();
+            let mut bytes = Vec::new();
+            meta.encode(&mut bytes);
+            let back = SegmentMeta::decode(&bytes, 0)
+                .unwrap_or_else(|e| panic!("{n} values rejected: {e}"));
+            assert_eq!(back.0.value_count, n as u64);
+
+            // FullZip too. It spends sixteen bytes a chunk against
+            // MiniBlock's twelve, so the bound is derived from the
+            // cheaper layout and has to admit the dearer one as well.
+            let blobs: Vec<Vec<u8>> = (0..n).map(|i| format!("v{i}").into_bytes()).collect();
+            let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+            let meta = crate::fullzip::write_blob_segment(&mut db, &refs).unwrap();
+            let mut bytes = Vec::new();
+            meta.encode(&mut bytes);
+            let back = SegmentMeta::decode(&bytes, 0)
+                .unwrap_or_else(|e| panic!("{n} blobs rejected: {e}"));
+            assert_eq!(back.0.value_count, n as u64);
+        }
     }
 
     #[test]

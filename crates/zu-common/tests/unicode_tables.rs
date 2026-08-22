@@ -45,6 +45,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+/// The two halves of the identifier table: the codes a name may start
+/// with and the codes it may go on with, each as `(start, end)` ranges.
+type Ident = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -121,7 +125,7 @@ fn parse_unicode_data(text: &str) -> Database {
 /// Adjacent codes of the same kind are merged into one range, which is
 /// what makes the table a few hundred entries rather than a hundred and
 /// forty thousand.
-fn parse_ident(text: &str) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+fn parse_ident(text: &str) -> Ident {
     const START: [&str; 6] = ["Lu", "Ll", "Lt", "Lm", "Lo", "Nl"];
     const MORE: [&str; 5] = ["Mn", "Mc", "Nd", "Pc", "Cf"];
 
@@ -244,12 +248,7 @@ struct Tables {
     ident_extend: Vec<(u32, u32)>,
 }
 
-fn build(
-    db: &Database,
-    exclusions: &[u32],
-    version: String,
-    ident: (Vec<(u32, u32)>, Vec<(u32, u32)>),
-) -> Tables {
+fn build(db: &Database, exclusions: &[u32], version: String, ident: Ident) -> Tables {
     let mut pool = Pool::default();
     let mut canonical = Vec::new();
     for &code in db.canonical.keys() {

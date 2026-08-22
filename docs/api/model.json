@@ -198,6 +198,14 @@
       "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
     },
     {
+      "id": "zu::Config::stale_bound",
+      "kind": "method",
+      "name": "stale_bound",
+      "of": "zu::Config",
+      "signature": "fn stale_bound(self, epochs: u64) -> Config",
+      "doc": "How many epochs a session parameter holding a binding table may\nfall behind before the statement after it carries a warning\nsaying so (plan/06 §2).\n\nA pin holds no blocks in zu, since a binding table parameter\nholds rows copied out of the snapshot rather than a reader into\nit, so this is not a knob against the store growing. It is how\nlong a caller wants to go without being told that what it is\nholding was read a while ago."
+    },
+    {
       "id": "zu::Config::threads",
       "kind": "method",
       "name": "threads",
@@ -1667,6 +1675,14 @@
       "doc": "How closing-edge probes reach the `MultiwayIntersect`, the\nWCOJ closing step of docs/07 §4."
     },
     {
+      "id": "zu::Options::zone",
+      "kind": "field",
+      "name": "zone",
+      "of": "zu::Options",
+      "signature": "i16",
+      "doc": "GS07 and GS15. The session time zone as minutes east of UTC,\nwhich is the displacement the clock read below is stamped with.\nNought is UTC, which is what a session opens in and what every\nrun that never set one keeps.\n\nA displacement and never a zone name: a name is a rule the zone\ndatabase can change, so a session set to one would answer one\nthing today and another after an upgrade, while a session set to\nan offset answers the offset for as long as it holds it."
+    },
+    {
       "id": "zu::PlanNode",
       "kind": "struct",
       "name": "PlanNode",
@@ -2840,6 +2856,14 @@
       "of": "zu::db::Config",
       "signature": "fn read_only(self, read_only: bool) -> Config",
       "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
+    },
+    {
+      "id": "zu::db::Config::stale_bound",
+      "kind": "method",
+      "name": "stale_bound",
+      "of": "zu::db::Config",
+      "signature": "fn stale_bound(self, epochs: u64) -> Config",
+      "doc": "How many epochs a session parameter holding a binding table may\nfall behind before the statement after it carries a warning\nsaying so (plan/06 §2).\n\nA pin holds no blocks in zu, since a binding table parameter\nholds rows copied out of the snapshot rather than a reader into\nit, so this is not a knob against the store growing. It is how\nlong a caller wants to go without being told that what it is\nholding was read a while ago."
     },
     {
       "id": "zu::db::Config::threads",
@@ -5323,6 +5347,59 @@
       "doc": "A persistent query session over one zu1 file: the catalog, stats,\nand schema stay resident, compiled plans are cached by source text,\nand the graph readers keep their decoded groups warm across\nqueries. The one-shot entry points in [`crate::query`] pay the full\nopen-load-parse-plan cost on every call, which is fine for a CLI\ninvocation and hopeless for a server loop; a session pays it once\nand then a warm query is a hash lookup, parameter binding, and\nexecution.\n\nStaleness is a single u64 compare: every entry point checks the\nhandle's header epoch and reloads the catalog, stats, and plan\ncache when it moved. Reads through one session are serial (the\nunderlying handle seeks), so a session is Send but queries on it\ndo not overlap; open one session per thread."
     },
     {
+      "id": "zu::session::DEFAULT_STALE_BOUND",
+      "kind": "constant",
+      "name": "DEFAULT_STALE_BOUND",
+      "signature": "u64",
+      "doc": "How many epochs a held binding table may fall behind before the\nsession mentions it.\n\nAny number here is a judgement rather than a fact, and this one is\nthe judgement that a session which has fallen sixteen epochs behind\nis holding rows from before a fair amount of churn and would like to\nhear about it, where one or two epochs behind is what an ordinary\nbusy store does under a session that is doing nothing wrong."
+    },
+    {
+      "id": "zu::session::Pin",
+      "kind": "struct",
+      "name": "Pin",
+      "doc": "What one held reference parameter is pinned to (plan/06 §2).\n\nWorth being clear about what a pin is here and what it is not. It is\nan epoch number written on a handle, and it holds no blocks: a lease\nlives for a statement, and a binding table parameter holds rows that\nwere copied out of the snapshot rather than a reader into it. So a\nsession sitting on an old parameter does not stop a checkpoint from\nreusing anything and does not grow the store. What goes stale is the\nmeaning of the reference, not the space behind it, and that is what\nthis reports."
+    },
+    {
+      "id": "zu::session::Pin::epoch",
+      "kind": "field",
+      "name": "epoch",
+      "of": "zu::session::Pin",
+      "signature": "u64",
+      "doc": "The epoch the reference was taken at."
+    },
+    {
+      "id": "zu::session::Pin::kind",
+      "kind": "field",
+      "name": "kind",
+      "of": "zu::session::Pin",
+      "signature": "&str",
+      "doc": "`GRAPH` or `BINDING TABLE`, the word it was set with."
+    },
+    {
+      "id": "zu::session::Pin::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::session::Pin",
+      "signature": "String",
+      "doc": "The name the session holds it under, without the dollar."
+    },
+    {
+      "id": "zu::session::Pin::stale",
+      "kind": "field",
+      "name": "stale",
+      "of": "zu::session::Pin",
+      "signature": "Stale",
+      "doc": "Whether it still means what it meant."
+    },
+    {
+      "id": "zu::session::Pin::what",
+      "kind": "field",
+      "name": "what",
+      "of": "zu::session::Pin",
+      "signature": "String",
+      "doc": "What it names, as a line a person reads."
+    },
+    {
       "id": "zu::session::Session",
       "kind": "struct",
       "name": "Session"
@@ -5485,6 +5562,22 @@
       "doc": "The execution switches this session runs statements under."
     },
     {
+      "id": "zu::session::Session::pinned_epoch",
+      "kind": "method",
+      "name": "pinned_epoch",
+      "of": "zu::session::Session",
+      "signature": "fn pinned_epoch(&self) -> Option<u64>",
+      "doc": "The oldest epoch any held parameter is pinned to, which is the\none number a caller watching a long-lived session wants."
+    },
+    {
+      "id": "zu::session::Session::pins",
+      "kind": "method",
+      "name": "pins",
+      "of": "zu::session::Session",
+      "signature": "fn pins(&self) -> Vec<Pin>",
+      "doc": "What the reference parameters this session holds are pinned to,\nin name order, one entry per parameter holding a graph or a\nbinding table (GS01, GS02, GS10 and GS13).\n\nA value parameter is not here because it pins nothing: a number\nis a number at every epoch. The two reference kinds each carry\nthe epoch they were taken at, and that is the pin."
+    },
+    {
       "id": "zu::session::Session::prepare",
       "kind": "method",
       "name": "prepare",
@@ -5533,12 +5626,44 @@
       "doc": "Runs one query and hands its rows to `sink` in batches as they\nare made, instead of returning them.\n\nA statement that has to see every row before it can give one,\nwhich is ORDER BY, DISTINCT and the aggregates, runs whole and is\nhanded over in batches afterwards, and so does a statement that\nwrites, because a write runs as the parts it was split into and\nthe rows come out of the last of them. Which happened is in\n[`Streamed::streamed`], and the caller's loop is the same either\nway."
     },
     {
+      "id": "zu::session::Session::session_params",
+      "kind": "method",
+      "name": "session_params",
+      "of": "zu::session::Session",
+      "signature": "fn session_params(&self) -> Vec<(&str, &str, &Value)>",
+      "doc": "The parameters this session is holding, each as its name, the\nword it was set with, and the value it holds, in name order\n(GS01 through GS03).\n\nA statement cannot ask this: `$p` answers what `$p` holds, and\nthere is no expression that answers what a session holds under\nevery name. So a shell that prints them and a test that says\nwhat a reset took away both come here."
+    },
+    {
+      "id": "zu::session::Session::session_schema",
+      "kind": "method",
+      "name": "session_schema",
+      "of": "zu::session::Session",
+      "signature": "fn session_schema(&self) -> &str",
+      "doc": "The catalog schema this session works in (GS05), which is the\nroot until a `SESSION SET SCHEMA` moves it."
+    },
+    {
       "id": "zu::session::Session::set_options",
       "kind": "method",
       "name": "set_options",
       "of": "zu::session::Session",
       "signature": "fn set_options(&mut self, options: exec::Options)",
-      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement."
+      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement.\n\nSo does the time zone, for the same reason and a stronger one:\nit is a session characteristic a statement set (GS15), not a\nswitch a caller configured, and a thread count arriving from\n[`crate::db::Config`] has nothing to say about what time it is."
+    },
+    {
+      "id": "zu::session::Session::set_stale_bound",
+      "kind": "method",
+      "name": "set_stale_bound",
+      "of": "zu::session::Session",
+      "signature": "fn set_stale_bound(&mut self, epochs: u64)",
+      "doc": "How many epochs a held binding table may fall behind before the\nsession says so on the statement after it. The default is\n[`DEFAULT_STALE_BOUND`]."
+    },
+    {
+      "id": "zu::session::Session::time_zone",
+      "kind": "method",
+      "name": "time_zone",
+      "of": "zu::session::Session",
+      "signature": "fn time_zone(&self) -> i16",
+      "doc": "The session time zone as minutes east of UTC (GS07 and GS15),\nnought being the UTC a session opens in."
     },
     {
       "id": "zu::session::Session::unregister_frame",
@@ -5557,6 +5682,14 @@
       "doc": "Makes sure a statement is compiled and cached, and reports\nwhether it already was. A server preloads its statement set\nwith this at startup; the P0 plan-hit gate times the `true`\npath, which is exactly the work between receiving a known\nquery text and starting execution: the epoch check and the\ncache lookup."
     },
     {
+      "id": "zu::session::Session::working_graph",
+      "kind": "method",
+      "name": "working_graph",
+      "of": "zu::session::Session",
+      "signature": "fn working_graph(&self) -> u32",
+      "doc": "The id of the graph a statement on this session runs against\nwhen it carries no `USE` (GS06)."
+    },
+    {
       "id": "zu::session::Session::working_graph_ref",
       "kind": "method",
       "name": "working_graph_ref",
@@ -5571,6 +5704,36 @@
       "of": "zu::session::Session",
       "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<T>",
       "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes.\n\nThe frames go to the log here and the wait for the platter does\nnot: it happens in [`Self::durable`], after the write side has\ngone back, so the writer queued behind this one stages into the\nsame sync rather than after it. What that costs is that the\nstate has to be held back too, because a reader shown a commit\na crash could take away is the one thing the deferral must not\nbuy."
+    },
+    {
+      "id": "zu::session::Stale",
+      "kind": "enum",
+      "name": "Stale",
+      "doc": "What has happened to what a held reference parameter names, which is\nwhat decides whether the session says anything about it."
+    },
+    {
+      "id": "zu::session::Stale::Fresh",
+      "kind": "variant",
+      "name": "Fresh",
+      "of": "zu::session::Stale",
+      "signature": "Fresh",
+      "doc": "The reference still means what it meant."
+    },
+    {
+      "id": "zu::session::Stale::Gone",
+      "kind": "variant",
+      "name": "Gone",
+      "of": "zu::session::Stale",
+      "signature": "Gone",
+      "doc": "A statement reading it will be refused: the graph is dropped, or\nthe rows name elements of a snapshot that has moved."
+    },
+    {
+      "id": "zu::session::Stale::Old",
+      "kind": "variant",
+      "name": "Old",
+      "of": "zu::session::Stale",
+      "signature": "Old",
+      "doc": "Behind the bound but still usable: the rows hold no element\nreferences, so what they say is as true now as it was."
     },
     {
       "id": "zu::shared",

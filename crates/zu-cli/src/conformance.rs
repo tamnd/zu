@@ -789,6 +789,12 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
             print!("{}", crate::impdef::render());
             ExitCode::SUCCESS
         }
+        // The Clause 24 claim itself, rendered from a tally rather than
+        // written, so no line of it can outrun the run behind it.
+        Some("--statement") => match args.get(1) {
+            Some(path) if args.len() == 2 => crate::statement::statement_command(path),
+            _ => crate::usage_error("conformance"),
+        },
         Some("--verify") => match args.get(1) {
             Some(path) => verify(path),
             None => crate::usage_error("conformance"),

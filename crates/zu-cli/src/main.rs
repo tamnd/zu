@@ -35,6 +35,7 @@ mod page;
 mod repl;
 mod scoreboard;
 mod shell;
+mod statement;
 mod term;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

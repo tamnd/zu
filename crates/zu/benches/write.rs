@@ -159,18 +159,25 @@ const MB: f64 = 1024.0 * 1024.0;
 /// the readings that picked this.
 const CALIBRATION_TABLE: usize = 4 << 20;
 
+/// How many distinct keys [`calibrate`] keeps in its map.
+///
+/// A million, so the map is tens of megabytes and a lookup misses cache
+/// and mispredicts, which is what an index in a store does. Sixty four
+/// of them sit in L1 and every probe is a hit, which is not.
+const CALIBRATION_KEYS: usize = 1 << 20;
+
 /// What one round of [`calibrate`] costs on the machine the target was
 /// written for, in nanoseconds. A laptop M4 with its cores to itself.
 ///
-/// Three consecutive runs on that host read 279, 287 and 293, so the
-/// middle one is the figure and the spread is under three percent, which
+/// Three consecutive runs on that host read 598, 710 and 705, so the
+/// middle one is the figure and the spread is about ten percent, which
 /// the floor of the clamp absorbs: a host at or under the reference
 /// reads the target exactly and never anything tighter.
 ///
 /// This is not a number to tune. It is a property of one host, and the
 /// only reason to change it is that the host it was taken on has been
 /// replaced.
-const CALIBRATION_REFERENCE_NS: f64 = 287.0;
+const CALIBRATION_REFERENCE_NS: f64 = 705.0;
 
 /// The most the host calibration is allowed to relax the write ceiling.
 ///
@@ -235,9 +242,8 @@ fn xorshift(state: &mut u64) -> u64 {
 /// between two kernels instead of the difference between two boxes. The
 /// file is out and the ratio is taken on wall clock, which is what the
 /// four other calibrated numbers in this file are taken on.
-fn calibrate(table: usize) -> f64 {
+fn calibrate(table: usize, keys: usize) -> f64 {
     const ROUNDS: usize = 20_000;
-    const KEYS: usize = 64;
     const VALUE: usize = 256;
     const STRIDE: usize = 4096;
     let mut rng = 0x2064u64;
@@ -253,11 +259,18 @@ fn calibrate(table: usize) -> f64 {
         page[0] = 1;
     }
     let slots = (table / STRIDE).max(1) as u64;
-    let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    // How many distinct keys are live in the map. A handful of them fit
+    // in L1 and every lookup is a hit and a predicted branch, which is
+    // not what a store's index does. A million of them is a hash table
+    // several tens of megabytes wide where the probe misses and the
+    // branch is a coin toss, which is.
+    let keys = keys as u64;
+    let mut seen: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::with_capacity(keys as usize);
     let mut round =
         |rng: &mut u64, sink: &mut usize, seen: &mut std::collections::HashMap<u64, usize>| {
             for _ in 0..4 {
-                let k = xorshift(rng) % KEYS as u64;
+                let k = xorshift(rng) % keys;
                 let key = format!("person:{k:012}");
                 // A page the round did not choose, which is the part a
                 // small buffer cannot imitate: the store decides where the
@@ -272,10 +285,10 @@ fn calibrate(table: usize) -> f64 {
             }
             // A fold reads back what it just wrote, so the round does too.
             for _ in 0..4 {
-                let k = xorshift(rng) % KEYS as u64;
+                let k = xorshift(rng) % keys;
                 *sink += seen.get(&k).copied().unwrap_or(0);
             }
-            if seen.len() > KEYS {
+            if seen.len() as u64 > keys {
                 seen.clear();
             }
         };
@@ -1589,16 +1602,22 @@ fn main() {
     // read at what the target says on the reference host and at the
     // ratio above it on a slower one. See #648 for what this replaced.
     let root = tempfile::tempdir().expect("tempdir");
-    let cal_ns = calibrate(CALIBRATION_TABLE);
-    // The other two footprints, printed and not used, so a run on a host
-    // where the scaled ceiling looks wrong says in its own log which
-    // sizes tracked the write path and which did not. Remove them once
-    // enough hosts have reported for the choice to be settled.
-    for probe in [64 << 10, 64 << 20] {
+    let cal_ns = calibrate(CALIBRATION_TABLE, CALIBRATION_KEYS);
+    // The other shapes, printed and not used, so a run on a host where
+    // the scaled ceiling looks wrong says in its own log which of them
+    // tracked the write path and which did not. Remove them once enough
+    // hosts have reported for the choice to be settled.
+    for (table, keys) in [
+        (4 << 20, 64),
+        (64 << 20, 64),
+        (64 << 10, 1 << 20),
+        (64 << 20, 1 << 20),
+    ] {
         println!(
-            "host calibration probe: {} KiB table, {:.0} ns per round",
-            probe / 1024,
-            calibrate(probe)
+            "host calibration probe: {} KiB table, {} keys, {:.0} ns per round",
+            table / 1024,
+            keys,
+            calibrate(table, keys)
         );
     }
     let raw = cal_ns / CALIBRATION_REFERENCE_NS;

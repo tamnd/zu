@@ -992,6 +992,15 @@ impl Db {
     /// commit does not have to allocate on its way to the device, and
     /// counting them would report the database as costing up to a
     /// megabyte more than it holds. The next commit provisions again.
+    ///
+    /// What this counts is the log and the cold tier. It is not the size
+    /// of the directory: the checkpoint sits beside them and is not
+    /// included, and neither is the relink journal a compaction leaves
+    /// while it runs. So a caller comparing this against `du` on the
+    /// path should expect the filesystem to be the larger of the two by
+    /// about the checkpoint, which measures at 0.8 per cent of the
+    /// database from five thousand rows to a million. A run where this
+    /// number comes out *above* the filesystem's is #631 and is a bug.
     pub fn disk_bytes(&self) -> Result<u64> {
         self.core.log.trim_tail()?;
         let mut bytes = self.core.log.disk_bytes()?;

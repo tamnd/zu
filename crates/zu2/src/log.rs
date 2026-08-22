@@ -480,6 +480,15 @@ impl Log {
         }
         self.release_chunks(page_of(upto));
         self.retire_pages();
+        // The boundary moving is not enough on its own. A read that has
+        // already passed the floor check is going to pread the file, and
+        // between that check and the pread there is nothing stopping the
+        // hole from arriving, which hands the reader a page of zeros and
+        // a checksum that does not hold (#563). So the punch waits for
+        // every session that could still be inside such a read, the same
+        // wait a doubling does before it touches the old table. It costs
+        // the maintenance thread and nothing on the read path.
+        self.epochs.wait_for_quiescence();
         // Never the first block: it holds the marker, and a hole there
         // would zero the very thing that says where the log starts.
         let floor = from.max(file::BLOCK);

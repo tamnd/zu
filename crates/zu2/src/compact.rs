@@ -347,7 +347,7 @@ pub fn compact_cold(session: &mut Session<'_>, upto: Address) -> Result<Compacte
 
     let tier = session.core_ref().cold.as_ref().expect("zu2 cold tier");
     tier.sync()?;
-    done.reclaimed = tier.reclaim_to(stopped.min(upto))?;
+    done.reclaimed = tier.reclaim_to(stopped.min(upto), session.core_ref().epochs())?;
     Ok(done)
 }
 

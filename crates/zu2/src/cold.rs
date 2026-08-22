@@ -457,7 +457,7 @@ impl Cold {
 
     /// Hands the front of the tier back to the filesystem, after the
     /// caller has moved everything live out of it.
-    pub fn reclaim_to(&self, upto: Address) -> Result<u64> {
+    pub fn reclaim_to(&self, upto: Address, epochs: &crate::epoch::Epochs) -> Result<u64> {
         let from = self.begin();
         debug_assert_eq!(
             self.at(upto) % PAGE_SIZE as u64,
@@ -470,6 +470,15 @@ impl Cold {
         self.sync()?;
         self.write_begin(upto)?;
         self.begin.store(upto, Ordering::Release);
+        // A reader that passed the bounds check at the top of `load` is
+        // about to pread, and down here that pread is the only copy of
+        // the record: there are no resident pages in this tier. Punching
+        // between the check and the read gives it a page of zeros and a
+        // checksum that does not hold, which is what #563 was, one run
+        // in four of the reclaim test. The new floor is published above,
+        // so a reader that starts now stops before it asks; this waits
+        // out the ones that started before it.
+        epochs.wait_for_quiescence();
         // Never the first block: it holds the floor, and a hole there
         // would zero the very thing that says where the tier starts.
         let floor = self.at(from).max(file::BLOCK);

@@ -855,12 +855,22 @@ fn fold_rel(
             bwd,
         })
         .collect();
+    let changed = mvcc.edge_updates(rel.id, epoch);
+    // An edge property column is dense over the edge ordinal, so it is
+    // the edges that decide whether it has anything to say, and a fold
+    // gets here for reasons that are not about the edges at all: a row
+    // appended to either end table moves the row domain the CSR is
+    // keyed by, and every rel table over that label is rebuilt for it.
+    // Nothing about the edges moved, so nothing about the columns over
+    // them did either, and the old chain is already the answer. Writing
+    // it again would cost the whole of it: the value bytes are laid out
+    // in load order and a rewrite hands them all back to the allocator,
+    // which on the LinkBench shape is two and a half megabytes of
+    // identical bytes per fold, and folds land often.
     let props = match old.props {
         NULL_BLOCK => NULL_BLOCK,
-        root => {
-            let changed = mvcc.edge_updates(rel.id, epoch);
-            fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed)?
-        }
+        root if overlay.is_empty() && dead.is_empty() && changed.is_empty() => root,
+        root => fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed)?,
     };
     let directory = Directory {
         from_count: new_from,
@@ -1826,6 +1836,58 @@ mod tests {
             assert_eq!(reader.read_int(&mut db, col, row).unwrap(), i as u64 + 1);
         }
         let path = dir.path().join("relfold.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// And it comes through naming the same blocks, not just the same
+    /// edges. A rel table is rebuilt whenever either end table grows,
+    /// because the row domain its CSR is keyed by has moved, but the
+    /// edges are where they were and so are the columns over them. The
+    /// old chain is the answer and writing it again would cost the
+    /// whole of it: on a table of any size that is the column's bytes
+    /// handed back to the allocator once a fold for nothing.
+    #[test]
+    fn a_grown_row_domain_leaves_the_edge_columns_in_their_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relgrow.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        store_props(
+            &mut db,
+            "person",
+            &[("age", PropValues::Int(&[10, 20, 30, 40]))],
+        )
+        .unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2, 3]))])
+            .unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.node_by_name("person").unwrap().id;
+        let before = GraphReader::load_table(&mut db, "knows")
+            .unwrap()
+            .directory()
+            .props;
+        let mut wal = Wal::open(&dir.path().join("relgrow.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_nodes(person, vec![(0, vec![Cell::Int(50)])])
+            .unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let after = GraphReader::load_table(&mut db, "knows")
+            .unwrap()
+            .directory()
+            .props;
+        assert_eq!(before, after, "the fold rewrote a column nothing wrote to");
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, catalog.rel_by_name("knows").unwrap().id)
+                .unwrap()
+                .unwrap(),
+        );
+        let col = reader.col("since").unwrap();
+        for i in 0..3u64 {
+            assert_eq!(reader.read_int(&mut db, col, i).unwrap(), i + 1);
+        }
+        let path = dir.path().join("relgrow.zu1");
         drop(db);
         crate::verify(&path).unwrap();
     }

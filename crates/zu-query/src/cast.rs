@@ -492,7 +492,19 @@ fn show(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Str(s) => format!("'{s}'"),
-        other => format!("{other:?}"),
+        // The references have no spelling a statement could have
+        // written, so they are named by what they are: a message
+        // saying a node is not an edge is the whole of what a reader
+        // needs, and the row it sits in is not.
+        Value::Node { .. } => "a node".into(),
+        Value::Rel { .. } => "an edge".into(),
+        Value::Path(_) | Value::Chain(_) => "a path".into(),
+        Value::Graph(_) => "a graph".into(),
+        Value::BindingTable(_) => "a binding table".into(),
+        Value::Record(_) => "a record".into(),
+        Value::List(_) => "a list".into(),
+        Value::Bytes(_) => "a byte string".into(),
+        Value::Temporal(t) => t.to_string(),
     }
 }
 

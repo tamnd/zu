@@ -688,12 +688,38 @@ impl Parser<'_> {
     /// `RETURN 1 AS MATCH` is refused and ``RETURN 1 AS `MATCH` `` is
     /// not, which is what the delimited form is for.
     fn expect_name(&mut self, what: &str) -> Result<String> {
+        self.name(what, false)
+    }
+
+    /// A property name or a record field name, which admits a reserved
+    /// word where the other name slots do not.
+    ///
+    /// Read strictly, ISO refuses one here too: `<property name>` and
+    /// `<field name>` are both `<identifier>` and the 21.3 rule reaches
+    /// every one of them. But the standard writes its own datetime
+    /// constructors as records with the fields `year`, `month`, `day`,
+    /// `hour`, `minute` and `second`, and all six of those words are in
+    /// `<reserved word>`, so `DATE({year: 2024, month: 1, day: 1})` is
+    /// a statement the standard both defines and forbids. Something has
+    /// to give, and the rule is what gives: a name in this slot always
+    /// stands between a delimiter and a colon or behind a dot, so no
+    /// word here could be read as the keyword it is spelled like, and
+    /// the rule buys nothing where there is nothing to disambiguate.
+    ///
+    /// The slots where a word could be read either way keep the rule.
+    /// `RETURN 1 AS year` is still refused, and so is `MATCH (year)`.
+    /// This is a deviation and `docs/07-query-engine.md` records it.
+    fn expect_field_name(&mut self, what: &str) -> Result<String> {
+        self.name(what, true)
+    }
+
+    fn name(&mut self, what: &str, reserved_admitted: bool) -> Result<String> {
         let Some(token) = self.peek() else {
             return Err(self.error(what));
         };
         let name = match &token.kind {
             TokenKind::Ident(s) => {
-                if keywords::is_reserved(s) {
+                if !reserved_admitted && keywords::is_reserved(s) {
                     let at = token.start;
                     let word = s.clone();
                     return Err(ZuError::gql_in(
@@ -1546,7 +1572,7 @@ impl Parser<'_> {
         let mut properties = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let name = self.expect_name("a property name")?;
+                let name = self.expect_field_name("a property name")?;
                 if !self.eat_kw("TYPED") {
                     self.expect_double_colon()?;
                 }
@@ -1620,7 +1646,7 @@ impl Parser<'_> {
             });
         }
         self.expect(&TokenKind::Dot)?;
-        let key = self.expect_name("a property name after the dot")?;
+        let key = self.expect_field_name("a property name after the dot")?;
         Ok(RemoveItem {
             target,
             what: Removed::Property(key),
@@ -1721,7 +1747,7 @@ impl Parser<'_> {
             });
         }
         self.expect(&TokenKind::Dot)?;
-        let key = self.expect_name("a property name after the dot")?;
+        let key = self.expect_field_name("a property name after the dot")?;
         self.expect(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
         Ok(SetItem {
@@ -4332,7 +4358,7 @@ impl Parser<'_> {
         let mut props = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let key = self.expect_name("a property name")?;
+                let key = self.expect_field_name("a property name")?;
                 self.expect(&TokenKind::Colon)?;
                 props.push((key, self.parse_expr()?));
                 if !self.eat(&TokenKind::Comma) {
@@ -4628,7 +4654,7 @@ impl Parser<'_> {
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         while self.eat(&TokenKind::Dot) {
-            let key = self.expect_name("a property name after '.'")?;
+            let key = self.expect_field_name("a property name after '.'")?;
             expr = Expr::Property {
                 base: Box::new(expr),
                 key,
@@ -5468,8 +5494,17 @@ impl Parser<'_> {
                 self.expect_kw("VALUE")?;
                 return Ok(LogicalType::AnyProperty);
             }
+            // GV56 and GV57 in their open spelling. ANY is optional in
+            // front of both, so the word is read here as well as below
+            // rather than the prefix being a type of its own.
+            if let Some(ty) = self.parse_reference_type()? {
+                return Ok(ty);
+            }
             self.eat_kw("VALUE");
             return Ok(LogicalType::Any);
+        }
+        if let Some(ty) = self.parse_reference_type()? {
+            return Ok(ty);
         }
         if self.eat_kw("RECORD") {
             return Ok(LogicalType::Record(self.parse_record_type()?));
@@ -5574,7 +5609,16 @@ impl Parser<'_> {
         // The one constraint a list type carries is a maximum length,
         // and it is a count rather than an expression for the same
         // reason a string's length is.
-        let max = if self.eat(&TokenKind::LParen) {
+        //
+        // ISO writes it in square brackets, `LIST<INT>[2]`, which is
+        // the only length in the grammar not written in parentheses.
+        // Both are read, since a query that spells it the way every
+        // other length is spelled meant the same thing.
+        let max = if self.eat(&TokenKind::LBracket) {
+            let n = self.parse_type_argument()?;
+            self.expect(&TokenKind::RBracket)?;
+            Some(n)
+        } else if self.eat(&TokenKind::LParen) {
             let n = self.parse_type_argument()?;
             self.expect(&TokenKind::RParen)?;
             Some(n)
@@ -5585,6 +5629,45 @@ impl Parser<'_> {
             elem: Box::new(elem),
             max,
         })
+    }
+
+    /// A node or edge reference value type, GV56 and GV57, or `None`
+    /// where the next word is neither synonym.
+    ///
+    /// Open and closed are one production here because they differ
+    /// only in what follows the synonym: `NODE` on its own admits any
+    /// node, and `NODE :Person` admits the ones wearing that label.
+    /// The two are the same word read one token further, so a caller
+    /// that had to choose between them before reading would have to
+    /// look ahead anyway.
+    ///
+    /// The label set is one name rather than a label expression. A
+    /// reference type in zu carries a name, and widening it to an
+    /// expression is worth doing when a cast to a disjunction is a
+    /// thing somebody writes; refusing the rest here says so plainly
+    /// rather than accepting a conjunction and checking one half of it.
+    fn parse_reference_type(&mut self) -> Result<Option<LogicalType>> {
+        let node = self.at_kw("NODE") || self.at_kw("VERTEX");
+        if !node && !(self.at_kw("EDGE") || self.at_kw("RELATIONSHIP")) {
+            return Ok(None);
+        }
+        self.pos += 1;
+        self.eat_kw("TYPE");
+        let mut label = None;
+        // `NODE (:Person)` is the pattern spelling of the same thing,
+        // and the parenthesis is what tells it from the phrase.
+        let parenthesised = self.eat(&TokenKind::LParen);
+        if self.eat(&TokenKind::Colon) {
+            label = Some(self.expect_name("a label in a reference type")?);
+        }
+        if parenthesised {
+            self.expect(&TokenKind::RParen)?;
+        }
+        Ok(Some(if node {
+            LogicalType::Node(label)
+        } else {
+            LogicalType::Edge(label)
+        }))
     }
 
     /// The fields of a record type, GV46, or no fields at all.
@@ -5601,7 +5684,7 @@ impl Parser<'_> {
         let mut fields = Vec::new();
         if !self.at(&TokenKind::RBrace) {
             loop {
-                let name = self.expect_name("a field name")?;
+                let name = self.expect_field_name("a field name")?;
                 self.expect_double_colon()?;
                 let ty = self.parse_value_type()?;
                 fields.push(Field { name, ty });
@@ -5670,7 +5753,7 @@ impl Parser<'_> {
         self.expect(&TokenKind::LParen)?;
         let expr = Box::new(self.parse_expr()?);
         self.expect(&TokenKind::Comma)?;
-        let key = self.expect_name("a property name")?;
+        let key = self.expect_field_name("a property name")?;
         self.expect(&TokenKind::RParen)?;
         Ok(Expr::PropertyExists { expr, key })
     }
@@ -7874,6 +7957,62 @@ mod tests {
         assert_eq!(
             q.result().expect("RETURN").items[0].expr,
             Expr::Variable("tally".to_string())
+        );
+    }
+
+    /// The deviation `expect_field_name` exists for: a reserved word
+    /// is a property name and a field name and is nothing else.
+    #[test]
+    fn a_reserved_word_is_still_a_property_name() {
+        for text in [
+            "INSERT (:Thing {year: 2024})",
+            "RETURN {year: 1} AS r",
+            "MATCH (n:Thing) RETURN n.year AS y",
+            "MATCH (n:Thing) SET n.year = 2024",
+            "RETURN DATE({year: 2024, month: 1, day: 1}) AS v",
+        ] {
+            parsed(text);
+        }
+        for text in [
+            "RETURN 1 AS year",
+            "MATCH (year:Person) RETURN 1 AS n",
+            "LET year = 1 RETURN year",
+        ] {
+            let e = parse_err(text);
+            assert!(e.contains("reserved word"), "{text}: {e}");
+        }
+    }
+
+    /// GV56 and GV57, both spellings of each, and GV50's maximum in
+    /// the brackets ISO writes it in.
+    #[test]
+    fn a_reference_value_type_parses_open_and_closed() {
+        let ty = |text: &str| {
+            let q = parsed(&format!("RETURN CAST(x AS {text}) AS v"));
+            match &q.result().expect("RETURN").items[0].expr {
+                Expr::Cast { ty, .. } => ty.base().clone(),
+                other => panic!("{text}: {other:?}"),
+            }
+        };
+        assert_eq!(ty("NODE"), LogicalType::Node(None));
+        assert_eq!(ty("ANY NODE"), LogicalType::Node(None));
+        assert_eq!(ty("ANY VERTEX"), LogicalType::Node(None));
+        assert_eq!(ty("EDGE"), LogicalType::Edge(None));
+        assert_eq!(ty("ANY RELATIONSHIP"), LogicalType::Edge(None));
+        assert_eq!(ty("NODE :Person"), LogicalType::Node(Some("Person".into())));
+        assert_eq!(
+            ty("NODE TYPE :Person"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(
+            ty("NODE (:Person)"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(ty("EDGE :KNOWS"), LogicalType::Edge(Some("KNOWS".into())));
+        assert_eq!(
+            ty("LIST<INT>[2]"),
+            ty("LIST<INT>(2)"),
+            "the two spellings of a maximum are one type"
         );
     }
 

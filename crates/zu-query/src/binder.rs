@@ -1554,6 +1554,26 @@ pub struct BoundNode {
     pub filter: Option<BoundExpr>,
 }
 
+/// The label set of a closed node or edge reference value type, GV56
+/// and GV57, as the executor checks it.
+///
+/// A node answers with the word its row carries and an edge with the
+/// table it is in, which is the same split [`BoundExpr::IsLabeled`]
+/// makes, for the same reason: an edge's label is the name of its
+/// table and is settled before any row is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constrained {
+    pub node: LabelTest,
+    pub rels: Vec<u32>,
+    /// The name as the statement wrote it, so a refusal can say which
+    /// label the value did not wear rather than printing a bit mask.
+    pub wanted: String,
+    /// Whether the type names nodes. A cast to `NODE :P` of an edge is
+    /// the wrong base type and not an unworn label, and the executor
+    /// needs this to tell the two conditions apart.
+    pub over_nodes: bool,
+}
+
 /// A compiled label expression: bit tests over the one word a row
 /// carries (docs/03 §1). The bits are dictionary ids, which are a
 /// property of the graph and not of any one table, so a test reads the
@@ -2142,6 +2162,10 @@ pub enum BoundExpr {
     Cast {
         expr: Box<BoundExpr>,
         ty: LogicalType,
+        /// The label set a closed reference value type names, GV56 and
+        /// GV57, compiled here because it is a question about the
+        /// graph and the cast itself is a pure function over values.
+        constrained: Option<Box<Constrained>>,
     },
     /// GE01. `CASE` in both forms, the branches in the order they were
     /// written, which is the order they are asked in: a branch is only
@@ -5849,6 +5873,37 @@ impl Binder<'_> {
     /// A conjunction of plain names collapses to one mask, which is the
     /// shape almost every pattern has and the one the runtime answers
     /// with a single AND.
+    /// The label test a closed reference value type carries, or `None`
+    /// where the type names no label set.
+    ///
+    /// A cast to `NODE :Person` asks two questions and the standard
+    /// gives each its own condition: whether the value is a node at
+    /// all, which is 22G0V and is the type's own business, and whether
+    /// it wears the label, which is 22G0W and is the row's. The second
+    /// is the same question `IS LABELED` asks, so it is compiled the
+    /// same way and answered by the same test rather than by a second
+    /// piece of label logic that could disagree with the first.
+    fn constrain(&self, ty: &LogicalType) -> Result<Option<Box<Constrained>>> {
+        let (name, node) = match ty.base() {
+            LogicalType::Node(Some(name)) => (name, true),
+            LogicalType::Edge(Some(name)) => (name, false),
+            _ => return Ok(None),
+        };
+        let label = LabelExpr::Label(name.clone());
+        Ok(Some(Box::new(Constrained {
+            node: self.compile_label(&label)?,
+            rels: self
+                .schema
+                .rels()
+                .iter()
+                .filter(|rel| label_holds(&label, &rel.name))
+                .map(|rel| rel.id)
+                .collect(),
+            wanted: name.clone(),
+            over_nodes: node,
+        })))
+    }
+
     fn compile_label(&self, expr: &LabelExpr) -> Result<LabelTest> {
         Ok(match expr {
             // A name the dictionary does not hold is not a mistake to
@@ -6652,6 +6707,7 @@ impl Binder<'_> {
                     BoundExpr::Cast {
                         expr: Box::new(bound),
                         ty: ty.clone(),
+                        constrained: self.constrain(ty)?,
                     },
                     plan_type(ty),
                 ))

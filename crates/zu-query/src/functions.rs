@@ -20,7 +20,7 @@
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, unicode};
+use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, temporal, unicode};
 
 use crate::ast::{Literal, TemporalFn};
 use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Percentile, Trim, Type};
@@ -1695,6 +1695,7 @@ fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
     };
     let read = match args.first().map(|value| settle(value.clone())) {
         Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Record(fields)) => temporal_record(which, &fields),
         Some(Value::Str(text)) => Temporal::parse(&which.target(), &text).ok_or_else(|| {
             gql(
                 codes::C22007,
@@ -1717,10 +1718,153 @@ fn temporal_kernel(func: Func, args: &[Value]) -> Result<Value> {
                 )
             })
         }
-        Some(other) => Err(bad_type(func, "a string", &other)),
+        Some(other) => Err(bad_type(func, "a string or a record", &other)),
         None => Err(invalid(format!("{}() was given nothing", name_of(func)))),
     }?;
     Ok(Value::Temporal(read))
+}
+
+/// The record form of a temporal value function, ISO 20.27 and 20.29:
+/// `DATE({year: 2024, month: 1, day: 1})` beside `DATE('2024-01-01')`.
+///
+/// Three things can be wrong with one of these and the standard gives
+/// each its own condition, so they are checked in the order a reader
+/// would check them. A field the type does not have is a name that
+/// means nothing, whatever it holds, and that is 22G05 for a datetime
+/// and 22G07 for a duration. A field with a value of the wrong type is
+/// not a temporal condition at all and is the ordinary 22G03. A field
+/// whose value the calendar refuses is 22G06, and it is last because a
+/// thirteenth month is only a thirteenth month once `month` is known
+/// to be a field.
+///
+/// The refusal names the fields the type does have, since the two ways
+/// to get here are a typo and a field borrowed from another type, and
+/// the list answers both without a trip to the standard.
+fn temporal_record(which: TemporalFn, fields: &[(String, Value)]) -> Result<Temporal> {
+    let target = which.target();
+    let duration = matches!(target, LogicalType::Duration(_));
+    let known = temporal::fields_of(&target);
+    let mut parts = temporal::Parts::default();
+    for (name, value) in fields {
+        let field = name.to_ascii_lowercase();
+        if !known.contains(&field.as_str()) {
+            return Err(gql(
+                if duration {
+                    codes::C22G07
+                } else {
+                    codes::C22G05
+                },
+                format!(
+                    "{}() has no field named {name:?}; it takes {}",
+                    which.word(),
+                    known.join(", ")
+                ),
+            ));
+        }
+        let whole = |value: &Value| -> Result<i64> {
+            match value {
+                Value::Int(n) => Ok(*n),
+                other => Err(gql(
+                    codes::C22G03,
+                    format!(
+                        "{}() wants a whole number for {field}, got {}",
+                        which.word(),
+                        crate::cast::value_type(other)
+                    ),
+                )),
+            }
+        };
+        match field.as_str() {
+            "year" => parts.year = Some(whole(value)?),
+            "month" => parts.month = Some(whole(value)?),
+            "day" => parts.day = Some(whole(value)?),
+            "hour" => parts.hour = Some(whole(value)?),
+            "minute" => parts.minute = Some(whole(value)?),
+            "second" => {
+                parts.second = Some(match value {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(f) => *f,
+                    other => {
+                        return Err(gql(
+                            codes::C22G03,
+                            format!(
+                                "{}() wants a number for second, got {}",
+                                which.word(),
+                                crate::cast::value_type(other)
+                            ),
+                        ));
+                    }
+                });
+            }
+            // The only field that is not a count. A zone reaches zu as
+            // an offset in minutes however it was written, so the text
+            // is read here rather than carried.
+            _ => {
+                let Value::Str(text) = value else {
+                    return Err(gql(
+                        codes::C22G03,
+                        format!(
+                            "{}() wants an offset like '+07:00' for timezone, got {}",
+                            which.word(),
+                            crate::cast::value_type(value)
+                        ),
+                    ));
+                };
+                parts.timezone = Some(temporal::zone_offset(text).ok_or_else(|| {
+                    gql(
+                        codes::C22G06,
+                        format!("{}() cannot read {text:?} as a zone offset", which.word()),
+                    )
+                })?);
+            }
+        }
+    }
+    Temporal::from_parts(&target, &parts).ok_or_else(|| {
+        gql(
+            if duration {
+                codes::C22G0H
+            } else {
+                codes::C22G06
+            },
+            if duration {
+                format!(
+                    "{}() was given a length in months and a length in days at once, and the two \
+                     kinds of duration do not mix",
+                    which.word()
+                )
+            } else {
+                format!(
+                    "{}() cannot make a {target} out of {}",
+                    which.word(),
+                    spelled_parts(&parts)
+                )
+            },
+        )
+    })
+}
+
+/// The fields a record gave, as the refusal prints them back. Only the
+/// ones that were written appear, so the message shows what the
+/// statement said rather than what it left to the default.
+fn spelled_parts(parts: &temporal::Parts) -> String {
+    let mut said = Vec::new();
+    let mut whole = |name: &str, held: Option<i64>| {
+        if let Some(n) = held {
+            said.push(format!("{name} {n}"));
+        }
+    };
+    whole("year", parts.year);
+    whole("month", parts.month);
+    whole("day", parts.day);
+    whole("hour", parts.hour);
+    whole("minute", parts.minute);
+    if let Some(second) = parts.second {
+        said.push(format!("second {second}"));
+    }
+    if let Some(offset) = parts.timezone {
+        said.push(format!("timezone {offset} minutes"));
+    }
+    said.join(", ")
 }
 
 /// `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`, ISO 20.28.

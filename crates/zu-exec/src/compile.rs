@@ -4608,7 +4608,14 @@ impl Compiler<'_> {
             // same holds for a float column asked for as a float of at
             // least the width it has. Peeling those keeps a filter
             // written that way on the kernel.
-            BoundExpr::Cast { expr, ty } => {
+            // A cast carrying a label set is never one of those: it
+            // reads the graph and can raise, so it stays on the row
+            // engine whatever the register holds.
+            BoundExpr::Cast {
+                expr,
+                ty,
+                constrained: None,
+            } => {
                 let Some(src) = self.value_reg(b, expr, level, outer)? else {
                     return Ok(None);
                 };

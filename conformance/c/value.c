@@ -825,12 +825,16 @@ typedef struct cv_type {
  * corpus is a contract for languages where they are not: a TypeScript
  * client returns `number` for one and `bigint` for the other, and a case
  * that did not say which meant nothing to it. */
-static const cv_type TYPES[23] = {
+static const cv_type TYPES[24] = {
     {"NULL", CV_EXACT},          {"BOOL", CV_EXACT},          {"INT8", CV_EXACT},
     {"INT16", CV_EXACT},         {"INT32", CV_EXACT},         {"INT64", CV_TEXT},
     {"UINT8", CV_EXACT},         {"UINT16", CV_EXACT},        {"UINT32", CV_EXACT},
     {"UINT64", CV_TEXT},         {"FLOAT32", CV_TEXT},        {"FLOAT64", CV_TEXT},
-    {"STRING", CV_EXACT},        {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
+    {"STRING", CV_EXACT},
+    /* Written in quotes because what a case spells is the hexits, and a
+     * run of them is text in every reader: 0041 bare is a number that
+     * reads back as 41 and 00AB bare is not a scalar at all. */
+    {"BYTES", CV_TEXT},          {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
     {"ZONEDTIME", CV_TEXT},      {"LOCALDATETIME", CV_TEXT},  {"ZONEDDATETIME", CV_TEXT},
     {"DURATION", CV_TEXT},       {"LIST", CV_EXACT},
     /* A node and an edge are written in quotes because what a case
@@ -844,7 +848,7 @@ static const cv_type TYPES[23] = {
 /* The types the encoding reserves a name for and the engine has no
  * runtime value for yet, kept apart from an outright typo so that the
  * error says which of the two it is. */
-static const char *const RESERVED[2] = {"DECIMAL", "BYTES"};
+static const char *const RESERVED[1] = {"DECIMAL"};
 
 static const cv_type *type_of(const char *ty) {
     size_t i;
@@ -871,6 +875,62 @@ static int unknown(char *err, size_t err_len, size_t line, const char *ty) {
     return fail(err, err_len, line, "%s is not a type this encoding knows", ty);
 }
 
+/* The nibble a hexit names, or -1. Both cases spell the same nibble,
+ * because the value is the octets and the case a case was written in is
+ * not part of it. */
+static int nibble(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* The octets a run of hexits names, two hexits to an octet. Space is
+ * allowed anywhere and dropped, which is what the standard's production
+ * allows and what lets a long literal be written in groups. A run of an
+ * odd length names half an octet and is refused. */
+static int parse_hexits(cv_arena *a, zy_str text, cv *out) {
+    size_t i, n = 0;
+    unsigned char *p;
+    int hi = -1;
+    /* Two hexits an octet, so the octets can never outnumber them, and
+     * one byte over is what an empty payload needs to allocate at all. */
+    p = (unsigned char *)cv_alloc(a, text.len / 2 + 1);
+    if (p == NULL) {
+        return -2;
+    }
+    for (i = 0; i < text.len; i++) {
+        char c = text.ptr[i];
+        int v;
+        if (c == ' ' || c == '\t') {
+            continue;
+        }
+        v = nibble(c);
+        if (v < 0) {
+            return -1;
+        }
+        if (hi < 0) {
+            hi = v;
+        } else {
+            p[n++] = (unsigned char)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    if (hi >= 0) {
+        return -1;
+    }
+    out->kind = CV_BYTES;
+    out->as.bytes.ptr = (const char *)p;
+    out->as.bytes.len = n;
+    return 0;
+}
+
 /* The value a scalar payload spells, or -1 if it does not spell one of
  * that type. */
 static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
@@ -893,6 +953,9 @@ static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
         /* Out of memory, which is not the text failing to be a STRING
          * and does not get that message. */
         return out->as.str.ptr == NULL ? -2 : 0;
+    }
+    if (strcmp(ty, "BYTES") == 0) {
+        return parse_hexits(a, text, out);
     }
     if (strcmp(ty, "FLOAT32") == 0 || strcmp(ty, "FLOAT64") == 0) {
         double f;
@@ -1387,6 +1450,13 @@ static void emit_value(cv_out *o, const cv *v) {
         emit(o, "STRING ");
         emit_quoted(o, v->as.str);
         return;
+    case CV_BYTES:
+        emit(o, "BYTES \"");
+        for (i = 0; i < v->as.bytes.len; i++) {
+            emit(o, "%02X", (unsigned)(unsigned char)v->as.bytes.ptr[i]);
+        }
+        emit(o, "\"");
+        return;
     case CV_TEMPORAL:
         emit(o, "%s \"", unit_name(v->as.temporal.unit));
         switch (v->as.temporal.unit) {
@@ -1448,8 +1518,12 @@ size_t cv_show(const cv *v, char *buf, size_t len) {
 
 /* Two strings, which is a length and a memcmp because a corpus string
  * may hold a NUL of its own. */
+/* The length first and then the octets, and nothing at all when there
+ * are none: a byte string of no octets may come back as a null pointer
+ * and a length of zero, and memcmp on a null pointer is undefined even
+ * for a length of zero. */
 static int same_str(zy_str a, zy_str b) {
-    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
+    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);
 }
 
 static uint64_t bits(double f) {
@@ -1480,6 +1554,8 @@ int cv_same(const cv *a, const cv *b) {
         return bits(a->as.real) == bits(b->as.real);
     case CV_STR:
         return same_str(a->as.str, b->as.str);
+    case CV_BYTES:
+        return same_str(a->as.bytes, b->as.bytes);
     case CV_TEMPORAL:
         return a->as.temporal.unit == b->as.temporal.unit &&
                a->as.temporal.count == b->as.temporal.count &&

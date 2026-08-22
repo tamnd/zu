@@ -325,9 +325,45 @@ static void a_list_holds_encoded_values_and_not_bare_ones(void) {
     check_show(&list, "LIST [LIST [BOOL true]]", "a list of a list");
 }
 
+/* A byte string is the octets and not the hexits they are written in,
+ * and not the characters those octets happen to encode either. */
+static void a_byte_string_is_the_octets_and_not_the_text_of_them(void) {
+    cv b = ok("type: BYTES\nvalue: \"00AB00\"\n");
+    cv other;
+    check(b.kind == CV_BYTES && b.as.bytes.len == 3, "three octets");
+    if (b.kind == CV_BYTES && b.as.bytes.len == 3) {
+        check((unsigned char)b.as.bytes.ptr[0] == 0x00 &&
+                  (unsigned char)b.as.bytes.ptr[1] == 0xAB &&
+                  (unsigned char)b.as.bytes.ptr[2] == 0x00,
+              "the octets they name");
+    }
+    /* A NUL in the middle is an octet like any other, which is why the
+     * length and never strlen decides how long one is. */
+    check_show(&b, "BYTES \"00AB00\"", "a byte string prints as its hexits");
+    /* Both cases of a hexit spell one octet, so two spellings of one
+     * value compare equal and print the one way. */
+    other = ok("type: BYTES\nvalue: \"00ab00\"\n");
+    check(cv_same(&b, &other), "either case of a hexit is the same value");
+    check_show(&other, "BYTES \"00AB00\"", "and prints upper case");
+    /* Space anywhere, which is what the standard's production allows so
+     * that a long literal can be written in groups. */
+    other = ok("type: BYTES\nvalue: \"00 AB 00\"\n");
+    check(cv_same(&b, &other), "space between the groups changes nothing");
+    /* No octets at all is a value the way the empty string is one. */
+    other = ok("type: BYTES\nvalue: \"\"\n");
+    check(other.kind == CV_BYTES && other.as.bytes.len == 0, "the empty byte string");
+    check_show(&other, "BYTES \"\"", "which prints as no hexits");
+    check(!cv_same(&b, &other), "and is not every other byte string");
+    /* A byte string is never the character string its octets encode. */
+    other = ok("type: STRING\nvalue: \"00AB00\"\n");
+    check(!cv_same(&b, &other), "a byte string is not the text of its hexits");
+    refused("type: BYTES\nvalue: \"0\"\n", "is not a BYTES");
+    refused("type: BYTES\nvalue: \"00AG\"\n", "is not a BYTES");
+    refused("type: BYTES\nvalue: 00\n", "in quotes");
+}
+
 static void a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo(void) {
     refused("type: DECIMAL\nvalue: \"1.00\"\n", "reserves");
-    refused("type: BYTES\nvalue: \"00\"\n", "reserves");
     refused("type: INT65\nvalue: \"1\"\n", "not a type this encoding knows");
     check(cv_is_type("INT64") && cv_is_type("LIST"), "the names a load column may write");
     check(!cv_is_type("DECIMAL") && !cv_is_type("int64"), "and the ones it may not");
@@ -652,6 +688,7 @@ int main(int argc, char **argv) {
     the_calendar_holds_from_the_first_day_to_the_last();
     a_datetime_wider_than_a_nanosecond_count_is_refused();
     a_list_holds_encoded_values_and_not_bare_ones();
+    a_byte_string_is_the_octets_and_not_the_text_of_them();
     a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo();
     a_node_and_an_edge_are_written_as_a_table_and_the_rows_they_are();
     a_path_is_a_walk_and_a_sequence_that_is_not_one_is_refused();

@@ -2303,6 +2303,14 @@
       "doc": "The duration from `from` to `to`, of the kind asked for, or\n`None` when the two are not two instants of one shape or the\nanswer leaves the calendar.\n\nThis is what `DURATION_BETWEEN` answers and what a minus\nbetween two instants answers, so the operator and the function\ncannot drift apart.\n\nThe two operands have to be the same shape. A date and a time\nhave no length between them, and a local datetime and a zoned\none have none either, because a local value names a wall clock\nand not an instant, so the length would depend on a zone nobody\nwrote.\n\nA day-time answer is a count of nanoseconds and needs no\ncalendar. A year-month answer is the largest count of whole\nmonths that does not carry `from` past `to`, which is stated\nagainst zu's own month addition rather than against a\ncomparison of day numbers. The two readings differ: 31 March to\n30 April is one month here, because 31 March plus one month is\n30 April and lands exactly on it, and is nought under a rule\nthat compares the days of the month first. Stating it against\nthe addition is what makes `from + DURATION_BETWEEN(from, to)`\nland at or before `to` and one month more overshoot, and a law\nthat holds is worth more than agreement with a rule that does\nnot.\n\nA backwards answer truncates toward nought the same way, so the\ntwo directions are not mirror images when a month is clipped."
     },
     {
+      "id": "zu::Temporal::from_parts",
+      "kind": "method",
+      "name": "from_parts",
+      "of": "zu::Temporal",
+      "signature": "fn from_parts(ty: &LogicalType, parts: &Parts) -> Option<Temporal>",
+      "doc": "The value a record constructor spells, or `None` where it\nspells none.\n\nThis is the second way ISO 20.27 and 20.29 write a temporal\nvalue: `DATE({year: 2024, month: 1, day: 1})` beside\n`DATE('2024-01-01')`. A field the record left out takes the\nleast value it has, so `DATE({year: 2024})` is the first of\nJanuary, which is what the standard's default for an omitted\n`<field>` comes to.\n\n`None` is the calendar refusing, not the record being malformed:\nthe names were checked before anything got here and what is\nleft is a thirteenth month or a thirty-first of February, which\nthe caller reports as 22G06."
+    },
+    {
       "id": "zu::Temporal::logical_type",
       "kind": "method",
       "name": "logical_type",
@@ -5801,7 +5809,7 @@
       "name": "put",
       "of": "zu::shared::FileHandle",
       "signature": "fn put(&self, side: WriteSide)",
-      "doc": "Gives the write side back and serves the next ticket."
+      "doc": "Gives the write side back, to the writer at the front of the line\nif anyone is waiting."
     },
     {
       "id": "zu::shared::FileHandle::reader",

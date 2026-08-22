@@ -42,6 +42,11 @@ typedef enum cv_kind {
     CV_INT,
     CV_FLOAT,
     CV_STR,
+    /* GV35, a sequence of octets. Its own kind and not a string with a
+     * different name, because the two are not comparable in GQL and a
+     * byte string that compared equal to the characters its octets
+     * happen to encode would be a case passing for the wrong reason. */
+    CV_BYTES,
     CV_TEMPORAL,
     CV_LIST,
     /* A node and an edge carry the name of their table rather than its
@@ -98,6 +103,11 @@ struct cv {
         /* CV_STR, which may hold a NUL and so is never read with
          * strlen. It is NUL terminated as well, for printing. */
         zy_str str;
+        /* CV_BYTES, the octets themselves and not the hexits they are
+         * written in. It holds a NUL as readily as any other octet, so
+         * like a string it is never read with strlen, and unlike a
+         * string it is never printed as itself. */
+        zy_str bytes;
         /* CV_TEMPORAL. The offset is in minutes and is zero for every
          * unit but the two zoned ones. */
         struct {

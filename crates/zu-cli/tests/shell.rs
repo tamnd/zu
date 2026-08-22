@@ -254,3 +254,78 @@ fn the_memory_name_is_the_same_as_no_name() {
         "no file called :memory: is left behind"
     );
 }
+
+/// A bare statement goes through the fold and a frame does not, so the
+/// two paths have to answer a string the same way. They did not: the
+/// fold ran over the whole line including inside the quotes, so
+/// `'a\\b'` reached the engine as `'a\b'` and came back as a backspace,
+/// and `'\\'` reached it as `'\'` and came back as a string nothing
+/// closes. The frame path was right the whole time, which is why this
+/// asks both and compares them rather than pinning one.
+#[test]
+fn a_string_reads_the_same_bare_as_it_does_in_a_frame() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zu"))
+        .arg("shell")
+        .arg("--format")
+        .arg("jsonl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting").expect("greeting");
+    let mut ask = |line: &str| -> String {
+        writeln!(stdin, "{line}").expect("write");
+        stdin.flush().expect("flush");
+        lines.next().expect("a response line").expect("read")
+    };
+
+    for (bare, framed) in [
+        (
+            r"RETURN 'a\\b' AS v",
+            r#"{"op":"query","q":"RETURN 'a\\\\b' AS v"}"#,
+        ),
+        (
+            r"RETURN '\\' AS v",
+            r#"{"op":"query","q":"RETURN '\\\\' AS v"}"#,
+        ),
+        (
+            r"RETURN 'a\nb' AS v",
+            r#"{"op":"query","q":"RETURN 'a\\nb' AS v"}"#,
+        ),
+        (
+            r"RETURN @'a\b' AS v",
+            r#"{"op":"query","q":"RETURN @'a\\b' AS v"}"#,
+        ),
+        (
+            r"RETURN 'it''s' AS v",
+            r#"{"op":"query","q":"RETURN 'it''s' AS v"}"#,
+        ),
+        (
+            r"RETURN X'01AF' AS v",
+            r#"{"op":"query","q":"RETURN X'01AF' AS v"}"#,
+        ),
+    ] {
+        let from_bare = ask(bare);
+        let from_frame = ask(framed);
+        assert_eq!(from_bare, from_frame, "{bare} against {framed}");
+        assert!(
+            from_bare.contains("\"rows\""),
+            "{bare} answered {from_bare}"
+        );
+    }
+
+    // And the fold still does its job around them, which is the half a
+    // fix that simply stopped folding would have broken.
+    let folded = ask(r"RETURN\n'a\\b' AS v");
+    assert!(folded.contains(r#"[["a\\b"]]"#), "got {folded}");
+    // A comment folded onto the line ends where the fold says it does,
+    // apostrophe and all, rather than swallowing the statement after
+    // it.
+    assert_eq!(ask(r"// it's folded\nRETURN 'a\\b' AS v"), folded);
+    assert_eq!(ask(r"-- it's folded\nRETURN 'a\\b' AS v"), folded);
+
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+}

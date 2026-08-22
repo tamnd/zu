@@ -17,7 +17,11 @@
 //! plus `prepare`, `execute`, `close_stmt`, `explain`,
 //! `explain_analyze`, and `quit`. Any other non-empty line is a bare
 //! statement run with no parameters, with `\n`, `\t`, and `\\`
-//! unfolded so a multi-line statement can travel on one line. A
+//! unfolded so a multi-line statement can travel on one line. The
+//! fold carries the statement's structure and stops at the quotes: a
+//! string, a delimited identifier and a byte string arrive as they
+//! were written, so `'a\\b'` is the backslash the standard says it is
+//! rather than a backspace. A
 //! parameter is JSON and takes the value JSON says it is, except for
 //! the two references a statement can be handed: `{"$graph": "/social"}`
 //! is the graph at that path and `{"$table": {"columns": [], "rows": []}}`
@@ -492,26 +496,197 @@ fn failure_line(err: &zu::ZuError) -> String {
 /// `\n` and `\t` become the real characters and `\\` a single
 /// backslash. Any other backslash pair is left alone, so a statement
 /// that was never folded still runs.
+///
+/// The fold carries a statement's structure and none of a statement's
+/// structure lives inside a string, so a quoted sequence is copied
+/// through as it was written. `'a\\b'` is how ISO spells one backslash
+/// between two letters, and a fold that reached into it would hand the
+/// engine `'a\b'`, which is a backspace. Staying out means reading the
+/// same lexical layer the engine reads: the three quotes, the quote
+/// written twice to mean itself, the `@` form where a backslash is a
+/// backslash, the byte string, and the two comments.
 fn unfold(line: &str) -> String {
+    let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let mut ix = 0;
+    while ix < bytes.len() {
+        let b = bytes[ix];
+        // A word is taken whole so that the `x` that ends `max` cannot
+        // open a byte string the way the `x` of `x'01'` does, which is
+        // the rule the lexer reads them under.
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            let word = ix;
+            while ix < bytes.len() && (bytes[ix].is_ascii_alphanumeric() || bytes[ix] == b'_') {
+                ix += 1;
+            }
+            out.push_str(&line[word..ix]);
+            if matches!(&line[word..ix], "X" | "x") && bytes.get(ix) == Some(&b'\'') {
+                ix = copy_byte_string(line, ix, &mut out);
+            }
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
+        match b {
+            b'\'' | b'"' | b'`' => ix = copy_quoted(line, ix, true, &mut out),
+            // GL11's `@` turns the escapes off inside the sequence it
+            // opens, and a lone `@` is nothing at all.
+            b'@' if matches!(bytes.get(ix + 1), Some(b'\'' | b'"' | b'`')) => {
+                out.push('@');
+                ix = copy_quoted(line, ix + 1, false, &mut out);
             }
-            None => out.push('\\'),
+            b'/' if bytes.get(ix + 1) == Some(&b'*') => ix = copy_block_comment(line, ix, &mut out),
+            b'/' | b'-' if bytes.get(ix + 1) == Some(&b) => {
+                out.push_str(&line[ix..ix + 2]);
+                ix = unfold_line_comment(line, ix + 2, &mut out);
+            }
+            b'\\' => ix = unfold_escape(line, ix, &mut out),
+            _ => {
+                let ch = line[ix..].chars().next().expect("a char at a boundary");
+                out.push(ch);
+                ix += ch.len_utf8();
+            }
         }
     }
     out
+}
+
+/// Writes what the escape at `at` stands for and answers the index
+/// after it. The caller has seen the backslash. A pair the fold does
+/// not use is written back as it came, which is what lets a statement
+/// that was never folded through unchanged.
+fn unfold_escape(line: &str, at: usize, out: &mut String) -> usize {
+    match line[at + 1..].chars().next() {
+        Some('n') => {
+            out.push('\n');
+            at + 2
+        }
+        Some('t') => {
+            out.push('\t');
+            at + 2
+        }
+        Some('\\') => {
+            out.push('\\');
+            at + 2
+        }
+        Some(other) => {
+            out.push('\\');
+            out.push(other);
+            at + 1 + other.len_utf8()
+        }
+        None => {
+            out.push('\\');
+            at + 1
+        }
+    }
+}
+
+/// Copies the quoted sequence opening at `open` through as written and
+/// answers the index after it. `escapes` is off for the `@` form, where
+/// a backslash is one character and writing the quote twice is the only
+/// way one gets in.
+///
+/// A sequence with no closing quote takes the rest of the line, which
+/// leaves the engine to say it is unterminated. That is the right
+/// answer and it is the same one an unfolded statement would have got.
+fn copy_quoted(line: &str, open: usize, escapes: bool, out: &mut String) -> usize {
+    let bytes = line.as_bytes();
+    let quote = bytes[open];
+    out.push(quote as char);
+    let mut ix = open + 1;
+    while ix < bytes.len() {
+        if bytes[ix] == quote {
+            let doubled = bytes.get(ix + 1) == Some(&quote);
+            out.push_str(&line[ix..ix + 1 + usize::from(doubled)]);
+            ix += 1 + usize::from(doubled);
+            if !doubled {
+                return ix;
+            }
+            continue;
+        }
+        // The escaped character is copied with its backslash, which is
+        // what keeps `'it\'s'` from ending three characters early. A
+        // backslash with nothing after it is one more character.
+        let width = usize::from(escapes && bytes[ix] == b'\\' && ix + 1 < bytes.len());
+        let ch = line[ix + width..]
+            .chars()
+            .next()
+            .expect("a char at a boundary");
+        out.push_str(&line[ix..ix + width + ch.len_utf8()]);
+        ix += width + ch.len_utf8();
+    }
+    ix
+}
+
+/// Copies GL08's byte string through as written and answers the index
+/// after it. The caller has seen the `X` and the quote at `open`.
+///
+/// It is not the same shape as the other three: there are no escapes,
+/// and a quote written twice is an empty byte string followed by
+/// another one rather than a quote standing for itself.
+fn copy_byte_string(line: &str, open: usize, out: &mut String) -> usize {
+    let bytes = line.as_bytes();
+    out.push('\'');
+    let mut ix = open + 1;
+    while ix < bytes.len() {
+        let ch = line[ix..].chars().next().expect("a char at a boundary");
+        out.push(ch);
+        ix += ch.len_utf8();
+        if ch == '\'' {
+            return ix;
+        }
+    }
+    ix
+}
+
+/// Unfolds a comment running to the end of the line and answers the
+/// index after it. The caller has seen the two solidi or the two minus
+/// signs.
+///
+/// A comment is unfolded rather than copied, and it is the one place
+/// where undoing the fold is what makes the statement work rather than
+/// what breaks it: the newline the fold wrote as `\n` is the only thing
+/// that ends the comment, and a comment left folded would swallow every
+/// statement after it. Nothing else in here is worth touching, so the
+/// rest goes through as written.
+fn unfold_line_comment(line: &str, at: usize, out: &mut String) -> usize {
+    let bytes = line.as_bytes();
+    let mut ix = at;
+    while ix < bytes.len() {
+        if bytes[ix] == b'\n' {
+            out.push('\n');
+            return ix + 1;
+        }
+        if bytes[ix] == b'\\' && bytes.get(ix + 1) == Some(&b'n') {
+            out.push('\n');
+            return ix + 2;
+        }
+        let ch = line[ix..].chars().next().expect("a char at a boundary");
+        out.push(ch);
+        ix += ch.len_utf8();
+    }
+    ix
+}
+
+/// Copies a block comment through as written and answers the index
+/// after it. The caller has seen the `/*`.
+///
+/// Nothing inside one is read by anybody, so a newline the fold wrote
+/// as `\n` can stay written that way; what matters is finding the `*/`
+/// without mistaking a quote or an apostrophe in the prose for the
+/// start of a string.
+fn copy_block_comment(line: &str, at: usize, out: &mut String) -> usize {
+    let bytes = line.as_bytes();
+    out.push_str("/*");
+    let mut ix = at + 2;
+    while ix < bytes.len() {
+        if bytes[ix] == b'*' && bytes.get(ix + 1) == Some(&b'/') {
+            out.push_str("*/");
+            return ix + 2;
+        }
+        let ch = line[ix..].chars().next().expect("a char at a boundary");
+        out.push(ch);
+        ix += ch.len_utf8();
+    }
+    ix
 }
 
 #[cfg(test)]
@@ -524,6 +699,110 @@ mod tests {
         assert_eq!(unfold(r"a\tb\\c"), "a\tb\\c");
         assert_eq!(unfold(r"plain"), "plain");
         assert_eq!(unfold(r"odd\q\"), "odd\\q\\");
+    }
+
+    /// A string is the statement's data and the fold carries the
+    /// statement's structure, so the fold does not reach into one. Each
+    /// of these was wrong before: `'a\\b'` came out as `'a\b'`, which
+    /// the engine reads as a backspace, and `'\\'` came out as `'\'`,
+    /// which it reads as a string nothing closes.
+    #[test]
+    fn a_quoted_sequence_keeps_the_backslashes_it_was_written_with() {
+        for written in [
+            r"RETURN 'a\\b' AS v",
+            r"RETURN '\\' AS v",
+            r"RETURN 'a\nb' AS v",
+            r"RETURN 'a\tb' AS v",
+            r#"RETURN "a\\b" AS v"#,
+            r"RETURN 1 AS `a\\b`",
+            r"RETURN 'it''s\\' AS v",
+            r"RETURN @'a\\b' AS v",
+            r"RETURN X'01AF' AS v",
+        ] {
+            assert_eq!(unfold(written), written, "{written}");
+        }
+    }
+
+    /// The fold picks up again after the sequence ends, which is what
+    /// says the scanner found the end rather than giving up on the
+    /// line. The third of these is the reason the escapes are read at
+    /// all: `\'` does not close the string, so a scanner that ignored
+    /// it would call the rest of the statement string and leave the
+    /// newline folded.
+    #[test]
+    fn the_fold_resumes_after_a_quoted_sequence() {
+        assert_eq!(
+            unfold(r"RETURN 'a\\b' AS v\nRETURN 2"),
+            "RETURN 'a\\\\b' AS v\nRETURN 2"
+        );
+        assert_eq!(
+            unfold(r"RETURN 'a''b' AS v\nRETURN 2"),
+            "RETURN 'a''b' AS v\nRETURN 2"
+        );
+        assert_eq!(
+            unfold(r"RETURN 'it\'s' AS v\nRETURN 2"),
+            "RETURN 'it\\'s' AS v\nRETURN 2"
+        );
+        // The `@` form has no escapes, so the backslash is a character
+        // and the quote after it still ends the sequence.
+        assert_eq!(
+            unfold(r"RETURN @'a\b' AS v\nRETURN 2"),
+            "RETURN @'a\\b' AS v\nRETURN 2"
+        );
+        // An empty byte string is two quotes that do not mean a quote,
+        // and reading them as one would swallow the fold after them.
+        assert_eq!(
+            unfold(r"RETURN X'' AS v\nRETURN 2"),
+            "RETURN X'' AS v\nRETURN 2"
+        );
+        // The `x` that ends a word does not open one.
+        assert_eq!(
+            unfold(r"RETURN max'a\\b'\nRETURN 2"),
+            "RETURN max'a\\\\b'\nRETURN 2"
+        );
+    }
+
+    /// A comment is the one place the fold has to be undone rather than
+    /// left alone, because the newline it wrote as `\n` is the only
+    /// thing that ends a comment to the end of the line. The
+    /// apostrophes are there on purpose: a scanner that read them as
+    /// quotes would call the rest of the line a string and lose the
+    /// newline, and the comment would swallow the statement.
+    #[test]
+    fn a_comment_is_unfolded_rather_than_copied() {
+        assert_eq!(unfold(r"// it's fine\nRETURN 1"), "// it's fine\nRETURN 1");
+        assert_eq!(unfold(r"-- it's fine\nRETURN 1"), "-- it's fine\nRETURN 1");
+        assert_eq!(
+            unfold(r"/* it's fine */ RETURN 'a\\b'"),
+            r"/* it's fine */ RETURN 'a\\b'"
+        );
+        assert_eq!(
+            unfold(r"RETURN 1 // x\nRETURN 2"),
+            "RETURN 1 // x\nRETURN 2"
+        );
+        // A real newline ends one as well, since a client is free to
+        // send a statement that was never folded.
+        assert_eq!(unfold("// x\nRETURN 1"), "// x\nRETURN 1");
+    }
+
+    /// The ends of the line, which is where a scanner that assumed a
+    /// closing character would panic rather than answer.
+    #[test]
+    fn an_unfinished_line_is_still_a_line() {
+        for written in [
+            r"RETURN 'a",
+            r"RETURN 'a\",
+            r"RETURN @'a",
+            r"RETURN X'0",
+            r"RETURN 1 /* a",
+            r"RETURN 1 //",
+            r"RETURN 1 \",
+            r"RETURN '",
+            "@",
+            "",
+        ] {
+            unfold(written);
+        }
     }
 
     /// A session on nothing, which every parameter test binds against

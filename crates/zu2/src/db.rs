@@ -625,6 +625,7 @@ impl Core {
             scratch: Vec::new(),
             promoting: self.promote,
             promote: None,
+            truncated: false,
         }
     }
 
@@ -665,6 +666,15 @@ impl Core {
             Some(cold) if cold::is_cold(address) => cold.begin(),
             _ => self.log.begin(),
         }
+    }
+
+    /// Both compaction floors at once, for a caller that wants to know
+    /// whether either of them moved while it was reading. See
+    /// [`Session::newest`]. #564.
+    #[inline]
+    pub(crate) fn floors(&self) -> (Address, Address) {
+        let cold = self.cold.as_ref().map_or(NULL, |cold| cold.begin());
+        (self.log.begin(), cold)
     }
 
     pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
@@ -1459,6 +1469,11 @@ pub struct Session<'a> {
     /// of its epoch and free to write. The version and kind are the
     /// record's own, because a promotion is a copy and not a new write.
     promote: Option<(Address, u64, u32)>,
+    /// Whether the last bucket scan gave up on a chain at a compaction
+    /// floor rather than at [`NULL`]. A scan that did that and found
+    /// nothing has not proved the key is absent, only that the entry it
+    /// walked is older than the floor. See [`Session::newest`]. #564.
+    truncated: bool,
 }
 
 impl<'a> Session<'a> {
@@ -1562,7 +1577,16 @@ impl<'a> Session<'a> {
         // may cross from the log into the cold tier. It crosses at most
         // once and never comes back, since a cold record has no
         // `previous`, which is what makes this walk terminate.
-        while address != NULL && address >= self.core.floor_of(address) {
+        while address != NULL {
+            if address < self.core.floor_of(address) {
+                // The chain ran out under the floor rather than at its
+                // end, so this entry has been overtaken by a compaction
+                // and what it names is gone. Nothing is wrong with the
+                // database, but nothing has been proved about the key
+                // either, and the caller has to look again. #564.
+                self.truncated = true;
+                return Ok(None);
+            }
             let base = self.locate(address)?;
             // SAFETY: locate returns a whole record, 8 byte aligned,
             // valid until the next call, and nothing below moves on
@@ -1895,7 +1919,46 @@ impl<'a> Session<'a> {
     /// second chain, and that only happens for a slot whose tag matches
     /// or which is foreign, which in a bucket that is not full is the one
     /// slot that was going to be walked anyway.
+    ///
+    /// A scan runs again when it found nothing, some chain in it stopped
+    /// at a compaction floor, and a floor moved while it ran. Those three
+    /// together are a scan that read an entry a compaction was in the
+    /// middle of replacing: the copy to the tail swings the entry and
+    /// then begin rises past the old record, and a reader that loaded the
+    /// slot before the swing and the record after the rise saw a live key
+    /// as absent. It answered `None` for a key that was there, roughly
+    /// once in forty runs of the cold tier test, and the very next read
+    /// on the same session got it right (#564). Rereading the slots is
+    /// enough, because the swing is what the reader missed and it is
+    /// already done. The floor test is what makes this terminate: floors
+    /// only rise, and a key that is genuinely absent leaves them alone.
     fn newest(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<Search> {
+        loop {
+            let floors = self.core.floors();
+            self.truncated = false;
+            // A walk that passed the floor check on an address and then
+            // found the floor above it by the time it loaded gets the
+            // same treatment as one that found nothing: look again, and
+            // only because a floor moved. See
+            // [`newest_record`](Self::newest_record).
+            let search = match self.scan_bucket(bucket, tag, key) {
+                Ok(search) => search,
+                Err(error) => {
+                    if floors == self.core.floors() {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
+            if search.found.is_some() || !self.truncated || floors == self.core.floors() {
+                return Ok(search);
+            }
+        }
+    }
+
+    /// One pass over the eight slots. See [`newest`](Self::newest),
+    /// which is what everything else calls.
+    fn scan_bucket(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<Search> {
         let mut search = Search::default();
         for i in 0..SLOTS {
             let entry = bucket.slots[i].load(Ordering::Acquire);
@@ -1933,6 +1996,38 @@ impl<'a> Session<'a> {
             .newest(bucket, tag, key)?
             .found
             .map(|(slot, _, address, _)| (slot, address)))
+    }
+
+    /// The newest record for `key`, as its address and a pointer to it.
+    ///
+    /// The lookup and the load are one step here because a compaction
+    /// can come between them. The lookup proves the address is above the
+    /// floor, and by the time the load runs the floor may have passed it,
+    /// which the tier rejects as an address outside itself. That is not a
+    /// broken database, it is a record that has just moved to the tail,
+    /// and the entry naming its new home is already in the bucket, so
+    /// looking again finds it. Only a floor that moved earns the retry,
+    /// so a real error still comes back as one. #564.
+    fn newest_record(
+        &mut self,
+        bucket: &Bucket,
+        tag: u64,
+        key: &[u8],
+    ) -> Result<Option<(Address, *const u8)>> {
+        loop {
+            let floors = self.core.floors();
+            let Some((_, address)) = self.lookup(bucket, tag, key)? else {
+                return Ok(None);
+            };
+            match self.locate(address) {
+                Ok(base) => return Ok(Some((address, base))),
+                Err(error) => {
+                    if floors == self.core.floors() {
+                        return Err(error);
+                    }
+                }
+            }
+        }
     }
 
     /// Reads the newest value for `key` into `out`.
@@ -1977,10 +2072,9 @@ impl<'a> Session<'a> {
         key: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<bool> {
-        let Some((_, address)) = self.lookup(bucket, tag, key)? else {
+        let Some((address, base)) = self.newest_record(bucket, tag, key)? else {
             return Ok(false);
         };
-        let base = self.locate(address)?;
         // SAFETY: as in chain_find.
         let live = unsafe {
             let r = RecordRef::new(base);
@@ -2130,10 +2224,9 @@ impl<'a> Session<'a> {
     /// Whether `key` has a record that is not a tombstone. The caller
     /// holds the epoch, as [`lookup`](Self::lookup) requires.
     fn live(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<bool> {
-        let Some((_, address)) = self.lookup(bucket, tag, key)? else {
+        let Some((_, base)) = self.newest_record(bucket, tag, key)? else {
             return Ok(false);
         };
-        let base = self.locate(address)?;
         // SAFETY: as in chain_find.
         Ok(unsafe { !RecordRef::new(base).tombstone() })
     }
@@ -2993,5 +3086,72 @@ mod tests {
         // And the slot is usable again once there is room, which is what
         // being left claimed would have cost.
         db.compact().expect("compact");
+    }
+
+    #[test]
+    fn a_chain_that_ends_under_the_floor_is_not_an_answer() {
+        // #564. A compaction copies a record to the tail, swings the
+        // entry that named it, and then raises begin past where it was.
+        // A reader that read the slot before the swing and the record
+        // after the rise walked a chain into ground that is no longer
+        // there and answered that the key was absent. It is a live key,
+        // and the very next read of it was right, which is what says the
+        // walk was inconclusive rather than the key gone.
+        //
+        // The half of that worth pinning down by hand is the telling:
+        // the walk has to know the difference between a chain that ran
+        // out at NULL and one that ran out at the floor. The retry the
+        // difference buys is a floor comparison over it, and what
+        // exercises the two together is the cold tier test, since it
+        // takes two threads and a compaction to line the window up.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(&dir.path().join("s.zu2"), one_bucket()).expect("create");
+        let mut session = db.session();
+        let key = b"the key".to_vec();
+        let hash = index::hash(&key);
+        let tag = Index::tag(hash);
+
+        session.upsert(&key, b"a value").expect("write");
+        let bucket = db.core.index.live().bucket(hash);
+        let at = index::address_of(bucket.slots[0].load(Ordering::Acquire));
+
+        // Push the floor past that record. Compaction copies it to the
+        // tail and swings the entry, so the bucket is left naming the
+        // copy and the address above is under the floor.
+        // One key rewritten past the end of the page the record above is
+        // in, alternating length so each write is a fresh record rather
+        // than a rewrite in place. All but the last of them is dead, so
+        // the pass has something to reclaim and begin has somewhere to
+        // go.
+        for i in 0..(3 * PAGE_SIZE / 1000) {
+            let value = vec![b'x'; 1000 + (i % 2) * 8];
+            session.upsert(b"churn", &value).expect("churn");
+        }
+        drop(session);
+        db.compact().expect("compact");
+        let mut session = db.session();
+        assert!(
+            at < db.core.log.begin(),
+            "the compaction did not reach the record, so there is nothing to walk off"
+        );
+
+        // The bucket as the losing reader saw it: the key's entry still
+        // naming where the record used to be.
+        for i in 0..SLOTS {
+            bucket.slots[i].store(EMPTY, Ordering::Release);
+        }
+        bucket.slots[0].store(index::entry(tag, at, false), Ordering::Release);
+
+        session.slot.protect();
+        let search = session.newest(bucket, tag, &key).expect("newest");
+        session.slot.unprotect();
+        assert!(
+            search.found.is_none(),
+            "the record under the floor answered"
+        );
+        assert!(
+            session.truncated,
+            "the walk ran off the floor and called it an absent key"
+        );
     }
 }

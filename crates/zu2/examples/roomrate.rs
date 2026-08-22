@@ -15,6 +15,12 @@
 //! beside it, which is what says whether the writers are paying for
 //! copying or paying for waiting.
 //!
+//! What it says on a laptop is mostly that a laptop is a bad place to
+//! ask. The durable column moves by a factor of five between two runs
+//! of this an hour apart with nothing changed, which is wider than
+//! anything being looked for here, so a row from this is worth quoting
+//! only from a machine that is doing nothing else. #585.
+//!
 //! The live set here is about two megabytes against a page of four, so
 //! at four pages the log is twelve percent live and at thirty two it is
 //! under two. Nothing in that range should need a stall.
@@ -98,7 +104,7 @@ fn main() {
     // durable rows fall away then what the writers are waiting on is the
     // device, and if both do then it is the pass.
     for durability in [Durability::Async, Durability::Durable] {
-        for max_pages in [4, 8, 16, 32, 128] {
+        for max_pages in [2, 3, 4, 8, 16, 32, 128] {
             run(max_pages, durability, WRITES);
         }
     }

@@ -96,12 +96,15 @@ fn the_declaration_is_toml_a_reader_can_parse() {
         // Strip the trailing reason comment before judging the value.
         let value = value.split("  #").next().expect("split always yields one");
         assert!(
-            value == "true" || value == "false" || (value.starts_with('"') && value.ends_with('"')),
-            "value is not a bool or a quoted string: {value:?} in {line:?}"
+            value == "true"
+                || value == "false"
+                || value.chars().all(|c| c.is_ascii_digit())
+                || (value.starts_with('"') && value.ends_with('"')),
+            "value is not a bool, an integer or a quoted string: {value:?} in {line:?}"
         );
     }
     assert!(!in_list, "the notes list was never closed");
-    assert_eq!(tables, ["[engine]", "[data]", "[capabilities]"]);
+    assert_eq!(tables, ["[engine]", "[data]", "[capabilities]", "[limits]"]);
 }
 
 #[test]
@@ -157,7 +160,9 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
         "undirected-edges":true,"self-loops":true,"parallel-edges":true,
         "parallel-edge-properties":true},
         "GQLStatus":true,"Parameters":true,"Transactions":true,
-        "MultipleStatements":true,"Isolated":true}},
+        "MultipleStatements":true,"Isolated":true,
+        "Limits":{"IL001/node":64,"IL001/edge":1,"IL002/node":4096,
+        "IL002/edge":4096,"IL003/node":63,"IL003/edge":63}}},
         "cases":[{"id":"a","got_gqlstatus":"22012"}]}"#;
     let ok = dir.join("agree.json");
     std::fs::write(&ok, agreeing).expect("write");
@@ -222,6 +227,26 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
     assert!(!out.status.success(), "a silent capability was accepted");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("reported nothing at all"),
+        "got {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A limit that drifted. This one is quieter than a flag and worse:
+    // a harness sizing a statement from a stale maximum sends one under
+    // the real limit, the engine accepts it, and the run records that
+    // the condition was not reachable rather than that the number was
+    // wrong.
+    let stale = agreeing.replace("\"IL002/node\":4096", "\"IL002/node\":64");
+    let old = dir.join("stale.json");
+    std::fs::write(&old, &stale).expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_zu"))
+        .args(["conformance", "--verify"])
+        .arg(&old)
+        .output()
+        .expect("run");
+    assert!(!out.status.success(), "a stale limit was accepted");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("limit IL002/node"),
         "got {}",
         String::from_utf8_lossy(&out.stderr)
     );

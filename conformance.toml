@@ -38,6 +38,18 @@ transactions = true  # START TRANSACTION, COMMIT and ROLLBACK run across stateme
 multiple-statements = true  # one shell process runs a case's setup list in order
 isolated = true  # a reset is a statement on the running session, so a case starts on a graph the case before it did not write to
 
+# The implementation-defined limits of ISO 24.5.2 that zu declares a
+# finite value for, as the largest a statement may ask for. An item
+# that is not here is one zu sets no maximum on, and a reader must
+# take the absence for an absence rather than for a zero.
+[limits]
+"IL001/node" = 64  # a node's labels are the bits of one word, so the dictionary and the node are the same 64 wide
+"IL001/edge" = 1  # an edge is stored under the one type its rel table is named by, so its label set holds one label
+"IL002/node" = 4096  # a node holds the property columns its table declares, and a table is 4096 columns wide
+"IL002/edge" = 4096  # an edge holds the property columns its rel table declares, under the same width
+"IL003/node" = 63  # a key label set has to leave room in the word for whatever the pattern around it adds, so it is one short of the label set that has to contain it
+"IL003/edge" = 63  # an edge type's key label set is bounded by the same word, for the same reason
+
 # Printed verbatim beside zu's numbers in the report.
 notes = [
   "driven through `zu shell --format jsonl`, one long-lived process per session",

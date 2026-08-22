@@ -781,6 +781,14 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
             },
             _ => crate::usage_error("conformance"),
         },
+        // The Clause 24.5.2 register, which is the other half of what a
+        // conformance statement has to say: `--declare` says what zu
+        // supports and this says what zu chose where the standard left
+        // the choice open.
+        Some("--implementation-defined") if args.len() == 1 => {
+            print!("{}", crate::impdef::render());
+            ExitCode::SUCCESS
+        }
         Some("--verify") => match args.get(1) {
             Some(path) => verify(path),
             None => crate::usage_error("conformance"),

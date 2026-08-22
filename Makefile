@@ -1,9 +1,11 @@
 .PHONY: build test lint fmt bench gate check-artifacts grammar extension
 
-# The ISO/IEC 39075:2024 conditions artifact is checked in, and the
-# generated status table is derived from it. This verifies the bytes are
-# the ones we derived from; the drift test in zu-common verifies the
-# table still matches them.
+# The ISO/IEC 39075:2024 digital artifacts are checked in and the
+# generated tables are derived from them: the status table in zu-common
+# from the conditions artifact, and the Clause 24.5.2 register in zu-cli
+# from the two that list what the standard leaves to the implementation.
+# This verifies the bytes are the ones we derived from; the drift tests
+# beside each table verify the table still matches them.
 check-artifacts:
 	cd crates/zu-common/artifacts && shasum -a 256 -c SHA256SUMS
 

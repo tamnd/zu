@@ -77,3 +77,4 @@ One database = one engine at a time; `COPY TO / ATTACH` moves graphs between eng
 | `11-benchmarks-and-targets.md` | Perf budgets, LDBC plan, CI regression gates |
 | `12-implementation-plan.md` | Milestones M0–M6, dependency choices, risks |
 | `gql-conformance.md` | Generated scoreboard: where zu and other engines stand on the ISO GQL corpus |
+| `gql-implementation-defined.md` | Generated register: zu's answer to every Clause 24.5.2 item the standard leaves open |

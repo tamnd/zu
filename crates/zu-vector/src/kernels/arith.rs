@@ -503,13 +503,7 @@ mod tests {
     /// keeps the two from drifting apart.
     #[test]
     fn every_operation_answers_what_one_pair_answers() {
-        const OPS: [BinOp; 5] = [
-            BinOp::Add,
-            BinOp::Sub,
-            BinOp::Mul,
-            BinOp::Div,
-            BinOp::Mod,
-        ];
+        const OPS: [BinOp; 5] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod];
         let whole: [i64; 4] = [7, -30, 1, 5];
         let real: [f64; 4] = [7.5, -30.25, 1.0, 5.0];
         let mut arena = MorselArena::new();

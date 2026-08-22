@@ -58,6 +58,7 @@ $ zu edge --no-such-flag
 
 $ zu conformance --no-such-flag
 ! usage: zu conformance --declare [--format toml|json]
+!        zu conformance --implementation-defined
 !        zu conformance --verify <report.json>
 !        zu conformance --tally <report.json>
 !        zu conformance --scoreboard <tally.json>...

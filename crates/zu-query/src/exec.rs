@@ -6781,10 +6781,11 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     None => Value::Null,
                 }),
                 UnaryOp::Neg => match v {
-                    Value::Int(i) => Ok(Value::Int(
-                        i.checked_neg()
-                            .ok_or_else(|| gql(codes::C22003, "integer overflow".into()))?,
-                    )),
+                    Value::Int(i) => {
+                        Ok(Value::Int(i.checked_neg().ok_or_else(|| {
+                            gql(codes::C22003, "integer overflow".into())
+                        })?))
+                    }
                     Value::Float(f) => Ok(Value::Float(-f)),
                     Value::Null => Ok(Value::Null),
                     other => Err(invalid(format!("cannot negate {other:?}"))),
@@ -7322,19 +7323,19 @@ impl AggState {
         match &mut self.acc {
             Acc::Count(n) => *n += mult,
             Acc::Sum(acc) => {
-                let scaled = match &v {
-                    Value::Int(i) => Value::Int(
-                        i.checked_mul(mult)
-                            .ok_or_else(|| gql(codes::C22003, "integer overflow in sum()".into()))?,
-                    ),
-                    Value::Float(f) => Value::Float(f * mult as f64),
-                    other => {
-                        return Err(gql(
-                            codes::C22G03,
-                            format!("sum() needs numbers, got {other:?}"),
-                        ));
-                    }
-                };
+                let scaled =
+                    match &v {
+                        Value::Int(i) => Value::Int(i.checked_mul(mult).ok_or_else(|| {
+                            gql(codes::C22003, "integer overflow in sum()".into())
+                        })?),
+                        Value::Float(f) => Value::Float(f * mult as f64),
+                        other => {
+                            return Err(gql(
+                                codes::C22G03,
+                                format!("sum() needs numbers, got {other:?}"),
+                            ));
+                        }
+                    };
                 *acc = Some(match acc.take() {
                     None => scaled,
                     Some(prev) => arith(BinaryOp::Add, prev, scaled)?,

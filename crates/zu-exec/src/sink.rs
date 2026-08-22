@@ -99,13 +99,13 @@ impl Acc {
         match (self, *other) {
             (Acc::Count(n), Acc::Count(m)) => *n += m,
             (Acc::Sum(a), Acc::Sum(b)) => {
-                *a = match (*a, b) {
-                    (Some(x), Some(y)) => Some(
-                        x.checked_add(y)
-                            .ok_or_else(|| ZuError::gql(codes::C22003, "integer overflow in sum()"))?,
-                    ),
-                    (x, y) => x.or(y),
-                };
+                *a =
+                    match (*a, b) {
+                        (Some(x), Some(y)) => Some(x.checked_add(y).ok_or_else(|| {
+                            ZuError::gql(codes::C22003, "integer overflow in sum()")
+                        })?),
+                        (x, y) => x.or(y),
+                    };
             }
             (Acc::Avg { sum, n }, Acc::Avg { sum: s2, n: n2 }) => {
                 *sum += s2;

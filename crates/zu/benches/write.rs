@@ -1372,6 +1372,17 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
+    // The same statement over ten times the table, which is the one
+    // question the `SET` pair above cannot answer. A `SET` leaves the
+    // row domain where it was, so the fold rewrites the chunks the
+    // statement touched and leaves every other column alone. An
+    // `INSERT` grows the domain, and a column that has to grow is a
+    // column the fold has to rewrite, so the work an append leaves for
+    // the fold is set by the table and not by the append. Whether that
+    // is what happens is `insert_fold_x`.
+    let insert_large = run_insert(&root.path().join("insert-large"), LARGE);
+    insert_large.report(&format!("INSERT, {LARGE} rows"), sync);
+
     let merge = run_merge(&root.path().join("merge"), SMALL);
     merge.report(&format!("MERGE, one found one made, {SMALL} rows"), sync);
 
@@ -1432,12 +1443,37 @@ fn main() {
         "sustained_window_x: {:.2}x store at its peak against the store as the window opened",
         sustained.window_x
     );
+    // The byte counter is the operating system's, and it counts what
+    // reached a block device. A store on a memory filesystem, which is
+    // what /tmp is on a good many Linux boxes, reaches one never, so
+    // the column reads zero for every scenario and the ratio is zero
+    // over zero. That is the instrument missing rather than the folds
+    // missing, and the two have to be told apart: the file check below
+    // holds either way, and it is the one that would catch a run that
+    // stopped churning.
+    let bytes_counted = set_small.written > 0.0 || sustained.cost.written > 0.0;
+    match bytes_counted {
+        true => assert!(
+            sustained_fold_x > 1.05,
+            "the sustained window has to contain the folds it is measuring, and it pushed \
+             {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
+            sustained.cost.written / 1024.0,
+            set_small.written / 1024.0
+        ),
+        false => println!(
+            "sustained_fold_x: nothing this run wrote reached a block device, so the bytes \
+             are the counter and not the folds: reported, not checked"
+        ),
+    }
+    // What the folds did to the file, which is on the file itself and
+    // so is there to read wherever the store is. A run whose folds
+    // stopped is a run that loaded a store and left it the size it
+    // loaded it.
     assert!(
-        sustained_fold_x > 1.05,
-        "the sustained window has to contain the folds it is measuring, and it pushed \
-         {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
-        sustained.cost.written / 1024.0,
-        set_small.written / 1024.0
+        sustained.file_x > 1.05,
+        "the sustained window has to contain the folds it is measuring, and the store came \
+         out of it {:.2}x the size it was loaded at",
+        sustained.file_x
     );
     assert!(
         sustained.window_x < 1.25,
@@ -1467,6 +1503,16 @@ fn main() {
     let write_x = set_large.written / set_small.written.max(1.0);
     println!("set_fold_x:  {fold_x:.2}x in time from {SMALL} to {LARGE} rows");
     println!("set_write_x: {write_x:.2}x in bytes written from {SMALL} to {LARGE} rows");
+
+    // The same question of the append, on the processor time rather
+    // than the clock for the reason the edge ratio below gives. An
+    // `INSERT` puts one row past the end of every column, so what it
+    // asks of the store does not depend on how many rows are already
+    // there, and a ratio near one is that. A ratio near ten is the fold
+    // rewriting the whole table to add a row to it, which is a cost per
+    // statement that goes up forever as the table fills.
+    let insert_x = insert_large.cpu / insert.cpu.max(0.001);
+    println!("insert_fold_x: {insert_x:.2}x in processor time from {SMALL} to {LARGE} rows");
 
     // The same question of an edge insert, which is the one write that
     // rebuilds a whole structure rather than rewriting a column of it.
@@ -1535,6 +1581,7 @@ fn main() {
         ("set_peak_rss_mb", set_small.peak as f64 / MB),
         ("set_fold_x", fold_x),
         ("set_write_x", write_x),
+        ("insert_fold_x", insert_x),
         ("sustained_stmt_us", sustained.cost.us),
         ("sustained_stmt_cpu_us", sustained.cost.cpu),
         (

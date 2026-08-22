@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{Result, ZuError};
 use zu_query::binder::{BoundSetInto, BoundSetItem};
 
@@ -367,7 +367,8 @@ impl<'a> Changes<'a> {
                             "'{label}' is the name of the table the element is in, and a node carries at least the one label, so there is no taking it off"
                         ),
                     ),
-                });
+                }
+                .about(Subject::Label(label.clone())));
             }
             mask |= 1 << id;
         }
@@ -394,7 +395,8 @@ impl<'a> Changes<'a> {
                 "'{label}' would be label {} of this graph, and a node's labels are the bits of one word, so zu holds {MAX_LABELS}",
                 MAX_LABELS + 1
             ),
-        ))
+        )
+        .about(Subject::Label(label.to_string())))
     }
 
     /// What the whole run changes, in written order, and the catalog it
@@ -467,6 +469,7 @@ fn column_of(columns: &[PropColumn], key: &str, at: At) -> Result<usize> {
                     holds(columns)
                 ),
             )
+            .about(Subject::Property(key.to_string()))
         })
 }
 

@@ -9,7 +9,7 @@
 //! a file is not a condition the standard has a code for, and inventing
 //! one would be worse than admitting it.
 
-use crate::gqlstatus::{DiagnosticRecord, GqlStatus, Position};
+use crate::gqlstatus::{DiagnosticRecord, GqlStatus, Position, Subject};
 
 /// Top-level error for all zu operations.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +73,27 @@ impl ZuError {
         ZuError::Gql(Box::new(DiagnosticRecord::in_source(
             status, source, offset, detail,
         )))
+    }
+
+    /// The same error, about a thing the statement named.
+    ///
+    /// A builder rather than a fourth constructor, so that a raise site
+    /// adds a subject without changing which of the three it went
+    /// through. It does nothing to an engine-internal failure, which
+    /// has no record to put a subject on.
+    pub fn about(mut self, subject: Subject) -> Self {
+        if let ZuError::Gql(record) = &mut self {
+            record.subject = Some(subject);
+        }
+        self
+    }
+
+    /// What the condition is about, when it is about something named.
+    pub fn subject(&self) -> Option<&Subject> {
+        match self {
+            ZuError::Gql(record) => record.subject.as_ref(),
+            _ => None,
+        }
     }
 
     /// Where in the statement this was raised, when it was raised

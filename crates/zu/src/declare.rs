@@ -26,7 +26,7 @@
 //! statement holds, so a table made for a statement that then raises is
 //! a table that was never made.
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{Result, Temporal, ZuError};
 use zu_query::ast::{
     Clause, Expr, LabelExpr, Literal, NodePattern, PathPattern, Query, RelDirection, RelPattern,
@@ -200,7 +200,8 @@ fn end_table(parsed: &Query, rel: &str, node: &NodePattern, side: &str) -> Resul
                 None => "that end is written with no label".to_string(),
             }
         ),
-    ))
+    )
+    .about(Subject::Label(rel.to_string())))
 }
 
 /// The label some other pattern of the same statement writes on `var`,
@@ -255,6 +256,7 @@ pub(crate) fn create(db: &mut Zu1File, graph: u32, wanted: &Wanted) -> Result<()
                         rel.name
                     ),
                 )
+                .about(Subject::Label(name.to_string()))
             })
         };
         let (from, to) = (end(&rel.from)?, end(&rel.to)?);
@@ -418,7 +420,8 @@ fn columns_of(name: &str, node: &NodePattern) -> Result<Vec<(String, PropValues<
             format!(
                 "no node table is named '{name}', and the pattern that would make one carries no property, so the table would have no column for a row to grow"
             ),
-        ));
+        )
+        .about(Subject::Label(name.to_string())));
     }
     let mut columns: Vec<(String, PropValues<'static>)> = Vec::with_capacity(node.props.len());
     for (key, value) in &node.props {
@@ -449,7 +452,8 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
             format!(
                 "{what}, and the value of '{key}' is worked out rather than written, so it does not say what the column would hold"
             ),
-        ));
+        )
+        .about(Subject::Property(key.to_string())));
     };
     Ok(match literal {
         Literal::Bool(_) => PropValues::Bool(&[]),
@@ -470,7 +474,8 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
                 format!(
                     "{what}, and '{key}' is written as null, which does not say what the column would hold"
                 ),
-            ));
+            )
+            .about(Subject::Property(key.to_string())));
         }
         // A value carrying an offset from UTC is not a column type
         // here, so a table made to hold one would be a table nothing
@@ -481,7 +486,8 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
                 format!(
                     "{what}, and '{key}' is written with an offset from UTC, which is not something a column holds"
                 ),
-            ));
+            )
+            .about(Subject::Property(key.to_string())));
         }
     })
 }

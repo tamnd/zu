@@ -222,10 +222,10 @@ pub fn run(source: &str, store: &SqliteStore, params: &[(&str, Value)]) -> Resul
                 // Same condition the zu1 facade raises, for the same
                 // reason: a parameter with no value is a reference in
                 // the statement that resolves to nothing.
-                return Err(ZuError::gql(
-                    codes::C42002,
-                    format!("missing parameter ${name}"),
-                ));
+                return Err(
+                    ZuError::gql(codes::C42002, format!("missing parameter ${name}"))
+                        .about(zu_common::gqlstatus::Subject::Variable(name.to_string())),
+                );
             }
         }
     }

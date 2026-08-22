@@ -54,6 +54,24 @@ pub fn adbc(err: ZuError) -> Error {
             if let Some(excerpt) = &record.excerpt {
                 details.push(("zu.excerpt".to_string(), excerpt.clone().into_bytes()));
             }
+            // What the condition is about and where the statement was
+            // running, which ISO 23.2 asks a diagnostic record for. The
+            // kind goes in its own key rather than being glued to the
+            // name, so a caller matching on "is this about a label"
+            // compares one string against one word.
+            if let Some(subject) = &record.subject {
+                details.push(("zu.subject_kind".to_string(), subject.kind().into()));
+                details.push((
+                    "zu.subject".to_string(),
+                    subject.name().to_string().into_bytes(),
+                ));
+            }
+            if let Some(graph) = &record.graph {
+                details.push(("zu.graph".to_string(), graph.clone().into_bytes()));
+            }
+            if let Some(schema) = &record.schema {
+                details.push(("zu.schema".to_string(), schema.clone().into_bytes()));
+            }
             error.details = Some(details);
             error
         }
@@ -170,5 +188,35 @@ mod tests {
         };
         assert_eq!(value("zu.gqlstatus").as_deref(), Some("40000"));
         assert_eq!(value("zu.retryable").as_deref(), Some("true"));
+    }
+
+    /// What the condition is about and where the statement ran, which
+    /// ADBC has no field for and which ISO 23.2 asks a record to carry.
+    #[test]
+    fn a_condition_about_a_name_carries_the_name_and_the_place_it_ran() {
+        use zudb::gqlstatus::{DiagnosticRecord, Subject};
+
+        let mut record = DiagnosticRecord::new(codes::C42002, "no label 'Persn' here")
+            .about(Subject::Label("Persn".to_string()));
+        record.within("social", "/");
+        let err = adbc(ZuError::Gql(Box::new(record)));
+        let details = err.details.expect("a condition carries details");
+        let value = |key: &str| {
+            details
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| String::from_utf8(value.clone()).expect("utf-8"))
+        };
+        // The kind on its own, so a caller asking whether this is about
+        // a label compares one string against one word.
+        assert_eq!(value("zu.subject_kind").as_deref(), Some("label"));
+        assert_eq!(value("zu.subject").as_deref(), Some("Persn"));
+        assert_eq!(value("zu.graph").as_deref(), Some("social"));
+        assert_eq!(value("zu.schema").as_deref(), Some("/"));
+
+        // A condition about nothing named carries no empty key for it.
+        let plain = adbc(ZuError::gql(codes::C22012, "divided by zero"));
+        let details = plain.details.expect("a condition carries details");
+        assert!(!details.iter().any(|(name, _)| name == "zu.subject"));
     }
 }

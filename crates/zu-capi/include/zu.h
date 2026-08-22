@@ -231,6 +231,21 @@ const char *zu_version(void);
  * is longer than anyone would read under a caret, since a line cut to
  * fit would put the column somewhere it is not.
  *
+ * zu_error_subject_kind and zu_error_subject are what the condition is
+ * about, when it is about something the statement named: the kind is
+ * one lower-case word out of graph, schema, label, property, variable,
+ * type and function, and the subject is the name itself, written the
+ * way the statement wrote it and with nothing around it. They are both
+ * NULL or both set. A binding that highlights the offending label in
+ * an editor wants the name on its own, and the kind is kept in its own
+ * accessor rather than glued to the front of it so that asking "is
+ * this about a label" is one string compared against one word.
+ *
+ * zu_error_graph and zu_error_schema are where the statement was
+ * running, which ISO 39075 subclause 23.2 asks a diagnostic record to
+ * name. They are NULL when the failure happened before there was one,
+ * which is the case for a connection that never opened.
+ *
  * The message says all of this in words and keeps saying it, so
  * printing it alone is still a complete report. The fields are for the
  * caller that would rather underline the token than read the numbers
@@ -245,6 +260,10 @@ int32_t zu_error_retryable(const zu_error *e); /* -1 for a NULL error */
 zu_status zu_error_position(const zu_error *e, uint32_t *line, uint32_t *column);
 zu_status zu_error_offset(const zu_error *e, uint32_t *offset);
 const char *zu_error_excerpt(const zu_error *e, size_t *len);
+const char *zu_error_subject_kind(const zu_error *e, size_t *len);
+const char *zu_error_subject(const zu_error *e, size_t *len);
+const char *zu_error_graph(const zu_error *e, size_t *len);
+const char *zu_error_schema(const zu_error *e, size_t *len);
 void zu_error_free(zu_error *e);
 
 /* How a database is opened. The only struct that crosses this boundary

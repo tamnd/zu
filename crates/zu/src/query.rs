@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{IdMap, Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, DeletedRows, Graph};
@@ -1290,6 +1290,7 @@ fn graph_of_name(catalog: &Catalog, schema: &str, name: &str) -> Result<u32> {
             codes::C42002,
             format!("'{name}' is no graph in the schema '{schema}'"),
         )
+        .about(Subject::Graph(name.to_string()))
     })
 }
 
@@ -1364,7 +1365,8 @@ pub(crate) fn graph_of_param(
         return Err(ZuError::gql(
             codes::C42002,
             format!("USE names ${name}, and no parameter of that name was given"),
-        ));
+        )
+        .about(Subject::Variable(name.to_string())));
     };
     let Value::Graph(handle) = value else {
         return Err(ZuError::gql(
@@ -1373,7 +1375,8 @@ pub(crate) fn graph_of_param(
                 "USE ${name} names a graph, so ${name} has to be a graph reference and not {}: take one with Session::graph_ref",
                 crate::insert::describe(value)
             ),
-        ));
+        )
+        .about(Subject::Variable(name.to_string())));
     };
     match catalog.graph(&handle.schema, &handle.name) {
         Some(graph) if graph.id == handle.id => Ok(handle.id),
@@ -1383,7 +1386,8 @@ pub(crate) fn graph_of_param(
                 "USE ${name} names {}, which is no longer the graph the reference was taken on",
                 handle.label()
             ),
-        )),
+        )
+        .about(Subject::Graph(handle.label()))),
     }
 }
 
@@ -1424,10 +1428,10 @@ pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Ve
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {
-                return Err(ZuError::gql(
-                    codes::C42002,
-                    format!("missing parameter ${name}"),
-                ));
+                return Err(
+                    ZuError::gql(codes::C42002, format!("missing parameter ${name}"))
+                        .about(Subject::Variable(name.to_string())),
+                );
             }
         }
     }

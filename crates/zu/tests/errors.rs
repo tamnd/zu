@@ -158,3 +158,65 @@ fn a_condition_the_standard_names_is_the_one_raised() {
         "42002"
     );
 }
+
+/// Every condition about a thing the statement named says which thing,
+/// as a field and not as a sentence.
+///
+/// This is the G9 exit criterion: a record for an element-related code
+/// carries a subject, so a client underlines the offending name in an
+/// editor instead of reading it back out of English. The kind and the
+/// name are apart, because asking "is this about a label" should be one
+/// string against one word.
+#[test]
+fn a_condition_about_a_name_says_which_name() {
+    let (_dir, db) = opened("subject.zu1");
+    let mut conn = db.connect().expect("connect");
+    // A table with a property on it, since a property nobody declared
+    // is only a condition where the table declares some.
+    conn.query("INSERT (:thing {a: 1})").expect("insert");
+
+    // Statement, code, kind of thing, and the name itself. Each of
+    // these is a condition ISO raises about something the statement
+    // wrote down, which is the whole set the criterion is about.
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "MATCH (p:person) RETURN q.id AS id",
+            "42002",
+            "variable",
+            "q",
+        ),
+        ("RETURN nosuchfn(1) AS v", "42002", "function", "nosuchfn"),
+        (
+            "USE nowhere MATCH (p) RETURN p",
+            "42002",
+            "graph",
+            "nowhere",
+        ),
+        (
+            "MATCH (t:thing) SET t.nosuchprop = 1",
+            "22G0S",
+            "property",
+            "nosuchprop",
+        ),
+        ("MATCH (t:thing) SET t:thing", "22G03", "label", "thing"),
+        ("MATCH (t:thing) REMOVE t:thing", "22G0N", "label", "thing"),
+    ];
+
+    for (source, code, kind, name) in cases {
+        let err = conn.query(source).expect_err(source);
+        let record = err
+            .diagnostic()
+            .unwrap_or_else(|| panic!("{source}: {err}"));
+        assert_eq!(record.status.code(), *code, "{source}");
+        let subject = record
+            .subject
+            .as_ref()
+            .unwrap_or_else(|| panic!("{source} raised {code} about nothing"));
+        assert_eq!(subject.kind(), *kind, "{source}");
+        assert_eq!(subject.name(), *name, "{source}");
+        // And the record says where the statement was running, which
+        // is what ISO 23.2 asks for and what no raise site holds.
+        assert_eq!(record.graph.as_deref(), Some("home"), "{source}");
+        assert!(record.schema.is_some(), "{source}");
+    }
+}

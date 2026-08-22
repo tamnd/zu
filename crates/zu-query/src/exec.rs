@@ -6197,7 +6197,9 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
     if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
         return temporal_arith(op, &a, &b);
     }
-    let overflow = || invalid("integer overflow".into());
+    // `22003 numeric value out of range`, the same condition the
+    // vector kernel raises for the same answer.
+    let overflow = || gql(codes::C22003, "integer overflow".into());
     match (&a, &b) {
         (Value::Int(x), Value::Int(y)) => {
             let (x, y) = (*x, *y);
@@ -6781,7 +6783,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 UnaryOp::Neg => match v {
                     Value::Int(i) => Ok(Value::Int(
                         i.checked_neg()
-                            .ok_or_else(|| invalid("integer overflow".into()))?,
+                            .ok_or_else(|| gql(codes::C22003, "integer overflow".into()))?,
                     )),
                     Value::Float(f) => Ok(Value::Float(-f)),
                     Value::Null => Ok(Value::Null),
@@ -7323,7 +7325,7 @@ impl AggState {
                 let scaled = match &v {
                     Value::Int(i) => Value::Int(
                         i.checked_mul(mult)
-                            .ok_or_else(|| invalid("integer overflow in sum()".into()))?,
+                            .ok_or_else(|| gql(codes::C22003, "integer overflow in sum()".into()))?,
                     ),
                     Value::Float(f) => Value::Float(f * mult as f64),
                     other => {

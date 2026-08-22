@@ -329,7 +329,10 @@ fn a_cold_pass_does_not_reclaim_under_a_reader() {
         .expect("create"),
     );
     let records = lapped(&db, 3000);
-    assert!(db.cold_span() > 0, "nothing went cold, so this proves nothing");
+    assert!(
+        db.cold_span() > 0,
+        "nothing went cold, so this proves nothing"
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..8u32)

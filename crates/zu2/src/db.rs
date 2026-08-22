@@ -1279,6 +1279,21 @@ impl Drop for Db {
         // and nothing else, so it goes the way every other best effort
         // in this function goes.
         if self.options.checkpoint_on_close {
+            // The size in a checkpoint is what the run that wrote it
+            // learned the key set needs, and the next open takes it
+            // rather than learning it again. That only holds if the
+            // table is the size the keys want when the checkpoint is
+            // taken, and at the end of a load it usually is not: the
+            // doubling runs on the background thread and a load that
+            // fills the table faster than the thread can drain its
+            // migrations leaves it one doubling behind (#537). A
+            // checkpoint written then hands the next run a table that
+            // is already crowded and makes it do the learning over.
+            //
+            // So the growth is finished here, on the way out, where
+            // there is no traffic left to race and the wait for
+            // quiescence is against nobody.
+            let _ = resize_index(&self.core);
             let _ = self.checkpoint();
         }
         self.core.log.stop();

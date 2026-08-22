@@ -42,6 +42,12 @@ typedef enum cv_kind {
     CV_INT,
     CV_FLOAT,
     CV_STR,
+    /* The octets of a byte string, GV35. A kind of its own and not a
+     * CV_STR holding the same bytes, because a byte string is not the
+     * characters its octets happen to encode and a case that compared
+     * equal to the string would be a case passing for the wrong
+     * reason. */
+    CV_BYTES,
     CV_TEMPORAL,
     CV_LIST,
     /* A node and an edge carry the name of their table rather than its
@@ -98,6 +104,10 @@ struct cv {
         /* CV_STR, which may hold a NUL and so is never read with
          * strlen. It is NUL terminated as well, for printing. */
         zy_str str;
+        /* CV_BYTES, the decoded octets. Same representation as the
+         * string above and read the same way, by length: a byte string
+         * holds a zero octet as readily as any other. */
+        zy_str bytes;
         /* CV_TEMPORAL. The offset is in minutes and is zero for every
          * unit but the two zoned ones. */
         struct {

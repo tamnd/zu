@@ -219,6 +219,24 @@ static void quoted(zy_str s, char *buf, size_t len) {
  *
  * A minimum of zero is what says the type is unsigned, and an unsigned
  * type refuses a sign outright rather than accepting `-0`. */
+/* The value of one hexit, or -1 for a character that is not one. Both
+ * cases, because ISO writes the literal in upper case and a person
+ * writing a case does not always. Spelled out rather than reached for
+ * through isxdigit, which answers for the locale and this file does
+ * not have one. */
+static int hexit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
 static int parse_int(zy_str text, int64_t min, int64_t max, int64_t *out) {
     size_t i = 0;
     int negative = 0;
@@ -825,7 +843,7 @@ typedef struct cv_type {
  * corpus is a contract for languages where they are not: a TypeScript
  * client returns `number` for one and `bigint` for the other, and a case
  * that did not say which meant nothing to it. */
-static const cv_type TYPES[23] = {
+static const cv_type TYPES[24] = {
     {"NULL", CV_EXACT},          {"BOOL", CV_EXACT},          {"INT8", CV_EXACT},
     {"INT16", CV_EXACT},         {"INT32", CV_EXACT},         {"INT64", CV_TEXT},
     {"UINT8", CV_EXACT},         {"UINT16", CV_EXACT},        {"UINT32", CV_EXACT},
@@ -833,6 +851,9 @@ static const cv_type TYPES[23] = {
     {"STRING", CV_EXACT},        {"DATE", CV_TEXT},           {"LOCALTIME", CV_TEXT},
     {"ZONEDTIME", CV_TEXT},      {"LOCALDATETIME", CV_TEXT},  {"ZONEDDATETIME", CV_TEXT},
     {"DURATION", CV_TEXT},       {"LIST", CV_EXACT},
+    /* Hexits in quotes, because a bare 00AB reads as a number in some
+     * reader of this file and an empty one reads as nothing at all. */
+    {"BYTES", CV_TEXT},
     /* A node and an edge are written in quotes because what a case
      * spells is a name and two numbers with punctuation between them,
      * which is text in every reader and a number in none. */
@@ -844,7 +865,7 @@ static const cv_type TYPES[23] = {
 /* The types the encoding reserves a name for and the engine has no
  * runtime value for yet, kept apart from an outright typo so that the
  * error says which of the two it is. */
-static const char *const RESERVED[2] = {"DECIMAL", "BYTES"};
+static const char *const RESERVED[1] = {"DECIMAL"};
 
 static const cv_type *type_of(const char *ty) {
     size_t i;
@@ -893,6 +914,37 @@ static int scalar(cv_arena *a, const char *ty, zy_str text, cv *out) {
         /* Out of memory, which is not the text failing to be a STRING
          * and does not get that message. */
         return out->as.str.ptr == NULL ? -2 : 0;
+    }
+    if (strcmp(ty, "BYTES") == 0) {
+        /* The octets the hexits name, decoded here rather than kept as
+         * the source text, because keeping the text is the misread the
+         * cases are written to catch: X'0041' is one octet pair and not
+         * the letter A, and a reader that never decodes cannot tell the
+         * difference between the two. An odd count of hexits names half
+         * an octet and anything outside the hexits names none, so both
+         * are the text failing to be a BYTES. */
+        size_t i;
+        char *p;
+        if (text.len % 2 != 0) {
+            return -1;
+        }
+        for (i = 0; i < text.len; i++) {
+            if (hexit(text.ptr[i]) < 0) {
+                return -1;
+            }
+        }
+        out->kind = CV_BYTES;
+        p = (char *)cv_alloc(a, text.len / 2 + 1);
+        if (p == NULL) {
+            return -2;
+        }
+        for (i = 0; i < text.len; i += 2) {
+            p[i / 2] = (char)((hexit(text.ptr[i]) << 4) | hexit(text.ptr[i + 1]));
+        }
+        p[text.len / 2] = '\0';
+        out->as.bytes.ptr = p;
+        out->as.bytes.len = text.len / 2;
+        return 0;
     }
     if (strcmp(ty, "FLOAT32") == 0 || strcmp(ty, "FLOAT64") == 0) {
         double f;
@@ -1387,6 +1439,17 @@ static void emit_value(cv_out *o, const cv *v) {
         emit(o, "STRING ");
         emit_quoted(o, v->as.str);
         return;
+    case CV_BYTES: {
+        /* Back to the hexits, upper case, which is how ISO writes the
+         * literal and therefore how the corpus writes the payload. */
+        size_t i;
+        emit(o, "BYTES \"");
+        for (i = 0; i < v->as.bytes.len; i++) {
+            emit(o, "%02X", (unsigned)(unsigned char)v->as.bytes.ptr[i]);
+        }
+        emit(o, "\"");
+        return;
+    }
     case CV_TEMPORAL:
         emit(o, "%s \"", unit_name(v->as.temporal.unit));
         switch (v->as.temporal.unit) {
@@ -1480,6 +1543,8 @@ int cv_same(const cv *a, const cv *b) {
         return bits(a->as.real) == bits(b->as.real);
     case CV_STR:
         return same_str(a->as.str, b->as.str);
+    case CV_BYTES:
+        return same_str(a->as.bytes, b->as.bytes);
     case CV_TEMPORAL:
         return a->as.temporal.unit == b->as.temporal.unit &&
                a->as.temporal.count == b->as.temporal.count &&

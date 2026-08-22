@@ -72,7 +72,7 @@ use zu_common::{Clock, DurationKind, Interrupt, Result, Temporal, ZuError, tempo
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
-    UnaryOp,
+    TruthValue, UnaryOp,
 };
 use crate::binder::{
     BoundExpr, BoundItem, BoundQuery, Constrained, Deviation, Func, PathPart, Percentile, Schema,
@@ -6931,6 +6931,31 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         BoundExpr::IsNull { expr, negated } => {
             let is_null = matches!(eval(ctx, expr)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
+        }
+        // ISO 20.20. The test is two valued whatever it is handed, so
+        // a null operand answers here rather than propagating: that is
+        // the whole point of the construct, and `IS NOT x` is the exact
+        // complement of `IS x` because there is no third answer left
+        // for the negation to fall into.
+        BoundExpr::BooleanTest {
+            expr,
+            truth,
+            negated,
+        } => {
+            let held = match eval(ctx, expr)? {
+                Value::Bool(b) => Some(b),
+                Value::Null => None,
+                // The binder types the operand, so anything else here
+                // is a value that arrived without one, and the answer
+                // it gives is the one unknown gives.
+                _ => None,
+            };
+            let matched = match truth {
+                TruthValue::True => held == Some(true),
+                TruthValue::False => held == Some(false),
+                TruthValue::Unknown => held.is_none(),
+            };
+            Ok(Value::Bool(matched != *negated))
         }
         BoundExpr::IsTyped { expr, ty, negated } => {
             let is_typed = crate::typed::is_of(&eval(ctx, expr)?, ty);

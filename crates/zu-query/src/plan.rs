@@ -1402,6 +1402,14 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 format!("{} IS NULL", expr_text(expr, query))
             }
         }
+        BoundExpr::BooleanTest {
+            expr,
+            truth,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}{}", expr_text(expr, query), truth.word())
+        }
         BoundExpr::IsTyped { expr, ty, negated } => {
             let not = if *negated { "NOT " } else { "" };
             format!("{} IS {not}TYPED {ty}", expr_text(expr, query))

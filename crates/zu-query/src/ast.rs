@@ -1398,6 +1398,28 @@ impl RelDirection {
     }
 }
 
+/// The three truth values a `<boolean test>` asks about, ISO 20.20.
+/// UNKNOWN is spelled apart from TRUE and FALSE because it is not a
+/// boolean an expression can hold, it is the absence of one, and the
+/// test is the only construct that can see the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruthValue {
+    True,
+    False,
+    Unknown,
+}
+
+impl TruthValue {
+    /// The word the test is written with, for an error and for a plan.
+    pub fn word(self) -> &'static str {
+        match self {
+            TruthValue::True => "TRUE",
+            TruthValue::False => "FALSE",
+            TruthValue::Unknown => "UNKNOWN",
+        }
+    }
+}
+
 /// Which end of a string an explicit `TRIM` takes characters off, ISO
 /// 20.24's trim specification. The three words are the whole of the
 /// production, and leaving them out means BOTH.
@@ -1547,6 +1569,15 @@ pub enum Expr {
     },
     IsNull {
         expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `expr IS [NOT] TRUE`, ISO 20.20's `<boolean test>`. The one place
+    /// in the language where a three valued answer is asked for a two
+    /// valued one: every other boolean operator carries unknown through,
+    /// and this takes a side about it.
+    BooleanTest {
+        expr: Box<Expr>,
+        truth: TruthValue,
         negated: bool,
     },
     /// `NORMALIZE(s, NFC)`, ISO 20.24. Written like a call and not one,

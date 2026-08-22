@@ -895,6 +895,17 @@ pub struct Options {
     /// A caller may set it before running, which is how a test pins the
     /// time.
     pub clock: Option<Clock>,
+    /// GA08. The GQL-status object the statement before this one in
+    /// this session ended with, as the record value
+    /// [`crate::binder::STATUS_FN`] answers, and `None` for a session
+    /// that has run nothing yet.
+    ///
+    /// Here for the reason the clock is here: it is session state, one
+    /// value for the length of a statement, and every path through the
+    /// executor already carries the switches. The session builds it
+    /// once on the way in, so a scan of ten million rows reading it
+    /// clones a record rather than formatting one.
+    pub status: Option<Value>,
     /// GS07 and GS15. The session time zone as minutes east of UTC,
     /// which is the displacement the clock read below is stamped with.
     /// Nought is UTC, which is what a session opens in and what every
@@ -6605,6 +6616,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         BoundExpr::Clock => Ok(Value::Temporal(
             ctx.scalars.options.clock.unwrap_or_default().instant(),
         )),
+        // GA08. The GQL-status object the statement before this one
+        // ended with, built once by the session and handed out here as
+        // many times as the rows ask for it. A session that has run
+        // nothing yet answers null rather than a record of nulls,
+        // because there is no status before the first statement and a
+        // record saying nothing would read as one that said so.
+        BoundExpr::Status => Ok(ctx.scalars.options.status.clone().unwrap_or(Value::Null)),
         // GE01. The binder already asked the catalog which graph this
         // is, so the row's work is a clone of the handle and nothing
         // else.

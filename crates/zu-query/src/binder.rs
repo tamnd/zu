@@ -691,6 +691,17 @@ pub struct Schema {
 /// The most labels one graph holds, one bit of the word a row carries.
 pub const MAX_LABELS: usize = 64;
 
+/// GA08. The name of the built-in that answers the GQL-status object
+/// the statement before this one ended with, as a record value.
+///
+/// ISO/IEC 39075:2024 writes no statement for reading a status back:
+/// there is no `GET DIAGNOSTICS` in it, and subclause 23 is about
+/// producing the record and exposing it rather than about a statement
+/// that asks for one. So the name is zu's, spelled the way the rest of
+/// the value functions are spelled, and it is an extension and not a
+/// reading of the standard.
+pub const STATUS_FN: &str = "current_status";
+
 /// The factor the ceilings have to beat the estimates by before the
 /// join order DP takes the robust order, when nothing overrides it.
 pub const DEFAULT_BOUND_DISAGREEMENT: f64 = 100.0;
@@ -2135,6 +2146,14 @@ pub enum BoundExpr {
     /// later statement with it. A leaf the run supplies is read where
     /// the run is, once per statement.
     Clock,
+    /// GA08. The GQL-status object the statement before this one ended
+    /// with, as a record value.
+    ///
+    /// A leaf for the same reason the clock is one: what it answers is
+    /// session state, it reaches the run through the switches, and a
+    /// plan that folded it would answer every later statement with the
+    /// status of whatever statement happened to compile it.
+    Status,
     Call {
         func: Func,
         /// Which row of the function registry answers this call, found
@@ -2857,7 +2876,11 @@ fn merge_props<'a>(
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) | BoundExpr::Clock => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Graph(_)
+        | BoundExpr::Clock
+        | BoundExpr::Status => {}
         // A value query expression reads the slots the query inside it
         // captured, and nothing at all when it captured none, which is
         // what makes that one a single value for the whole run.
@@ -2955,6 +2978,7 @@ fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundE
         | BoundExpr::Param(_)
         | BoundExpr::Graph(_)
         | BoundExpr::Clock
+        | BoundExpr::Status
         | BoundExpr::Scalar { .. }
         | BoundExpr::Var(_)
         | BoundExpr::HasLabels { .. } => {}
@@ -7065,6 +7089,19 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
+        // GA08. The status of the statement before this one, which is
+        // not in the registry because no kernel could answer it: a
+        // kernel sees its arguments and this reads session state. It
+        // reaches the run the way the clock does, through the switches,
+        // so it binds to a leaf here rather than to a call.
+        if name.eq_ignore_ascii_case(STATUS_FN) {
+            if distinct || star || !args.is_empty() {
+                return Err(invalid(format!(
+                    "{STATUS_FN}() is the status of the statement before this one and takes nothing"
+                )));
+            }
+            return Ok((BoundExpr::Status, Type::Any));
+        }
         let at = crate::functions::lookup(name).ok_or_else(|| {
             bad_reference(
                 Subject::Function(name.to_string()),

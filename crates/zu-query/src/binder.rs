@@ -2238,27 +2238,39 @@ enum Projected {
 
 /// The schema an `AT` clause names, written as a catalog path (GP16).
 ///
-/// `CURRENT_SCHEMA` and `HOME_SCHEMA` both answer the root, because
-/// nothing moves a session out of it: the schema a session opens in is
-/// the schema it works in for as long as it lives, so the two words
-/// name the same directory and always will until a statement that
-/// changes the working schema exists.
-fn at_path(at: &Option<ast::SchemaRef>) -> Option<&str> {
+/// `session` is the schema the statement was sent in, which is the root
+/// until a `SESSION SET SCHEMA` moves it (GS05). `CURRENT_SCHEMA` is
+/// that one and `HOME_SCHEMA` is the root, the schema the session
+/// opened in: the two words name the same directory until something
+/// moves the current one, which is the whole reason there are two of
+/// them.
+fn at_path<'a>(at: &'a Option<ast::SchemaRef>, session: &'a str) -> Option<&'a str> {
     match at.as_ref()? {
-        ast::SchemaRef::Current | ast::SchemaRef::Home => Some(procedures::ROOT),
+        ast::SchemaRef::Current => Some(session),
+        ast::SchemaRef::Home => Some(procedures::ROOT),
         ast::SchemaRef::Path(path) => Some(path),
     }
 }
 
-/// Binds a parsed query against a schema.
+/// Binds a parsed query against a schema, in the root catalog schema.
+///
+/// This is the reading a statement gets when nobody says where it was
+/// sent from, which is every caller that is not a session: a session
+/// can be moved out of the root and reaches for [`bind_in`].
+pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
+    bind_in(query, schema, procedures::ROOT)
+}
+
+/// Binds a parsed query against a schema, sent from a session working
+/// in `session`, a catalog path (GS05).
 ///
 /// A composite is bound operand by operand, left to right. Each gets a
 /// binder of its own, because the operands share no variables: what
 /// they do share is the parameter list, which is positional and belongs
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
-pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
-    let at = at_path(&query.at_schema);
+pub fn bind_in(query: &ast::Query, schema: &Schema, session: &str) -> Result<BoundQuery> {
+    let at = at_path(&query.at_schema, session).or(Some(session));
     let mut params = Vec::new();
     // The binding variable definition block at the head of the
     // statement (GP17), bound before anything that could read one of
@@ -2421,7 +2433,7 @@ fn bind_bindings(
         // A definition holding a query of its own may say which schema
         // that query resolves in, and one that does not resolves where
         // the statement around it does.
-        let at = at_path(&query.at_schema).or(at);
+        let at = at_path(&query.at_schema, at.unwrap_or(procedures::ROOT)).or(at);
         let mut inner = visible.clone();
         bind_bindings(&query.bindings, schema, at, params, out, &mut inner)?;
         let mut bound = bind_body(&query.body, schema, at, params, &[], &inner)?;
@@ -2522,7 +2534,11 @@ struct Visible {
 /// One shape reaches the executor rather than two: a definition is a
 /// query whatever it was written as, so there is one way to work one
 /// out and one place for that to be wrong.
-fn returning(expr: ast::Expr, name: &str) -> ast::Query {
+///
+/// It is public because a session parameter is a definition too (GS01
+/// through GS03), and the session works one out by running the
+/// definition with this wrapped round the name it defines.
+pub fn returning(expr: ast::Expr, name: &str) -> ast::Query {
     ast::Query {
         at_schema: None,
         use_graph: None,
@@ -6705,9 +6721,12 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let at = at_path(&query.at_schema)
-            .map(str::to_string)
-            .or_else(|| self.at.clone());
+        let at = at_path(
+            &query.at_schema,
+            self.at.as_deref().unwrap_or(procedures::ROOT),
+        )
+        .map(str::to_string)
+        .or_else(|| self.at.clone());
         let mut bound = bind_body(
             &query.body,
             self.schema,

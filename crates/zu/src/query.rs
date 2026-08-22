@@ -166,7 +166,13 @@ pub fn check(source: &str) -> Result<()> {
 /// graph reference this binds ever reaches a caller.
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
+    let graph = graph_of(
+        catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        &[],
+    )?;
     binder::bind(&parsed, &schema_of_graph(catalog, graph, 0)?)
 }
 
@@ -174,7 +180,13 @@ pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
 /// EXPLAIN listing of the plan that would execute.
 pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
+    let graph = graph_of(
+        catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        &[],
+    )?;
     let schema = schema_of_graph(catalog, graph, 0)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
@@ -1199,8 +1211,13 @@ pub(crate) fn schema_with_stats(db: &mut Zu1File, catalog: &Catalog, graph: u32)
 ///
 /// The parameters are here because `USE $g` names its graph with one,
 /// and that is the one form whose answer is not in the text.
+///
+/// `schema` is the catalog schema the statement was sent in, which is
+/// the root until a `SESSION SET SCHEMA` moves it (GS05): a `USE` that
+/// names a graph and no path is looked up there.
 pub(crate) fn graph_of(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     query: &zu_query::ast::Query,
     params: &[(&str, Value)],
@@ -1208,7 +1225,7 @@ pub(crate) fn graph_of(
     let Some(named) = &query.use_graph else {
         return Ok(working);
     };
-    graph_of_ref(catalog, working, named, &query.bindings, params)
+    graph_of_ref(catalog, schema, working, named, &query.bindings, params)
 }
 
 /// The graph one reference names, which is the body of [`graph_of`]
@@ -1219,8 +1236,9 @@ pub(crate) fn graph_of(
 /// they are what a name is looked up in before the catalog is: a
 /// definition is a name the statement itself gave, so it stands in
 /// front of a graph the catalog happens to hold under that name.
-fn graph_of_ref(
+pub(crate) fn graph_of_ref(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     named: &zu_query::ast::GraphRef,
     bindings: &[zu_query::ast::BindingDef],
@@ -1232,8 +1250,8 @@ fn graph_of_ref(
         GraphRef::Home => Ok(catalog.home_graph_id()),
         GraphRef::Named(name) if name.schema.is_none() => {
             match graph_variable(bindings, &name.name) {
-                Some(upto) => graph_of_variable(catalog, working, upto, params),
-                None => graph_of_name(catalog, "/", &name.name),
+                Some(upto) => graph_of_variable(catalog, schema, working, upto, params),
+                None => graph_of_name(catalog, schema, &name.name),
             }
         }
         GraphRef::Named(name) => {
@@ -1248,7 +1266,7 @@ fn graph_of_name(catalog: &Catalog, schema: &str, name: &str) -> Result<u32> {
     catalog.graph(schema, name).map(|g| g.id).ok_or_else(|| {
         ZuError::gql(
             codes::C42002,
-            format!("USE names '{name}', which is no graph in '{schema}'"),
+            format!("'{name}' is no graph in the schema '{schema}'"),
         )
     })
 }
@@ -1284,13 +1302,14 @@ fn graph_variable<'a>(
 /// against one graph and running it against another.
 fn graph_of_variable(
     catalog: &Catalog,
+    schema: &str,
     working: u32,
     upto: &[zu_query::ast::BindingDef],
     params: &[(&str, Value)],
 ) -> Result<u32> {
     let (def, above) = upto.split_last().expect("a definition was found");
     if let Some(named) = def.init.graph_ref() {
-        return graph_of_ref(catalog, working, named, above, params);
+        return graph_of_ref(catalog, schema, working, named, above, params);
     }
     match &def.init {
         zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::Param(name)) => {
@@ -1354,8 +1373,9 @@ pub(crate) fn graph_of_param(
 pub(crate) fn compile_parsed(
     parsed: &zu_query::ast::Query,
     schema: &Schema,
+    session_schema: &str,
 ) -> Result<(BoundQuery, plan::LogicalPlan, Vec<String>)> {
-    let query = binder::bind(parsed, schema)?;
+    let query = binder::bind_in(parsed, schema, session_schema)?;
     let built = plan::build(&query)?;
     let (plan, notes) = optimizer::optimize_noted(built, &query, schema)?;
     Ok((query, plan, notes))
@@ -1402,6 +1422,10 @@ pub(crate) enum NotAQuery {
     /// GP18. Several statements chained by `NEXT`, one of which changes
     /// the catalog, each carried as its own text.
     Block(Vec<String>),
+    /// GS01 through GS16. One that changes the session it was sent on:
+    /// a parameter it holds, the schema or the graph it works in, or
+    /// the time zone it reads a clock in.
+    Session(zu_query::ast::SessionStmt),
 }
 
 /// What this source is when it is not a query, `None` when it is one.
@@ -1414,6 +1438,7 @@ pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
         zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
         zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
         zu_query::ast::Statement::Block(parts) => Ok(Some(NotAQuery::Block(parts))),
+        zu_query::ast::Statement::Session(stmt) => Ok(Some(NotAQuery::Session(stmt))),
         zu_query::ast::Statement::Query(_) => Ok(None),
     }
 }
@@ -1423,9 +1448,15 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     let parsed = parser::parse(source)?;
     // A one-shot call has no session, so the graph it works in is the
     // home graph and a `USE` is the only way to name another one.
-    let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed, params)?;
+    let graph = graph_of(
+        &catalog,
+        zu_query::procedures::ROOT,
+        catalog.home_graph_id(),
+        &parsed,
+        params,
+    )?;
     let schema = schema_with_stats(db, &catalog, graph)?;
-    let (query, plan, notes) = compile_parsed(&parsed, &schema)?;
+    let (query, plan, notes) = compile_parsed(&parsed, &schema, zu_query::procedures::ROOT)?;
     // A write needs the log and the overlay a session owns, and this
     // entry point has neither: it was given a file handle and it hands
     // it back. Saying so here is better than compiling a plan whose
@@ -1504,6 +1535,14 @@ pub fn run_with(
                 "a statement block runs its parts as one transaction, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
+        // A session statement changes the session the statements after
+        // it run in, and this entry point has none: what it changed
+        // would go away with the call that changed it.
+        Some(NotAQuery::Session(_)) => {
+            return Err(ZuError::InvalidArgument(
+                "a session statement changes what the statements after it run in, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
+            ));
+        }
         None => {}
     }
     let p = prepare(source, db, params)?;
@@ -1511,7 +1550,7 @@ pub fn run_with(
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a
     // read gets this far: a write was refused while it was prepared.
-    if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
+    if let Some(parts) = crate::split::split(&p.query, &p.schema, zu_query::procedures::ROOT)? {
         return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
             read_one(plan, query, &p.schema, db, &p.catalog, args, options)
         });

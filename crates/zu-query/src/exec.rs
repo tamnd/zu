@@ -894,6 +894,16 @@ pub struct Options {
     /// A caller may set it before running, which is how a test pins the
     /// time.
     pub clock: Option<Clock>,
+    /// GS07 and GS15. The session time zone as minutes east of UTC,
+    /// which is the displacement the clock read below is stamped with.
+    /// Nought is UTC, which is what a session opens in and what every
+    /// run that never set one keeps.
+    ///
+    /// A displacement and never a zone name: a name is a rule the zone
+    /// database can change, so a session set to one would answer one
+    /// thing today and another after an upgrade, while a session set to
+    /// an offset answers the offset for as long as it holds it.
+    pub zone: i16,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -8553,13 +8563,18 @@ fn run_stages(
     // with, read here and nowhere else. A run that arrives with one
     // already keeps it, which is what makes a query written inside an
     // expression agree with the query around it, and what lets a test
-    // say what time it is.
+    // say what time it is. The displacement it is stamped with is the
+    // session's (GS15), so the instant is the same instant either way
+    // and what moves is the zone the statement reads it in.
     let read;
     let options = match options.clock {
         Some(_) => options,
         None => {
             read = Options {
-                clock: Some(Clock::read()),
+                clock: Some(Clock {
+                    offset: options.zone,
+                    ..Clock::read()
+                }),
                 ..options.clone()
             };
             &read

@@ -97,9 +97,12 @@ impl Clock {
     /// The clock read now, in UTC, which is what a statement does once
     /// before its first row.
     ///
-    /// The displacement is nought because zu's session time zone is
-    /// UTC, which is one of the implementation-defined choices the
-    /// standard leaves open and is written down as such. A clock before
+    /// The displacement is nought because a session opens in UTC, which
+    /// is one of the implementation-defined choices the standard leaves
+    /// open and is written down as such. A session that has moved its
+    /// zone stamps this reading with what it moved to (GS15), so the
+    /// zone rides in beside the instant rather than being read here. A
+    /// clock before
     /// the epoch on a machine whose time is set wrong reads as the
     /// epoch rather than refusing, since a statement asking what time
     /// it is has no better answer to give and no condition to raise.
@@ -619,6 +622,29 @@ fn parse_seconds(text: &str) -> Option<(i64, i64)> {
             let scale = 10i64.pow(9 - frac.len() as u32);
             Some((whole.parse().ok()?, frac.parse::<i64>().ok()? * scale))
         }
+    }
+}
+
+/// A time zone displacement on its own, as minutes east of UTC, or
+/// `None` for a string that is not one (GS15, ISO 7.1).
+///
+/// `SESSION SET TIME ZONE` is where a displacement is written with no
+/// time in front of it, so the reader below, which takes the zone off
+/// the end of a time, has nothing to take it off. What it accepts is
+/// what a zoned literal accepts, `Z` and `+hh`, `+hhmm` and `+hh:mm`
+/// either way of nought, and an empty body is the whole of the
+/// difference: a string that reads as a zone and leaves anything in
+/// front of it is a time and not a displacement.
+///
+/// A name is not a displacement and is refused as one. A zone name is
+/// a rule that changes when the zone database is updated, so a session
+/// set to `Europe/Dublin` would mean one thing today and another after
+/// an upgrade, and `02 §3.4` writes zu's answer to that down: an offset
+/// or nothing.
+pub fn zone_offset(text: &str) -> Option<i16> {
+    match split_offset(text.trim())? {
+        ("", Some(minutes)) => Some(minutes),
+        _ => None,
     }
 }
 
@@ -1182,5 +1208,26 @@ mod tests {
         assert_eq!(instant_at(1, 5), Some(NANOS_PER_DAY + 5));
         assert_eq!(instant_at(MAX_DAY, 0), None);
         assert_eq!(instant_at(MIN_DAY, 0), None);
+    }
+
+    /// GS15. A displacement on its own, which is what a session takes,
+    /// and never a name.
+    #[test]
+    fn a_session_zone_is_a_displacement_and_not_a_name() {
+        assert_eq!(zone_offset("+07:00"), Some(420));
+        assert_eq!(zone_offset("-05:30"), Some(-330));
+        assert_eq!(zone_offset("+0700"), Some(420));
+        assert_eq!(zone_offset("+07"), Some(420));
+        assert_eq!(zone_offset(" Z "), Some(0));
+        assert_eq!(zone_offset("-00:00"), Some(0));
+        assert_eq!(zone_offset("+00:00"), Some(0));
+
+        assert_eq!(zone_offset("UTC"), None);
+        assert_eq!(zone_offset("Europe/Dublin"), None);
+        assert_eq!(zone_offset(""), None);
+        // Eighteen hours is the widest displacement there is, and a
+        // time in front of the sign is a time and not a zone.
+        assert_eq!(zone_offset("+19:00"), None);
+        assert_eq!(zone_offset("12:00:00+07:00"), None);
     }
 }

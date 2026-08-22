@@ -6,7 +6,7 @@
    assembles every arrow from single characters. Changes here require a
    spec change to docs/07 first. *)
 
-statement       = statement_block | transaction_statement ;
+statement       = statement_block | transaction_statement | session_statement ;
 
 (* GP18, ISO 13.6. A statement block is the parts of a procedure body,
    and what a session is handed is a procedure body. A part is a query
@@ -40,6 +40,46 @@ transaction_statement
                 | "COMMIT" | "ROLLBACK" ;
 access_mode     = "READ" , ( "ONLY" | "WRITE" ) ;
 
+(* GS01 to GS16, ISO 7.1 and 7.2. What moves the session: the schema
+   names with no path in them resolve in, the graph a statement with
+   no USE is against, the displacement the datetime value functions
+   answer in, and the parameters every statement sent afterwards can
+   read. None of them reads the graph, so like the three above they
+   are whole statements rather than parts of a block.
+
+   A parameter is a binding variable definition whose name is written
+   with a dollar, and it is read by the same rule: the same three
+   kinds, the same optional type, and the same choice of an expression
+   or a query in braces. That is what makes GS10 and GS11 the same
+   work as GS13 and GS14 rather than four features.
+
+   PROPERTY GRAPH is written two ways and the dollar is the whole
+   difference, a parameter after the word and a graph expression
+   without one. A reset with nothing after it is the widest one, which
+   is what the standard says a reset with no arguments means. *)
+session_statement
+                = "SESSION" , ( session_set | session_reset ) , [ ";" ] ;
+session_set     = "SET" , ( session_parameter
+                          | "SCHEMA" , schema_path
+                          | [ "PROPERTY" ] , "GRAPH" , graph_ref
+                          | "TIME" , "ZONE" , time_zone_string ) ;
+session_parameter
+                = ( "VALUE" | [ "BINDING" ] , "TABLE"
+                  | [ "PROPERTY" ] , "GRAPH" ) ,
+                  [ "IF" , "NOT" , "EXISTS" ] , parameter ,
+                  [ typed_as , value_type ] , "=" , session_initializer ;
+session_initializer
+                = [ "VALUE" ] , "{" , query , "}" | graph_ref | expression ;
+session_reset   = "RESET" , [ [ "ALL" ] , ( "PARAMETERS" | "CHARACTERISTICS" )
+                            | "SCHEMA" | [ "PROPERTY" ] , "GRAPH"
+                            | "TIME" , "ZONE"
+                            | "PARAMETER" , parameter ] ;
+(* A displacement and never a zone name, docs/02 §3.4: "Z", or a sign
+   and "hh", "hhmm" or "hh:mm". A name is a rule the zone database can
+   change under a session holding it, so it is refused rather than
+   resolved once and remembered. *)
+time_zone_string = string ;
+
 (* GQ02 to GQ07, ISO 12.1. A composite query meets two result tables.
    Every conjunction is at one level and the fold is to the left, so
    there is no precedence between UNION and INTERSECT the way there is
@@ -71,9 +111,9 @@ simple_query    = { reading_clause } , return_clause
    inside the statement writes. It stands in front of the graph clause
    and reaches the whole statement, so a call that names a schema of
    its own wins: a path says where a thing lives and the clause is only
-   the default for a name that gave none. CURRENT_SCHEMA and
-   HOME_SCHEMA both name the schema the session opened in, nothing
-   moving a session out of one yet.
+   the default for a name that gave none. HOME_SCHEMA names the schema
+   the session opened in and CURRENT_SCHEMA the one it is in now, which
+   are the same schema until a SESSION SET SCHEMA moves it.
 
    Whitespace is nothing to the lexer, so `AT / MATCH (p)` is the same
    tokens as `AT /MATCH (p)` and the path would otherwise swallow the

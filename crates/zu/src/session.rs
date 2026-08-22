@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::{IdMap, Interrupt, Result, ZuError};
-use zu_query::ast::TxnStmt;
+use zu_query::ast::{
+    BindingDef, BindingKind, GraphRef, SchemaRef, SessionReset, SessionStmt, TxnStmt,
+};
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
 use zu_query::frame::{Frame, FrameSet};
@@ -126,12 +128,64 @@ struct Held {
     entered: bool,
 }
 
+/// A value this session holds under a name (ISO 7.1, GS01 through
+/// GS03).
+///
+/// It is a binding variable that outlived the statement that made it,
+/// which is what a session parameter is: the same three kinds, worked
+/// out the same way, kept until something resets it rather than until
+/// the statement ends.
+#[derive(Clone, Debug)]
+struct SessionParam {
+    /// Which of the three kinds it was set as. Kept so that what a
+    /// session is holding can be listed and said back in the words it
+    /// was written in.
+    kind: BindingKind,
+    value: Value,
+}
+
+/// The parameters one statement runs with, which are what the caller
+/// passed on top of what the session holds (GS01 through GS03).
+///
+/// The caller's win, name for name. A parameter passed with the
+/// statement is the nearer of the two, the way a binding variable
+/// defined at the head of a statement stands in front of a graph the
+/// catalog happens to hold under that name.
+fn merged_params<'a>(
+    held: &'a HashMap<String, SessionParam>,
+    passed: &[(&'a str, Value)],
+) -> Vec<(&'a str, Value)> {
+    let mut out = Vec::with_capacity(held.len() + passed.len());
+    out.extend_from_slice(passed);
+    for (name, param) in held {
+        if !passed.iter().any(|(n, _)| *n == name) {
+            out.push((name.as_str(), param.value.clone()));
+        }
+    }
+    out
+}
+
 pub struct Session {
     graph: Zu1Graph<'static>,
     /// The graph a statement is against when it does not say, which is
-    /// the home graph for the life of the session so far: there is no
-    /// statement yet that moves it.
+    /// the home graph until a `SESSION SET PROPERTY GRAPH` moves it
+    /// (GS06).
     working: u32,
+    /// GS05. The catalog schema this session works in, which is the
+    /// root until a `SESSION SET SCHEMA` moves it. A name written with
+    /// no path in front of it is looked up here: the graph a `USE`
+    /// names and the procedure a `CALL` names.
+    schema: String,
+    /// GS01 through GS03. The parameters this session holds, read by a
+    /// statement under the same `$name` a caller's parameter is read
+    /// under.
+    ///
+    /// Behind an `Arc` because a statement reads the set while the
+    /// session it belongs to is being run through. Setting one clones
+    /// the map, which happens once per `SESSION SET`; running a
+    /// statement clones the pointer, and a session holding none does
+    /// not even do that, which is what the plan-hit path can afford.
+    params: Arc<HashMap<String, SessionParam>>,
     /// One schema per graph a statement has named, built on the first
     /// naming and dropped when the epoch moves.
     schemas: IdMap<u32, Arc<zu_query::binder::Schema>>,
@@ -254,6 +308,8 @@ impl Session {
         Ok(Session {
             graph,
             working,
+            schema: zu_query::procedures::ROOT.to_string(),
+            params: Arc::new(HashMap::new()),
             schemas: IdMap::from_iter([(working, Arc::new(schema))]),
             epoch,
             snap,
@@ -726,6 +782,226 @@ impl Session {
         Ok(QueryResult::new(Vec::new(), Vec::new()))
     }
 
+    /// Runs one session statement, which changes this session and
+    /// answers no rows (ISO 7.1 and 7.2, GS01 through GS16).
+    ///
+    /// A session is a named mutable environment and this is the whole
+    /// of what a statement may move in it: the parameters it holds, the
+    /// schema and the graph it works in, and the time zone it reads a
+    /// clock in. None of it touches the file, so none of it is a write,
+    /// none of it takes the write side, and none of it costs an epoch:
+    /// two sessions on the same file may sit in different schemas
+    /// holding different parameters and neither can tell.
+    fn session_stmt(&mut self, stmt: SessionStmt, params: &[(&str, Value)]) -> Result<QueryResult> {
+        match stmt {
+            SessionStmt::SetParameter { def, if_not_exists } => {
+                self.set_parameter(&def, if_not_exists, params)?;
+            }
+            SessionStmt::SetSchema(reference) => self.set_schema(&reference)?,
+            SessionStmt::SetGraph(reference) => self.set_graph(&reference, params)?,
+            SessionStmt::SetTimeZone(minutes) => self.options.zone = minutes,
+            SessionStmt::Reset(what) => self.reset(&what)?,
+        }
+        Ok(QueryResult::new(Vec::new(), Vec::new()))
+    }
+
+    /// Sets one session parameter (GS01 through GS03, GS10 through
+    /// GS14).
+    ///
+    /// A session parameter is a binding variable definition whose name
+    /// is written with a dollar, so it is worked out the way one is:
+    /// the definition is run as the query it means, `RETURN` of the
+    /// name it defines, and what comes back is what the session holds.
+    /// That is what makes the two initializer forms cost nothing extra
+    /// here. An expression is a definition initialized with one and a
+    /// query in braces is a definition initialized with one, and both
+    /// were already worked out for GP05 through GP13.
+    ///
+    /// It is worked out once, now, and not once per statement that
+    /// reads it. A parameter set from a query holds the rows that query
+    /// answered at the moment it was set, which is the point of the
+    /// form: a session names a result and hands it to whatever runs
+    /// next without reading the graph again.
+    fn set_parameter(
+        &mut self,
+        def: &BindingDef,
+        if_not_exists: bool,
+        params: &[(&str, Value)],
+    ) -> Result<()> {
+        if if_not_exists && self.params.contains_key(&def.name) {
+            return Ok(());
+        }
+        let value = self.definition_value(def, params)?;
+        Arc::make_mut(&mut self.params).insert(
+            def.name.clone(),
+            SessionParam {
+                kind: def.kind,
+                value,
+            },
+        );
+        Ok(())
+    }
+
+    /// What one binding variable definition defines, worked out here
+    /// rather than inside a statement.
+    fn definition_value(&mut self, def: &BindingDef, params: &[(&str, Value)]) -> Result<Value> {
+        let mut wrapped =
+            zu_query::binder::returning(zu_query::ast::Expr::Variable(def.name.clone()), &def.name);
+        wrapped.bindings = vec![def.clone()];
+        let result = self.run_parsed(&wrapped, params)?;
+        // A definition stands for one value, which the binder has
+        // already made sure of by refusing anything that answers more
+        // than one column. What is left is the row count, and a query
+        // that answered no row at all defines the name as null rather
+        // than leaving it undefined: a parameter that exists and holds
+        // nothing is something a statement can read and ask about, and
+        // one that does not exist is a reference that resolves to
+        // nothing.
+        match result.rows.len() {
+            0 => Ok(Value::Null),
+            1 => Ok(result.rows.into_vec().swap_remove(0).swap_remove(0)),
+            n => Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{} $ {} stands for one value and what defines it answered {n} rows",
+                    def.kind.word(),
+                    def.name
+                ),
+            )),
+        }
+    }
+
+    /// Runs one parsed query on this session, off the plan cache.
+    ///
+    /// A session parameter's initializer is a query with no text of its
+    /// own: it was written inside a statement that is not a query, so
+    /// there is nothing to key a cached plan on and nothing that would
+    /// be asked for twice. It compiles against the graph this session
+    /// is working in, which is the graph the initializer would read if
+    /// it had been written inside a statement instead.
+    fn run_parsed(
+        &mut self,
+        parsed: &zu_query::ast::Query,
+        params: &[(&str, Value)],
+    ) -> Result<QueryResult> {
+        let graph = query::graph_of(
+            self.graph.catalog(),
+            &self.schema,
+            self.working,
+            parsed,
+            params,
+        )?;
+        let cached = Arc::new(self.compile_ast(parsed, graph)?);
+        let args = query::bind_args(&cached.query.params, params)?;
+        match &cached.parts {
+            Some(parts) if crate::split::writes(parts) => {
+                self.refuse_a_write()?;
+                let held = self.hold()?;
+                let out = self.run_parts(&cached, parts, args, params);
+                self.settle(out, held)
+            }
+            Some(parts) => self.run_parts(&cached, parts, args, params),
+            None => self.run_plan(&cached, args),
+        }
+    }
+
+    /// Moves the schema this session works in (GS05).
+    ///
+    /// A schema the catalog does not hold is a reference that resolves
+    /// to nothing, which is `42002`, and it is checked here rather than
+    /// left to the first statement that fails in it: the statement that
+    /// moved the session is the one that knows where it was going.
+    ///
+    /// The plans go with it. A plan was compiled against the schema the
+    /// session was in, and a name in it that resolved there may resolve
+    /// somewhere else or nowhere now, so keeping them would run a
+    /// statement against a lookup nobody would make today.
+    fn set_schema(&mut self, reference: &SchemaRef) -> Result<()> {
+        let path = match reference {
+            SchemaRef::Current => return Ok(()),
+            SchemaRef::Home => zu_query::procedures::ROOT.to_string(),
+            SchemaRef::Path(path) => path.clone(),
+        };
+        if !self.graph.catalog().has_schema(&path) {
+            return Err(ZuError::gql(
+                codes::C42002,
+                format!("'{path}' is no schema in this catalog"),
+            ));
+        }
+        if path != self.schema {
+            self.schema = path;
+            self.plans.clear();
+            self.focused.clear();
+        }
+        Ok(())
+    }
+
+    /// Moves the graph this session works in (GS06), which is the graph
+    /// a statement runs against when it carries no `USE`.
+    ///
+    /// The plans stay. A plan is held under its text and the graph it
+    /// was compiled against is in the schema riding with it, so the
+    /// cache is not wrong after this; what it holds is a plan for the
+    /// graph the text named, and a text that named no graph is keyed
+    /// under the text alone and would be. That last case is what the
+    /// clear is for.
+    fn set_graph(&mut self, reference: &GraphRef, params: &[(&str, Value)]) -> Result<()> {
+        let graph = query::graph_of_ref(
+            self.graph.catalog(),
+            &self.schema,
+            self.working,
+            reference,
+            &[],
+            params,
+        )?;
+        if graph != self.working {
+            self.working = graph;
+            self.plans.clear();
+            self.focused.clear();
+        }
+        Ok(())
+    }
+
+    /// Puts back what a `SESSION RESET` names (GS04 through GS08, GS16).
+    ///
+    /// Reset is to what the session opened with and not to nothing: the
+    /// schema goes back to the root, the graph to the home graph, the
+    /// zone to UTC, and the parameters go away, since a session opened
+    /// holding none. `ALL CHARACTERISTICS` is all four, which is the
+    /// session as it was on its first statement.
+    fn reset(&mut self, what: &SessionReset) -> Result<()> {
+        match what {
+            SessionReset::Characteristics => {
+                self.set_schema(&SchemaRef::Home)?;
+                self.set_graph(&GraphRef::Home, &[])?;
+                self.options.zone = 0;
+                self.clear_params();
+            }
+            SessionReset::Schema => self.set_schema(&SchemaRef::Home)?,
+            SessionReset::Graph => self.set_graph(&GraphRef::Home, &[])?,
+            SessionReset::TimeZone => self.options.zone = 0,
+            SessionReset::Parameters => self.clear_params(),
+            // GS16. A name the session is not holding is not a refusal:
+            // the statement says what the session should be holding
+            // afterwards, and afterwards it is holding nothing under
+            // that name either way.
+            SessionReset::Parameter(name) => {
+                if self.params.contains_key(name) {
+                    Arc::make_mut(&mut self.params).remove(name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// GS08. Lets go of every parameter, without touching the pointer
+    /// when there is nothing behind it to let go of.
+    fn clear_params(&mut self) {
+        if !self.params.is_empty() {
+            self.params = Arc::new(HashMap::new());
+        }
+    }
+
     /// Refuses a statement that writes inside a transaction that was
     /// started `READ ONLY` (GT02), before the statement is compiled and
     /// before anything is staged.
@@ -981,6 +1257,42 @@ impl Session {
         Ok(())
     }
 
+    /// The catalog schema this session works in (GS05), which is the
+    /// root until a `SESSION SET SCHEMA` moves it.
+    pub fn session_schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// The session time zone as minutes east of UTC (GS07 and GS15),
+    /// nought being the UTC a session opens in.
+    pub fn time_zone(&self) -> i16 {
+        self.options.zone
+    }
+
+    /// The id of the graph a statement on this session runs against
+    /// when it carries no `USE` (GS06).
+    pub fn working_graph(&self) -> u32 {
+        self.working
+    }
+
+    /// The parameters this session is holding, each as its name, the
+    /// word it was set with, and the value it holds, in name order
+    /// (GS01 through GS03).
+    ///
+    /// A statement cannot ask this: `$p` answers what `$p` holds, and
+    /// there is no expression that answers what a session holds under
+    /// every name. So a shell that prints them and a test that says
+    /// what a reset took away both come here.
+    pub fn session_params(&self) -> Vec<(&str, &'static str, &Value)> {
+        let mut out: Vec<(&str, &'static str, &Value)> = self
+            .params
+            .iter()
+            .map(|(name, param)| (name.as_str(), param.kind.word(), &param.value))
+            .collect();
+        out.sort_unstable_by_key(|(name, _, _)| *name);
+        out
+    }
+
     /// The file this session reads through, shared with every other
     /// session this process has on the same file.
     ///
@@ -1008,10 +1320,17 @@ impl Session {
     /// switches it rides in, and a caller changing the thread count
     /// would otherwise silently take away the only way to stop a
     /// statement.
+    ///
+    /// So does the time zone, for the same reason and a stronger one:
+    /// it is a session characteristic a statement set (GS15), not a
+    /// switch a caller configured, and a thread count arriving from
+    /// [`crate::db::Config`] has nothing to say about what time it is.
     pub fn set_options(&mut self, options: exec::Options) {
         let interrupt = self.options.interrupt.clone();
+        let zone = self.options.zone;
         self.options = exec::Options {
             interrupt,
+            zone,
             ..options
         };
     }
@@ -1047,16 +1366,32 @@ impl Session {
         batch_rows: usize,
         sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
     ) -> Result<Streamed> {
+        if self.params.is_empty() {
+            return self.stream_in(source, params, batch_rows, sink);
+        }
+        let held = Arc::clone(&self.params);
+        let merged = merged_params(&held, params);
+        self.stream_in(source, &merged, batch_rows, sink)
+    }
+
+    /// The same stream, with the session's parameters folded in.
+    fn stream_in(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        batch_rows: usize,
+        sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
+    ) -> Result<Streamed> {
         self.sync()?;
         self.check_refs(params)?;
         if query::not_a_query(source)?.is_some() {
-            let result = self.run(source, params)?;
+            let result = self.run_in(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
         }
         let cached = self.plan_for(source, params)?;
         let args = query::bind_args(&cached.query.params, params)?;
         if cached.parts.is_some() {
-            let result = self.run(source, params)?;
+            let result = self.run_in(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
         }
         let options = self.options.clone();
@@ -1101,10 +1436,27 @@ impl Session {
     /// Runs one query, compiling it on the first sighting of this text
     /// and reusing the cached plan afterwards.
     pub fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
+        if self.params.is_empty() {
+            return self.run_in(source, params);
+        }
+        let held = Arc::clone(&self.params);
+        let merged = merged_params(&held, params);
+        self.run_in(source, &merged)
+    }
+
+    /// The same run, with the session's parameters already folded into
+    /// the ones it was passed. Everything inside the session that runs
+    /// a statement comes here, so the fold happens once at the edge
+    /// rather than at every place a statement is reached.
+    fn run_in(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.sync()?;
         self.check_refs(params)?;
         match query::not_a_query(source)? {
             Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
+            // GS01 through GS16. It changes this session and answers no
+            // rows, and it is not held in the plan cache: there is
+            // nothing compiled to hold.
+            Some(NotAQuery::Session(stmt)) => return self.session_stmt(stmt, params),
             // A catalog statement publishes a new epoch, and the plans
             // and readers this session holds describe the old one.
             // Refreshing after it is what drops them, so the next query
@@ -1158,6 +1510,13 @@ impl Session {
             let out = self.run_parts(&cached, parts, args, params);
             return self.settle(out, held);
         }
+        self.run_plan(&cached, args)
+    }
+
+    /// Runs one compiled plan whole: on the pipeline executor when it
+    /// covers the plan, and on the row executor when it hands the plan
+    /// back.
+    fn run_plan(&mut self, cached: &CachedPlan, args: Vec<Value>) -> Result<QueryResult> {
         let options = self.options.clone();
         if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
@@ -1199,7 +1558,7 @@ impl Session {
     fn run_block(&mut self, parts: &[String], params: &[(&str, Value)]) -> Result<QueryResult> {
         let mut last = QueryResult::new(Vec::new(), Vec::new());
         for part in parts {
-            last = self.run(part, params)?;
+            last = self.run_in(part, params)?;
         }
         Ok(last)
     }
@@ -1645,8 +2004,18 @@ impl Session {
     /// EXPLAIN ANALYZE through the session: same cache, same options,
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
+        if !self.params.is_empty() {
+            let held = Arc::clone(&self.params);
+            let merged = merged_params(&held, params);
+            return self.analyze_in(source, &merged);
+        }
+        self.analyze_in(source, params)
+    }
+
+    /// The same listing, with the session's parameters folded in.
+    fn analyze_in(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
         let notes = self.plan_for(source, params)?.notes.clone();
-        let listing = self.profile(source, params)?.render();
+        let listing = self.profile_in(source, params)?.render();
         let listing = match self.decisions(source, params)? {
             Some(d) => format!("{listing}decisions:\n{}", d.render()),
             None => listing,
@@ -1691,6 +2060,16 @@ impl Session {
     /// rendering, for callers that want the numbers. `zu bench
     /// cardinality` reads q-error off this.
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
+        if !self.params.is_empty() {
+            let held = Arc::clone(&self.params);
+            let merged = merged_params(&held, params);
+            return self.profile_in(source, &merged);
+        }
+        self.profile_in(source, params)
+    }
+
+    /// The same profile, with the session's parameters folded in.
+    fn profile_in(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
         self.sync()?;
         let cached = self.plan_for(source, params)?;
         if cached.parts.is_some() {
@@ -1732,7 +2111,13 @@ impl Session {
         let Ok(parsed) = zu_query::parser::parse(source) else {
             return Err(failed);
         };
-        let Ok(graph) = query::graph_of(self.graph.catalog(), self.working, &parsed, params) else {
+        let Ok(graph) = query::graph_of(
+            self.graph.catalog(),
+            &self.schema,
+            self.working,
+            &parsed,
+            params,
+        ) else {
             return Err(failed);
         };
         let wanted = crate::declare::wanted(self.graph.catalog(), graph, &parsed)?;
@@ -1803,7 +2188,13 @@ impl Session {
             }
             Err(other) => return Err(other),
         };
-        let graph = query::graph_of(self.graph.catalog(), self.working, &parsed, params)?;
+        let graph = query::graph_of(
+            self.graph.catalog(),
+            &self.schema,
+            self.working,
+            &parsed,
+            params,
+        )?;
         // A `USE` that named a parameter is remembered as the parameter
         // it named, and its plan is held under the graph as well as the
         // text. Holding it under the text alone would hand the next
@@ -1842,16 +2233,24 @@ impl Session {
 
     fn compile(&mut self, source: &str, graph: u32) -> Result<Arc<CachedPlan>> {
         let parsed = zu_query::parser::parse(source)?;
+        Ok(Arc::new(self.compile_ast(&parsed, graph)?))
+    }
+
+    /// The same compile from the parse rather than the text, which is
+    /// what a session parameter's initializer has: it was written
+    /// inside a statement that is not a query, so it never had a text
+    /// of its own.
+    fn compile_ast(&mut self, parsed: &zu_query::ast::Query, graph: u32) -> Result<CachedPlan> {
         let schema = self.schema_for(graph)?;
-        let (query, plan, notes) = query::compile_parsed(&parsed, &schema)?;
-        let parts = crate::split::split(&query, &schema)?;
-        Ok(Arc::new(CachedPlan {
+        let (query, plan, notes) = query::compile_parsed(parsed, &schema, &self.schema)?;
+        let parts = crate::split::split(&query, &schema, &self.schema)?;
+        Ok(CachedPlan {
             schema,
             query,
             plan,
             parts,
             notes,
-        }))
+        })
     }
 
     /// The schema of one graph, built on the first statement that names
@@ -2524,7 +2923,10 @@ mod tests {
         let err = session
             .run(&format!("USE nowhere {source}"), &[])
             .expect_err("no such graph");
-        assert!(err.to_string().contains("is no graph in '/'"), "{err}");
+        assert!(
+            err.to_string().contains("is no graph in the schema '/'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3005,7 +3407,7 @@ mod tests {
             .run(&format!("USE twin {pattern}"), &[])
             .expect_err("the copy is gone")
             .to_string();
-        assert!(err.contains("which is no graph in"), "{err}");
+        assert!(err.contains("is no graph in the schema"), "{err}");
     }
 
     /// How many blocks the committed free list names, which is what a

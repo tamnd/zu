@@ -115,6 +115,17 @@ pub struct Cold {
     /// device before anything depends on it being there, because the
     /// caller syncs before it reclaims the region the records came from.
     appending: Mutex<Buffer>,
+    /// Where the buffered page starts, published so a reader can tell
+    /// that a record is in the file without taking the append lock.
+    ///
+    /// It only ever moves up, and it moves after the page below it has
+    /// been written, so a record below the value a reader loads is a
+    /// record the file holds. That is the whole of what a reader needed
+    /// the lock for, and the lock is held across a page sized `pwrite`
+    /// while a pass migrates, so wanting it was the difference between a
+    /// read that costs a `pread` and a read that costs a `pread` plus
+    /// however long somebody else's write takes. #557.
+    filling: AtomicU64,
     /// Bytes written here since the tier was opened, and records.
     pub written: AtomicU64,
     pub records: AtomicU64,
@@ -152,6 +163,7 @@ impl Cold {
             begin: AtomicU64::new(BASE + FIRST),
             synced: AtomicU64::new(BASE + FIRST),
             appending: Mutex::new(Buffer::at(BASE + FIRST)),
+            filling: AtomicU64::new(BASE + FIRST),
             written: AtomicU64::new(0),
             records: AtomicU64::new(0),
         };
@@ -226,6 +238,7 @@ impl Cold {
     pub fn resume_at(&self, address: Address) {
         let mut buffer = self.appending.lock().expect("zu2 cold append");
         *buffer = Buffer::at(address);
+        self.filling.store(buffer.base, Ordering::Release);
         let held = buffer.len;
         if held > 0 {
             let from = self.at(buffer.base);
@@ -295,6 +308,9 @@ impl Cold {
             }
             self.flush(&mut buffer)?;
             *buffer = Buffer::at(page_start(page_of(buffer.base) + 1));
+            // After the flush, so a reader that sees this value can rely
+            // on everything below it being in the file.
+            self.filling.store(buffer.base, Ordering::Release);
         }
 
         let at = buffer.base + buffer.len as u64;
@@ -362,17 +378,19 @@ impl Cold {
                 why: "outside the cold tier",
             });
         }
-        let written = {
+        let mut written = self.filling.load(Ordering::Acquire);
+        if address >= written {
             // The page being filled is not in the file yet, and a record
             // that has just been migrated is read the moment somebody
-            // looks the key up.
+            // looks the key up. This is the only case that wants the
+            // append lock, and it is the rare one.
             let buffer = self.appending.lock().expect("zu2 cold append");
             if address >= buffer.base {
                 let from = (address - buffer.base) as usize;
                 return buffer.read(from, address, into);
             }
-            buffer.base
-        };
+            written = buffer.base;
+        }
         // One read where the obvious two would be a header and then the
         // record it describes. A cold read is the slowest thing in the
         // read path, because there are no resident pages down here and

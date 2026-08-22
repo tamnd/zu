@@ -44,7 +44,7 @@
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -112,18 +112,90 @@ fn checkpoint_due(db: &Zu1File) -> bool {
 /// A deferred commit is a frame in the log and a handful of cells in
 /// the overlay, and neither is freed until a fold takes them, so this
 /// is what a recovery has to replay and what the patch below has to
-/// carry. It is deliberately well short of what the log can hold: the
-/// point is to take the fold off the statement, and folding one
-/// statement in a few hundred does that whatever the number is.
-const DEFERRED_COMMITS: u32 = 256;
+/// carry.
+///
+/// It is also what decides the write tail, and that is the reason it is
+/// this large. One statement in this many carries a fold, and a fold is
+/// milliseconds where a statement is microseconds, and it holds the
+/// write side while it runs, so at eight writers one fold is eight slow
+/// statements. The share of statements a fold makes slow is therefore
+/// about the width over this number, and a share that is to stay under
+/// a percentile has to be under what that percentile leaves: a p99 that
+/// is not to contain a fold wants this over a hundred times the widest
+/// burst it will see. Four thousand covers thirty two writers with room
+/// left.
+///
+/// What that costs is what the two bounds below hold down, and what
+/// made it impossible until now was neither of them: the patch used to
+/// be copied whole every time a commit added to it, so a run of this
+/// length cost the square of it. See [`Writer::stage_patch`].
+const DEFERRED_COMMITS: u32 = 4096;
+
+/// How many of them may leave something behind that the patch copies
+/// rather than shares.
+///
+/// The bound above is what the write tail wants and this is what the
+/// rest of the system can afford, and they are two numbers because the
+/// changes are of two kinds. A row appended past the end of a table is
+/// data the reader was going to produce anyway, in the order it was
+/// going to produce it in, so the patch keeps them in sealed chunks
+/// that a copy shares and a reader walks once. Everything else is laid
+/// over data already there: a cell over a cell, a tombstone over an
+/// offset, a label word over the bitset's. Those are copied when the
+/// commit after them touches the same table, and worse, every scan
+/// between here and the next fold puts them back over the column
+/// again. So the cost of the run is the depth of it times the reads
+/// through it, and that is a cost the write tail gets nothing for.
+///
+/// Measured on the sustained SET window, which scans a ten thousand
+/// row column a statement: 23.7 us of processor time a statement at a
+/// fold every 256 commits against 35.2 at every 1024. Both of those
+/// were the same patch, so it is the reads paying, not the writes.
+///
+/// An added edge is on this side of the line too, for the other of the
+/// two reasons. A read of it is cheap, because the patch holds the
+/// added edges by the node they leave, so a traversal asks about one
+/// node's list rather than looking through every edge the run added.
+/// What is not cheap is the commit: those lists are still copied whole
+/// each time one is added to, the way the cells were before they were
+/// split into a run and a tail. Give the edges the same treatment and
+/// they move over to the other bound; until then they fold with the
+/// overwrites.
+///
+/// Which leaves the tail. A run of writes over rows that are already
+/// there folds as often as it did before any of this, and a run that
+/// appends rows gets the whole four thousand. That is the right way
+/// round: an append is what a load does and what the commit tail was
+/// measured on, and an overwrite is what a scan pays for.
+const DEFERRED_COPIED: u32 = 256;
 
 /// How many cells the deferred commits may hold between them.
 ///
-/// The patch is rebuilt when a commit adds to it, so this bounds the
-/// per-commit cost of deferring as well as the memory: a few hundred
-/// cells is a copy of a few kilobytes, against the column rewrite and
-/// the two segment writes a fold costs.
+/// A cell written over one the file already holds goes in a map the
+/// commit after it copies, so this bounds the per-commit cost of
+/// deferring as well as the memory. Rows appended past the end of a
+/// table are not copied that way and have a bound of their own below.
+///
+/// Left where it was while the commit bound went to 4096, and what
+/// holds a run of overwrites down now is [`DEFERRED_COPIED`] rather
+/// than this. It used to be this one: the cells were copied whole, so
+/// bounding how many there were bounded what the copy cost. They are
+/// not any more, because they sit in a sorted run with the recent ones
+/// in a map beside it and a commit copies a few dozen of them whatever
+/// the run has reached. So this is a bound on memory and on the string
+/// bytes below it, and a single statement writing a thousand cells
+/// still trips it.
 const DEFERRED_CELLS: usize = 1024;
+
+/// How many rows the deferred commits may append between them.
+///
+/// Apart from the cells because the cost is not the same. An appended
+/// row is never written into again, so the patch holds them in sealed
+/// chunks a copy shares rather than copies, and what a commit pays for
+/// the ones already there is a pointer. So this is a bound on memory
+/// and on how much a fold has to seal in one go, and not, the way the
+/// cell bound is, a bound on what the commit before the fold cost.
+const DEFERRED_ROWS: usize = 4096;
 
 /// How many bytes of string the cells among them may hold.
 ///
@@ -146,7 +218,7 @@ const DEFERRED_BYTES: usize = 256 * 1024;
 /// property columns, a row taken away, which is an offset every read of
 /// the table filters by, and a label change, which is a word the reader
 /// answers with in place of the bitset's.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Patches {
     /// New values, by table.
     pub cells: IdMap<u32, Arc<CellPatch>>,
@@ -182,11 +254,15 @@ impl Patches {
             && self.marks.is_empty()
     }
 
-    /// How many cells everything in here holds between them, which is
-    /// what a writer bounds when it decides whether to keep deferring.
+    /// How many cells the parts of this that a commit copies whole hold
+    /// between them, which is what the writer bounds when it decides
+    /// whether to keep deferring.
+    ///
+    /// Everything but the appended rows, which are counted on their own
+    /// by [`Self::appended`] because they are the one part a commit
+    /// does not copy. See [`DEFERRED_CELLS`] and [`DEFERRED_ROWS`].
     fn cells(&self) -> usize {
         self.cells.values().map(|p| p.cells()).sum::<usize>()
-            + self.rows.values().map(|p| p.len()).sum::<usize>()
             + self
                 .edges
                 .values()
@@ -194,6 +270,11 @@ impl Patches {
                 .sum::<usize>()
             + self.gone.values().map(|rows| rows.len()).sum::<usize>()
             + self.marks.values().map(|p| p.len()).sum::<usize>()
+    }
+
+    /// How many rows the deferred commits have appended between them.
+    fn appended(&self) -> usize {
+        self.rows.values().map(|p| p.len()).sum()
     }
 
     /// How many rows a commit has added to `table` and not folded,
@@ -258,33 +339,24 @@ pub struct Writer {
     wal: Wal,
     mvcc: Mvcc,
     path: PathBuf,
-    /// The words the commits since the last fold wrote, by table and
-    /// then by column, which is the running form the patch below is
-    /// built from.
-    pending: IdMap<u32, BTreeMap<usize, BTreeMap<u64, u64>>>,
-    /// The strings they wrote, the same way. Apart from the words
-    /// because the patch keeps them apart, and the two never name the
-    /// same column: a column stores one kind or the other.
-    strings: IdMap<u32, BTreeMap<usize, BTreeMap<u64, Vec<u8>>>>,
-    /// The same cells as a reader takes them. Rebuilt whenever a
-    /// deferred commit adds to `pending`, and shared from there: a
-    /// reader holds the `Arc` and hands copies of it to the workers a
-    /// query forks.
+    /// Everything the commits since the last fold left behind, as a
+    /// reader takes it. This is the writer's own copy as well: a
+    /// deferred commit writes into it in place where nothing is looking
+    /// and clones it where something is, and the read-your-writes
+    /// questions [`Writer::defers`] asks are asked of it rather than of
+    /// a second copy kept alongside. A reader holds the `Arc` and hands
+    /// copies of it to the workers a query forks.
     patches: Arc<Patches>,
     /// How many commits have gone without a fold.
     deferred: u32,
-    /// The rows the deferred commits added, by table, in the running
-    /// form the patch above is built from.
-    added: IdMap<u32, RowPatch>,
-    /// The edges they added, by rel table, the same way.
-    fresh: IdMap<u32, EdgePatch>,
-    /// The labels they left on rows, by table, again the same way. A
-    /// row named twice is in here once, carrying what the later of the
-    /// two commits left it with.
-    marks: IdMap<u32, LabelPatch>,
+    /// How many of them left something the patch copies rather than
+    /// shares. See [`DEFERRED_COPIED`].
+    copied: u32,
     /// The rows they took away, by table. A set, because a row can be
     /// deleted twice and the second one takes nothing away, and sorted
-    /// because that is the order the readers merge it in.
+    /// because that is the order the readers merge it in. Kept apart
+    /// from the patch because what the patch publishes is a sorted run
+    /// and what a delete wants is somewhere to put an offset.
     graves: IdMap<u32, BTreeSet<u64>>,
     /// Adjacency readers of the rel tables a deferred commit has added
     /// an edge to, which is what says whether the pair is already
@@ -336,13 +408,9 @@ impl Writer {
             wal,
             mvcc,
             path,
-            pending: IdMap::default(),
-            strings: IdMap::default(),
             patches: Arc::new(Patches::new()),
             deferred: 0,
-            added: IdMap::default(),
-            fresh: IdMap::default(),
-            marks: IdMap::default(),
+            copied: 0,
             graves: IdMap::default(),
             readers: IdMap::default(),
             catalog: None,
@@ -464,9 +532,11 @@ impl Writer {
     /// drops it out of the two lists it is in as it reads them.
     /// Anything else, a label above all, folds the way it always did.
     /// On top of the shape
-    /// there are four bounds: how many commits may go unfolded, how
-    /// many cells they may hold, how many bytes of string among them,
-    /// and the block growth the checkpoint threshold already bounds.
+    /// there are five bounds: how many commits may go unfolded, how
+    /// many of those may leave a change laid over data already there,
+    /// how many cells they may hold, how many bytes of string among
+    /// them, and the block growth the checkpoint threshold already
+    /// bounds.
     fn defers(
         &mut self,
         db: &mut Zu1File,
@@ -476,7 +546,9 @@ impl Writer {
             return Ok(None);
         }
         if self.deferred >= DEFERRED_COMMITS
+            || self.copied >= DEFERRED_COPIED
             || self.patches.cells() + written_cells(&changes) > DEFERRED_CELLS
+            || self.patches.appended() + written_rows(&changes) > DEFERRED_ROWS
             || self.patches.bytes() + written_bytes(&changes) > DEFERRED_BYTES
             || checkpoint_due(db)
         {
@@ -573,7 +645,12 @@ impl Writer {
         col: usize,
         value: &Cell,
     ) -> Result<Option<std::ops::Range<u64>>> {
-        if self.fresh.get(&rel).is_some_and(|p| p.holds(src, dst)) {
+        if self
+            .patches
+            .edges
+            .get(&rel)
+            .is_some_and(|p| p.holds(src, dst))
+        {
             return Ok(None);
         }
         self.load_reader(db, rel)?;
@@ -621,7 +698,12 @@ impl Writer {
         dst: u64,
         cols: &[(u32, Cell)],
     ) -> Result<bool> {
-        if self.fresh.get(&rel).is_some_and(|p| p.holds(src, dst)) {
+        if self
+            .patches
+            .edges
+            .get(&rel)
+            .is_some_and(|p| p.holds(src, dst))
+        {
             return Ok(false);
         }
         self.load_reader(db, rel)?;
@@ -667,7 +749,12 @@ impl Writer {
     /// move, because nothing has been rebuilt around the ones that
     /// went.
     fn edge_removable(&mut self, db: &mut Zu1File, rel: u32, src: u64, dst: u64) -> Result<bool> {
-        if self.fresh.get(&rel).is_some_and(|p| p.holds(src, dst)) {
+        if self
+            .patches
+            .edges
+            .get(&rel)
+            .is_some_and(|p| p.holds(src, dst))
+        {
             return Ok(false);
         }
         self.load_reader(db, rel)?;
@@ -826,7 +913,12 @@ impl Writer {
             .collect();
         let mut list = Vec::new();
         for (rel, out, back) in rels {
-            if self.fresh.get(&rel).is_some_and(|patch| patch.adds() > 0) {
+            if self
+                .patches
+                .edges
+                .get(&rel)
+                .is_some_and(|patch| patch.adds() > 0)
+            {
                 return Ok(false);
             }
             self.load_reader(db, rel)?;
@@ -865,7 +957,8 @@ impl Writer {
             Direction::Fwd => (node, other),
             Direction::Bwd => (other, node),
         };
-        self.fresh
+        self.patches
+            .edges
             .get(&rel)
             .is_some_and(|patch| patch.drops(node, other, dir))
             || dying.contains(&(rel, src, dst))
@@ -921,15 +1014,17 @@ impl Writer {
         let Some(directory) = self.dirs[&table].as_ref() else {
             return Ok(None);
         };
-        let rows = directory.node_count + self.added.get(&table).map_or(0, |p| p.len() as u64);
+        let rows =
+            directory.node_count + self.patches.rows.get(&table).map_or(0, |p| p.len() as u64);
         if offset >= rows {
             return Ok(None);
         }
-        let held = match staged
-            .get(&(table, offset))
-            .copied()
-            .or_else(|| self.marks.get(&table).and_then(|marks| marks.get(offset)))
-        {
+        let held = match staged.get(&(table, offset)).copied().or_else(|| {
+            self.patches
+                .marks
+                .get(&table)
+                .and_then(|marks| marks.get(offset))
+        }) {
             Some(word) => word,
             None => stored_label_word(db, directory, offset)?.unwrap_or(primary),
         };
@@ -948,77 +1043,87 @@ impl Writer {
 
     /// Adds a deferred commit's cells to the patch and republishes it.
     ///
-    /// Only the tables this commit wrote into are rebuilt. The others
-    /// keep the `Arc` they already had, so a reader that has read one
-    /// of them is not made to look at it again.
+    /// The patch a reader holds is the one this writes into, through
+    /// [`Arc::make_mut`], so what a commit costs is what the commit
+    /// changed and not what the run has accumulated. It used to be the
+    /// other way around: the writer kept a running copy of everything
+    /// and built a fresh patch out of the whole of it whenever a commit
+    /// added to it, which is a copy of the run on every commit of the
+    /// run, and quadratic in how long the run is allowed to get. That
+    /// is what held the deferral bound down, because the bound is how
+    /// long the run gets.
+    ///
+    /// A copy still happens where one is owed, and only there: a reader
+    /// holding this patch is holding the database as of the commit it
+    /// opened at, so the first write after it looked clones what it is
+    /// looking at and leaves it alone. A reader that has moved on, and
+    /// a burst with no readers in it at all, is written into in place.
     fn stage_patch(&mut self, changes: Vec<Deferred>) {
-        let mut cells: Vec<u32> = Vec::new();
-        let mut rels: Vec<u32> = Vec::new();
-        let mut graves: Vec<u32> = Vec::new();
-        let mut grown: Vec<u32> = Vec::new();
-        let mut marked: Vec<u32> = Vec::new();
+        // Borrowed a field at a time rather than through `&mut self`,
+        // because the loop reads the readers and the directories while
+        // it writes the patch and those are three different fields.
+        let (readers, dirs, graves) = (&self.readers, &self.dirs, &mut self.graves);
+        // Asked before the loop takes the changes, and the question is
+        // the one [`written_cells`] answers: everything but an appended
+        // row is something the patch copies.
+        let copies = written_cells(&changes) > 0;
+        let mut dug: Vec<u32> = Vec::new();
+        let patches = Arc::make_mut(&mut self.patches);
         for change in changes {
             match change {
                 Deferred::Cell((table, row, col, value)) => {
+                    let cells = Arc::make_mut(patches.cells.entry(table).or_default());
                     match value {
-                        Cell::Int(word) => {
-                            self.pending
-                                .entry(table)
-                                .or_default()
-                                .entry(col as usize)
-                                .or_default()
-                                .insert(row, word);
-                        }
-                        Cell::Str(bytes) => {
-                            self.strings
-                                .entry(table)
-                                .or_default()
-                                .entry(col as usize)
-                                .or_default()
-                                .insert(row, bytes);
-                        }
+                        Cell::Int(word) => cells.set(col as usize, row, word),
+                        Cell::Str(bytes) => cells.set_bytes(col as usize, row, bytes),
                         // A value taken away is not one of the shapes
                         // [`Self::defers`] takes, because what it
                         // changes is the validity mask.
                         Cell::Null => unreachable!("refused where the commit was taken"),
                     }
-                    if !cells.contains(&table) {
-                        cells.push(table);
-                    }
                 }
                 Deferred::Edge(rel, src, dst, cols) => {
-                    self.stage_edge(rel, src, dst, cols);
-                    if !rels.contains(&rel) {
-                        rels.push(rel);
+                    let edges = readers[&rel].directory().edge_count;
+                    Arc::make_mut(edge_patch(patches, rel, edges)).add(src, dst);
+                    // The ordinal the edge took and the row number of
+                    // its properties are the same number, because a rel
+                    // table's columns are dense over its edges in load
+                    // order and an added edge goes on the end of both.
+                    if let Some(directory) = dirs.get(&rel).and_then(Option::as_ref) {
+                        let width = directory.columns.len();
+                        let key = key_col(directory);
+                        Arc::make_mut(row_patch(patches, rel, edges, key))
+                            .push(row_of(width, &cols));
                     }
                 }
                 Deferred::Gone(table, offset) => {
-                    self.graves.entry(table).or_default().insert(offset);
-                    if !graves.contains(&table) {
-                        graves.push(table);
+                    graves.entry(table).or_default().insert(offset);
+                    if !dug.contains(&table) {
+                        dug.push(table);
                     }
                 }
                 Deferred::DeadRel(rel, src, dst) => {
-                    let edges = self.readers[&rel].directory().edge_count;
-                    self.fresh
-                        .entry(rel)
-                        .or_insert_with(|| EdgePatch::new(edges))
-                        .remove(src, dst);
-                    if !rels.contains(&rel) {
-                        rels.push(rel);
-                    }
+                    let edges = readers[&rel].directory().edge_count;
+                    Arc::make_mut(edge_patch(patches, rel, edges)).remove(src, dst);
                 }
                 Deferred::Rows(table, rows) => {
-                    self.stage_rows(table, rows);
-                    if !grown.contains(&table) {
-                        grown.push(table);
+                    // The base is the count the columns hold, which is
+                    // the offset the first added row takes, and it is
+                    // read from the props directory rather than the
+                    // catalog because that is what the fold checks its
+                    // own arithmetic against.
+                    let Some(directory) = dirs.get(&table).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    let (base, width) = (directory.node_count, directory.columns.len());
+                    let key = key_col(directory);
+                    let patch = Arc::make_mut(row_patch(patches, table, base, key));
+                    for row in rows {
+                        patch.push(row_of(width, &row));
                     }
                 }
                 Deferred::Marks(table, row, word) => {
-                    self.marks.entry(table).or_default().set(row, word);
-                    if !marked.contains(&table) {
-                        marked.push(table);
-                    }
+                    Arc::make_mut(patches.marks.entry(table).or_default()).set(row, word);
                 }
                 // [`Self::defers`] reads the word the row had and puts
                 // the masks over it, so what reaches here is the answer.
@@ -1028,126 +1133,30 @@ impl Writer {
                 Deferred::RelCell(..) => unreachable!("resolved where the commit was taken"),
             }
         }
-        let mut patches = Patches {
-            cells: self.patches.cells.clone(),
-            rows: self.patches.rows.clone(),
-            edges: self.patches.edges.clone(),
-            gone: self.patches.gone.clone(),
-            marks: self.patches.marks.clone(),
-        };
-        for table in cells {
-            let words = self.pending.get(&table).map_or_else(BTreeMap::new, |cols| {
-                cols.iter()
-                    .map(|(&col, rows)| (col, rows.iter().map(|(&r, &w)| (r, w)).collect()))
-                    .collect()
-            });
-            let strs = self.strings.get(&table).map_or_else(BTreeMap::new, |cols| {
-                cols.iter()
-                    .map(|(&col, rows)| (col, rows.iter().map(|(&r, b)| (r, b.clone())).collect()))
-                    .collect()
-            });
-            patches
-                .cells
-                .insert(table, Arc::new(CellPatch::new(words, strs)));
-        }
-        for rel in rels {
-            patches
-                .edges
-                .insert(rel, Arc::new(self.fresh[&rel].clone()));
-            if let Some(rows) = self.added.get(&rel) {
-                patches.rows.insert(rel, Arc::new(rows.clone()));
-            }
-        }
-        for table in graves {
+        // The tombstones alone are still rebuilt whole, because what a
+        // reader wants of them is a sorted run it can binary search and
+        // an offset can land anywhere in one. A run of deletes is what
+        // that costs, and it is bounded by the same deferral bound as
+        // everything else.
+        for table in dug {
             patches
                 .gone
-                .insert(table, self.graves[&table].iter().copied().collect());
+                .insert(table, graves[&table].iter().copied().collect());
         }
-        for table in grown {
-            patches
-                .rows
-                .insert(table, Arc::new(self.added[&table].clone()));
-        }
-        for table in marked {
-            patches
-                .marks
-                .insert(table, Arc::new(self.marks[&table].clone()));
-        }
-        self.patches = Arc::new(patches);
         self.deferred += 1;
-    }
-
-    /// Puts one edge in the running patch of its table: the pair in the
-    /// two adjacency lists, and a row of cells under the ordinal that
-    /// hands it, one per column the table stores.
-    ///
-    /// The ordinal and the row number are the same number, because a
-    /// rel table's property columns are dense over its edges in load
-    /// order and an added edge goes on the end of both.
-    fn stage_edge(&mut self, rel: u32, src: u64, dst: u64, cols: Vec<(u32, Cell)>) {
-        let edges = self.readers[&rel].directory().edge_count;
-        self.fresh
-            .entry(rel)
-            .or_insert_with(|| EdgePatch::new(edges))
-            .add(src, dst);
-        let Some(directory) = self.dirs.get(&rel).and_then(Option::as_ref) else {
-            return;
-        };
-        let row = (0..directory.columns.len())
-            .map(|at| {
-                cols.iter()
-                    .find(|(c, _)| *c as usize == at)
-                    .map_or(Cell::Null, |(_, cell)| cell.clone())
-            })
-            .collect();
-        self.added
-            .entry(rel)
-            .or_insert_with(|| RowPatch::new(edges))
-            .push(row);
-    }
-
-    /// Puts rows a commit added to a node table in that table's running
-    /// patch, one cell per column of it, in the order the fold would
-    /// have appended them in.
-    ///
-    /// The base is the count the columns hold, which is the offset the
-    /// first of them takes, and it is read from the props directory
-    /// rather than the catalog because that is what the fold checks its
-    /// own arithmetic against.
-    fn stage_rows(&mut self, table: u32, rows: Vec<Vec<(u32, Cell)>>) {
-        let Some(directory) = self.dirs.get(&table).and_then(Option::as_ref) else {
-            return;
-        };
-        let (base, width) = (directory.node_count, directory.columns.len());
-        let patch = self
-            .added
-            .entry(table)
-            .or_insert_with(|| RowPatch::new(base));
-        for row in rows {
-            patch.push(
-                (0..width)
-                    .map(|at| {
-                        row.iter()
-                            .find(|(c, _)| *c as usize == at)
-                            .map_or(Cell::Null, |(_, cell)| cell.clone())
-                    })
-                    .collect(),
-            );
+        if copies {
+            self.copied += 1;
         }
     }
 
     /// Drops the patch a fold has just sealed into the columns.
     fn sealed(&mut self) {
         self.deferred = 0;
+        self.copied = 0;
         self.dirs.clear();
         self.readers.clear();
         self.catalog = None;
         if !self.patches.is_empty() {
-            self.pending.clear();
-            self.strings.clear();
-            self.added.clear();
-            self.fresh.clear();
-            self.marks.clear();
             self.graves.clear();
             self.patches = Arc::new(Patches::new());
         }
@@ -1170,6 +1179,49 @@ impl Writer {
     pub fn discard_above(&mut self, floor: Epoch) -> Result<()> {
         self.wal.rollback_above(floor)
     }
+}
+
+/// The running edge patch of `rel`, started over a CSR holding `edges`
+/// if this is the first change to it since the last fold.
+fn edge_patch(patches: &mut Patches, rel: u32, edges: u64) -> &mut Arc<EdgePatch> {
+    patches
+        .edges
+        .entry(rel)
+        .or_insert_with(|| Arc::new(EdgePatch::new(edges)))
+}
+
+/// The running row patch of `table`, started over columns holding
+/// `base` rows the same way.
+fn row_patch(
+    patches: &mut Patches,
+    table: u32,
+    base: u64,
+    key: Option<usize>,
+) -> &mut Arc<RowPatch> {
+    patches
+        .rows
+        .entry(table)
+        .or_insert_with(|| Arc::new(RowPatch::new(base, key)))
+}
+
+/// The column a key lookup on this table asks about, which is the one
+/// the fold takes the key from and is named the same way the reader
+/// names it.
+fn key_col(directory: &PropsDirectory) -> Option<usize> {
+    directory.columns.iter().position(|col| col.name == "id")
+}
+
+/// One row of a table `width` columns wide out of the cells a statement
+/// named, which are the columns it named and no others. What it did not
+/// name it does not hold, and an absent value is [`Cell::Null`].
+fn row_of(width: usize, cols: &[(u32, Cell)]) -> Vec<Cell> {
+    (0..width)
+        .map(|at| {
+            cols.iter()
+                .find(|(c, _)| *c as usize == at)
+                .map_or(Cell::Null, |(_, cell)| cell.clone())
+        })
+        .collect()
 }
 
 /// Whether a column can be handed this value without being rewritten:
@@ -1219,8 +1271,22 @@ fn written_cells(changes: &[Deferred]) -> usize {
     changes
         .iter()
         .map(|change| match change {
-            Deferred::Rows(_, rows) => rows.len(),
+            Deferred::Rows(..) => 0,
             _ => 1,
+        })
+        .sum()
+}
+
+/// How many rows a commit's changes append past the end of a table,
+/// which is the other half of the same question and bounded on its own
+/// because it costs something else. See [`DEFERRED_ROWS`].
+fn written_rows(changes: &[Deferred]) -> usize {
+    changes
+        .iter()
+        .map(|change| match change {
+            Deferred::Rows(_, rows) => rows.len(),
+            Deferred::Edge(..) => 1,
+            _ => 0,
         })
         .sum()
 }

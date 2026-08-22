@@ -2252,52 +2252,66 @@ exec_temporal_mrows_s_core = 70.0
 # this repository owns: the queue in front of the write side, and the
 # fold that runs while a writer is holding it.
 #
-# The number is the fold. Six runs on a quiet thirty two core box put
-# it between 3450 and 3645, with the median statement at 281, and
-# 3.9 percent of statements over a millisecond against 0.58 percent at
-# one writer. Those three read together: a fold lands every 257
-# statements and costs about three and a half milliseconds, and it
-# holds the write side while it runs, so the seven writers behind it
-# wait it out too. That is why the share over a millisecond goes up
-# with the width and the tail does not go down.
+# The number is the fold. A fold lands every so many statements, costs
+# milliseconds where a statement costs microseconds, and holds the write
+# side while it runs, so the writers queued behind it wait it out too.
+# That puts about one statement in every (bound / writers) over a
+# millisecond, and while the bound was 256 the tail at eight writers was
+# a fold every time: six runs on a quiet thirty two core box read
+# between 3450 and 3645 with the median statement at 281.
 #
-# So the P5 target of 2000 is not met and this is not it. This is set
-# where the measurement is, to hold the ground already taken: it went
-# from 3905 to 3455 when the write side stopped waking every waiter to
-# hand over to one of them. Getting under the target means the fold
-# not being on the statement's path at all, which is a change to when
-# folds run rather than to what they cost.
+# The bound is 4096 now for what this bench writes, which is rows on the
+# end of a table, and a p99 at eight writers no longer reaches a fold.
+# It reads 357 on that box and 156 to 188 on a laptop, against the 3548
+# the same box read on the commit before. That is under the P5 target of
+# 2000 and this ceiling is under it too, which it could not be while the
+# tail was a fold. Writes over rows that are already there keep the old
+# bound of 256 and would read the old tail, for the reason DEFERRED_COPIED
+# gives: what they cost is not the commit but every scan after it.
 #
-# Loose, because a fold is processor work and a box with somebody
-# else's build on it stretches processor work. The same commit read
-# 2121 on a quiet laptop, 3450 to 3645 over six runs on a quiet thirty
-# two core box, and 4825 on the laptop at load 20. The ceiling is over
-# the worst of those and still catches a doubling. The share below is
-# the tighter of the two gates and the one to watch.
+# What made the bound moveable was not the fold getting cheaper. It was
+# the deferred patch: every commit used to copy the whole run of rows it
+# had accumulated, so a run of length n cost n squared and 256 was as far
+# as it went. The patch keeps its rows in sealed chunks now and a commit
+# copies a pointer, so the run costs what it holds.
+#
+# Set at four times the worst reading rather than at the measurement,
+# because a fold is processor work and a box with somebody else's build
+# on it stretches processor work: the same commit was seen at 156, 357
+# and 523 on three boxes at three loads. Four times the worst still
+# catches the tail going back to being a fold, which is the regression
+# this is here for and is a factor of seven away.
 #
 # Both of these are held only where the level's own median leaves room
 # under a millisecond. On two shared cores eight writers queue for
 # long enough that a tail in milliseconds is reading the box, and the
 # bench says so and reports rather than failing.
-commit_p99_nosync_us = 6000.0
+commit_p99_nosync_us = 1500.0
 
 # How many statements a fold makes slow, at eight writers on the
 # unsynced store.
 #
-# The tail above says how slow and moves with the box. This says how
-# many, and does not: a fold costs milliseconds on any machine that
-# runs this, so which statements land over a millisecond is which ones
-# a fold was holding the write side through, whether the box is quick
-# or busy. It read 3.21 percent on a quiet laptop and 3.77 to 3.99 over
-# six runs on the thirty two core box, against 0.58 percent at one
-# writer, and the gap between those two is the whole point: one fold is
-# one slow statement when one writer is waiting for the side and eight
-# when eight are.
+# The tail above says how slow and this says how many. It read 3.21
+# percent on a quiet laptop and 3.77 to 3.99 over six runs on the
+# thirty two core box while a fold landed every 256 statements, against
+# 0.58 percent at one writer, and the gap between those two is the
+# whole point: one fold is one slow statement when one writer is
+# waiting for the write side and eight when eight are.
 #
 # So this is the number that goes down when folds come off the
-# statement's path, and the number that goes up if anything else moves
-# onto it.
-commit_slow_share = 0.06
+# statement's path. It is 0.34 percent now, on the laptop and on the
+# thirty two core box, which is the same arithmetic run at a bound of
+# 4096 instead of 256.
+#
+# The ceiling is not three times that but four, and the reason is a
+# reading of 0.73 percent on the laptop under load, on a run whose
+# median was 246 us against the 80 of the quiet one. A fold costs
+# milliseconds on any box, so the folds themselves put the same count
+# over the line either way, but a loaded box also queues statements
+# past a millisecond that no fold was anywhere near, and those land on
+# this number too. Four times leaves room for that and still catches
+# the bound going back, which would be worth ten times.
+commit_slow_share = 0.015
 
 # What eight writers get through against one, on the same unsynced
 # store.
@@ -2308,6 +2322,14 @@ commit_slow_share = 0.06
 # costing more than the work. It read 0.40 before the write side began
 # handing over to one waiter instead of waking all of them, and 0.53
 # after, on the same box in the same hour.
+#
+# Left where it is although both ends of it got faster, because the
+# ratio went the wrong way while doing so: one writer went from 36915
+# statements a second to 67475 and eight went from 20849 to 31647, so
+# more got through at both widths and the ratio fell from 0.56 to 0.47.
+# That is one writer having been the one paying most of the copy this
+# ratio's denominator is made of, and it is not the taking of turns
+# getting worse. The laptop, whose cores are not shared, reads 0.96.
 commit_stmt_nosync_x = 0.45
 
 # What an append costs at ten times the table

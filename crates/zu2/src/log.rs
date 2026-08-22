@@ -310,8 +310,23 @@ impl Log {
             commits: AtomicU64::new(0),
             dirty: Condvar::new(),
             dirty_lock: Mutex::new(false),
-            mutable_pages: mutable_pages.max(1),
-            memory_pages: memory_pages.max(mutable_pages.max(1) + 1),
+            // Never so wide that the boundary cannot get past the
+            // compaction floor. Opening page p puts the boundary at
+            // p minus this, compaction may only take what is below the
+            // boundary, and the span cap forbids p from being more than
+            // max_pages minus one above the floor. So a window of
+            // max_pages minus one or wider is a log that fills once and
+            // then cannot be compacted, because the pass it needs is
+            // never allowed to see anything. It deadlocked rather than
+            // said so. #584.
+            //
+            // Zero is a real setting and it is what this clamps to at
+            // the smallest cap: the window is the page being appended to
+            // and nothing older, since the boundary lands on the page
+            // that just opened.
+            mutable_pages: mutable_pages.min(max_pages.saturating_sub(2)),
+            memory_pages: memory_pages
+                .max(mutable_pages.min(max_pages.saturating_sub(2)).max(1) + 1),
             epochs: Epochs::new(sessions),
         }
     }
@@ -346,6 +361,62 @@ impl Log {
     #[inline]
     pub fn flushed(&self) -> Address {
         self.flushed.load(Ordering::Acquire)
+    }
+
+    /// The cap on the span, in pages, which is what an [`Error::LogFull`]
+    /// reports as its `max`.
+    #[inline]
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    /// Pages the span covers right now, which is the same measure
+    /// [`Log::allocate`] bounds.
+    #[inline]
+    pub fn pages(&self) -> usize {
+        page_of(self.tail()) - page_of(self.begin()) + 1
+    }
+
+    /// Whether the log has room for a group of records of these sizes
+    /// without running past `max_pages`, which is what a caller asks
+    /// when it has a group to write and no way to take back the ones it
+    /// has already written. See [`crate::db::Transaction::commit`].
+    /// #571.
+    ///
+    /// It walks the sizes the way [`Log::allocate`] would rather than
+    /// guessing at the padding, because the padding is the whole
+    /// difficulty: a record never straddles a page, so one that does not
+    /// fit in what is left of the current page skips to the next and
+    /// leaves the remainder behind. Guessing generously is not the safe
+    /// direction either, since a demand larger than `max_pages` can
+    /// never be met and the caller would compact for ever waiting for
+    /// it.
+    ///
+    /// Answers about the log as it is at this instant. A concurrent
+    /// writer can take the room between this and the append, which is
+    /// what the caller's wedge is for.
+    pub fn room_for(&self, sizes: &[usize]) -> bool {
+        let tail = self.tail();
+        let mut at = tail;
+        for &size in sizes {
+            let page = page_of(at);
+            let offset = (at - page_start(page)) as usize;
+            if offset + size > PAGE_SIZE {
+                at = page_start(page + 1);
+            }
+            at += size as u64;
+        }
+        if at == tail {
+            return true;
+        }
+        if page_of(at - 1) >= MAX_PAGES {
+            return false;
+        }
+        // The span the last of these records would leave, counted the
+        // way `allocate` counts it: the pages from the compaction floor
+        // to the page the record ends on, both included.
+        let span = page_of(at - 1) - page_of(self.begin()) + 1;
+        span <= self.max_pages
     }
 
     /// The lowest address a record can still be at. Everything below is
@@ -1515,6 +1586,42 @@ mod tests {
             tail_page - 2,
             "the mutable window is two pages"
         );
+    }
+
+    /// A window as wide as the cap is a log that fills once and then
+    /// cannot be compacted: compaction may only take what is below the
+    /// boundary, opening a page puts the boundary that many pages back,
+    /// and the cap forbids the tail from getting further than that from
+    /// the floor, so the boundary never rises above the floor and a pass
+    /// is never allowed to see anything. That deadlocked rather than
+    /// said so, and #584 is the clamp that makes it impossible to ask
+    /// for.
+    #[test]
+    fn a_mutable_window_leaves_room_for_a_compaction_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("w.zu2");
+        for max_pages in 1..8usize {
+            for asked in 0..8usize {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("open");
+                let log = Log::new(file, &path, max_pages, asked, 8, 8, PROVISION_CHUNK);
+                assert!(
+                    log.mutable_pages + 2 <= max_pages.max(2),
+                    "a cap of {max_pages} pages took a window of {} from an asked for {asked}",
+                    log.mutable_pages
+                );
+                assert!(
+                    log.mutable_pages <= asked,
+                    "the window widened from {asked} to {}",
+                    log.mutable_pages
+                );
+            }
+        }
     }
 
     #[test]

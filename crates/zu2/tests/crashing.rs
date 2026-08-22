@@ -31,7 +31,10 @@ use zu2::{Db, Durability, Options};
 /// Small enough that the child laps the log several times a second and
 /// the index doubles from one bucket, so the kill has a fair chance of
 /// landing in the middle of a compaction pass rather than always in the
-/// middle of a plain append.
+/// middle of a plain append. Eight pages and not two: at two a durable
+/// write costs a device flush apiece and the child gets a few hundred
+/// writes out rather than tens of thousands, which is #585 and which
+/// leaves the kill landing in the same place every time.
 ///
 /// `ordered` maintains the key order alongside the hash index, which is
 /// a second structure the crash has to leave recoverable, so both are
@@ -40,7 +43,7 @@ fn options(ordered: bool) -> Options {
     Options {
         durability: Durability::Durable,
         index_buckets: 1,
-        max_pages: 2,
+        max_pages: 8,
         max_nodes: 1 << 16,
         mutable_pages: 1,
         compact_below: 1 << 20,
@@ -74,6 +77,20 @@ fn round(value: &[u8]) -> u64 {
         .expect("value carries its round")
 }
 
+/// How many keys a transaction writes at once, and how many groups of
+/// that size the transaction child cycles over. Small enough that a
+/// commit is quick and there are many of them before the kill, wide
+/// enough that a torn one would be obvious.
+const GROUP: u64 = 16;
+const GROUPS: u64 = 400;
+
+/// The key `j` of group `g`. Laid out so a group is contiguous in the
+/// key order and so the groups together cover the same sort of key space
+/// the other children use.
+fn member(g: u64, j: u64) -> Vec<u8> {
+    format!("key{:016}", g * GROUP + j).into_bytes()
+}
+
 /// The child. Returns without doing anything when it is the parent's
 /// own run of this test, which is how one binary is both.
 #[test]
@@ -84,6 +101,20 @@ fn writes_until_it_is_killed() {
     let ordered = std::env::var_os("ZU2_CRASH_ORDERED").is_some();
     let db = Db::create(std::path::Path::new(&path), options(ordered)).expect("create");
     let mut session = db.session();
+    if std::env::var_os("ZU2_CRASH_TXN").is_some() {
+        // A group at a time, all of it or none of it. `t` is printed
+        // after `commit` returns, so a `t` the parent read is a
+        // transaction the engine said was on the device.
+        for t in 0..=u64::MAX {
+            let g = t % GROUPS;
+            let mut txn = session.transaction();
+            for j in 0..GROUP {
+                txn.upsert(&member(g, j), &value(t)).expect("stage");
+            }
+            txn.commit().expect("commit");
+            println!("{t}");
+        }
+    }
     // Until it is killed, which at these rates is somewhere in the first
     // few hundred thousand.
     for i in 0..=u64::MAX {
@@ -94,10 +125,11 @@ fn writes_until_it_is_killed() {
     }
 }
 
-/// Runs a child, kills it, and gives back the last write to each key
-/// that the parent saw acknowledged, along with the path it was killed
-/// on.
-fn kill_a_writer(dir: &std::path::Path, ordered: bool) -> (std::path::PathBuf, Vec<u64>) {
+/// Runs a child, kills it, and gives back every write the parent saw
+/// acknowledged in the order it saw them, along with the path it was
+/// killed on. `mode` is the environment variable that picks which child
+/// this is, or nothing for the plain one.
+fn kill_a_writer(dir: &std::path::Path, mode: Option<&str>) -> (std::path::PathBuf, Vec<u64>) {
     let path = dir.join("c.zu2");
     let mut command = Command::new(std::env::current_exe().expect("current exe"));
     command
@@ -105,8 +137,8 @@ fn kill_a_writer(dir: &std::path::Path, ordered: bool) -> (std::path::PathBuf, V
         .env("ZU2_CRASH_CHILD", &path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if ordered {
-        command.env("ZU2_CRASH_ORDERED", "1");
+    if let Some(mode) = mode {
+        command.env(mode, "1");
     }
     let mut child = command.spawn().expect("spawn");
 
@@ -148,27 +180,43 @@ fn kill_a_writer(dir: &std::path::Path, ordered: bool) -> (std::path::PathBuf, V
     // The last line can be half a line, since the kill lands wherever it
     // lands, and a partial line is not an acknowledgement.
     acknowledged.pop();
+    println!("{} acknowledged writes before the kill", acknowledged.len());
+    (path, acknowledged)
+}
 
-    // The child cycles over `KEYS` keys, so what matters for each one is
-    // the last write to it the parent saw acknowledged. Walking backwards
-    // keeps the first sighting of a key, which is that write.
+/// The last write to each key the parent saw acknowledged, in key order,
+/// which is the order a scan gives them back in. It is not the order
+/// they were written in: the last cycle over the key space is a partial
+/// one, so the low keys carry a later write than the high ones do.
+///
+/// How far into the key space the child got depends on the machine and
+/// on where the kill landed, so what comes back is however much of it
+/// the child covered rather than all of it. The child writes the keys in
+/// order, so the keys covered are the first `n` of them and the live set
+/// is exactly those, which is what lets the scan test still know what it
+/// is looking at.
+fn last_per_key(mut acknowledged: Vec<u64>, keys: u64) -> Vec<u64> {
+    // Walking backwards keeps the first sighting of a key, which is the
+    // last write to it.
     let mut seen = HashSet::new();
     acknowledged.reverse();
-    acknowledged.retain(|i| seen.insert(i % KEYS));
+    acknowledged.retain(|i| seen.insert(i % keys));
+    // Enough of them that the run is worth something. A child that got
+    // this far has lapped the log and doubled the index whatever the
+    // machine was doing at the time.
+    let enough = (keys / 2).min(512);
     assert!(
-        acknowledged.len() as u64 == KEYS,
-        "the child did not get through a full cycle of the key space, only {} of {KEYS}",
+        acknowledged.len() as u64 >= enough,
+        "the child only covered {} keys of {keys} before the kill, and {enough} is the least this is worth running on",
         acknowledged.len()
     );
-    println!(
-        "{} acknowledged writes checked after the kill",
-        acknowledged.len()
-    );
-    // In key order, which is the order a scan gives them back in. It is
-    // not the order they were written in: the last cycle is a partial
-    // one, so the low keys carry a later write than the high ones.
-    acknowledged.sort_by_key(|i| i % KEYS);
-    (path, acknowledged)
+    acknowledged.sort_by_key(|i| i % keys);
+    // Contiguous from zero, since the child writes them in order, and
+    // the tests below read that into the live set.
+    for (n, i) in acknowledged.iter().enumerate() {
+        assert_eq!(i % keys, n as u64, "the child skipped a key");
+    }
+    acknowledged
 }
 
 /// Whether a value found under a key is one the crash was allowed to
@@ -192,7 +240,8 @@ fn a_durable_write_survives_a_kill() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, acknowledged) = kill_a_writer(dir.path(), false);
+    let (path, acknowledged) = kill_a_writer(dir.path(), None);
+    let acknowledged = last_per_key(acknowledged, KEYS);
 
     let db = Db::open(&path, options(false)).expect("reopen");
     let mut session = db.session();
@@ -222,7 +271,8 @@ fn an_ordered_database_survives_a_kill() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, acknowledged) = kill_a_writer(dir.path(), true);
+    let (path, acknowledged) = kill_a_writer(dir.path(), Some("ZU2_CRASH_ORDERED"));
+    let acknowledged = last_per_key(acknowledged, KEYS);
 
     let db = Db::open(&path, options(true)).expect("reopen");
     let mut session = db.session();
@@ -232,11 +282,17 @@ fn an_ordered_database_survives_a_kill() {
             seen.push((k.to_vec(), v.to_vec()))
         })
         .expect("scan");
-    assert_eq!(
-        seen.len() as u64,
-        KEYS,
-        "the scan gave back {} keys and every one of {KEYS} was acknowledged",
-        seen.len()
+    // More than was acknowledged is allowed and fewer is not. The pipe
+    // is a pipe rather than a terminal, so the child's lines go out a
+    // block at a time and the writes that were in the buffer when the
+    // kill landed are writes that happened and were never acknowledged.
+    // They are allowed to be there, and since the child writes the keys
+    // in order they are the keys just past the ones that were.
+    assert!(
+        seen.len() >= acknowledged.len(),
+        "the scan gave back {} keys and {} of them were acknowledged",
+        seen.len(),
+        acknowledged.len()
     );
     for (i, (got_key, got_value)) in acknowledged.iter().zip(&seen) {
         assert_eq!(
@@ -249,5 +305,57 @@ fn an_ordered_database_survives_a_kill() {
             "write {i} was acknowledged as durable and the scan gave back write {}",
             round(got_value)
         );
+    }
+}
+
+/// A transaction is all of it or none of it, and a kill is the only way
+/// to find out whether that holds when the answer is decided by what is
+/// on the device rather than by what is in memory.
+///
+/// tests/transactions.rs makes the same case against a reopen after a
+/// clean close, which proves the markers are written and read. It cannot
+/// prove anything about a group the process died in the middle of, and
+/// that is the group that matters: a record goes into the index before
+/// the transaction it belongs to has committed, and what makes that safe
+/// is that the index does not outlive the crash.
+#[test]
+fn a_transaction_is_all_of_it_or_none_of_it_after_a_kill() {
+    if std::env::var_os("ZU2_CRASH_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, acknowledged) = kill_a_writer(dir.path(), Some("ZU2_CRASH_TXN"));
+    let acknowledged = last_per_key(acknowledged, GROUPS);
+
+    let db = Db::open(&path, options(false)).expect("reopen");
+    let mut session = db.session();
+    let mut out = Vec::new();
+    for t in &acknowledged {
+        let g = t % GROUPS;
+        let mut group = None;
+        for j in 0..GROUP {
+            out.clear();
+            assert!(
+                session.read(&member(g, j), &mut out).expect("read"),
+                "transaction {t} committed and key {j} of group {g} is not there after the kill"
+            );
+            let got = round(&out);
+            // Every member carries the transaction that wrote it, so a
+            // group holding two different numbers is a torn commit, and
+            // it is torn whether or not either number is one the parent
+            // saw acknowledged.
+            let group = *group.get_or_insert(got);
+            assert_eq!(
+                got, group,
+                "group {g} came back torn after the kill: key 0 holds {group} and key {j} holds {got}"
+            );
+            // And the group as a whole is the transaction the parent saw
+            // acknowledged or a later one, never an earlier one, which
+            // is the durability half.
+            assert!(
+                got >= *t && got % GROUPS == g,
+                "transaction {t} committed and group {g} came back holding {got}"
+            );
+        }
     }
 }

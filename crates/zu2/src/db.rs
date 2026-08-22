@@ -395,6 +395,33 @@ impl<'s, 'a> Transaction<'s, 'a> {
             found?;
         }
 
+        // The room for the whole group, before any of it is written. A
+        // transaction knows the size of every record it is about to
+        // write, which is the one thing the single key path does not
+        // know, so it can ask for all of it up front and compact until
+        // it fits rather than discovering half way through that there is
+        // nowhere to put the rest. What is left after this is a
+        // concurrent writer taking the room between here and the append,
+        // which is the rare case the wedge below was written for. #571.
+        let marker = record::size_of(0, size_of::<u64>());
+        let mut needed = Vec::with_capacity(self.staged.len() + 2);
+        needed.push(marker);
+        needed.extend(
+            self.staged
+                .iter()
+                .map(|write| record::size_of(write.key.len(), write.value.len())),
+        );
+        needed.push(marker);
+        while !self.session.core.log.room_for(&needed) {
+            if !self.session.make_room()? {
+                let max = self.session.core.log.max_pages();
+                return Err(Error::LogFull {
+                    span: self.session.core.log.pages(),
+                    max,
+                });
+            }
+        }
+
         let core = self.session.core;
         let id = core.next_version();
         let marker = id.to_le_bytes();
@@ -996,6 +1023,18 @@ impl Db {
     /// A database whose log was written before pad records existed does
     /// not get one, and says so.
     pub fn checkpoint(&self) -> Result<Checkpointed> {
+        // A wedged index is holding part of a transaction that never
+        // committed, and what makes that survivable is that the index
+        // does not outlive the process. A checkpoint is exactly the act
+        // of making it outlive the process, so it is the one thing a
+        // wedged database must not do: writing it out would hand the
+        // next open half a transaction as its starting point instead of
+        // the log, which drops it. See [`Transaction::commit`]. #572.
+        if self.core.wedged.load(Ordering::Relaxed) {
+            return Err(Error::Wedged {
+                why: "the index is missing part of a committed transaction, reopen the database",
+            });
+        }
         if !checkpoint::writable(self.core.log.format()) {
             return Err(Error::Checkpoint {
                 why: "the log was written before pad records existed",
@@ -2327,13 +2366,24 @@ impl<'a> Session<'a> {
     ///
     /// The caller must be out of its epoch. See [`write`](Self::write).
     fn make_room(&mut self) -> Result<bool> {
-        let before = self.core.log.begin();
+        // Room and not merely progress. A pass over a region where
+        // everything is still live copies all of it to the tail and
+        // raises the floor by what it freed, which is a floor that moved
+        // and a span that did not, and a caller that retried on that
+        // would ask for the same pass for ever. So the answer is whether
+        // the span shrank. #573.
+        let span = |core: &Core| (core.log.begin(), core.log.pages());
+        let before = span(self.core);
+        let made_room = |core: &Core| {
+            let now = span(core);
+            now.0 > before.0 && now.1 < before.1
+        };
         let _maintenance = self.core.maintenance.lock().expect("zu2 maintenance");
         // Somebody else's pass, either the maintenance thread or another
         // writer in the same place, ran while this one waited for the
         // lock. Then the room is already there and a second pass over
         // what it left would find it all live.
-        if self.core.log.begin() > before {
+        if made_room(self.core) {
             return Ok(true);
         }
         let mut session = self.core.maintenance_session()?;
@@ -2344,7 +2394,7 @@ impl<'a> Session<'a> {
             if pass.scanned > 0 {
                 checkpoint::discard(self.core);
             }
-            if self.core.log.begin() > before {
+            if made_room(self.core) {
                 return Ok(true);
             }
             if attempt == 0 {

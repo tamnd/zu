@@ -1418,6 +1418,14 @@ fn render_json(r: &QueryResult) -> String {
 /// One diagnostic record on the wire. The standard's code and the
 /// standard's own text go in fields of their own, apart from zu's
 /// message, so a harness grades the code and never has to parse prose.
+///
+/// The rest of what ISO 39075 subclause 23.2 asks a record to carry is
+/// written where the record carries it and left out where it does not,
+/// because a field holding null for what the condition is about reads
+/// as a condition about nothing rather than as a record that has no
+/// opinion. What is about a name comes out in two fields, `subject`
+/// and `subject_kind`, so a client asking whether this is about a
+/// label compares one string against one word.
 pub(crate) fn write_json_diagnostic(out: &mut String, d: &DiagnosticRecord) {
     out.push_str("{\"gqlstatus\":");
     write_json_str(out, d.status.code());
@@ -1427,6 +1435,31 @@ pub(crate) fn write_json_diagnostic(out: &mut String, d: &DiagnosticRecord) {
     write_json_str(out, severity_name(d.severity()));
     out.push_str(",\"message\":");
     write_json_str(out, &d.detail);
+    if let Some(subject) = &d.subject {
+        out.push_str(",\"subject_kind\":");
+        write_json_str(out, subject.kind());
+        out.push_str(",\"subject\":");
+        write_json_str(out, subject.name());
+    }
+    if let Some(graph) = &d.graph {
+        out.push_str(",\"graph\":");
+        write_json_str(out, graph);
+    }
+    if let Some(schema) = &d.schema {
+        out.push_str(",\"schema\":");
+        write_json_str(out, schema);
+    }
+    if let Some(at) = d.position {
+        let _ = write!(
+            out,
+            ",\"line\":{},\"column\":{},\"offset\":{}",
+            at.line, at.column, at.offset
+        );
+    }
+    if let Some(excerpt) = &d.excerpt {
+        out.push_str(",\"excerpt\":");
+        write_json_str(out, excerpt);
+    }
     out.push('}');
 }
 

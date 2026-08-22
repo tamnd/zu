@@ -176,3 +176,51 @@ fn a_doubling_gives_a_key_one_entry_and_not_two() {
         "{occupancy} entries for {keys} keys, so the split left them crowded"
     );
 }
+
+/// Issue #537: a load whose whole key set fits inside the mutable
+/// window gives the log no page to flush, and the doubling check only
+/// runs on the maintenance thread. This is what says whether the table
+/// still catches up, and how far behind it is when the load stops.
+#[test]
+fn a_load_that_never_flushes_still_doubles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = Options {
+        durability: Durability::Async,
+        index_buckets: 1,
+        // Room for the whole load, so no page ever seals and the log
+        // never wakes the maintainer with work of its own.
+        max_pages: 1 << 12,
+        max_nodes: 1 << 16,
+        compact_below: 0,
+        ..Options::default()
+    };
+    let db = Db::create(&dir.path().join("m.zu2"), options).expect("create");
+    let keys = 60000u32;
+    {
+        let mut s = db.session();
+        for i in 0..keys {
+            s.upsert(&key(i), &value(i)).expect("upsert");
+        }
+    }
+    let straight_after = db.index_buckets();
+    let mut buckets = straight_after;
+    for _ in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let now = db.index_buckets();
+        if now == buckets && !db.index_resizing() {
+            break;
+        }
+        buckets = now;
+    }
+    // 60000 keys over eight slots a bucket wants at least 8192 buckets
+    // to stay under the load factor.
+    assert!(
+        buckets >= 8192,
+        "{buckets} buckets for {keys} keys, so the table never doubled"
+    );
+    assert!(
+        straight_after >= 8192,
+        "{straight_after} buckets when the load returned, {buckets} once the \
+         maintainer caught up, so the doubling is behind the writer"
+    );
+}

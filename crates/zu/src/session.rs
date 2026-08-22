@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::gqlstatus::{DiagnosticRecord, Subject, codes};
+use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, Severity, Subject, codes};
 use zu_common::{IdMap, Interrupt, Result, ZuError};
 use zu_query::ast::{
     BindingDef, BindingInit, BindingKind, GraphRef, SchemaRef, SessionReset, SessionStmt, TxnStmt,
@@ -190,6 +190,119 @@ pub struct Pin {
     pub what: String,
     /// Whether it still means what it meant.
     pub stale: Stale,
+}
+
+/// GA08. A statement's GQL-status object as the record value
+/// [`zu_query::binder::STATUS_FN`] answers.
+///
+/// ISO subclause 23 says a status object is the five characters, the
+/// standard's own words for them, and a sequence of diagnostic
+/// records, and that is the shape here: the outcome at the top and the
+/// records under `diagnostics`. There is one record for a statement
+/// that was refused and one per notice for a statement that was not, so
+/// a plain completion with nothing to say carries an empty list rather
+/// than a record of nulls. "Nothing was diagnosed" and "something was
+/// diagnosed and it was blank" are different answers and a client
+/// should not have to tell them apart by reading the fields.
+fn status_value(answer: &Result<QueryResult>) -> Value {
+    match answer {
+        Ok(result) => status_object(result.status(), None, &result.notices),
+        Err(ZuError::Gql(record)) => status_object(
+            record.status,
+            Some(&record.detail),
+            std::slice::from_ref(&**record),
+        ),
+        // An engine fault is not a condition and the standard has no
+        // code for one, so this says so with a null rather than
+        // reaching for the nearest five characters. The severity is
+        // still an exception, because the statement still did not
+        // complete.
+        Err(other) => Value::record(vec![
+            ("gqlstatus".to_string(), Value::Null),
+            ("condition".to_string(), Value::Null),
+            (
+                "severity".to_string(),
+                Value::Str(Severity::Exception.letter().to_string()),
+            ),
+            ("message".to_string(), Value::Str(other.to_string())),
+            ("diagnostics".to_string(), Value::List(Vec::new())),
+        ]),
+    }
+}
+
+/// The outcome and the records under it.
+fn status_object(status: GqlStatus, detail: Option<&str>, records: &[DiagnosticRecord]) -> Value {
+    Value::record(vec![
+        (
+            "gqlstatus".to_string(),
+            Value::Str(status.code().to_string()),
+        ),
+        ("condition".to_string(), Value::Str(status.standard_text())),
+        (
+            "severity".to_string(),
+            Value::Str(status.severity().letter().to_string()),
+        ),
+        (
+            "message".to_string(),
+            detail.map_or(Value::Null, |text| Value::Str(text.to_string())),
+        ),
+        (
+            "diagnostics".to_string(),
+            Value::List(records.iter().map(diagnostic_value).collect()),
+        ),
+    ])
+}
+
+/// One diagnostic record, field for field, with a null wherever the
+/// record carries nothing rather than a blank that would read as an
+/// answer.
+fn diagnostic_value(record: &DiagnosticRecord) -> Value {
+    let text = |held: Option<&str>| held.map_or(Value::Null, |v| Value::Str(v.to_string()));
+    let number = |held: Option<u32>| held.map_or(Value::Null, |v| Value::Int(i64::from(v)));
+    Value::record(vec![
+        (
+            "gqlstatus".to_string(),
+            Value::Str(record.status.code().to_string()),
+        ),
+        (
+            "condition".to_string(),
+            Value::Str(record.status.standard_text()),
+        ),
+        (
+            "severity".to_string(),
+            Value::Str(record.severity().letter().to_string()),
+        ),
+        ("message".to_string(), Value::Str(record.detail.clone())),
+        ("current_graph".to_string(), text(record.graph.as_deref())),
+        ("current_schema".to_string(), text(record.schema.as_deref())),
+        (
+            "subject".to_string(),
+            record
+                .subject
+                .as_ref()
+                .map_or(Value::Null, |s| Value::Str(s.name().to_string())),
+        ),
+        (
+            "subject_kind".to_string(),
+            record
+                .subject
+                .as_ref()
+                .map_or(Value::Null, |s| Value::Str(s.kind().to_string())),
+        ),
+        (
+            "line".to_string(),
+            number(record.position.map(|at| at.line)),
+        ),
+        (
+            "column".to_string(),
+            number(record.position.map(|at| at.column)),
+        ),
+        (
+            "offset".to_string(),
+            number(record.position.map(|at| at.offset)),
+        ),
+        ("excerpt".to_string(), text(record.excerpt.as_deref())),
+    ])
 }
 
 /// The parameters one statement runs with, which are what the caller
@@ -1585,12 +1698,20 @@ impl Session {
     /// it is a session characteristic a statement set (GS15), not a
     /// switch a caller configured, and a thread count arriving from
     /// [`crate::db::Config`] has nothing to say about what time it is.
+    ///
+    /// And so does the status of the last statement, for that same
+    /// reason. It is what the statement before this one ended with, so
+    /// changing a switch between two statements must not be able to
+    /// answer the second one with a blank where the first one's
+    /// condition was.
     pub fn set_options(&mut self, options: exec::Options) {
         let interrupt = self.options.interrupt.clone();
         let zone = self.options.zone;
+        let status = self.options.status.take();
         self.options = exec::Options {
             interrupt,
             zone,
+            status,
             ..options
         };
     }
@@ -1736,6 +1857,7 @@ impl Session {
             }
             Err(_) => {}
         }
+        self.options.status = Some(status_value(&answer));
         answer
     }
 

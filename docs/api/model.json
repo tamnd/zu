@@ -1698,6 +1698,14 @@
       "doc": "Whether a join hands what it knows about its keys to the\noperators producing its probe side, the sideways pass of\nperf/13 §1."
     },
     {
+      "id": "zu::Options::status",
+      "kind": "field",
+      "name": "status",
+      "of": "zu::Options",
+      "signature": "Option<Value>",
+      "doc": "GA08. The GQL-status object the statement before this one in\nthis session ended with, as the record value\n[`crate::binder::STATUS_FN`] answers, and `None` for a session\nthat has run nothing yet.\n\nHere for the reason the clock is here: it is session state, one\nvalue for the length of a statement, and every path through the\nexecutor already carries the switches. The session builds it\nonce on the way in, so a scan of ten million rows reading it\nclones a record rather than formatting one."
+    },
+    {
       "id": "zu::Options::threads",
       "kind": "field",
       "name": "threads",
@@ -2117,6 +2125,14 @@
       "of": "zu::Severity",
       "signature": "const fn is_success(self) -> bool",
       "doc": "True when the statement kept its result. Warnings ride along with\nan answer; exceptions replace it."
+    },
+    {
+      "id": "zu::Severity::letter",
+      "kind": "method",
+      "name": "letter",
+      "of": "zu::Severity",
+      "signature": "const fn letter(self) -> &str",
+      "doc": "The one character ISO writes it as, which is what a status read\nas a value carries: a client that has to print or compare one\nshould not have to pick its own spelling of these five words."
     },
     {
       "id": "zu::Sink",
@@ -3517,6 +3533,14 @@
       "of": "zu::gqlstatus::Severity",
       "signature": "const fn is_success(self) -> bool",
       "doc": "True when the statement kept its result. Warnings ride along with\nan answer; exceptions replace it."
+    },
+    {
+      "id": "zu::gqlstatus::Severity::letter",
+      "kind": "method",
+      "name": "letter",
+      "of": "zu::gqlstatus::Severity",
+      "signature": "const fn letter(self) -> &str",
+      "doc": "The one character ISO writes it as, which is what a status read\nas a value carries: a client that has to print or compare one\nshould not have to pick its own spelling of these five words."
     },
     {
       "id": "zu::gqlstatus::Subject",
@@ -5827,7 +5851,7 @@
       "name": "set_options",
       "of": "zu::session::Session",
       "signature": "fn set_options(&mut self, options: exec::Options)",
-      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement.\n\nSo does the time zone, for the same reason and a stronger one:\nit is a session characteristic a statement set (GS15), not a\nswitch a caller configured, and a thread count arriving from\n[`crate::db::Config`] has nothing to say about what time it is."
+      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement.\n\nSo does the time zone, for the same reason and a stronger one:\nit is a session characteristic a statement set (GS15), not a\nswitch a caller configured, and a thread count arriving from\n[`crate::db::Config`] has nothing to say about what time it is.\n\nAnd so does the status of the last statement, for that same\nreason. It is what the statement before this one ended with, so\nchanging a switch between two statements must not be able to\nanswer the second one with a blank where the first one's\ncondition was."
     },
     {
       "id": "zu::session::Session::set_stale_bound",
@@ -9791,11 +9815,20 @@
       "signature": "fn is_empty(&self) -> bool"
     },
     {
-      "id": "zu::zu1::props::CellPatch::new",
+      "id": "zu::zu1::props::CellPatch::set",
       "kind": "method",
-      "name": "new",
+      "name": "set",
       "of": "zu::zu1::props::CellPatch",
-      "signature": "fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>, strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>) -> Self"
+      "signature": "fn set(&mut self, col: usize, row: u64, word: u64)",
+      "doc": "Writes `word` onto row `row` of lane column `col`.\n\nA row written twice before a fold is in here once, holding what\nthe later of the two commits left, which is why this answers\nwith nothing: there is no history to keep, only the value a read\ngets now."
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::set_bytes",
+      "kind": "method",
+      "name": "set_bytes",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn set_bytes(&mut self, col: usize, row: u64, value: Vec<u8>)",
+      "doc": "The same for a blob column, where what the row held also has to\ncome off the byte count the writer bounds."
     },
     {
       "id": "zu::zu1::props::EdgesWithProps",
@@ -10342,8 +10375,7 @@
     {
       "id": "zu::zu1::props::RowPatch",
       "kind": "struct",
-      "name": "RowPatch",
-      "doc": "The rows a commit added that no fold has put in the columns yet.\n\n[`CellPatch`] carries a new value for a row the columns already hold,\nwhich is an update. This carries whole rows past the end of them,\nwhich is what an edge insert leaves behind once the adjacency reader\nstopped needing the CSR rebuilt to see it: the edge takes the next\nordinal, its property values sit here under that ordinal, and a\ngather asking for it reads them from here rather than off a column\nthat has not been rewritten.\n\nAny value at all, unlike the lane patch, because these rows are not\nstored anywhere yet and there is nothing to lay a word over: a\nstring is the bytes and an absent value is [`Cell::Null`]."
+      "name": "RowPatch"
     },
     {
       "id": "zu::zu1::props::RowPatch::base",
@@ -10381,8 +10413,8 @@
       "kind": "method",
       "name": "new",
       "of": "zu::zu1::props::RowPatch",
-      "signature": "fn new(base: u64) -> Self",
-      "doc": "An empty patch over columns holding `base` rows."
+      "signature": "fn new(base: u64, key: Option<usize>) -> Self",
+      "doc": "An empty patch over columns holding `base` rows, where `key` is\nthe column a key lookup will ask about if the table has one."
     },
     {
       "id": "zu::zu1::props::RowPatch::push",
@@ -10398,7 +10430,7 @@
       "name": "row_with",
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn row_with(&self, col: usize, word: u64) -> Option<u64>",
-      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column. The walk is over the rows a handful of commits\nadded rather than over the table, and it is bounded by what the\nwriter lets the patch grow to."
+      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column.\n\nThe sealed chunks answer out of the index each of them built as\nit was sealed, and the chunk being filled is walked, so what a\nlookup costs is a probe per sealed chunk and a walk of at most\n[`PATCH_CHUNK`] rows. Asked about any other column it walks the\nwhole run, which is what it used to do for every column and is\nwhat the fold's own index is for."
     },
     {
       "id": "zu::zu1::props::list_elements",

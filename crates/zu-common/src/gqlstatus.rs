@@ -51,6 +51,19 @@ impl Severity {
     pub const fn is_success(self) -> bool {
         !matches!(self, Severity::Exception)
     }
+
+    /// The one character ISO writes it as, which is what a status read
+    /// as a value carries: a client that has to print or compare one
+    /// should not have to pick its own spelling of these five words.
+    pub const fn letter(self) -> &'static str {
+        match self {
+            Severity::Success => "S",
+            Severity::NoData => "N",
+            Severity::Warning => "W",
+            Severity::Informational => "I",
+            Severity::Exception => "X",
+        }
+    }
 }
 
 /// One row of the standard's condition table.

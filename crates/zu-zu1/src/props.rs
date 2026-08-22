@@ -3656,9 +3656,14 @@ mod tests {
     /// list code in one is a file that neither version wrote.
     #[test]
     fn a_list_code_in_a_version_2_directory_is_refused() {
+        // The meta is a placeholder this test never reads through, but it
+        // still has to be one the decoder will accept: a one value
+        // MiniBlock payload is a four byte chunk count, a four byte index
+        // entry, an eight byte fence and a body, and the decoder now
+        // holds `value_count` to what the payload can describe.
         let meta = SegmentMeta {
             value_count: 1,
-            payload_len: 8,
+            payload_len: 17,
             uncompressed_bytes: 8,
             min: 0,
             max: 0,

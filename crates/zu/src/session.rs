@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::gqlstatus::{DiagnosticRecord, codes};
+use zu_common::gqlstatus::{DiagnosticRecord, Subject, codes};
 use zu_common::{IdMap, Interrupt, Result, ZuError};
 use zu_query::ast::{
     BindingDef, BindingInit, BindingKind, GraphRef, SchemaRef, SessionReset, SessionStmt, TxnStmt,
@@ -1001,7 +1001,8 @@ impl Session {
             return Err(ZuError::gql(
                 codes::C42002,
                 format!("'{path}' is no schema in this catalog"),
-            ));
+            )
+            .about(Subject::Schema(path)));
         }
         if path != self.schema {
             self.schema = path;
@@ -1220,6 +1221,7 @@ impl Session {
         self.sync()?;
         let graph = self.graph.catalog().graph(schema, name).ok_or_else(|| {
             ZuError::gql(codes::C42002, format!("no graph '{name}' in '{schema}'"))
+                .about(Subject::Graph(name.to_string()))
         })?;
         Ok(Value::Graph(GraphHandle::new(
             graph.id, schema, name, self.epoch,
@@ -1339,7 +1341,8 @@ impl Session {
                         "${name} references {}, and that graph has been dropped",
                         g.label()
                     ),
-                ))
+                )
+                .about(Subject::Graph(g.label())))
             }
             Value::BindingTable(t) if t.epoch() != self.epoch && t.holds_elements() => {
                 Err(ZuError::gql(
@@ -1709,10 +1712,48 @@ impl Session {
     }
 
     /// The same run, with the session's parameters already folded into
-    /// the ones it was passed. Everything inside the session that runs
-    /// a statement comes here, so the fold happens once at the edge
-    /// rather than at every place a statement is reached.
+    /// the ones it was passed, and the place the statement ran written
+    /// onto everything it has to say about itself.
+    ///
+    /// ISO 23.2 asks a diagnostic record to name the graph and the
+    /// schema, and this is the one place that knows them. There are
+    /// two hundred raise sites and none of them holds a session, so
+    /// filling it here is not a shortcut: a raise site that named the
+    /// working graph would be repeating what the session already
+    /// knows, and it would be repeating it two hundred times. A record
+    /// that named a graph of its own keeps the one it named, since a
+    /// condition about some other graph is exactly the case where the
+    /// session's answer would be wrong.
     fn run_in(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
+        let mut answer = self.run_within(source, params);
+        let (graph, schema) = self.where_it_ran();
+        match &mut answer {
+            Err(ZuError::Gql(record)) => record.within(&graph, &schema),
+            Ok(result) => {
+                for notice in &mut result.notices {
+                    notice.within(&graph, &schema);
+                }
+            }
+            Err(_) => {}
+        }
+        answer
+    }
+
+    /// The graph a statement just ran against and the schema it was
+    /// reached through, for the record. The graph is named by the
+    /// catalog and falls back to its id, because a record saying which
+    /// graph is more use than a record saying nothing when the graph
+    /// has been dropped out from under the statement.
+    fn where_it_ran(&self) -> (String, String) {
+        let graph = self
+            .graph
+            .catalog()
+            .graph_by_id(self.working)
+            .map_or_else(|| format!("#{}", self.working), |g| g.name.clone());
+        (graph, self.schema.clone())
+    }
+
+    fn run_within(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.sync()?;
         self.check_refs(params)?;
         match query::not_a_query(source)? {

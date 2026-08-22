@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::unicode::NormalForm;
 use zu_common::{DurationKind, LogicalType, Result, ZuError};
 
@@ -86,8 +86,16 @@ fn label_count(expr: &LabelExpr) -> usize {
     }
 }
 
-fn bad_reference(detail: String) -> ZuError {
-    ZuError::gql(codes::C42002, detail)
+/// `42002`, invalid reference, which is the condition for every name a
+/// statement writes that the catalog or the scope has no answer for.
+///
+/// The subject is not optional here, and that is the point: every one
+/// of these is about a name, the caller has that name in hand at the
+/// moment it raises, and a record whose subject is empty makes a client
+/// read the name back out of an English sentence. Requiring it in the
+/// signature is what keeps the next one from forgetting.
+fn bad_reference(subject: Subject, detail: String) -> ZuError {
+    ZuError::gql(codes::C42002, detail).about(subject)
 }
 
 /// A group variable a match written several ways bound, read behind
@@ -99,13 +107,16 @@ fn bad_reference(detail: String) -> ZuError {
 /// Binding it costs nothing and reading it is what has nowhere to come
 /// from, so the refusal is here and not where the pattern was written.
 fn out_of_reach(name: &str) -> ZuError {
-    bad_reference(format!(
-        "'{name}' stands for what a repeated stretch bound, and the stretch is \
+    bad_reference(
+        Subject::Variable(name.to_string()),
+        format!(
+            "'{name}' stands for what a repeated stretch bound, and the stretch is \
          written a number of lengths rather than one, so the elements it stands \
          for are in a different place in each of them; write the lengths as \
          statements of their own, joined with UNION, where each of them reads a \
          stretch of one length"
-    ))
+        ),
+    )
 }
 
 /// `22G03 data exception, invalid value type`: the expression is well
@@ -2456,10 +2467,13 @@ fn bind_bindings(
 ) -> Result<()> {
     for def in defs {
         if visible.iter().any(|v| v.name == def.name) {
-            return Err(bad_reference(format!(
-                "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
-                def.name
-            )));
+            return Err(bad_reference(
+                Subject::Variable(def.name.clone()),
+                format!(
+                    "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
+                    def.name
+                ),
+            ));
         }
         let query = match &def.init {
             ast::BindingInit::Query(query) => (**query).clone(),
@@ -2498,10 +2512,13 @@ fn bind_bindings(
         }
         for scalar in &bound.scalars {
             if !scalar.captures.is_empty() {
-                return Err(bad_reference(format!(
-                    "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
-                    def.name
-                )));
+                return Err(bad_reference(
+                    Subject::Variable(def.name.clone()),
+                    format!(
+                        "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
+                        def.name
+                    ),
+                ));
             }
         }
         if def.kind != ast::BindingKind::Table && bound.columns.len() != 1 {
@@ -3217,9 +3234,10 @@ impl Binder<'_> {
 
     fn declare(&mut self, name: &str, ty: Type) -> Result<usize> {
         if self.scope.contains_key(name) {
-            return Err(bad_reference(format!(
-                "variable '{name}' is already defined"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!("variable '{name}' is already defined"),
+            ));
         }
         let slot = self.new_slot(name.to_string(), ty);
         self.scope.insert(name.to_string(), slot);
@@ -4278,19 +4296,25 @@ impl Binder<'_> {
             // from a procedure that is nowhere, because the caller
             // spelled the name right and looked in the wrong place.
             if procedures::resolve(procedures::ROOT, &reference.name).is_some() {
-                bad_reference(format!(
-                    "no procedure '{}' in the schema '{schema}', it is in the root schema",
-                    reference.name
-                ))
+                bad_reference(
+                    Subject::Function(reference.name.clone()),
+                    format!(
+                        "no procedure '{}' in the schema '{schema}', it is in the root schema",
+                        reference.name
+                    ),
+                )
             } else {
-                bad_reference(format!(
-                    "no procedure '{}' in the schema '{schema}', the ones there are {}",
-                    reference.name,
-                    match procedures::in_schema(schema).join(", ").as_str() {
-                        "" => "none".to_string(),
-                        list => list.to_string(),
-                    }
-                ))
+                bad_reference(
+                    Subject::Function(reference.name.clone()),
+                    format!(
+                        "no procedure '{}' in the schema '{schema}', the ones there are {}",
+                        reference.name,
+                        match procedures::in_schema(schema).join(", ").as_str() {
+                            "" => "none".to_string(),
+                            list => list.to_string(),
+                        }
+                    ),
+                )
             }
         })?;
         let func = proc.func;
@@ -4312,15 +4336,20 @@ impl Binder<'_> {
                 .schema
                 .rel_in_graph(handle.id, rel_name)
                 .ok_or_else(|| {
-                    bad_reference(format!(
-                        "the graph '{}' holds no rel table '{rel_name}'",
-                        handle.name
-                    ))
+                    bad_reference(
+                        Subject::Label(rel_name.to_string()),
+                        format!(
+                            "the graph '{}' holds no rel table '{rel_name}'",
+                            handle.name
+                        ),
+                    )
                 })?,
-            None => self
-                .schema
-                .rel_by_name(rel_name)
-                .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?,
+            None => self.schema.rel_by_name(rel_name).ok_or_else(|| {
+                bad_reference(
+                    Subject::Label(rel_name.to_string()),
+                    format!("unknown rel table '{rel_name}'"),
+                )
+            })?,
         };
         if rel.from != rel.to {
             return Err(invalid(format!(
@@ -4542,10 +4571,10 @@ impl Binder<'_> {
         let mut new_scope: HashMap<String, usize> = HashMap::new();
         for item in &mut items {
             if names_rows && new_scope.contains_key(&item.name) {
-                return Err(bad_reference(format!(
-                    "duplicate name '{}' in {clause}",
-                    item.name
-                )));
+                return Err(bad_reference(
+                    Subject::Variable(item.name.clone()),
+                    format!("duplicate name '{}' in {clause}", item.name),
+                ));
             }
             // Projecting a plain variable keeps its slot; anything else
             // gets a fresh one carrying the item's type.
@@ -5067,11 +5096,14 @@ impl Binder<'_> {
         // rather than at a slot of its own.
         for group in &path.groups {
             if self.scope.contains_key(&group.name) {
-                return Err(bad_reference(format!(
-                    "'{}' already stands for one element, and a name inside a repeated \
+                return Err(bad_reference(
+                    Subject::Variable(group.name.clone()),
+                    format!(
+                        "'{}' already stands for one element, and a name inside a repeated \
                      stretch stands for one per repetition",
-                    group.name
-                )));
+                        group.name
+                    ),
+                ));
             }
             let element = match group.kind {
                 ast::GroupKind::Node => Type::Node,
@@ -5494,9 +5526,12 @@ impl Binder<'_> {
     /// which of their clauses is the one that cannot run.
     fn write_target(&self, verb: &str, name: &str) -> Result<usize> {
         let Some(&target) = self.scope.get(name) else {
-            return Err(bad_reference(format!(
-                "'{name}' stands for nothing here, and {verb} changes an element an earlier clause found"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!(
+                    "'{name}' stands for nothing here, and {verb} changes an element an earlier clause found"
+                ),
+            ));
         };
         match self.variables[target].ty {
             // An edge takes a property the way a node does. Where it
@@ -5519,9 +5554,12 @@ impl Binder<'_> {
     /// table holds it in.
     fn bind_delete_target(&mut self, name: &str) -> Result<usize> {
         let Some(&target) = self.scope.get(name) else {
-            return Err(bad_reference(format!(
-                "'{name}' stands for nothing here, and DELETE takes away an element an earlier clause found"
-            )));
+            return Err(bad_reference(
+                Subject::Variable(name.to_string()),
+                format!(
+                    "'{name}' stands for nothing here, and DELETE takes away an element an earlier clause found"
+                ),
+            ));
         };
         match self.variables[target].ty {
             // An edge is deletable the same way an element is, and it
@@ -5596,7 +5634,10 @@ impl Binder<'_> {
                     format!(
                         "{verb} needs an edge type saying which table the edge goes in, and this one names none"
                     ),
-                ),
+                )
+                .about(Subject::Variable(
+                    pat.var.clone().unwrap_or_default(),
+                )),
                 false => invalid(format!(
                     "an edge goes in one table, and '{}' names {}",
                     pat.types.join("|"),
@@ -5609,7 +5650,12 @@ impl Binder<'_> {
             .rels
             .iter()
             .find(|r| r.name == *name)
-            .ok_or_else(|| bad_reference(format!("no edge table is named '{name}'")))?
+            .ok_or_else(|| {
+                bad_reference(
+                    Subject::Label(name.to_string()),
+                    format!("no edge table is named '{name}'"),
+                )
+            })?
             .clone();
         // Which way round the arrow points is which row the edge leaves
         // and which it arrives at, and that is the whole of the
@@ -5650,13 +5696,16 @@ impl Binder<'_> {
             };
             if !tables.is_empty() && !tables.contains(&want) {
                 let names: Vec<&str> = tables.iter().map(|t| self.table_name(*t)).collect();
-                return Err(bad_reference(format!(
-                    "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
-                    rel.name,
-                    self.table_name(want),
-                    self.var_text(end),
-                    names.join("|")
-                )));
+                return Err(bad_reference(
+                    Subject::Label(rel.name.clone()),
+                    format!(
+                        "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
+                        rel.name,
+                        self.table_name(want),
+                        self.var_text(end),
+                        names.join("|")
+                    ),
+                ));
             }
         }
         Ok((rel.id, src, dst))
@@ -5727,7 +5776,8 @@ impl Binder<'_> {
                     "{verb} needs a label saying which table the element goes in, and '({})' names none",
                     pat.var.as_deref().unwrap_or("")
                 ),
-            ));
+            )
+            .about(Subject::Variable(pat.var.clone().unwrap_or_default())));
         };
         let LabelExpr::Label(name) = label else {
             // 22G0P, the other end of the same item. The key label set
@@ -5742,7 +5792,8 @@ impl Binder<'_> {
                     "{verb} writes an element into the one table its label names, so it takes                      one label and this pattern writes {}; add the rest with SET",
                     label_count(label)
                 ),
-            ));
+            )
+            .about(Subject::Variable(pat.var.clone().unwrap_or_default())));
         };
         // A row lands in a table, and the label a table gives every row
         // it holds is its own name, so that is the one that says where
@@ -5756,7 +5807,7 @@ impl Binder<'_> {
             .iter()
             .find(|n| n.name == *name)
             .ok_or_else(|| {
-                bad_reference(format!(
+                bad_reference(Subject::Label(name.to_string()), format!(
                     "no node table is named '{name}', and an element is created in the table whose own name is the label"
                 ))
             })?
@@ -5802,10 +5853,13 @@ impl Binder<'_> {
                     if self.variables[slot].ty != Type::Node {
                         // The name resolves and resolves to something
                         // already taken, which is what 42002 is for.
-                        return Err(bad_reference(format!(
-                            "'{name}' is already bound as {}, not a node",
-                            self.variables[slot].ty
-                        )));
+                        return Err(bad_reference(
+                            Subject::Variable(name.to_string()),
+                            format!(
+                                "'{name}' is already bound as {}, not a node",
+                                self.variables[slot].ty
+                            ),
+                        ));
                     }
                     // A reused variable narrows to the tables both
                     // occurrences allow.
@@ -5839,10 +5893,13 @@ impl Binder<'_> {
             match self.scope.get(name).copied() {
                 Some(seen) if seen == slot => {}
                 Some(_) => {
-                    return Err(bad_reference(format!(
-                        "'{name}' already stands for something else, and where two stretches of \
+                    return Err(bad_reference(
+                        Subject::Variable(name.to_string()),
+                        format!(
+                            "'{name}' already stands for something else, and where two stretches of \
                          a pattern meet it would have to stand for the node they meet at"
-                    )));
+                        ),
+                    ));
                 }
                 None => {
                     self.scope.insert(name.clone(), slot);
@@ -6012,9 +6069,10 @@ impl Binder<'_> {
                     // Cypher's relationship uniqueness: a rel variable
                     // binds exactly once, and a second declaration of a
                     // name already taken is an invalid reference.
-                    return Err(bad_reference(format!(
-                        "relationship variable '{name}' is already bound"
-                    )));
+                    return Err(bad_reference(
+                        Subject::Variable(name.to_string()),
+                        format!("relationship variable '{name}' is already bound"),
+                    ));
                 }
                 self.declare(name, ty)?
             }
@@ -6295,7 +6353,10 @@ impl Binder<'_> {
                 if self.outer.iter().any(|n| n == name) {
                     return Ok((BoundExpr::Param(self.capture(name)), Type::Any));
                 }
-                Err(bad_reference(format!("variable '{name}' is not defined")))
+                Err(bad_reference(
+                    Subject::Variable(name.to_string()),
+                    format!("variable '{name}' is not defined"),
+                ))
             }
             // A property read on a group variable is read of each of
             // its elements, and the row holds the list of the answers
@@ -7004,8 +7065,12 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
-        let at = crate::functions::lookup(name)
-            .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        let at = crate::functions::lookup(name).ok_or_else(|| {
+            bad_reference(
+                Subject::Function(name.to_string()),
+                format!("unknown function '{name}'"),
+            )
+        })?;
         self.bind_row(at, name, distinct, star, args, ctx)
     }
 

@@ -26,8 +26,9 @@ use zu::{
     zu_conn_table_name, zu_conn_unregister_z, zu_connect, zu_create, zu_create_z,
     zu_database_close, zu_database_create_z, zu_database_is_memory, zu_database_memory,
     zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
-    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
-    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool,
+    zu_error_free, zu_error_graph, zu_error_message, zu_error_offset, zu_error_position,
+    zu_error_retryable, zu_error_schema, zu_error_severity, zu_error_standard_text,
+    zu_error_status, zu_error_subject, zu_error_subject_kind, zu_execute, zu_frame_col_bool,
     zu_frame_col_float, zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free,
     zu_frame_new, zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
     zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
@@ -597,6 +598,46 @@ fn a_refused_statement_carries_the_whole_error_model_as_fields() {
         // second attempt: dividing by zero divides by zero again.
         assert!(!zu_error_doc_url(err, ptr::null_mut()).is_null());
         assert_eq!(zu_error_retryable(err), 0);
+        // It is about no name, so it says so rather than handing back
+        // an empty string that reads like a thing with no name. Where
+        // the statement was running is filled in either way, which is
+        // what ISO 39075 subclause 23.2 asks a record for.
+        assert!(zu_error_subject(err, ptr::null_mut()).is_null());
+        assert!(zu_error_subject_kind(err, ptr::null_mut()).is_null());
+        assert!(!zu_error_graph(err, ptr::null_mut()).is_null());
+        assert!(!zu_error_schema(err, ptr::null_mut()).is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // A condition that is about a name says which name, with the
+        // kind of thing in its own field, so a client underlining the
+        // word in an editor does not parse it back out of a sentence.
+        let unknown = "MATCH (a:person) RETURN b.id AS id";
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_query(
+                conn,
+                unknown.as_ptr().cast::<c_char>(),
+                unknown.len(),
+                &mut result,
+                &mut err,
+            ),
+            ZuStatus::Error
+        );
+        let mut subject_len = 0usize;
+        let subject = zu_error_subject(err, &mut subject_len);
+        assert!(!subject.is_null(), "an unknown name names itself");
+        let subject = CStr::from_ptr(subject).to_str().expect("utf-8");
+        assert_eq!(subject, "b");
+        assert_eq!(subject_len, subject.len());
+        let kind = CStr::from_ptr(zu_error_subject_kind(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(kind, "variable");
+        let graph = CStr::from_ptr(zu_error_graph(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(graph, "home");
         zu_error_free(err);
         err = ptr::null_mut();
 

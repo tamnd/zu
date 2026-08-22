@@ -273,6 +273,16 @@ pub struct ZuError {
     /// The line that position is on, when the statement text was in
     /// hand where the condition was raised.
     excerpt: Option<CString>,
+    /// What the condition is about, as the one word for the sort of
+    /// thing it is and the name of the thing itself, kept apart so
+    /// that a caller asking "is this about a label" compares one
+    /// string against one word instead of parsing a phrase.
+    subject_kind: Option<CString>,
+    subject: Option<CString>,
+    /// The graph and the schema the statement was running in, which
+    /// ISO 23.2 asks a diagnostic record to name.
+    graph: Option<CString>,
+    schema: Option<CString>,
 }
 
 /// The status an engine error becomes.
@@ -330,6 +340,14 @@ impl ZuError {
             retryable: i32::from(e.retryable()),
             position: e.position(),
             excerpt: e.excerpt().map(c_message),
+            subject_kind: record
+                .and_then(|r| r.subject.as_ref())
+                .map(|s| c_message(s.kind())),
+            subject: record
+                .and_then(|r| r.subject.as_ref())
+                .map(|s| c_message(s.name())),
+            graph: record.and_then(|r| r.graph.as_deref()).map(c_message),
+            schema: record.and_then(|r| r.schema.as_deref()).map(c_message),
         }
     }
 
@@ -357,6 +375,10 @@ impl ZuError {
             retryable: i32::from(record.retryable()),
             position: record.position,
             excerpt: record.excerpt.as_deref().map(c_message),
+            subject_kind: record.subject.as_ref().map(|s| c_message(s.kind())),
+            subject: record.subject.as_ref().map(|s| c_message(s.name())),
+            graph: record.graph.as_deref().map(c_message),
+            schema: record.schema.as_deref().map(c_message),
         }
     }
 
@@ -374,6 +396,10 @@ impl ZuError {
             retryable: 0,
             position: None,
             excerpt: None,
+            subject_kind: None,
+            subject: None,
+            graph: None,
+            schema: None,
         }
     }
 }
@@ -993,6 +1019,60 @@ pub unsafe extern "C" fn zu_error_excerpt(e: *const ZuError, len: *mut usize) ->
         return field(&None, len);
     }
     field(&unsafe { &*e }.excerpt, len)
+}
+
+/// What sort of thing the condition is about, as one lower-case word,
+/// or NULL when it is about nothing named.
+///
+/// One of `graph`, `schema`, `label`, `property`, `variable`, `type`
+/// and `function`. The set is closed and grows only when the engine
+/// learns to be precise about something new, so a binding may switch
+/// on it, and a word it does not know is a word to pass through rather
+/// than a reason to fail.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_subject_kind(
+    e: *const ZuError,
+    len: *mut usize,
+) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.subject_kind, len)
+}
+
+/// The name of the thing the condition is about, or NULL when it is
+/// about nothing named.
+///
+/// The name as the statement wrote it and nothing else: no quotes, no
+/// kind glued to the front, no sentence around it. A client that
+/// underlines the offending label in an editor wants exactly this, and
+/// reading it back out of the message would mean parsing English.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_subject(e: *const ZuError, len: *mut usize) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.subject, len)
+}
+
+/// The graph the statement was running in, or NULL when the failure
+/// happened before there was one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_graph(e: *const ZuError, len: *mut usize) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.graph, len)
+}
+
+/// The schema the statement was running in, or NULL when the failure
+/// happened before there was one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_schema(e: *const ZuError, len: *mut usize) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.schema, len)
 }
 
 /// Whether running the same statement again could succeed: 1 for yes,
@@ -5786,6 +5866,33 @@ mod tests {
         let panicked = ZuError::from_panic();
         assert_eq!(panicked.retryable, 0);
         assert!(panicked.doc_url.is_none());
+    }
+
+    /// What the condition is about and where the statement ran, which
+    /// ISO 39075 subclause 23.2 asks a diagnostic record for.
+    ///
+    /// The kind is its own field rather than the front of the name, so
+    /// a binding asking whether this is about a label compares one
+    /// string against one word. A condition about nothing named
+    /// carries neither, rather than an empty string that reads like a
+    /// thing with no name.
+    #[test]
+    fn an_error_handle_says_what_it_is_about_and_where_it_ran() {
+        use zudb::gqlstatus::Subject;
+
+        let mut record = DiagnosticRecord::new(codes::C42002, "no label 'Persn' here")
+            .about(Subject::Label("Persn".to_string()));
+        record.within("social", "/");
+        let e = ZuError::from_engine(&EngineError::Gql(Box::new(record)));
+        let text = |s: &Option<CString>| s.as_ref().map(|s| s.to_str().expect("utf-8").to_string());
+        assert_eq!(text(&e.subject_kind).as_deref(), Some("label"));
+        assert_eq!(text(&e.subject).as_deref(), Some("Persn"));
+        assert_eq!(text(&e.graph).as_deref(), Some("social"));
+        assert_eq!(text(&e.schema).as_deref(), Some("/"));
+
+        let plain = ZuError::from_engine(&EngineError::gql(codes::C22012, "divided by zero"));
+        assert!(plain.subject_kind.is_none() && plain.subject.is_none());
+        assert!(plain.graph.is_none() && plain.schema.is_none());
     }
 
     /// A NUL inside a message would truncate it at the boundary, so

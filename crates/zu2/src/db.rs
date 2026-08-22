@@ -607,7 +607,29 @@ pub struct Core {
     /// The key set in order, when the options asked for one. See
     /// [`crate::scan`].
     pub(crate) ordered: Option<Ordered>,
+    /// Held across a read modify write, striped by the key's hash, so
+    /// that two of them on one key happen one after the other rather
+    /// than both reading the same value and both writing from it.
+    ///
+    /// The same shape as [`crate::graph::Graph::order_edges`] and for
+    /// the same reason: the operation is a read and a write that have
+    /// to look like one, and nothing cheaper than an order makes them.
+    /// A thousand and twenty four stripes is a lock per hot key in
+    /// anything but a workload that has picked its keys to collide, and
+    /// a stripe nobody else wants costs an uncontended mutex.
+    ///
+    /// Readers never take it. An ordinary upsert does not either: it
+    /// does not read first, so there is nothing to lose.
+    updating: Box<[Stripe]>,
 }
+
+/// How many stripes [`Core::updating`] has.
+const UPDATE_STRIPES: usize = 1024;
+
+/// One of them, on a cacheline of its own so that two keys landing on
+/// neighbouring stripes are not two threads writing to one line.
+#[repr(align(64))]
+struct Stripe(Mutex<()>);
 
 impl Core {
     /// A session on a core held behind an `Arc`, which is what the
@@ -837,6 +859,9 @@ impl Db {
             // go on, so the floor is the smallest span worth a pass
             // rather than whatever floor the log was given.
             cold_at: AtomicU64::new(options.compact_below.max(PAGE_SIZE as u64)),
+            updating: (0..UPDATE_STRIPES)
+                .map(|_| Stripe(Mutex::new(())))
+                .collect(),
         }))
     }
 
@@ -2270,10 +2295,17 @@ impl<'a> Session<'a> {
         Ok(unsafe { !RecordRef::new(base).tombstone() })
     }
 
-    /// Reads the current value, computes a new one, and writes it back.
+    /// Reads the current value, computes a new one, and writes it back,
+    /// atomically against every other read modify write on the same key.
     /// The in-place path applies when the new value is the same length
     /// as the old and the record is still in the mutable region, which
     /// is what makes a hot key cost no log growth at all.
+    ///
+    /// Atomic against other calls to this, and not against an upsert or
+    /// a delete of the same key, which do not read first and take no
+    /// order. A counter kept with this and overwritten with an upsert is
+    /// a counter whose value is whichever of the two landed last, which
+    /// is what the caller asked for.
     pub fn rmw(
         &mut self,
         key: &[u8],
@@ -2282,35 +2314,60 @@ impl<'a> Session<'a> {
     ) -> Result<()> {
         let hash = index::hash(key);
         let tag = Index::tag(hash);
-        self.slot.protect();
-        let entered = self.bucket_of(hash);
         let mut current = Vec::new();
-        let outcome = (|| -> Result<Option<Address>> {
-            let bucket = entered?;
-            let found = self.lookup(bucket, tag, key)?;
-            let present = match found {
-                Some((_, address)) => {
-                    let base = self.locate(address)?;
-                    // SAFETY: as in chain_find.
-                    unsafe {
-                        let r = RecordRef::new(base);
-                        if r.tombstone() {
-                            false
-                        } else {
-                            r.read_value(&mut current);
-                            true
+        loop {
+            // The read and the write are one operation to the caller, so
+            // they are one here too. Without this, two sessions on the
+            // same key both read the same value, both compute from it
+            // and both write, and one of the two updates is gone: eight
+            // threads counting five thousand each on one key kept six
+            // and a half thousand of forty thousand (#591). Taken
+            // before the epoch is announced and dropped after it is
+            // left, the way the edge path takes its own order, so a
+            // thread waiting here is not a thread a flush is waiting for.
+            let order = self.core.updating[hash as usize % UPDATE_STRIPES]
+                .0
+                .lock()
+                .expect("zu2 update order");
+            self.slot.protect();
+            let entered = self.bucket_of(hash);
+            let outcome = (|| -> Result<Option<Address>> {
+                let bucket = entered?;
+                let found = self.lookup(bucket, tag, key)?;
+                let present = match found {
+                    Some((_, address)) => {
+                        let base = self.locate(address)?;
+                        // SAFETY: as in chain_find.
+                        unsafe {
+                            let r = RecordRef::new(base);
+                            if r.tombstone() {
+                                false
+                            } else {
+                                r.read_value(&mut current);
+                                true
+                            }
                         }
                     }
+                    None => false,
+                };
+                scratch.clear();
+                make(present.then_some(current.as_slice()), scratch);
+                self.install(bucket, tag, key, scratch, false, record::KIND_VALUE)
+            })();
+            self.slot.unprotect();
+            drop(order);
+            match outcome {
+                // The same as the upsert path, and for the same reason:
+                // a pass and another go, rather than a failure the
+                // caller can only answer by sleeping. #591, #566.
+                Err(Error::LogFull { span, max }) => {
+                    if !self.make_room()? {
+                        return Err(Error::LogFull { span, max });
+                    }
                 }
-                None => false,
-            };
-            scratch.clear();
-            make(present.then_some(current.as_slice()), scratch);
-            self.install(bucket, tag, key, scratch, false, record::KIND_VALUE)
-        })();
-        self.slot.unprotect();
-        let end = outcome?;
-        self.finish(end)
+                outcome => return self.finish(outcome?),
+            }
+        }
     }
 
     /// A group of writes that commits all at once. See

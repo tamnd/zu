@@ -316,6 +316,45 @@ fn version_reports_the_revisions_this_build_actually_publishes() {
     );
 }
 
+/// The two spellings of the feature list say the same thing.
+///
+/// Which features a build carries depends on how cargo was invoked, so
+/// the snapshots take the list out and no fixed list can be asserted
+/// here either. What can be asserted is that the text and the JSON
+/// agree, which is the part a reader of either one is relying on.
+#[test]
+fn the_two_spellings_of_the_feature_list_agree() {
+    let json = Command::new(ZU)
+        .args(["version", "--format", "json"])
+        .output()
+        .expect("the binary runs");
+    let doc = zu_json::parse(&String::from_utf8(json.stdout).expect("utf-8")).expect("json");
+    let from_json: Vec<&str> = doc
+        .get("features")
+        .and_then(zu_json::Json::as_arr)
+        .expect("an array of features")
+        .iter()
+        .map(|f| f.as_str().expect("a feature name"))
+        .collect();
+
+    let text = Command::new(ZU)
+        .arg("version")
+        .output()
+        .expect("the binary runs");
+    let text = String::from_utf8(text.stdout).expect("utf-8");
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("features: "))
+        .expect("a features line");
+
+    let want = if from_json.is_empty() {
+        "none".to_owned()
+    } else {
+        from_json.join(", ")
+    };
+    assert_eq!(line, want);
+}
+
 /// Every command name, from the CLI itself, so a command that ships
 /// without arriving in these snapshots is a failing test rather than a
 /// gap nobody sees. The list is the `commands` array of the JSON help,
@@ -388,6 +427,35 @@ fn code(args: &[&str]) -> i32 {
         .expect("a code rather than a signal")
 }
 
+/// The JSON spelling of the feature list, replaced by a placeholder.
+///
+/// The plain-text spelling is one line and is handled with the others.
+/// This one is an array in the middle of a line, so it is found by its
+/// key and cut at its bracket rather than by a rule that would have to
+/// know what is in it.
+fn scrub_features(text: &str) -> String {
+    const KEY: &str = "\"features\":[";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + KEY.len()..];
+        match rest.find(']') {
+            Some(end) => {
+                out.push_str("\"features\":<features>");
+                rest = &rest[end + 1..];
+            }
+            // An unterminated array is not this function's to repair.
+            None => {
+                out.push_str(KEY);
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A path as an argument. Every path in these tests is under a temp
 /// directory, so it is scrubbed out of the transcript again on the way
 /// in; this is the one place that decides how it was spelled.
@@ -423,6 +491,12 @@ fn clean(text: &str, scrub: &[(String, &'static str)]) -> String {
         &format!("\"c_abi\":\"{}\"", zu::C_ABI_VERSION),
         "\"c_abi\":\"<abi>\"",
     );
+    // Which optional features the binary carries is a property of how
+    // cargo was invoked, not of the code under test. A snapshot that
+    // pinned it passed on the machine it was taken on and failed on
+    // every machine that built the workspace a different way, which is
+    // the one thing a snapshot suite must not do.
+    text = scrub_features(&text);
     // `lines` drops the last newline, and a transcript that lost one is
     // a difference on every line after it.
     let ended = text.ends_with('\n');
@@ -431,6 +505,8 @@ fn clean(text: &str, scrub: &[(String, &'static str)]) -> String {
         .map(|line| {
             if line.starts_with("uuid:") {
                 "uuid:            <uuid>".to_owned()
+            } else if line.starts_with("features: ") {
+                "features: <features>".to_owned()
             } else if line == format!("c abi {}", zu::C_ABI_VERSION) {
                 "c abi <abi>".to_owned()
             } else {

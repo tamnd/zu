@@ -68,6 +68,7 @@ SegmentMeta {
   encoding_tree: EncodingNode,     // ≤ depth 3 cascade, e.g. Dict→FSST, Delta→BitPack
   structural: MiniBlock | FullZip, // Lance 2.1 split (§ below)
   blocks: [BlockPtr],              // contiguous runs preferred
+  start: u32,                      // byte offset of the payload in blocks[0]
   value_count: u32, null_count: u32,
   zone: { min, max (truncated to 16 B), has_null },
   uncompressed_bytes: u64, crc32c: u32,
@@ -75,6 +76,11 @@ SegmentMeta {
 ```
 
 <!-- terms: allow row group -->
+
+### Packing (directory version 10, props directory version 6)
+A block is 256 KiB and most segments are far smaller than one: a 50 row id column is 54 bytes. So a payload does not start a block of its own. Segments written inside one *packing scope* are laid end to end through as many blocks as they need, and `start` says how far into `blocks[0]` a payload begins; the decode rule is `(start + payload_len).div_ceil(BLOCK_SIZE) == blocks.len()`. A meta written before version 10 has no `start` word and every one of its payloads begins at its block, which is how an older store still reads.
+
+A scope is whatever the store frees as a unit, one props directory or one rel table's adjacency, and a scope always opens a block of its own, so no two things that are freed separately end up sharing bytes. Because a block can hold several payloads, the free path collects the blocks going and the blocks a kept segment still reads and hands back the difference, rather than walking one segment's block list at a time. A block a kept column sits in stays where it is, holding whatever the dropped ones left behind, until the rewrite that lets that column go too. The bound this keeps is one live block per live segment, which is what the format cost before any of this.
 
 ### Structural encodings (random access without row groups)
 - **MiniBlock** (types ≤ 16 B): values packed in chunks of 1024 values (FastLanes transposed layout inside); chunk index = one u32 cumulative end offset per chunk, followed by one u64 fence per chunk holding the chunk's last value (~12 B/chunk metadata; the width byte travels inside the chunk because every chunk is a self-describing cascade). Point read = 1 chunk decode (≤ 4 KiB touch). Matches Lance mini-block ~24–41 B/chunk finding. The fences double as zone maps for sorted row ranges: within a CSR neighbor list, a binary search over the fences names the single chunk that can hold a value, so an edge probe decodes one chunk regardless of degree, and the full-scan path cross-checks every fence against its chunk's decoded tail.

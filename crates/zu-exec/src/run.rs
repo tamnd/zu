@@ -1241,6 +1241,10 @@ struct Worker<'a> {
     /// Sort key scratch for the bounded sink, refilled per row so a
     /// row the buffer rejects costs no allocation at all.
     keybuf: Vec<Value>,
+    /// The chunk's own best rows under a single integer sort key, as
+    /// value, stitch position and position in the chunk, best first.
+    /// Held on the worker so the scan that fills it allocates nothing.
+    best: Vec<(i64, u32, u32)>,
     /// One entry per `Op::Sip` in the plan: what that filter has been
     /// asked and what it let through, which is how the operator knows
     /// whether it is earning the pass it costs.
@@ -1397,6 +1401,7 @@ impl<'a> Worker<'a> {
             local_rows: 0,
             morsel: 0,
             keybuf: Vec::new(),
+            best: Vec::new(),
             sips: vec![
                 SipState::default();
                 plan.ops
@@ -3898,32 +3903,90 @@ impl<'a> Worker<'a> {
             SinkSpec::Rows { items, .. } if self.sink.cols.is_some() => {
                 self.push_columns(items, set)
             }
+            // Under a LIMIT the buffer judges a row on its sort keys
+            // alone, and no row is built until the chunk is over: a
+            // loser is rejected on one compare and a winner the rest of
+            // the chunk beats is dropped before anything materializes
+            // it. What is left to build is k rows per chunk.
+            SinkSpec::Rows { items, .. } if self.sink.top.is_some() => {
+                let plan = self.plan;
+                let last = set.chunks.len() - 1;
+                let (fast, need) = {
+                    let top = self.sink.top.as_ref().expect("matched above");
+                    let need = top.need();
+                    (int_sort_key(set, items, top.keys(), need, last), need)
+                };
+                match fast {
+                    Some((vals, ascending)) => {
+                        let morsel = self.morsel as u32;
+                        let base = self.local_rows as u32;
+                        self.best.clear();
+                        let mut seen = 0u32;
+                        for pos in active_positions(&set.chunks[last]) {
+                            keep_best(
+                                &mut self.best,
+                                need,
+                                ascending,
+                                vals[pos],
+                                base + seen,
+                                pos as u32,
+                            );
+                            seen += 1;
+                        }
+                        self.local_rows += u64::from(seen);
+                        let top = self.sink.top.as_mut().expect("matched above");
+                        for &(v, local, pos) in &self.best {
+                            self.keybuf.clear();
+                            self.keybuf.push(Value::Int(v));
+                            if top.wants(&self.keybuf) {
+                                top.stage(&self.keybuf, (morsel, local), pos);
+                            }
+                        }
+                    }
+                    None => {
+                        for pos in active_positions(&set.chunks[last]) {
+                            let at = (self.morsel as u32, self.local_rows as u32);
+                            self.local_rows += 1;
+                            let top = self.sink.top.as_mut().expect("matched above");
+                            self.keybuf.clear();
+                            for key in top.keys() {
+                                self.keybuf.push(scalar(plan, set, items[key.expr], pos)?);
+                            }
+                            let top = self.sink.top.as_mut().expect("matched above");
+                            if top.wants(&self.keybuf) {
+                                top.stage(&self.keybuf, at, pos as u32);
+                            }
+                        }
+                    }
+                }
+                let owed = self
+                    .sink
+                    .top
+                    .as_mut()
+                    .expect("matched above")
+                    .settle()
+                    .len();
+                for nth in 0..owed {
+                    let top = self.sink.top.as_mut().expect("matched above");
+                    let pos = top.owed_at(nth);
+                    let mut row = top.row_buffer(items.len());
+                    for &r in items {
+                        row.push(scalar(plan, set, r, pos)?);
+                    }
+                    self.sink.top.as_mut().expect("matched above").owe(nth, row);
+                }
+                Ok(())
+            }
             SinkSpec::Rows { items, .. } => {
                 let plan = self.plan;
                 let last = set.chunks.len() - 1;
                 for pos in active_positions(&set.chunks[last]) {
-                    let at = (self.morsel as u32, self.local_rows as u32);
                     self.local_rows += 1;
-                    // Under a LIMIT the buffer judges the row on its
-                    // sort keys alone, and a row that loses to the k it
-                    // already holds is never built.
-                    if let Some(top) = self.sink.top.as_mut() {
-                        self.keybuf.clear();
-                        for key in top.keys() {
-                            self.keybuf.push(scalar(plan, set, items[key.expr], pos)?);
-                        }
-                        if !top.wants(&self.keybuf) {
-                            continue;
-                        }
-                    }
                     let mut row = Vec::with_capacity(items.len());
                     for &r in items {
                         row.push(scalar(plan, set, r, pos)?);
                     }
-                    match self.sink.top.as_mut() {
-                        Some(top) => top.keep(&self.keybuf, at, row),
-                        None => self.sink.rows.push(row),
-                    }
+                    self.sink.rows.push(row);
                 }
                 Ok(())
             }
@@ -4203,6 +4266,89 @@ fn active_positions(chunk: &DataChunk) -> impl Iterator<Item = usize> + '_ {
         Some(s) => Either::A(s.as_slice().iter().map(|&i| i as usize)),
         None => Either::B(0..chunk.count as usize),
     }
+}
+
+/// How many rows a bounded sort may want before the integer scan below
+/// stops being the cheap way to find them. The scan holds the chunk's
+/// best k in a sorted array and slides an entry in, so a stream that
+/// keeps improving costs a memmove of k per row. At three that is
+/// nothing and at sixteen thousand it is the whole cost, so the general
+/// path, which pays a selection per chunk instead, takes over well
+/// before then.
+const FAST_K: usize = 64;
+
+/// The one sort key, read straight off a flat integer column.
+///
+/// A bounded sort spends its time in the compare, and the compare it
+/// has is over `Value`, an enum wide enough to hold a string and dull
+/// to branch through. One key over a flat integer column with nothing
+/// missing from it is the shape where none of that is needed: the keys
+/// are already `i64` in a slice, in row order, and the chunk's own best
+/// k comes out of them on plain integer compares with no key built at
+/// all. That shape is `ORDER BY n.id DESC LIMIT 3`, which is what a
+/// bounded sort usually is.
+///
+/// Everything else goes the general way: a second key, a null, a
+/// dictionary, a constant, a string, a level that is not the sink's.
+fn int_sort_key<'a>(
+    set: &'a ChunkSet,
+    items: &[ScalarRef],
+    keys: &[zu_query::ast::SortKey<usize>],
+    need: usize,
+    last: usize,
+) -> Option<(&'a [i64], bool)> {
+    if need == 0 || need > FAST_K {
+        return None;
+    }
+    let [key] = keys else { return None };
+    let ScalarRef::Col { level, vec, ty } = *items.get(key.expr)? else {
+        return None;
+    };
+    if level != last || !matches!(ty, zu_query::snapshot::ColType::Int) {
+        return None;
+    }
+    let col = &set.chunks[last].vecs[vec];
+    // A null orders outside the direction, and the whole point here is
+    // that the direction is all there is, so a column that carries any
+    // validity at all is somebody else's problem.
+    if col.encoding != VecEncoding::Flat || col.validity.is_some() {
+        return None;
+    }
+    Some((col.values::<i64>(), key.ascending))
+}
+
+/// Slides one row into the chunk's best k, which is held best first.
+///
+/// Ties break on the stitch position and stitch positions only climb,
+/// so a row equal to one already held sits behind it: the compare is
+/// strict and a tie never displaces anything.
+#[inline]
+fn keep_best(
+    best: &mut Vec<(i64, u32, u32)>,
+    need: usize,
+    ascending: bool,
+    v: i64,
+    local: u32,
+    pos: u32,
+) {
+    let better = |a: i64, b: i64| if ascending { a < b } else { a > b };
+    if best.len() == need {
+        if !better(v, best[need - 1].0) {
+            return;
+        }
+        // A column that climbs with the scan under a descending key
+        // beats the head every time, and that is the shape a bounded
+        // sort over an ordered column has, so the head is tried before
+        // anything is searched for.
+        if better(v, best[0].0) {
+            best.rotate_right(1);
+            best[0] = (v, local, pos);
+            return;
+        }
+        best.pop();
+    }
+    let at = best.partition_point(|e| !better(v, e.0));
+    best.insert(at, (v, local, pos));
 }
 
 enum Either<A, B> {

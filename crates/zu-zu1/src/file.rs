@@ -331,6 +331,23 @@ pub struct Shared {
     forks: Option<Arc<std::sync::Mutex<Vec<Zu1File>>>>,
 }
 
+/// Where small payloads are being packed: the block under the cursor,
+/// how many of its bytes are spoken for, and the block's current
+/// contents, which are rewritten whole on every call so the file never
+/// lags what the caller has been handed.
+#[derive(Debug)]
+struct Pack {
+    ptr: BlockPtr,
+    used: usize,
+    block: Vec<u8>,
+}
+
+/// A packing scope suspended by [`Zu1File::pack_open`], to be handed
+/// back to [`Zu1File::pack_close`]. Opaque because the only thing a
+/// caller may do with one is put it back.
+#[derive(Debug)]
+pub struct PackScope(Option<Pack>);
+
 /// An open zu1 file: block I/O, the free list, and the header flip.
 #[derive(Debug)]
 pub struct Zu1File {
@@ -376,6 +393,9 @@ pub struct Zu1File {
     /// repeat pins handle-locally; [`Self::write_block`] drops it the
     /// same way it drops the shared entries.
     pin_memo: Option<(BlockPtr, PinnedBlock)>,
+    /// The block small payloads are being packed into, and how much of
+    /// it is spoken for. See [`Self::pack_bytes`].
+    pack: Option<Pack>,
     /// Retired fork handles waiting for the next [`Self::reopen`].
     /// Opening a file is cheap on Linux and painfully slow on Windows,
     /// where eight per-query opens were costing more than the query;
@@ -479,6 +499,7 @@ impl Zu1File {
             unpublished: 0,
             interrupted: None,
             pin_memo: None,
+            pack: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable: true,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
@@ -622,6 +643,7 @@ impl Zu1File {
             defer_reclaim: false,
             unpublished: 0,
             pin_memo: None,
+            pack: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
@@ -681,6 +703,7 @@ impl Zu1File {
             unpublished: 0,
             interrupted: None,
             pin_memo: None,
+            pack: None,
             forks: Some(Arc::clone(pool)),
             writable: self.writable,
             cache: Arc::clone(&self.cache),
@@ -787,6 +810,105 @@ impl Zu1File {
         }
         self.db.block_count += 1;
         self.db.block_count
+    }
+
+    /// Opens a packing scope: every [`Self::pack_bytes`] until the
+    /// matching [`Self::pack_close`] shares blocks with the others, and
+    /// with nothing outside.
+    ///
+    /// A scope is whatever the caller frees as a unit, one property
+    /// directory or one rel table's adjacency, because a block holding
+    /// two payloads has to be freed when the last of them goes and
+    /// nothing in the file counts what is left in one. Scoping by the
+    /// thing that frees makes the question moot: everything in the
+    /// block dies on the same call, and that call deduplicates the
+    /// pointers it hands back. A scope always starts on a fresh block,
+    /// so two folds of the same table never share one either.
+    ///
+    /// The returned value is the scope this one suspended and belongs
+    /// back in [`Self::pack_close`]. Scopes nest: an inner one takes
+    /// its own blocks and the outer resumes where it was.
+    #[must_use = "the suspended scope belongs back in pack_close"]
+    pub fn pack_open(&mut self) -> PackScope {
+        PackScope(self.pack.replace(Pack {
+            ptr: NULL_BLOCK,
+            used: BLOCK_SIZE as usize,
+            block: Vec::new(),
+        }))
+    }
+
+    /// Ends the scope [`Self::pack_open`] began and resumes the one it
+    /// suspended.
+    pub fn pack_close(&mut self, held: PackScope) {
+        self.pack = held.0;
+    }
+
+    /// Drops any scope still open, which is what a caller that is
+    /// starting a fold does: a fold that failed partway may have left
+    /// one, and a block half filled by work that was thrown away is not
+    /// a block the next fold may write into.
+    pub fn pack_reset(&mut self) {
+        self.pack = None;
+    }
+
+    /// Writes `payload` and returns the blocks it landed in and the
+    /// byte offset it starts at in the first of them.
+    ///
+    /// Under a tag this is a bump allocator: the payload starts where
+    /// the last one ended and spills into fresh blocks as it needs
+    /// them, so a store of thirty small segments costs the bytes they
+    /// weigh rather than thirty blocks. The block under the cursor is
+    /// rewritten whole on every call, which is what lets the caller
+    /// stop at any point without a flush: what is on disk is always
+    /// everything handed out so far.
+    pub fn pack_bytes(&mut self, payload: &[u8]) -> Result<(Vec<BlockPtr>, u32)> {
+        if payload.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let Some(pack) = self.pack.take() else {
+            return Ok((self.whole_blocks(payload)?, 0));
+        };
+        let (mut pack, mut blocks) = (pack, Vec::new());
+        if pack.used == BLOCK_SIZE as usize {
+            pack.ptr = self.allocate_block();
+            pack.block = vec![0u8; BLOCK_SIZE as usize];
+            pack.used = 0;
+        }
+        let start = pack.used as u32;
+        let mut rest = payload;
+        loop {
+            let room = BLOCK_SIZE as usize - pack.used;
+            let take = rest.len().min(room);
+            pack.block[pack.used..pack.used + take].copy_from_slice(&rest[..take]);
+            pack.used += take;
+            rest = &rest[take..];
+            blocks.push(pack.ptr);
+            self.write_block(pack.ptr, &pack.block)?;
+            if rest.is_empty() {
+                break;
+            }
+            pack.ptr = self.allocate_block();
+            pack.block.fill(0);
+            pack.used = 0;
+        }
+        self.pack = Some(pack);
+        Ok((blocks, start))
+    }
+
+    /// One payload across freshly allocated whole blocks, the untagged
+    /// case and the one a payload of any size still gets when nothing
+    /// asked for packing.
+    fn whole_blocks(&mut self, payload: &[u8]) -> Result<Vec<BlockPtr>> {
+        let mut blocks = Vec::new();
+        let mut block = vec![0u8; BLOCK_SIZE as usize];
+        for part in payload.chunks(BLOCK_SIZE as usize) {
+            let ptr = self.allocate_block();
+            block[..part.len()].copy_from_slice(part);
+            block[part.len()..].fill(0);
+            self.write_block(ptr, &block)?;
+            blocks.push(ptr);
+        }
+        Ok(blocks)
     }
 
     /// Blocks allocated since the last checkpoint. A writer that folds
@@ -1211,9 +1333,9 @@ impl Zu1File {
         // The free list recycles pointers, so a rewrite can hand a new
         // segment an old pool key; dropping the key here keeps the
         // pools honest the same way the line above keeps the cache.
-        self.pools.csr_offsets.remove(ptr);
-        self.pools.adjacency.remove(ptr);
-        self.pools.fences.remove(ptr);
+        self.pools.csr_offsets.remove_block(ptr);
+        self.pools.adjacency.remove_block(ptr);
+        self.pools.fences.remove_block(ptr);
         self.file.write_all_at(data, ptr * u64::from(BLOCK_SIZE))
     }
 

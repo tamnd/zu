@@ -73,13 +73,24 @@ pub struct SegmentMeta {
     /// a range scan can skip chunks without reading them. Unsorted
     /// segments keep only the segment-level min and max.
     pub sorted: bool,
+    /// Byte offset the payload starts at inside `blocks[0]`. A block
+    /// holds as many small payloads as fit (`Zu1File::pack_bytes`), so
+    /// where a segment starts is part of naming it.
+    pub start: u32,
     pub blocks: Vec<BlockPtr>,
 }
 
 impl SegmentMeta {
     /// Serialized size in bytes.
     pub fn encoded_len(&self) -> usize {
-        49 + self.blocks.len() * 8
+        53 + self.blocks.len() * 8
+    }
+
+    /// Where the payload starts in the file, which is what names a
+    /// segment when a block pointer no longer does: the pools above the
+    /// block cache key on this.
+    pub fn at(&self) -> u64 {
+        self.blocks.first().copied().unwrap_or(0) * u64::from(BLOCK_SIZE) + u64::from(self.start)
     }
 
     /// Appends the meta to `out`.
@@ -95,20 +106,45 @@ impl SegmentMeta {
         // flag costs no format version: old values 0 and 1 still decode
         // and a flagged MiniBlock reads back as 2.
         out.push(self.structural as u8 | (u8::from(self.sorted) << 1));
+        out.extend_from_slice(&self.start.to_le_bytes());
         for b in &self.blocks {
             out.extend_from_slice(&b.to_le_bytes());
         }
     }
 
+    /// Appends the meta the way a directory older than the packed
+    /// payload wrote it, with no start word. Only a test that forges an
+    /// old directory has any business writing one.
+    #[cfg(test)]
+    pub fn encode_unpacked(&self, out: &mut Vec<u8>) {
+        assert_eq!(self.start, 0, "an unpacked meta starts at its block");
+        let mut packed = Vec::new();
+        self.encode(&mut packed);
+        out.extend_from_slice(&packed[..49]);
+        out.extend_from_slice(&packed[53..]);
+    }
+
     /// Reads a meta from `bytes` starting at `pos`, returning the meta and
     /// the position after it.
     pub fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
+        Self::decode_at(bytes, pos, true)
+    }
+
+    /// The same, for a directory written before payloads could be
+    /// packed: its metas carry no start word and every one of them
+    /// begins at the head of its first block.
+    pub fn decode_unpacked(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
+        Self::decode_at(bytes, pos, false)
+    }
+
+    fn decode_at(bytes: &[u8], pos: usize, packed: bool) -> Result<(Self, usize)> {
+        let head_len = if packed { 53 } else { 49 };
         let corrupt = |detail: &str| ZuError::Corrupt {
             what: "segment meta",
             detail: detail.to_string(),
         };
         let head = bytes
-            .get(pos..pos + 49)
+            .get(pos..pos + head_len)
             .ok_or_else(|| corrupt("truncated header"))?;
         let word = |i: usize| u64::from_le_bytes(head[i..i + 8].try_into().unwrap());
         let value_count = word(0);
@@ -129,19 +165,26 @@ impl SegmentMeta {
             }
         };
         let sorted = head[48] & 2 != 0;
+        let start = match packed {
+            true => u32::from_le_bytes(head[49..53].try_into().unwrap()),
+            false => 0,
+        };
         if min > max {
             return Err(corrupt("zone min above max"));
         }
-        if payload_len.div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
+        if start >= BLOCK_SIZE {
+            return Err(corrupt("payload starts past the end of its block"));
+        }
+        if (u64::from(start) + payload_len).div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
             return Err(corrupt("payload length disagrees with block count"));
         }
         // The claimed count must fit in the bytes actually present before
         // it sizes an allocation.
-        if block_count > bytes.len().saturating_sub(pos + 49) / 8 {
+        if block_count > bytes.len().saturating_sub(pos + head_len) / 8 {
             return Err(corrupt("truncated block list"));
         }
         let mut blocks = Vec::with_capacity(block_count);
-        let mut p = pos + 49;
+        let mut p = pos + head_len;
         for _ in 0..block_count {
             let ptr = bytes
                 .get(p..p + 8)
@@ -159,6 +202,7 @@ impl SegmentMeta {
                 crc,
                 structural,
                 sorted,
+                start,
                 blocks,
             },
             p,
@@ -176,7 +220,7 @@ impl SegmentMeta {
 }
 
 /// Encodes `values` chunk by chunk with the cascade selector and writes
-/// the MiniBlock payload across freshly allocated blocks.
+/// the MiniBlock payload out through the file's placer.
 pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
     let mut body = Vec::new();
     let chunk_count = values.len().div_ceil(CHUNK_ROWS);
@@ -269,7 +313,7 @@ pub fn rewrite_segment(
 }
 
 /// Lays the index, the fences and the body out as a payload, checksums
-/// it, and writes it across freshly allocated blocks.
+/// it, and hands it to the file to place.
 fn store(
     db: &mut Zu1File,
     values: &[u64],
@@ -287,15 +331,7 @@ fn store(
     }
     payload.extend_from_slice(&body);
     let crc = crc32c::crc32c(&payload);
-    let mut blocks = Vec::new();
-    let mut block = vec![0u8; BLOCK_SIZE as usize];
-    for part in payload.chunks(BLOCK_SIZE as usize) {
-        let ptr = db.allocate_block();
-        block[..part.len()].copy_from_slice(part);
-        block[part.len()..].fill(0);
-        db.write_block(ptr, &block)?;
-        blocks.push(ptr);
-    }
+    let (blocks, start) = db.pack_bytes(&payload)?;
     Ok(SegmentMeta {
         value_count: values.len() as u64,
         payload_len: payload.len() as u64,
@@ -305,6 +341,7 @@ fn store(
         crc,
         structural: Structural::MiniBlock,
         sorted: values.is_sorted(),
+        start,
         blocks,
     })
 }
@@ -321,10 +358,12 @@ fn read_payload(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Vec<u8>> {
     // The claimed length only seeds the reservation; growth past the cap
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
+    let mut at = meta.start as usize;
     for &ptr in &meta.blocks {
         let block = db.pin_block(ptr)?;
-        let want = (meta.payload_len as usize - payload.len()).min(block.len());
-        payload.extend_from_slice(&block[..want]);
+        let want = (meta.payload_len as usize - payload.len()).min(block.len() - at);
+        payload.extend_from_slice(&block[at..at + want]);
+        at = 0;
     }
     if payload.len() != meta.payload_len as usize {
         return Err(corrupt("payload shorter than meta claims"));
@@ -407,15 +446,15 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
 }
 
 /// Reads a whole segment through `pool`, decoding it at most once per
-/// pooled lifetime. The key is the segment's first block pointer, which
-/// every segment has since even an empty one carries its chunk count,
-/// and which is unique per committed segment version.
+/// pooled lifetime. The key is where the payload starts in the file,
+/// which every segment has since even an empty one carries its chunk
+/// count, and which is unique per committed segment version.
 pub fn read_segment_pooled(
     db: &mut Zu1File,
     pool: &DecodedPool<Vec<u64>>,
     meta: &SegmentMeta,
 ) -> Result<Arc<Vec<u64>>> {
-    let key = meta.blocks[0];
+    let key = meta.at();
     if let Some(values) = pool.get(key) {
         return Ok(values);
     }
@@ -647,7 +686,7 @@ pub fn load_chunk_directory_pooled(
     pool: &DecodedPool<ChunkDirectory>,
     meta: &SegmentMeta,
 ) -> Result<Arc<ChunkDirectory>> {
-    let key = meta.blocks[0];
+    let key = meta.at();
     if let Some(dir) = pool.get(key) {
         return Ok(dir);
     }
@@ -858,6 +897,10 @@ pub(crate) fn read_payload_span(
     if to == from {
         return Ok(SegmentBytes::Owned(Vec::new()));
     }
+    // The payload starts partway into its first block when it was
+    // packed beside others, so every offset in it is shifted by that
+    // much before it names a block and a place in one.
+    let (from, to) = (from + meta.start as usize, to + meta.start as usize);
     if from / block == (to - 1) / block {
         let ptr = *meta.blocks.get(from / block).ok_or_else(past_list)?;
         return Ok(SegmentBytes::Pinned {
@@ -1111,10 +1154,98 @@ mod tests {
     }
 
     #[test]
+    fn small_segments_share_a_block_and_still_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let held = db.pack_open();
+        let columns: Vec<Vec<u64>> = (0..8u64)
+            .map(|c| (0..50u64).map(|i| i * 31 + c).collect())
+            .collect();
+        let metas: Vec<SegmentMeta> = columns
+            .iter()
+            .map(|values| write_segment(&mut db, values).unwrap())
+            .collect();
+        db.pack_close(held);
+
+        let blocks: BTreeSet<BlockPtr> = metas.iter().flat_map(|m| m.blocks.clone()).collect();
+        assert_eq!(blocks.len(), 1, "eight tiny columns fit in one block");
+        assert_eq!(
+            metas[0].start, 0,
+            "the first one starts where the block does"
+        );
+        assert!(metas[1].start > 0, "and the second one starts after it");
+
+        for (values, meta) in columns.iter().zip(&metas) {
+            let mut out = Vec::new();
+            read_segment(&mut db, meta, &mut out).unwrap();
+            assert_eq!(&out, values);
+            // A range read reaches the payload by offset rather than
+            // whole, which is where a packed payload's shift is easiest
+            // to drop.
+            let mut part = Vec::new();
+            read_range(&mut db, meta, 7, 19, &mut part).unwrap();
+            assert_eq!(part, values[7..19]);
+        }
+    }
+
+    #[test]
+    fn a_payload_packed_across_a_block_edge_reads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let held = db.pack_open();
+        // A first column that leaves a little room, then one far wider
+        // than what is left, so the second starts partway into one block
+        // and ends in another.
+        let head: Vec<u64> = (0..20_000u64).map(|i| i * 5).collect();
+        let first = write_segment(&mut db, &head).unwrap();
+        let mut rng = 0x5EEDu64;
+        let wide: Vec<u64> = (0..60_000)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                rng >> 3
+            })
+            .collect();
+        let second = write_segment(&mut db, &wide).unwrap();
+        db.pack_close(held);
+
+        assert!(second.start > 0, "the second payload starts inside a block");
+        assert!(second.blocks.len() > 1, "and runs past the end of it");
+        assert_eq!(second.blocks[0], *first.blocks.last().unwrap());
+        let mut out = Vec::new();
+        read_segment(&mut db, &second, &mut out).unwrap();
+        assert_eq!(out, wide);
+        let mut out = Vec::new();
+        read_segment(&mut db, &first, &mut out).unwrap();
+        assert_eq!(out, head, "and the one under it is untouched");
+    }
+
+    #[test]
+    fn a_scope_starts_a_block_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let held = db.pack_open();
+        let first = write_segment(&mut db, &[1u64, 2, 3]).unwrap();
+        let inner = db.pack_open();
+        let nested = write_segment(&mut db, &[4u64, 5, 6]).unwrap();
+        db.pack_close(inner);
+        let after = write_segment(&mut db, &[7u64, 8, 9]).unwrap();
+        db.pack_close(held);
+
+        assert_ne!(
+            nested.blocks[0], first.blocks[0],
+            "a scope that opens inside another does not write into its block"
+        );
+        assert_eq!(
+            after.blocks[0], first.blocks[0],
+            "and the outer scope carries on where it left off"
+        );
+    }
+
+    #[test]
     fn hostile_meta_block_count_rejected() {
-        // A 48 byte header whose payload length and block count agree
-        // with each other but not with the bytes present: the claimed
-        // list must fail the size check before it sizes an allocation.
+        // A header whose payload length and block count agree with
+        // each other but not with the bytes present: the claimed list
+        // must fail the size check before it sizes an allocation.
         let block_count = 0x1000_0000u32;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&100u64.to_le_bytes());
@@ -1125,6 +1256,7 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&block_count.to_le_bytes());
         bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(format!("{err}").contains("truncated block list"));
     }
@@ -1140,6 +1272,7 @@ mod tests {
             crc: 0,
             structural: Structural::MiniBlock,
             sorted: false,
+            start: 0,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();
@@ -1175,6 +1308,7 @@ mod tests {
             crc: 0,
             structural: Structural::MiniBlock,
             sorted: false,
+            start: 0,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();

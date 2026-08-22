@@ -239,17 +239,21 @@ struct PoolEntry<T> {
 }
 
 struct PoolInner<T> {
-    map: IdMap<BlockPtr, PoolEntry<T>>,
+    map: IdMap<u64, PoolEntry<T>>,
     bytes: usize,
     tick: u64,
 }
 
-/// A budgeted pool of decoded objects keyed by the first block pointer
-/// of the segment they decode, the decode-on-touch tier of perf/04
-/// section 2. A dropped table's keys stop being touched and age out;
+/// A budgeted pool of decoded objects keyed by where in the file the
+/// segment they decode starts, the decode-on-touch tier of perf/04
+/// section 2. The key is a byte offset rather than a block pointer
+/// because a block holds more than one packed segment, and two
+/// segments sharing a block are not the same segment.
+///
+/// A dropped table's keys stop being touched and age out;
 /// the one real hazard is the free list recycling a pointer into a new
 /// segment, which `Zu1File::write_block` covers by calling
-/// [`Self::remove`] on every block it rewrites. Values are `Arc`-handed:
+/// [`Self::remove_block`] on every block it rewrites. Values are `Arc`-handed:
 /// eviction drops the map's reference and any reader still holding the
 /// `Arc` keeps its snapshot alive, which is safe because decoded
 /// objects are immutable under MVCC.
@@ -301,7 +305,7 @@ impl<T> DecodedPool<T> {
     }
 
     /// The pooled object for `key`, or `None` on a miss.
-    pub fn get(&self, key: BlockPtr) -> Option<Arc<T>> {
+    pub fn get(&self, key: u64) -> Option<Arc<T>> {
         let mut inner = self.inner.lock().unwrap();
         inner.tick += 1;
         let tick = inner.tick;
@@ -318,21 +322,33 @@ impl<T> DecodedPool<T> {
         }
     }
 
-    /// Drops the entry under `key`, the write-invalidation hook: the
-    /// free list recycles block pointers, so a rewrite of a segment's
-    /// first block can give a new segment an old key. Readers still
-    /// holding the old `Arc` keep their snapshot, same as eviction.
-    pub fn remove(&self, key: BlockPtr) {
+    /// Drops every entry whose segment starts in the block at `ptr`,
+    /// the write-invalidation hook: the free list recycles block
+    /// pointers, so a rewrite of a segment's first block can give a new
+    /// segment an old key, and one block can be the first of several
+    /// packed segments. Readers still holding the old `Arc` keep their
+    /// snapshot, same as eviction.
+    pub fn remove_block(&self, ptr: BlockPtr) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.map.remove(&key) {
-            inner.bytes -= entry.bytes;
-        }
+        let (lo, hi) = (
+            ptr * u64::from(BLOCK_SIZE),
+            (ptr + 1) * u64::from(BLOCK_SIZE),
+        );
+        let mut dropped = 0;
+        inner.map.retain(|&key, entry| {
+            let keep = !(lo..hi).contains(&key);
+            if !keep {
+                dropped += entry.bytes;
+            }
+            keep
+        });
+        inner.bytes -= dropped;
     }
 
     /// Pools `value` under `key`, evicting least-recently-touched
     /// entries until the budget holds it. Racing inserts keep the
     /// first entry; both racers already hold a usable `Arc`.
-    pub fn insert(&self, key: BlockPtr, value: Arc<T>)
+    pub fn insert(&self, key: u64, value: Arc<T>)
     where
         T: PoolBytes,
     {

@@ -154,11 +154,17 @@ fn seal<T>(
     rows: u64,
 ) -> Result<(BlockPtr, T)> {
     let saved = db.take_free();
+    // One manifest is one packing scope, both because `free_ingest`
+    // takes its segments away together and because an abandoned ingest
+    // is thrown away by rewinding the block watermark: a block a sealed
+    // segment shares with anything older would go with it.
+    let held = db.pack_open();
     let result: Result<(BlockPtr, T)> = (|| {
         let (segments, extra) = build(db)?;
         let root = meta::write_chain(db, &encode_manifest(table, kind, rows, &segments))?;
         Ok((root, extra))
     })();
+    db.pack_close(held);
     db.restore_free(saved);
     let (root, extra) = result?;
     db.sync_data()?;
@@ -482,11 +488,9 @@ pub(crate) fn resolve(
 /// with the same flip that seals the data into the base.
 pub(crate) fn free_ingest(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     let manifest = decode_manifest(&meta::read_chain(db, root)?)?;
-    for seg in &manifest.segments {
-        for &ptr in &seg.meta.blocks {
-            db.free_block(ptr)?;
-        }
-    }
+    let mut going = crate::props::Sweep::default();
+    going.drop_all(manifest.segments.iter().map(|seg| &seg.meta));
+    going.sweep(db)?;
     for ptr in meta::chain_blocks(db, root)? {
         db.free_block(ptr)?;
     }
@@ -896,6 +900,7 @@ mod tests {
             crc: 0,
             structural: crate::segment::Structural::MiniBlock,
             sorted: false,
+            start: 0,
             blocks: vec![7],
         };
         let good = encode_manifest(

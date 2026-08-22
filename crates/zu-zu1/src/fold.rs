@@ -173,6 +173,10 @@ pub fn staged_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Result<(
 }
 
 fn fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal, publish: bool) -> Result<()> {
+    // A fold that failed partway may have left a packing scope open,
+    // and a block half filled by work that was thrown away is not one
+    // this fold may write into.
+    db.pack_reset();
     let epoch = mvcc.epoch();
     let mut catalog = Catalog::load(db)?;
     let mut index = TableIndex::load(db)?;
@@ -201,7 +205,13 @@ fn fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal, publish: bool) -> Resu
                 graph_type: catalog.closed_type_of(graph),
                 names: catalog.labels(),
             };
-            changed |= fold_props(db, mvcc, &mut index, table, &labels_of, base, epoch)?;
+            // Everything this table's properties are about to be
+            // written as packs into blocks of its own, because the
+            // next fold of the table frees exactly those blocks.
+            let held = db.pack_open();
+            let folded = fold_props(db, mvcc, &mut index, table, &labels_of, base, epoch);
+            db.pack_close(held);
+            changed |= folded?;
         }
         if appended > 0 {
             catalog.grow_node(table, base + appended)?;
@@ -232,7 +242,10 @@ fn fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal, publish: bool) -> Resu
         if !moved && !(retired.contains(&rel.from) && is_keyed(db, &index, rel.id)?) {
             continue;
         }
-        let edge_count = fold_rel(db, mvcc, &catalog, &mut index, &rel, epoch)?;
+        let held = db.pack_open();
+        let folded = fold_rel(db, mvcc, &catalog, &mut index, &rel, epoch);
+        db.pack_close(held);
+        let edge_count = folded?;
         catalog.set_edge_count(rel.id, edge_count)?;
         changed = true;
     }
@@ -887,7 +900,15 @@ fn fold_rel(
     let props = match old.props {
         NULL_BLOCK => NULL_BLOCK,
         root if stood => root,
-        root => fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed)?,
+        root => {
+            // Inside the rel table's own scope but not sharing with
+            // it: a fold that keeps the adjacency still rewrites the
+            // properties, and the two are freed by different calls.
+            let held = db.pack_open();
+            let folded = fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed);
+            db.pack_close(held);
+            folded?
+        }
     };
     let directory = Directory {
         from_count: new_from,

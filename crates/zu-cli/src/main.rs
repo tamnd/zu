@@ -30,6 +30,7 @@ mod impdef;
 mod keys;
 mod line;
 mod lsp;
+mod matrix;
 mod meta;
 mod page;
 mod repl;

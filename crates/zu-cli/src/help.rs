@@ -157,6 +157,8 @@ pub(crate) const COMMANDS: &[Command] = &[
             "zu conformance --verify <report.json>",
             "zu conformance --tally <report.json>",
             "zu conformance --scoreboard <tally.json>...",
+            "zu conformance --measured <report.json>",
+            "zu conformance --matrix <measured.json>...",
             "zu conformance --regressed <report.json> <baseline.json>",
         ],
         examples: &[

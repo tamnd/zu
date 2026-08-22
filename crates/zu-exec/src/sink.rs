@@ -384,12 +384,23 @@ fn key_cmp(a: &[Value], b: &[Value]) -> Ordering {
 /// How many of the sorted rows the steps above the sort can still use.
 /// A SKIP of n under a LIMIT of k needs n + k of them and nothing more,
 /// which is what turns an ORDER BY under a LIMIT into a selection.
+///
+/// A step that can drop a row or make one takes the bound off again,
+/// because the rows it hands on are no longer the rows the LIMIT was
+/// counting. `Emit` is the one step here that cannot: it rewrites a row
+/// into the columns the query asked for and hands on exactly the rows
+/// it was given, in the order it was given them. It sits above the sort
+/// whenever the ORDER BY names something the RETURN does not, which is
+/// what `ORDER BY n.id DESC LIMIT 3` over `RETURN n.id AS id` is, so
+/// reading it as a barrier is what kept the commonest bounded shape
+/// there is on the materializing path.
 fn needed_after(post: &[PostSpec]) -> usize {
     let mut need = usize::MAX;
     for op in post.iter().rev() {
         need = match op {
             PostSpec::Limit(k) => need.min(*k as usize),
             PostSpec::Skip(n) => need.saturating_add(*n as usize),
+            PostSpec::Emit(_) => need,
             _ => usize::MAX,
         };
     }
@@ -401,10 +412,6 @@ fn needed_after(post: &[PostSpec]) -> usize {
 /// over the whole fan costs about what pruning a buffer that wide
 /// does, so the plan keeps the materializing path.
 const TOPN_MAX: usize = 16384;
-
-/// The smallest buffer a bounded sink prunes, so a LIMIT of one does
-/// not run a selection every time a row wins.
-const TOPN_FLOOR: usize = 64;
 
 /// The ORDER BY under a LIMIT a bounded sink can serve: its keys and
 /// the number of ordered rows anything above the sort can still use.
@@ -428,6 +435,12 @@ pub(crate) struct Kept {
     key: Vec<Value>,
     at: (u32, u32),
     row: Vec<Value>,
+    /// Where in the chunk in flight the row sits, and whether `row` is
+    /// still empty because nobody has built it yet. Both are true only
+    /// between the settle that admitted the entry and the hand-back
+    /// that fills it.
+    pos: u32,
+    owing: bool,
 }
 
 /// One worker's bounded buffer for ORDER BY under a LIMIT.
@@ -444,10 +457,43 @@ pub(crate) struct Kept {
 /// rows and both spend one compare on a loser, which is the compare
 /// that matters here; the buffer gets to reuse the comparator the full
 /// sort already uses rather than carry a second one.
+///
+/// A loser costs one compare, and the shape that decides how fast this
+/// runs is therefore the one where nothing loses. `ORDER BY id DESC`
+/// over a table whose ids climb with the scan beats the worst kept row
+/// every single time, and that is not a rare case: it is what a bounded
+/// sort over an ordered column looks like. Building a row for each of
+/// those winners costs the same hundred thousand row builds the full
+/// sort costs, and the LIMIT saves nothing at all.
+///
+/// So a winner is not built when it wins. It is staged by its key
+/// alone, and the chunk it came out of is cut to the k best before any
+/// row is built: the caller settles the chunk, is told which positions
+/// survived it, and builds those. That is k rows per chunk rather than
+/// one per winner, and the ordered-column shape stops being the
+/// expensive one.
 pub(crate) struct TopN {
     keys: Vec<SortKey<usize>>,
     need: usize,
     kept: Vec<Kept>,
+    /// Keys staged out of the chunk in flight, laid end to end, one
+    /// run of `keys.len()` values per staged row.
+    staged: Vec<Value>,
+    /// Where each staged key's row sat, in the same order: the stitch
+    /// position that breaks its ties, and the position in the chunk the
+    /// caller builds the row from.
+    staged_at: Vec<((u32, u32), u32)>,
+    /// Scratch for the selection over the staged keys, so the chunk
+    /// does not allocate one per settle.
+    order: Vec<u32>,
+    /// Kept entries whose row is still owed, by their place in `kept`.
+    owed: Vec<u32>,
+    /// The positions those entries sit at, which is what the caller
+    /// reads to build the rows.
+    owed_pos: Vec<u32>,
+    /// Key and row buffers a prune dropped, emptied of their values but
+    /// not of their capacity, waiting to be filled again.
+    spare: Vec<Vec<Value>>,
     /// The key of the k-th best row so far, once k rows are in hand. A
     /// row that does not beat it cannot reach the answer: k rows
     /// already order ahead of it and none of them leave.
@@ -460,7 +506,22 @@ impl TopN {
             keys: keys.to_vec(),
             need,
             kept: Vec::new(),
+            staged: Vec::new(),
+            staged_at: Vec::new(),
+            order: Vec::new(),
+            owed: Vec::new(),
+            owed_pos: Vec::new(),
+            spare: Vec::new(),
             worst: None,
+        }
+    }
+
+    /// A buffer for a row the caller is about to build, out of the ones
+    /// a prune dropped where there is one to hand.
+    pub(crate) fn row_buffer(&mut self, width: usize) -> Vec<Value> {
+        match self.spare.pop() {
+            Some(buf) => buf,
+            None => Vec::with_capacity(width),
         }
     }
 
@@ -468,6 +529,13 @@ impl TopN {
     /// in the order the key is built.
     pub(crate) fn keys(&self) -> &[SortKey<usize>] {
         &self.keys
+    }
+
+    /// How many rows the buffer can still use. Nothing a chunk holds
+    /// past its own best `need` can reach the answer, which is what
+    /// lets a caller cut a chunk down before it stages anything.
+    pub(crate) fn need(&self) -> usize {
+        self.need
     }
 
     /// Whether a row with this key, arriving after everything the
@@ -482,17 +550,82 @@ impl TopN {
                 .is_none_or(|w| key_order(&self.keys, key, w) == Ordering::Less)
     }
 
-    /// Takes a row the buffer wants, with the morsel and the position
-    /// inside it the row was emitted at.
-    pub(crate) fn keep(&mut self, key: &[Value], at: (u32, u32), row: Vec<Value>) {
-        self.kept.push(Kept {
-            key: key.to_vec(),
-            at,
-            row,
-        });
-        if self.kept.len() >= self.need.saturating_mul(2).max(TOPN_FLOOR) {
-            self.prune();
+    /// Stages a key the buffer wants, with the stitch position that
+    /// breaks its ties and the position in the chunk its row would be
+    /// built from. The row is not built here and may never be.
+    pub(crate) fn stage(&mut self, key: &[Value], at: (u32, u32), pos: u32) {
+        self.staged.extend_from_slice(key);
+        self.staged_at.push((at, pos));
+    }
+
+    /// Ends the chunk: cuts everything staged against everything kept,
+    /// and reports the positions whose rows the caller now has to build.
+    /// Those rows come back through [`TopN::owe`], in this order.
+    pub(crate) fn settle(&mut self) -> &[u32] {
+        self.owed.clear();
+        self.owed_pos.clear();
+        if self.staged_at.is_empty() {
+            return &self.owed_pos;
         }
+        if self.need == 0 {
+            self.staged.clear();
+            self.staged_at.clear();
+            return &self.owed_pos;
+        }
+        // The chunk's own best k first, over indices rather than over
+        // the keys themselves, so nothing is moved that a row might
+        // still be built from.
+        let stride = self.keys.len().max(1);
+        self.order.clear();
+        self.order.extend(0..self.staged_at.len() as u32);
+        if self.order.len() > self.need {
+            let (keys, staged, staged_at) = (&self.keys, &self.staged, &self.staged_at);
+            let run = |i: u32| &staged[i as usize * stride..(i as usize + 1) * stride];
+            self.order.select_nth_unstable_by(self.need - 1, |x, y| {
+                key_order(keys, run(*x), run(*y))
+                    .then(staged_at[*x as usize].0.cmp(&staged_at[*y as usize].0))
+            });
+            self.order.truncate(self.need);
+        }
+        for &i in &self.order {
+            let (at, pos) = self.staged_at[i as usize];
+            let mut buf = match self.spare.pop() {
+                Some(buf) => buf,
+                None => Vec::with_capacity(stride),
+            };
+            buf.extend_from_slice(&self.staged[i as usize * stride..(i as usize + 1) * stride]);
+            let row = self.spare.pop().unwrap_or_default();
+            self.kept.push(Kept {
+                key: buf,
+                at,
+                row,
+                pos,
+                owing: true,
+            });
+        }
+        self.staged.clear();
+        self.staged_at.clear();
+        self.prune();
+        for (at, k) in self.kept.iter().enumerate() {
+            if k.owing {
+                self.owed.push(at as u32);
+                self.owed_pos.push(k.pos);
+            }
+        }
+        &self.owed_pos
+    }
+
+    /// The nth position [`TopN::settle`] asked for.
+    pub(crate) fn owed_at(&self, nth: usize) -> usize {
+        self.owed_pos[nth] as usize
+    }
+
+    /// Hands back the row for the nth position [`TopN::settle`] asked
+    /// for.
+    pub(crate) fn owe(&mut self, nth: usize, row: Vec<Value>) {
+        let at = self.owed[nth] as usize;
+        self.kept[at].row = row;
+        self.kept[at].owing = false;
     }
 
     /// Cuts the buffer back to the k best rows and records the new
@@ -509,11 +642,18 @@ impl TopN {
             keys,
             need,
             kept,
+            spare,
             worst,
+            ..
         } = self;
         let by = |x: &Kept, y: &Kept| key_order(keys, &x.key, &y.key).then(x.at.cmp(&y.at));
         kept.select_nth_unstable_by(*need - 1, by);
-        kept.truncate(*need);
+        for mut dropped in kept.drain(*need..) {
+            dropped.key.clear();
+            dropped.row.clear();
+            spare.push(dropped.key);
+            spare.push(dropped.row);
+        }
         *worst = Some(kept[*need - 1].key.clone());
     }
 }
@@ -1393,43 +1533,65 @@ mod tests {
                     rows.clone(),
                 );
                 for workers in 1..=3 {
-                    let mut tops: Vec<TopN> =
-                        (0..workers).map(|_| TopN::new(&keys, need)).collect();
-                    for (at, row) in rows.iter().enumerate() {
-                        let top = &mut tops[at % workers];
-                        let key: Vec<Value> = keys.iter().map(|k| row[k.expr].clone()).collect();
-                        if top.wants(&key) {
-                            top.keep(&key, (at as u32, 0), row.clone());
-                        }
+                    for chunk in [1, 2, rows.len()] {
+                        assert_eq!(
+                            deal(&rows, &keys, need, workers, chunk),
+                            want,
+                            "keys {keys:?}, need {need}, {workers} workers, chunks of {chunk}"
+                        );
                     }
-                    assert_eq!(
-                        merge_topn(&keys, need, tops),
-                        want,
-                        "keys {keys:?}, need {need}, {workers} workers"
-                    );
                 }
             }
         }
     }
 
+    /// One chunk through one buffer, the way the driver runs it: every
+    /// winner staged by its key alone, the chunk settled, and only the
+    /// rows the settle asked for built.
+    fn chunk_through(top: &mut TopN, keys: &[SortKey<usize>], part: &[(u32, Vec<Value>)]) {
+        for (pos, (at, row)) in part.iter().enumerate() {
+            let key: Vec<Value> = keys.iter().map(|k| row[k.expr].clone()).collect();
+            if top.wants(&key) {
+                top.stage(&key, (*at, 0), pos as u32);
+            }
+        }
+        for nth in 0..top.settle().len() {
+            let row = part[top.owed_at(nth)].1.clone();
+            top.owe(nth, row);
+        }
+    }
+
     /// The workers' side of a bounded run: rows are dealt to `workers`
     /// buffers one morsel each, in scan order, exactly as a worker
-    /// claiming morsels sees them.
+    /// claiming morsels sees them, and each buffer sees its share in
+    /// chunks of `chunk`.
+    fn deal(
+        rows: &[Vec<Value>],
+        keys: &[SortKey<usize>],
+        need: usize,
+        workers: usize,
+        chunk: usize,
+    ) -> Vec<Vec<Value>> {
+        let mut tops: Vec<TopN> = (0..workers).map(|_| TopN::new(keys, need)).collect();
+        let mut shares: Vec<Vec<(u32, Vec<Value>)>> = vec![Vec::new(); workers];
+        for (at, row) in rows.iter().enumerate() {
+            shares[at % workers].push((at as u32, row.clone()));
+        }
+        for (w, share) in shares.iter().enumerate() {
+            for part in share.chunks(chunk.max(1)) {
+                chunk_through(&mut tops[w], keys, part);
+            }
+        }
+        merge_topn(keys, need, tops)
+    }
+
     fn bounded(
         data: &[(i64, &str)],
         keys: &[SortKey<usize>],
         need: usize,
         workers: usize,
     ) -> Vec<Vec<Value>> {
-        let mut tops: Vec<TopN> = (0..workers).map(|_| TopN::new(keys, need)).collect();
-        for (at, row) in rows(data).into_iter().enumerate() {
-            let top = &mut tops[at % workers];
-            let key: Vec<Value> = keys.iter().map(|k| row[k.expr].clone()).collect();
-            if top.wants(&key) {
-                top.keep(&key, (at as u32, 0), row);
-            }
-        }
-        merge_topn(keys, need, tops)
+        deal(&rows(data), keys, need, workers, usize::MAX)
     }
 
     #[test]
@@ -1458,12 +1620,14 @@ mod tests {
 
     #[test]
     fn a_row_that_ties_the_worst_kept_key_loses() {
-        let mut top = TopN::new(&keys(&[(0, true)]), 2);
-        for (at, row) in rows(&[(1, "a"), (2, "b")]).into_iter().enumerate() {
-            let key = vec![row[0].clone()];
-            assert!(top.wants(&key));
-            top.keep(&key, (at as u32, 0), row);
-        }
+        let keys = keys(&[(0, true)]);
+        let mut top = TopN::new(&keys, 2);
+        let part: Vec<(u32, Vec<Value>)> = rows(&[(1, "a"), (2, "b")])
+            .into_iter()
+            .enumerate()
+            .map(|(at, row)| (at as u32, row))
+            .collect();
+        chunk_through(&mut top, &keys, &part);
         // The reject test is the k-th best key, which a prune records:
         // in a run that is the buffer filling, here it is by hand.
         top.prune();

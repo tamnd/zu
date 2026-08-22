@@ -1422,6 +1422,22 @@ impl Drop for Db {
     }
 }
 
+/// What one pass over a bucket found, for [`Session::newest`].
+///
+/// The write path wants all three of these and the read path only wants
+/// the first, and doing it in one pass is the point: the eight slots are
+/// one cache line and reading them twice to answer two questions would
+/// be two loads of it.
+#[derive(Default)]
+struct Search {
+    /// Slot, the entry as it read, the record's address, its version.
+    found: Option<(usize, u64, Address, u64)>,
+    /// The lowest empty slot, for a caller that has to make an entry.
+    empty: Option<usize>,
+    /// Whether a slot was claimed but not yet filled in.
+    claimed: bool,
+}
+
 /// One worker's view of the database.
 pub struct Session<'a> {
     pub(crate) core: &'a Core,
@@ -1535,7 +1551,11 @@ impl<'a> Session<'a> {
     /// floor once per walk rather than per step is deliberate: begin
     /// only rises, so a stale floor costs at worst a step into a page of
     /// zeros, which ends the walk anyway.
-    fn chain_find(&mut self, entry: u64, key: &[u8]) -> Result<Option<Address>> {
+    ///
+    /// The version comes back with the address because slot order is not
+    /// version order and the callers have to sort that out. See
+    /// [`newest`](Self::newest).
+    fn chain_find(&mut self, entry: u64, key: &[u8]) -> Result<Option<(Address, u64)>> {
         let mut address = index::address_of(entry);
         let foreign = index::is_foreign(entry);
         // Per tier, because the two have floors of their own and a chain
@@ -1550,7 +1570,7 @@ impl<'a> Session<'a> {
             let found = unsafe {
                 let r = RecordRef::new(base);
                 if r.key() == key {
-                    return Ok(Some(address));
+                    return Ok(Some((address, r.version())));
                 }
                 r.previous()
             };
@@ -1853,6 +1873,55 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// What a whole bucket has to say about `key`.
+    ///
+    /// Every slot is looked at, not just up to the first that answers,
+    /// and the answer is the one with the highest version. Slot order
+    /// used to be the tie break and it is not the same order as version
+    /// order. A full bucket makes the new record take over slot
+    /// `tag % SLOTS` and adopt whatever that entry held as its chain,
+    /// and that entry is marked foreign, which says it answers for every
+    /// key below it. The chain it adopted is a chain a split left behind,
+    /// so the keys in it have entries of their own further up the bucket
+    /// holding newer records. A lookup that stopped at the first slot
+    /// that matched then answered out of the displaced chain and handed
+    /// back a version the key had moved on from, while the key's own
+    /// entry, two slots along, held the record the caller wanted. Point
+    /// reads and scans both did it, and it takes a doubling to arrange,
+    /// which is why only the randomised mix ever caught it (#562).
+    ///
+    /// Reading all eight slots costs nothing: they are one cache line and
+    /// the loop was already loading them. What is not free is walking a
+    /// second chain, and that only happens for a slot whose tag matches
+    /// or which is foreign, which in a bucket that is not full is the one
+    /// slot that was going to be walked anyway.
+    fn newest(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<Search> {
+        let mut search = Search::default();
+        for i in 0..SLOTS {
+            let entry = bucket.slots[i].load(Ordering::Acquire);
+            if entry == EMPTY {
+                if search.empty.is_none() {
+                    search.empty = Some(i);
+                }
+                continue;
+            }
+            if index::is_tentative(entry) {
+                search.claimed = true;
+                continue;
+            }
+            if index::tag_of(entry) != tag && !index::is_foreign(entry) {
+                continue;
+            }
+            let Some((address, version)) = self.chain_find(entry, key)? else {
+                continue;
+            };
+            if search.found.is_none_or(|(_, _, _, held)| version > held) {
+                search.found = Some((i, entry, address, version));
+            }
+        }
+        Ok(search)
+    }
+
     /// Finds the newest record for `key`, and which entry named it.
     fn lookup(
         &mut self,
@@ -1860,19 +1929,10 @@ impl<'a> Session<'a> {
         tag: u64,
         key: &[u8],
     ) -> Result<Option<(usize, Address)>> {
-        for i in 0..SLOTS {
-            let entry = bucket.slots[i].load(Ordering::Acquire);
-            if entry == EMPTY || index::is_tentative(entry) {
-                continue;
-            }
-            if index::tag_of(entry) != tag && !index::is_foreign(entry) {
-                continue;
-            }
-            if let Some(address) = self.chain_find(entry, key)? {
-                return Ok(Some((i, address)));
-            }
-        }
-        Ok(None)
+        Ok(self
+            .newest(bucket, tag, key)?
+            .found
+            .map(|(slot, _, address, _)| (slot, address)))
     }
 
     /// Reads the newest value for `key` into `out`.
@@ -2045,18 +2105,37 @@ impl<'a> Session<'a> {
     }
 
     /// Removes `key`. Returns whether it was there.
+    ///
+    /// There means a live record, not a record. A key that has been
+    /// deleted still has a record in the chain, its tombstone, and
+    /// answering on the chain alone would say a second delete removed
+    /// something (#561). So this checks the tombstone the same way a
+    /// read does, and a key that is already gone writes nothing, since
+    /// a tombstone over a tombstone is log nobody can ever read.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let hash = index::hash(key);
         let tag = Index::tag(hash);
         self.slot.protect();
         let existed = self
             .bucket_of(hash)
-            .and_then(|bucket| self.lookup(bucket, tag, key))
-            .map(|f| f.is_some());
+            .and_then(|bucket| self.live(bucket, tag, key));
         self.slot.unprotect();
-        let existed = existed?;
+        if !existed? {
+            return Ok(false);
+        }
         self.write(key, &[], true, record::KIND_VALUE)?;
-        Ok(existed)
+        Ok(true)
+    }
+
+    /// Whether `key` has a record that is not a tombstone. The caller
+    /// holds the epoch, as [`lookup`](Self::lookup) requires.
+    fn live(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<bool> {
+        let Some((_, address)) = self.lookup(bucket, tag, key)? else {
+            return Ok(false);
+        };
+        let base = self.locate(address)?;
+        // SAFETY: as in chain_find.
+        Ok(unsafe { !RecordRef::new(base).tombstone() })
     }
 
     /// Reads the current value, computes a new one, and writes it back.
@@ -2152,29 +2231,11 @@ impl<'a> Session<'a> {
     ) -> Result<Option<Address>> {
         let size = record::size_of(key.len(), value.len()) as u64;
         loop {
-            let mut empty = None;
-            let mut found = None;
-            let mut claimed = false;
-            for i in 0..SLOTS {
-                let entry = bucket.slots[i].load(Ordering::Acquire);
-                if entry == EMPTY {
-                    if empty.is_none() {
-                        empty = Some(i);
-                    }
-                    continue;
-                }
-                if index::is_tentative(entry) {
-                    claimed = true;
-                    continue;
-                }
-                if index::tag_of(entry) != tag && !index::is_foreign(entry) {
-                    continue;
-                }
-                if let Some(address) = self.chain_find(entry, key)? {
-                    found = Some((i, entry, address));
-                    break;
-                }
-            }
+            let Search {
+                found,
+                empty,
+                claimed,
+            } = self.newest(bucket, tag, key)?;
 
             // A scan that walked past a claim did not see the key that
             // claim is for, because a claim names no address yet, so its
@@ -2195,7 +2256,7 @@ impl<'a> Session<'a> {
                 continue;
             }
 
-            if let Some((i, entry, address)) = found {
+            if let Some((i, entry, address, _)) = found {
                 // A transaction's record never takes the in place path.
                 // Rewriting the value inside a record that is already on
                 // the log would publish an uncommitted value to every
@@ -2359,21 +2420,7 @@ impl<'a> Session<'a> {
         let outcome = (|| -> Result<Placement> {
             let bucket = entered?;
             loop {
-                let mut found = None;
-                for i in 0..SLOTS {
-                    let entry = bucket.slots[i].load(Ordering::Acquire);
-                    if entry == EMPTY || index::is_tentative(entry) {
-                        continue;
-                    }
-                    if index::tag_of(entry) != tag && !index::is_foreign(entry) {
-                        continue;
-                    }
-                    if let Some(address) = self.chain_find(entry, key)? {
-                        found = Some((i, entry, address));
-                        break;
-                    }
-                }
-                let Some((i, entry, address)) = found else {
+                let Some((i, entry, address, _)) = self.newest(bucket, tag, key)?.found else {
                     return Ok(Placement::Dead);
                 };
                 if address != from {
@@ -2550,11 +2597,8 @@ mod tests {
             if entry == EMPTY || index::is_tentative(entry) {
                 continue;
             }
-            if let Some(address) = session.chain_find(entry, key).expect("chain find") {
-                let base = session.locate(address).expect("locate");
-                // SAFETY: locate returns a whole record and nothing is
-                // writing to this database by the time this runs.
-                found.push((i, unsafe { RecordRef::new(base).version() }));
+            if let Some((_, version)) = session.chain_find(entry, key).expect("chain find") {
+                found.push((i, version));
             }
         }
         found
@@ -2771,11 +2815,11 @@ mod tests {
 
         let bucket = db.core.index.live().bucket(index::hash(&under));
         let crowded = bucket.slots[tag as usize % SLOTS].load(Ordering::Acquire);
-        let over_at = session
+        let (over_at, _) = session
             .chain_find(crowded, &over)
             .expect("chain find")
             .expect("over is in the chain");
-        let under_at = session
+        let (under_at, _) = session
             .chain_find(crowded, &under)
             .expect("chain find")
             .expect("under is in the chain");
@@ -2821,6 +2865,76 @@ mod tests {
             "under is gone"
         );
         assert_eq!(out, b"under again".to_vec());
+    }
+
+    #[test]
+    fn a_displaced_chain_does_not_answer_over_a_newer_entry() {
+        // #562. A full bucket makes the arriving record take over slot
+        // tag % SLOTS and adopt what that entry held as its chain, and
+        // marks the entry foreign, which says it answers for every key
+        // under it. The chain it adopted is one a split left behind, so
+        // the keys in it have entries of their own elsewhere in the same
+        // bucket holding newer records. A lookup that stopped at the
+        // first slot that matched then answered out of the displaced
+        // chain and handed back a version the key had moved on from.
+        //
+        // Written by hand into that shape for the same reason the test
+        // above is: reaching it through a real doubling is a matter of
+        // luck, and the randomised mix took twenty thousand operations
+        // and four seeds to arrange it once.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(&dir.path().join("s.zu2"), one_bucket()).expect("create");
+        let mut session = db.session();
+        let key = b"the key".to_vec();
+        let tag = Index::tag(index::hash(&key));
+
+        // Two versions, of different lengths so the second is a fresh
+        // record chained behind the first rather than a rewrite in
+        // place. Both are still on the log afterwards.
+        session.upsert(&key, b"old").expect("first");
+        let bucket = db.core.index.live().bucket(index::hash(&key));
+        let old = index::address_of(bucket.slots[0].load(Ordering::Acquire));
+        session.upsert(&key, b"new and longer").expect("second");
+        let new = index::address_of(bucket.slots[0].load(Ordering::Acquire));
+        assert_ne!(old, new, "the update settled in place");
+
+        // The bucket as a displacement leaves it. Slot 0 is somebody
+        // else's record, foreign, over a chain that still runs through
+        // this key's old version. Slot 2 is the key's own entry, naming
+        // the record it actually has.
+        for i in 0..SLOTS {
+            bucket.slots[i].store(EMPTY, Ordering::Release);
+        }
+        bucket.slots[0].store(index::entry(tag ^ 1, old, true), Ordering::Release);
+        bucket.slots[2].store(index::entry(tag, new, false), Ordering::Release);
+
+        let mut out = Vec::new();
+        assert!(
+            session.read(&key, &mut out).expect("read"),
+            "the key is gone"
+        );
+        assert_eq!(
+            out,
+            b"new and longer".to_vec(),
+            "the read answered out of the displaced chain and gave back the old version"
+        );
+
+        // And the write path picks the same record, since it swings the
+        // entry it found the key through. Taking slot 0 here would put
+        // the update behind the stale chain and lose it.
+        session.upsert(&key, b"newer still").expect("third");
+        assert_eq!(
+            reachers(&db.core, &key).len(),
+            2,
+            "the key should be reachable through both entries and no more"
+        );
+        drop(session);
+        let mut session = db.session();
+        assert!(
+            session.read(&key, &mut out).expect("read"),
+            "the key is gone"
+        );
+        assert_eq!(out, b"newer still".to_vec());
     }
 
     #[test]

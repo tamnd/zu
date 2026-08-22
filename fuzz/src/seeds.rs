@@ -72,6 +72,9 @@ fn main() {
         crc: 0xC0FFEE,
         structural: segment::Structural::MiniBlock,
         sorted: true,
+        // The payload starts at the top of the block, which is what a
+        // segment that is the only thing in its block looks like.
+        start: 0,
         blocks: vec![3],
     };
     let mut meta_bytes = Vec::new();

@@ -5813,7 +5813,7 @@ impl Binder<'_> {
             return Err(ZuError::gql(
                 codes::C22G0P,
                 format!(
-                    "{verb} writes an element into the one table its label names, so it takes                      one label and this pattern writes {}; add the rest with SET",
+                    "{verb} writes an element into the one table its label names, so it takes one label and this pattern writes {}; add the rest with SET",
                     label_count(label)
                 ),
             )

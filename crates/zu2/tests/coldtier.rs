@@ -589,7 +589,10 @@ fn a_reopen_over_a_promoted_record_keeps_the_right_copy() {
             // copy of it, and every tenth written again afterwards so a
             // promotion has something newer above it.
             for i in (0..records).step_by(5) {
-                assert_eq!(read(&mut s, &key(i)).as_deref(), Some(value(i, 0).as_slice()));
+                assert_eq!(
+                    read(&mut s, &key(i)).as_deref(),
+                    Some(value(i, 0).as_slice())
+                );
             }
             assert!(db.promoted() > 0, "no read reached the tier");
             for i in (0..records).step_by(10) {

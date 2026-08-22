@@ -2625,8 +2625,39 @@ impl<'a> Session<'a> {
             // The bucket is full, so the new record takes over an entry
             // and adopts what it was holding as its chain.
             //
-            let i = tag as usize % SLOTS;
-            let entry = bucket.slots[i].load(Ordering::Acquire);
+            // Not an entry that names the cold tier, though, and that is
+            // not a preference. Every other link in a chain points down
+            // the log, so a record below a reclaimed one has been
+            // reclaimed too and a walk that stops at the floor has
+            // stopped at nothing. A cold address points the other way:
+            // it is above every hot address, it has no `previous` of its
+            // own, and the record it names is reachable only through
+            // whatever is chained above it. Bury a key under one of
+            // those and the hot record doing the burying can die, get
+            // dropped by a pass rather than copied, and take the cold
+            // record's only route to it with it. The key is then in
+            // neither the index nor any chain. See [`crate::cold`] and
+            // #596.
+            let mut i = tag as usize % SLOTS;
+            let mut entry = bucket.slots[i].load(Ordering::Acquire);
+            if cold::is_cold(index::address_of(entry)) {
+                let hot = (0..SLOTS).map(|step| (i + step) % SLOTS).find(|&at| {
+                    !cold::is_cold(index::address_of(bucket.slots[at].load(Ordering::Acquire)))
+                });
+                match hot {
+                    Some(at) => {
+                        i = at;
+                        entry = bucket.slots[i].load(Ordering::Acquire);
+                    }
+                    // Every slot has settled, so one of them comes back
+                    // to the log before anything hangs off it. The round
+                    // again is what reads the slot the copy left.
+                    None => {
+                        self.unsettle(bucket, i, entry)?;
+                        continue;
+                    }
+                }
+            }
             if index::is_tentative(entry) {
                 std::hint::spin_loop();
                 continue;
@@ -2650,6 +2681,47 @@ impl<'a> Session<'a> {
                 return Ok(Some(fresh + size));
             }
         }
+    }
+
+    /// Copies the record an entry names back into the log, so that a
+    /// chain can hang off it.
+    ///
+    /// Only ever called on an entry that names the cold tier, and only
+    /// when every slot in the bucket does, which is the one case
+    /// [`install`](Self::install) cannot get out of by displacing
+    /// somebody else. The copy chains to nothing because a cold record
+    /// has nothing to chain to, and it keeps the version it had, since
+    /// it is the same write and not a new one.
+    ///
+    /// A lost race leaves an unreachable record at the tail for a pass
+    /// to reclaim and is not an error: the caller looks at the slot
+    /// again either way.
+    fn unsettle(&mut self, bucket: &Bucket, i: usize, entry: u64) -> Result<()> {
+        let base = self.locate(index::address_of(entry))?;
+        // SAFETY: locate returns a whole record, valid until the next
+        // call on this session, which is why both halves are copied out
+        // before the append rather than borrowed across it.
+        let (key, value, tombstone, kind, version) = unsafe {
+            let r = RecordRef::new(base);
+            (
+                r.key().to_vec(),
+                r.value_unchecked().to_vec(),
+                r.tombstone(),
+                r.kind(),
+                r.version(),
+            )
+        };
+        let fresh = self
+            .core
+            .log
+            .append(&self.slot, NULL, version, &key, &value, tombstone, kind)?;
+        let _ = bucket.slots[i].compare_exchange(
+            entry,
+            index::entry(index::tag_of(entry), fresh, false),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        Ok(())
     }
 
     /// Writes a record again at the tail, but only if the copy is of the

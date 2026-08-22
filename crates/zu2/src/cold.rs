@@ -440,7 +440,10 @@ impl Cold {
             // SAFETY: the buffer is size bytes and 8 byte aligned, and
             // the first `have` of them are already the record's.
             let rest = unsafe {
-                std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>().add(have), size - have)
+                std::slice::from_raw_parts_mut(
+                    into.as_mut_ptr().cast::<u8>().add(have),
+                    size - have,
+                )
             };
             file::read_exact_at(&self.file, rest, self.at(address) + have as u64)?;
         }

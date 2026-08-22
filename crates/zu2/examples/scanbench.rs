@@ -86,7 +86,10 @@ fn main() {
     let took = started.elapsed();
 
     println!();
-    println!("{records} records of {} bytes, ordered, async", value(0).len());
+    println!(
+        "{records} records of {} bytes, ordered, async",
+        value(0).len()
+    );
     println!(
         "load    {:.0} records a second",
         records as f64 / load.as_secs_f64()

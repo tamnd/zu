@@ -78,7 +78,11 @@ struct Zipf {
 impl Zipf {
     fn new(n: u64) -> Self {
         const THETA: f64 = 0.99;
-        let zeta = |upto: u64| (1..=upto).map(|i| 1.0 / (i as f64).powf(THETA)).sum::<f64>();
+        let zeta = |upto: u64| {
+            (1..=upto)
+                .map(|i| 1.0 / (i as f64).powf(THETA))
+                .sum::<f64>()
+        };
         let zetan = zeta(n);
         let zeta2 = zeta(2);
         Self {
@@ -217,7 +221,14 @@ fn main() {
     // any engine does about hot data can show up in the five above.
     let z = Draw::Zipfian;
     run("zipfian, promoting", true, true, true, z, Duration::ZERO);
-    run("zipfian, no promotion", true, true, false, z, Duration::ZERO);
+    run(
+        "zipfian, no promotion",
+        true,
+        true,
+        false,
+        z,
+        Duration::ZERO,
+    );
     run("zipfian, no tier", true, false, false, z, Duration::ZERO);
     println!("\nMicroseconds. >100us is how many of the sampled reads took longer");
     println!("than that, and top1% is the share of the whole sample's time that the");

@@ -426,3 +426,56 @@ fn a_doubling_after_a_cold_pass_does_not_read_reclaimed_space() {
         assert!(read(&mut s, &key(i)).is_some(), "cold key {i} is gone");
     }
 }
+
+/// A scan after a reopen finds the keys whose only copy is cold.
+///
+/// A reopen without a checkpoint rebuilds the scan plane from what it
+/// reads, and what it reads is two files. A key that has settled has its
+/// hot copy reclaimed, so if the cold pass of recovery did not tell the
+/// plane about it the database would come back with that key readable by
+/// name and invisible to every scan, which is the worst shape a wrong
+/// answer takes: nothing fails and the answer is short. See #548 and the
+/// note_key in recover's install_cold.
+#[test]
+fn a_scan_after_a_reopen_finds_the_keys_that_only_the_cold_tier_holds() {
+    for checkpoint in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scan.zu2");
+        let records = {
+            let db = Db::create(
+                &path,
+                Options {
+                    ordered: true,
+                    checkpoint_on_close: checkpoint,
+                    ..options()
+                },
+            )
+            .expect("create");
+            let records = lapped(&db, 3000);
+            assert!(db.cold_span() > 0, "nothing migrated");
+            db.sync().expect("sync");
+            records
+        };
+
+        let db = Db::open(
+            &path,
+            Options {
+                ordered: true,
+                ..options()
+            },
+        )
+        .expect("open");
+        let mut s = db.session();
+        let mut seen = Vec::new();
+        s.scan(&key(0), records as usize, |k, _| seen.push(k.to_vec()))
+            .expect("scan");
+        let want: Vec<Vec<u8>> = (0..records).map(key).collect();
+        assert_eq!(
+            seen.len(),
+            want.len(),
+            "a scan came back {} keys short with checkpoint {checkpoint}",
+            want.len() - seen.len().min(want.len())
+        );
+        assert_eq!(seen, want, "with checkpoint {checkpoint}");
+    }
+}

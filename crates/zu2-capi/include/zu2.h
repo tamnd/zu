@@ -185,6 +185,15 @@ typedef struct zu2_options {
    * measuring what promotion is worth, and zu2_promoted() says how much
    * of it happened. */
   uint32_t no_promote_reads;
+  /* Pages of log kept in memory, 4 MiB each. 0 never evicts, which is
+   * the default, so this field's zero means unbounded rather than
+   * nothing kept.
+   *
+   * This is what decides whether the process's resident set is bounded
+   * at all. zu2 reads records out of a mapping, so with no eviction
+   * every page a read touches stays resident and a workload that reads
+   * uniformly ends up holding the whole database. */
+  uint64_t memory_pages;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;

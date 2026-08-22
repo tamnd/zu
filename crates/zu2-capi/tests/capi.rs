@@ -1106,6 +1106,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
         ("uint32_t", "salvage"),
         ("uint32_t", "ordered"),
         ("uint32_t", "no_promote_reads"),
+        ("uint64_t", "memory_pages"),
     ];
     let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/zu2.h"))
         .expect("the header ships with the crate");
@@ -1182,6 +1183,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "salvage" => std::mem::offset_of!(Zu2Options, salvage),
             "ordered" => std::mem::offset_of!(Zu2Options, ordered),
             "no_promote_reads" => std::mem::offset_of!(Zu2Options, no_promote_reads),
+            "memory_pages" => std::mem::offset_of!(Zu2Options, memory_pages),
             other => panic!("{other} is in the header and this test does not know it"),
         };
         assert_eq!(
@@ -1189,4 +1191,124 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "{name} is at {got} in the struct and {want} in the header"
         );
     }
+}
+
+/// Opens with an explicit page bound, which is the only option that
+/// decides whether the process's resident set is bounded at all.
+fn open_bounded(name: &str, memory_pages: u64) -> (tempfile::TempDir, *mut Zu2Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.compact_below = u64::MAX;
+    options.memory_pages = memory_pages;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let mut err: *const std::ffi::c_char = ptr::null();
+    let mut err_len = 0usize;
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            &mut err,
+            &mut err_len,
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok, "open failed: {}", message(err));
+    (dir, db)
+}
+
+/// `memory_pages` is what a host asks for when it wants its memory
+/// bounded, and until now there was no way to ask.
+///
+/// The engine has had the eviction machinery and the page bound the
+/// whole time and neither reached C, so every host that went through
+/// this library got `usize::MAX` and no eviction. What that costs shows
+/// up the moment anybody measures it: on server3, workload C at 200000
+/// records, zu2 held 230 MiB of a 247 MiB database resident while
+/// sqlite served the same data out of 20 MiB (#636). Not a leak and not
+/// the index, just a mapping that nothing ever evicts from.
+///
+/// Two databases with the same rows, one bounded and one not, because a
+/// bound asserted on its own could pass on a database too small to have
+/// filled anything. The unbounded one is the control that proves there
+/// was something to evict.
+#[test]
+fn a_page_bound_reaches_the_engine_and_bounds_what_it_holds() {
+    // A page is 4 MiB, so this is about fifteen pages of records:
+    // enough that the bound has to evict most of them and enough that
+    // the unbounded control is visibly holding the lot.
+    const ROWS: u32 = 60_000;
+    // Not a free choice. The engine clamps the bound up to one more
+    // than the mutable window, which defaults to four pages, because a
+    // window wider than what is kept would evict a page still being
+    // written to. So five is the smallest bound that means anything
+    // through this interface, and asking for less silently gets five.
+    const BOUND: u64 = 6;
+    let value = [b'v'; 1000];
+
+    let (_dir_b, bounded) = open_bounded("bounded.zu2", BOUND);
+    let (_dir_u, unbounded) = open_bounded("unbounded.zu2", 0);
+    let sb = session_on(bounded);
+    let su = session_on(unbounded);
+    for i in 0..ROWS {
+        let k = format!("user{i:019}");
+        upsert(sb, k.as_bytes(), &value);
+        upsert(su, k.as_bytes(), &value);
+    }
+
+    // Eviction is not a background job. It runs when a thread opens a
+    // new page, and it can only drop a page whose bytes are already on
+    // the device, so a burst of appends under async durability outruns
+    // it and the bound is exceeded until the flusher catches up. That
+    // is worth stating in the test rather than hidden behind a sleep:
+    // `memory_pages` is a bound on the steady state and not an
+    // instantaneous one. Sync, then open one more page, and the loop in
+    // `opened_page` walks the head up to the bound in one pass.
+    assert_eq!(unsafe { zu2::zu2_sync(bounded) }, Zu2Status::Ok);
+    assert_eq!(unsafe { zu2::zu2_sync(unbounded) }, Zu2Status::Ok);
+    for i in ROWS..ROWS + 5_000 {
+        let k = format!("user{i:019}");
+        upsert(sb, k.as_bytes(), &value);
+        upsert(su, k.as_bytes(), &value);
+    }
+
+    let held_b = unsafe { zu2::zu2_resident_pages(bounded) };
+    let held_u = unsafe { zu2::zu2_resident_pages(unbounded) };
+    assert!(
+        held_u > BOUND + 4,
+        "the control holds {held_u} pages, which is not more than the bound of {BOUND}, \
+         so this test wrote too little to tell a bound from an empty database"
+    );
+    assert!(
+        // One over, for the page currently being appended to, which is
+        // above the head by definition and cannot be evicted.
+        held_b <= BOUND + 1,
+        "asked for {BOUND} pages and the engine is holding {held_b}"
+    );
+    assert!(
+        held_b < held_u,
+        "bounded holds {held_b} and unbounded holds {held_u}, so the option did nothing"
+    );
+
+    // And the rows are still there. An eviction that loses bytes is a
+    // worse outcome than one that does not happen, and the read path
+    // below the bound is the one that has to go back to the device, so
+    // this is the half of the test that matters.
+    for i in [0u32, 1, ROWS / 2, ROWS - 2, ROWS - 1, ROWS + 4_999] {
+        let k = format!("user{i:019}");
+        assert_eq!(
+            read(sb, k.as_bytes()).as_deref(),
+            Some(&value[..]),
+            "row {i} did not come back off the device after eviction"
+        );
+    }
+    close(bounded, &[sb]);
+    close(unbounded, &[su]);
 }

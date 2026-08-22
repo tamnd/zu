@@ -118,6 +118,20 @@ pub struct Zu2Options {
     /// what promotion is worth, and `zu2_promoted` is how much of it
     /// happened.
     pub no_promote_reads: u32,
+    /// Pages of log kept in memory, 4 MiB each. Zero never evicts,
+    /// which is the engine's default and is why the field's zero has to
+    /// mean unbounded rather than nothing kept.
+    ///
+    /// This is the one option that decides whether the process's
+    /// resident set is bounded at all. zu2 reads records out of a
+    /// mapping, so without eviction every page a read touches stays
+    /// resident and a workload that reads uniformly ends up holding the
+    /// whole database. Measured on server3 that is 230 MiB of a 247 MiB
+    /// database, against sqlite serving the same data out of 20 MiB
+    /// (#636). The engine has had the eviction machinery and a page
+    /// bound the whole time; it just never reached C, so no host could
+    /// ask for it.
+    pub memory_pages: u64,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -387,6 +401,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.no_promote_reads != 0 {
         options.promote_reads = false;
+    }
+    if given.memory_pages > 0 {
+        options.memory_pages = given.memory_pages as usize;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,

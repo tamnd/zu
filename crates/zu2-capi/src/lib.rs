@@ -1698,6 +1698,43 @@ pub unsafe extern "C" fn zu2_log_span(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// What the scan plane is holding, in bytes, or zero when the database
+/// has no scan plane.
+///
+/// Memory and not disk. The plane is rebuilt from the log rather than
+/// written to it, so this is a cost a host pays for as long as the
+/// database is open and never a cost on the device. It is the arena
+/// reserved rather than the bytes used, because reserved is what the
+/// process is holding.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_ordered_bytes(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.ordered_bytes().unwrap_or(0) as u64,
+        None => 0,
+    }
+}
+
+/// Keys the scan plane has ever been told about, or zero when the
+/// database has no scan plane.
+///
+/// Not the number that are live. A delete leaves the key here and
+/// writes a tombstone into the log, and a scan walks past it, so this
+/// is above the live count by however many keys have been deleted and
+/// not written again.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_ordered_keys(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.ordered_keys().unwrap_or(0) as u64,
+        None => 0,
+    }
+}
+
 /// Slots in use in the hash index.
 ///
 /// Slots and not keys. A full bucket displaces, and the displaced key

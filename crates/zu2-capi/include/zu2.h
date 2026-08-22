@@ -412,6 +412,17 @@ uint64_t zu2_index_foreign(const zu2_db *db);
  * because the table was crowded or because the keys collided. */
 uint64_t zu2_index_buckets(const zu2_db *db);
 
+/* What the scan plane is holding, in bytes, or zero when the db has no
+ * scan plane. Memory and not disk: the plane is rebuilt from the log
+ * rather than written to it. The arena reserved rather than the bytes
+ * used, because reserved is what the process is holding. */
+uint64_t zu2_ordered_bytes(const zu2_db *db);
+
+/* Keys the scan plane has ever been told about, or zero when the db has
+ * no scan plane. Not the number that are live: a delete leaves the key
+ * here and writes a tombstone into the log. */
+uint64_t zu2_ordered_keys(const zu2_db *db);
+
 /* Times the index has doubled since the db was opened. Zero means the
  * table was sized right or was never grown, and the load factor tells
  * those apart. */

@@ -2073,8 +2073,10 @@ impl Session {
                     }
                     let propful = batch.propful();
                     let created = batch.created_rows();
+                    let keys = batch.new_keys();
                     let (new, edges) = batch.staged();
                     let catalog = self.graph.catalog().clone();
+                    crate::insert::refuse_duplicate_keys(&mut self.graph, &catalog, &keys)?;
                     crate::insert::refuse_duplicate_pairs(
                         &mut self.graph,
                         &catalog,
@@ -2155,10 +2157,12 @@ impl Session {
                     }
                     let propful = batch.propful();
                     let created = batch.created_rows();
+                    let keys = batch.new_keys();
                     let (new, edges) = batch.staged();
                     let inserting = !new.is_empty() || !edges.is_empty();
                     if inserting {
                         let catalog = self.graph.catalog().clone();
+                        crate::insert::refuse_duplicate_keys(&mut self.graph, &catalog, &keys)?;
                         crate::insert::refuse_duplicate_pairs(
                             &mut self.graph,
                             &catalog,

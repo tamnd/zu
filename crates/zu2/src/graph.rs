@@ -749,33 +749,58 @@ impl Session<'_> {
         // record either, so the file could not be opened again: one
         // rejected call and everything in it was gone (#455).
         core.graph().holds(src, dst)?;
-        // Before the epoch is announced, so a thread waiting here is not
-        // a thread a flush is waiting for, and dropped before the commit
-        // so that the device is never waited on under it.
-        let order = core.graph().order_edges(src);
-        // Inside the epoch, and this is not optional. The flusher decides
-        // that a page is complete by publishing its target and waiting
-        // for every announced session to leave, so an append that
-        // announced nothing is an append the flusher does not know to
-        // wait for. It would write the record's bytes half laid down,
-        // the checksum would not hold, and the next recovery would stop
-        // there and lose every edge after it. The record plane got this
-        // right from the start because its write path announces; this
-        // one did not, and it showed up as a reopened graph that had
-        // dropped a run of its edges.
-        self.slot.protect();
-        let outcome = (|| -> Result<Address> {
-            // The record goes down first. An edge on the log that is not
-            // in memory is replayed on the next open; an edge in memory
-            // that is not on the log would be a lost write.
-            let end = self.append_untracked(KIND_EDGE, &encode_edge(add, src, dst))?;
-            let core = self.core_ref();
-            core.graph().apply(core.epochs(), add, src, dst)?;
-            Ok(end)
-        })();
-        self.slot.unprotect();
-        drop(order);
-        self.make_durable(outcome?)
+        loop {
+            // Before the epoch is announced, so a thread waiting here is
+            // not a thread a flush is waiting for, and dropped before
+            // the commit so that the device is never waited on under it.
+            let order = core.graph().order_edges(src);
+            // Inside the epoch, and this is not optional. The flusher decides
+            // that a page is complete by publishing its target and waiting
+            // for every announced session to leave, so an append that
+            // announced nothing is an append the flusher does not know to
+            // wait for. It would write the record's bytes half laid down,
+            // the checksum would not hold, and the next recovery would stop
+            // there and lose every edge after it. The record plane got this
+            // right from the start because its write path announces; this
+            // one did not, and it showed up as a reopened graph that had
+            // dropped a run of its edges.
+            self.slot.protect();
+            // Whether the record reached the log, because that is what
+            // says whether going round again would write it twice.
+            let mut appended = false;
+            let outcome = (|| -> Result<Address> {
+                // The record goes down first. An edge on the log that is
+                // not in memory is replayed on the next open; an edge in
+                // memory that is not on the log would be a lost write.
+                let end = self.append_untracked(KIND_EDGE, &encode_edge(add, src, dst))?;
+                appended = true;
+                let core = self.core_ref();
+                core.graph().apply(core.epochs(), add, src, dst)?;
+                Ok(end)
+            })();
+            self.slot.unprotect();
+            // Both of them before the retry, because a pass reclaims
+            // through quiescence and a writer parked in its epoch is
+            // what a pass cannot get past, and because a pass takes the
+            // maintenance lock and holding this one under it would put
+            // two locks in two orders.
+            drop(order);
+            match outcome {
+                // The log is over its span and this writer is part of
+                // what filled it, so it pays for a pass and tries the
+                // edge again rather than handing back a failure the
+                // caller can only answer by sleeping. Safe to restart
+                // from here because the append left nothing behind and
+                // the adjacency has not been touched. #587, and the same
+                // shape as #566 on the record path.
+                Err(Error::LogFull { span, max }) if !appended => {
+                    if !self.make_room()? {
+                        return Err(Error::LogFull { span, max });
+                    }
+                }
+                outcome => return self.make_durable(outcome?),
+            }
+        }
     }
 
     /// Runs `visit` on a node's neighbours without copying them.

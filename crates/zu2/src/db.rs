@@ -2365,7 +2365,7 @@ impl<'a> Session<'a> {
     /// rather than a writer that got ahead of the maintenance thread.
     ///
     /// The caller must be out of its epoch. See [`write`](Self::write).
-    fn make_room(&mut self) -> Result<bool> {
+    pub(crate) fn make_room(&mut self) -> Result<bool> {
         // Room and not merely progress. A pass over a region where
         // everything is still live copies all of it to the tail and
         // raises the floor by what it freed, which is a floor that moved

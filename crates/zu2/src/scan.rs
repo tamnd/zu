@@ -287,19 +287,26 @@ impl Ordered {
     ) -> bool {
         let mut at = self.head;
         for level in (0..MAX_HEIGHT).rev() {
-            loop {
-                // SAFETY: as on the accessors. The head has full height,
-                // so every level is a real link on the first step, and
-                // a node reached from level `level` has at least that
-                // many links because that is how it got linked there.
-                let next = unsafe { next_of(at, level) };
-                if next.is_null() || unsafe { key_of(next) } >= key {
-                    break;
-                }
+            // SAFETY: as on the accessors. The head has full height, so
+            // every level is a real link on the first step, and a node
+            // reached from level `level` has at least that many links
+            // because that is how it got linked there.
+            let mut next = unsafe { next_of(at, level) };
+            while !next.is_null() && unsafe { key_of(next) } < key {
                 at = next;
+                next = unsafe { next_of(at, level) };
             }
             before[level] = at;
-            after[level] = unsafe { next_of(at, level) };
+            // The link this loop looked at, and not a fresh load of the
+            // same link. They are the same value on a quiet list and a
+            // different one the moment somebody inserts into this gap,
+            // and taking the fresh one is a bug that ends in a list out
+            // of order: `after` would be a node whose key was never
+            // compared with this one, an insert would put its own node
+            // in front of it on a link that still matches, and a key
+            // smaller than the one before it is what the scan then walks
+            // over. #590.
+            after[level] = next;
         }
         !after[0].is_null() && unsafe { key_of(after[0]) } == key
     }
@@ -626,6 +633,39 @@ mod tests {
         assert_eq!(list.keys(), 4000);
         let want: Vec<Vec<u8>> = (0..4000).map(key).collect();
         assert_eq!(walked, want);
+    }
+
+    #[test]
+    fn threads_filling_each_other_s_gaps_keep_the_order() {
+        // The same key from eight threads is one race and a key that
+        // lands between two keys another thread is inserting is a
+        // different one, which is the one #590 was: the gap is filled
+        // between the comparison and the link, and an insert that took
+        // its successor from a second load of the same link put its own
+        // node in front of a key smaller than itself. Every insert here
+        // is in somebody else's gap, so the whole list is that case.
+        let list = std::sync::Arc::new(Ordered::new().unwrap());
+        let mut threads = Vec::new();
+        for t in 0..8usize {
+            let list = list.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..4000 {
+                    assert!(list.insert(&key(i * 8 + t)).unwrap(), "{i} {t}");
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let walked: Vec<Vec<u8>> = list.first().map(<[u8]>::to_vec).collect();
+        let want: Vec<Vec<u8>> = (0..32_000).map(key).collect();
+        assert!(
+            walked.windows(2).all(|w| w[0] < w[1]),
+            "the list came back out of order"
+        );
+        assert_eq!(walked.len(), 32_000);
+        assert_eq!(walked, want);
+        assert_eq!(list.keys(), 32_000);
     }
 
     #[test]

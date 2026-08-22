@@ -106,6 +106,11 @@ unsafe fn query(conn: *mut ZuConn, text: &str, err: &mut *mut ZuError) -> *mut Z
             err,
         )
     };
+    if status != ZuStatus::Ok && !err.is_null() {
+        let mut len = 0usize;
+        let m = unsafe { CStr::from_ptr(zu_error_message(*err, &mut len)) };
+        panic!("{text}: {}", m.to_string_lossy());
+    }
     assert_eq!(status, ZuStatus::Ok, "{text}");
     assert!(err.is_null(), "a success left an error behind: {text}");
     assert!(!result.is_null());
@@ -2079,7 +2084,7 @@ fn a_loader_builds_a_database_a_query_reads_back() {
         assert_eq!(
             col_temporal_in(
                 l,
-                "at",
+                "clock",
                 ZU_TEMPORAL_LOCAL_TIME,
                 &[45_296_123_456_789, 0, 86_399_000_000_000]
             ),
@@ -2169,7 +2174,7 @@ fn a_loader_builds_a_database_a_query_reads_back() {
         for (column, kind, want) in [
             ("born", ZU_TEMPORAL_DATE, [19782i64, 19783, -1]),
             (
-                "at",
+                "clock",
                 ZU_TEMPORAL_LOCAL_TIME,
                 [45_296_123_456_789, 0, 86_399_000_000_000],
             ),
@@ -2253,8 +2258,8 @@ fn a_loader_refuses_what_cannot_be_a_table() {
         assert_eq!(
             zu_loader_col_temporal(
                 l,
-                "at".as_ptr().cast::<c_char>(),
-                2,
+                "clock".as_ptr().cast::<c_char>(),
+                5,
                 ZU_TEMPORAL_ZONED_DATETIME,
                 nanos.as_ptr(),
                 2,
@@ -2271,7 +2276,7 @@ fn a_loader_refuses_what_cannot_be_a_table() {
         zu_error_free(err);
 
         // A tag that is not one of the seven.
-        assert_eq!(col_temporal_in(l, "at", 99, &nanos), ZuStatus::Misuse);
+        assert_eq!(col_temporal_in(l, "clock", 99, &nanos), ZuStatus::Misuse);
         // A date that is not a number of days any date has.
         assert_eq!(
             col_temporal_in(l, "d", ZU_TEMPORAL_DATE, &[i64::MAX, 0]),
@@ -4816,13 +4821,13 @@ fn every_layout_a_host_holds_is_read_as_what_it_means() {
                 "column {name}"
             );
         };
-        add_int("count", counts.as_ptr().cast(), 32, 0, 1, ZU_FRAME_PLAIN);
-        add_int("small", smalls.as_ptr().cast(), 16, 1, 1, ZU_FRAME_PLAIN);
-        add_int("day", days.as_ptr().cast(), 32, 1, 1, ZU_TEMPORAL_DATE);
+        add_int("tally", counts.as_ptr().cast(), 32, 0, 1, ZU_FRAME_PLAIN);
+        add_int("tiny", smalls.as_ptr().cast(), 16, 1, 1, ZU_FRAME_PLAIN);
+        add_int("stamp", days.as_ptr().cast(), 32, 1, 1, ZU_TEMPORAL_DATE);
         // Microseconds against the nanoseconds this engine counts in,
         // which is the one scale every Arrow timestamp needs.
         add_int(
-            "at",
+            "clock",
             micros.as_ptr().cast(),
             64,
             1,
@@ -4872,8 +4877,8 @@ fn every_layout_a_host_holds_is_read_as_what_it_means() {
 
         let result = query(
             conn,
-            "MATCH (r:wide) RETURN r.count AS count, r.small AS small, r.single AS single, \
-             r.flag AS flag, r.day AS day, r.at AS at, r.word AS word ORDER BY r.small",
+            "MATCH (r:wide) RETURN r.tally AS tally, r.tiny AS tiny, r.single AS single, \
+             r.flag AS flag, r.stamp AS stamp, r.clock AS clock, r.word AS word ORDER BY r.tiny",
             &mut err,
         );
         assert_eq!(zu_result_rows(result), 2);

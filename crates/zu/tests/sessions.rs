@@ -182,10 +182,10 @@ fn a_graph_parameter_is_a_reference_a_use_can_name() {
 fn setting_the_graph_moves_the_session_and_setting_a_parameter_does_not() {
     let (_dir, mut session) = opened("working.zu1");
     let home = session.working_graph();
-    run(&mut session, "CREATE PROPERTY GRAPH second");
-    run(&mut session, "SESSION SET PROPERTY GRAPH $g = second");
+    run(&mut session, "CREATE PROPERTY GRAPH later");
+    run(&mut session, "SESSION SET PROPERTY GRAPH $g = later");
     assert_eq!(session.working_graph(), home);
-    run(&mut session, "SESSION SET PROPERTY GRAPH second");
+    run(&mut session, "SESSION SET PROPERTY GRAPH later");
     assert_ne!(session.working_graph(), home);
     // The second graph holds none of the first graph's tables, so the
     // statement that counted four people now counts none: it is the

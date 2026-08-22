@@ -243,6 +243,41 @@ pub fn is_normalized(s: &str, form: NormalForm) -> bool {
     normalize(s, form) == s
 }
 
+/// Whether a character may begin a regular identifier (ISO 21.3).
+///
+/// The standard writes the set as Unicode general category classes and
+/// the underscore, and that is what the table holds, so this is a
+/// lookup and not a judgement. ASCII is answered without touching the
+/// table, because nearly every identifier anybody writes is ASCII and
+/// the table is there for the ones that are not.
+pub fn is_ident_start(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic() || c == '_';
+    }
+    in_ranges(generated::IDENT_START, c)
+}
+
+/// Whether a character may continue a regular identifier (ISO 21.3):
+/// every start, and the marks, digits, connectors and format
+/// characters that go with them.
+pub fn is_ident_extend(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    in_ranges(generated::IDENT_EXTEND, c)
+}
+
+/// Whether a character falls in one of a sorted list of inclusive
+/// ranges. The ranges do not touch or overlap, the generator having
+/// merged the ones that did, so the search is over the starts alone.
+fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
+    match ranges.binary_search_by(|(from, _)| from.cmp(&c)) {
+        Ok(_) => true,
+        Err(0) => false,
+        Err(at) => ranges[at - 1].1 >= c,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

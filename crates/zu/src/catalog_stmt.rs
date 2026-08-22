@@ -494,22 +494,22 @@ mod tests {
         // GG25: two edge types keyed on one label, and three endpoint
         // patterns naming two node types between them.
         let catalog = applied(&["CREATE PROPERTY GRAPH TYPE gg25 {
-               (:Person)-[:KNOWS => :Close]->(:Person),
+               (:Person)-[:KNOWS => :Nearby]->(:Person),
                (:Person)-[:KNOWS => :Distant]->(:Company)
              }"]);
         let ty = catalog.graph_type("gg25").expect("gg25");
         assert_eq!(
             names(ty),
-            ["Person", "KNOWS&Close", "Company", "KNOWS&Distant"]
+            ["Person", "KNOWS&Nearby", "Company", "KNOWS&Distant"]
         );
-        let knows = ty.element("KNOWS&Close").expect("the first edge type");
+        let knows = ty.element("KNOWS&Nearby").expect("the first edge type");
         assert_eq!(knows.kind, ElementKind::Edge);
         assert_eq!(knows.from.as_deref(), Some("Person"));
         assert_eq!(knows.to.as_deref(), Some("Person"));
         assert!(!knows.undirected);
         // GG21: the key is what was written before the arrow, and the
         // label after it is one the edge carries and is not keyed on.
-        let close = catalog.label_id("Close").expect("Close");
+        let close = catalog.label_id("Nearby").expect("Nearby");
         assert_eq!(knows.key_labels.ids().len(), 1);
         assert!(knows.labels.contains(&close));
         assert_eq!(

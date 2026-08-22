@@ -967,9 +967,9 @@ cases:
 
   - name: empty-brackets-read-the-clock
     doc: The brackets of a constructor may stand empty, which reads the clock, so DATE() is CURRENT_DATE and ZONED_DATETIME() is CURRENT_TIMESTAMP. Both are cut from the one instant the statement is running at, so they agree whatever time the test runs at.
-    query: RETURN DATE() = CURRENT_DATE AND ZONED_DATETIME() = CURRENT_TIMESTAMP AND LOCAL_DATETIME() = LOCAL_TIMESTAMP AS same
+    query: RETURN DATE() = CURRENT_DATE AND ZONED_DATETIME() = CURRENT_TIMESTAMP AND LOCAL_DATETIME() = LOCAL_TIMESTAMP AS alike
     columns:
-      - same
+      - alike
     rows:
       - values:
           - type: BOOL

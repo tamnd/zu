@@ -12,20 +12,40 @@
 //! a null casts to a null; only a `NOT NULL` target turns a null into
 //! 22004, which is what makes `CAST` usable on optional properties.
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::temporal::{self, NANOS_PER_DAY, NANOS_PER_MINUTE};
 use zu_common::{FloatBits, IntBits, LogicalType, Result, Temporal, ZuError};
 
 use crate::exec::Value;
 
-/// Casts `v` to `ty`, or names the condition that stops it.
+/// Casts `v` to `ty`, dropping any warning the cast raised.
+///
+/// This is the form for a caller with nowhere to put a warning, which
+/// is a probe asking whether a value belongs to a type and a test
+/// asserting what one cast to. A statement uses [`cast_noting`],
+/// because a cast that succeeded and has something to say is a cast
+/// whose result is right and whose caller is owed the sentence.
+pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
+    cast_noting(v, ty, &mut Vec::new())
+}
+
+/// Casts `v` to `ty`, or names the condition that stops it, leaving any
+/// warning it raised in `notices`.
 ///
 /// Every pair of a value kind and a target type is one cell of the cast
 /// matrix and every cell has an answer: the value, or a condition that
 /// says which pair it was. A cell nobody wrote a rule for is refused by
 /// [`forbidden`] with both type names in the diagnostic record, so a
 /// hole in the matrix reads as a refusal and never as a wrong value.
-pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
+///
+/// One cell answers both at once. A character string cast to a shorter
+/// type loses characters, and whether that is an exception depends on
+/// what was lost: see [`to_str`].
+pub fn cast_noting(
+    v: Value,
+    ty: &LogicalType,
+    notices: &mut Vec<DiagnosticRecord>,
+) -> Result<Value> {
     if matches!(v, Value::Null) {
         if ty.is_nullable() {
             return Ok(Value::Null);
@@ -44,8 +64,8 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         } => to_int(v, *signed, *bits, *precision),
         LogicalType::Float { bits, .. } => to_float(v, *bits),
         LogicalType::Decimal { precision, scale } => to_decimal(v, *precision, *scale),
-        LogicalType::Str { min, max, .. } => to_str(v, *min, *max),
-        LogicalType::List { elem, max } => to_list(v, elem, *max),
+        LogicalType::Str { min, max, .. } => to_str(v, *min, *max, notices),
+        LogicalType::List { elem, max } => to_list(v, elem, *max, notices),
         LogicalType::Record(rt) => to_record(v, rt),
         target @ (LogicalType::Date
         | LogicalType::LocalTime
@@ -375,7 +395,12 @@ fn time_of(nanos: i128) -> i64 {
 /// message. Only a list casts to a list; nothing here wraps a single
 /// value into a list of one, because that would make a typo into a
 /// silent success.
-fn to_list(v: Value, elem: &LogicalType, max: Option<u32>) -> Result<Value> {
+fn to_list(
+    v: Value,
+    elem: &LogicalType,
+    max: Option<u32>,
+    notices: &mut Vec<DiagnosticRecord>,
+) -> Result<Value> {
     let Value::List(items) = v else {
         return Err(forbidden_named(&v, &format!("LIST<{elem}>")));
     };
@@ -389,7 +414,7 @@ fn to_list(v: Value, elem: &LogicalType, max: Option<u32>) -> Result<Value> {
     }
     let mut out = Vec::with_capacity(items.len());
     for (at, item) in items.into_iter().enumerate() {
-        let cast = cast(item, elem)
+        let cast = cast_noting(item, elem, notices)
             .map_err(|e| ZuError::gql(codes::C22G0C, format!("element {at} of the list: {e}")))?;
         out.push(cast);
     }
@@ -656,9 +681,23 @@ fn unscaled(text: &str, scale: u16) -> Option<i128> {
 /// The minimum length and the fixed length are one rule and not two: a
 /// value shorter than the minimum is padded with spaces, and a fixed
 /// length type is one whose minimum equals its maximum, so `CHAR(3)`
-/// pads without needing a case of its own. Past the maximum is 22001,
-/// because there is nowhere for the characters to go.
-fn to_str(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
+/// pads without needing a case of its own.
+///
+/// Past the maximum splits in two, and the split is ISO's rather than
+/// ours. Losing a character that is not a space loses information, so
+/// that is `22001` and the cast does not happen. Losing nothing but
+/// trailing spaces loses no information, since a character string that
+/// differs from another only in trailing spaces compares equal to it,
+/// so the cast happens and says so with `01004`, a warning on a result
+/// that is correct. An engine that refused both would be refusing a
+/// cast that ISO defines, and one that accepted both would be dropping
+/// characters and saying nothing.
+fn to_str(
+    v: Value,
+    min: Option<u32>,
+    max: Option<u32>,
+    notices: &mut Vec<DiagnosticRecord>,
+) -> Result<Value> {
     let mut s = match &v {
         Value::Str(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
@@ -674,10 +713,29 @@ fn to_str(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
     if let Some(max) = max
         && len > max as usize
     {
-        return Err(ZuError::gql(
-            codes::C22001,
-            format!("'{s}' is {len} characters and the target holds {max}"),
+        let max = max as usize;
+        let kept: usize = s.char_indices().nth(max).map_or(s.len(), |(at, _)| at);
+        if !s[kept..].chars().all(|c| c == ' ') {
+            return Err(ZuError::gql(
+                codes::C22001,
+                format!("'{s}' is {len} characters and the target holds {max}"),
+            ));
+        }
+        notices.push(DiagnosticRecord::new(
+            codes::C01004,
+            format!(
+                "'{s}' is {len} characters and the target holds {max}, and the {} cut off \
+                 {} a space",
+                if len - max == 1 {
+                    "character".to_string()
+                } else {
+                    format!("{} characters", len - max)
+                },
+                if len - max == 1 { "is" } else { "are each" }
+            ),
         ));
+        s.truncate(kept);
+        return Ok(Value::Str(s));
     }
     if let Some(min) = min
         && len < min as usize

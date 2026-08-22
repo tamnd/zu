@@ -158,7 +158,7 @@ fn half_a_block_is_none_of_it() {
             "MATCH (p:person) \
              WHERE p.id = 2 \
              OPTIONAL { MATCH (p)-[:knows]->(q:person) MATCH (q)-[:knows]->(r:person) } \
-             RETURN q.id AS first, r.id AS second",
+             RETURN q.id AS first, r.id AS later",
         )
         .expect("query");
     assert_eq!(rows.rows.len(), 1);
@@ -167,5 +167,5 @@ fn half_a_block_is_none_of_it() {
         row.get_by_name::<i64>("first").is_err(),
         "the hop is undone"
     );
-    assert!(row.get_by_name::<i64>("second").is_err());
+    assert!(row.get_by_name::<i64>("later").is_err());
 }

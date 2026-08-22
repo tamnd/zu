@@ -217,7 +217,7 @@ impl<'a> Changes<'a> {
             match &item.into {
                 BoundSetInto::Labels { .. } => unreachable!("settled above"),
                 BoundSetInto::Property(key) => {
-                    let col = column_of(columns, key)?;
+                    let col = column_of(columns, key, element)?;
                     self.updates.push(Update::Cell {
                         table,
                         at: element,
@@ -232,7 +232,7 @@ impl<'a> Changes<'a> {
                     // to change about it. A column the record leaves out
                     // therefore takes a null, which is the same value
                     // REMOVE writes.
-                    let given = named(&values[at], columns)?;
+                    let given = named(&values[at], columns, element)?;
                     for (ci, col) in columns.iter().enumerate() {
                         let cell = match given.get(&ci) {
                             Some(value) => written(col, value, &col.name)?,
@@ -442,15 +442,42 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, updates: &[Update]) -> Result<u64> {
 }
 
 /// Which column of a table a key names.
-fn column_of(columns: &[PropColumn], key: &str) -> Result<usize> {
+///
+/// A key the table has no column for is over the element's property
+/// maximum, which is ISO 24.5.2 item IL002 and is 22G0S for a node and
+/// 22G0T for an edge. The maximum here is not a number the engine picked
+/// but the width of the table the element is in: a table's columns are
+/// settled when it is created, so the property set an element can hold
+/// is the one its table declared and a key outside it is one property
+/// too many. `docs/07-query-engine.md` records the limit.
+fn column_of(columns: &[PropColumn], key: &str, at: At) -> Result<usize> {
     columns
         .iter()
         .position(|col| col.name == key)
         .ok_or_else(|| {
-            ZuError::InvalidArgument(format!(
-                "'{key}' is not a column of the table the element it is being set on is in"
-            ))
+            let kind = match at {
+                At::Row(_) => ("node", codes::C22G0S),
+                At::Edge(..) => ("edge", codes::C22G0T),
+            };
+            ZuError::gql(
+                kind.1,
+                format!(
+                    "a {} holds the properties its table declares, and '{key}' is not one of them: {}",
+                    kind.0,
+                    holds(columns)
+                ),
+            )
         })
+}
+
+/// The property names a table declares, for an error that has to tell a
+/// reader what they could have written instead.
+fn holds(columns: &[PropColumn]) -> String {
+    if columns.is_empty() {
+        return "the table declares none".to_string();
+    }
+    let names: Vec<&str> = columns.iter().map(|col| col.name.as_str()).collect();
+    format!("the table declares {}", names.join(", "))
 }
 
 /// The columns a whole record assignment gave a value for, by column
@@ -460,7 +487,11 @@ fn column_of(columns: &[PropColumn], key: &str) -> Result<usize> {
 /// rather than passed over, for the reason `SET p.nope = 1` is: a table
 /// holds the columns it holds, and a caller who wrote a key it does not
 /// have has either mistyped it or is thinking of another table.
-fn named<'a>(value: &'a Value, columns: &[PropColumn]) -> Result<BTreeMap<usize, &'a Value>> {
+fn named<'a>(
+    value: &'a Value,
+    columns: &[PropColumn],
+    at: At,
+) -> Result<BTreeMap<usize, &'a Value>> {
     let Value::Record(fields) = value else {
         // Unreachable through the parser, whose grammar for this form is
         // a record written out, so there is nothing else it can be.
@@ -471,7 +502,7 @@ fn named<'a>(value: &'a Value, columns: &[PropColumn]) -> Result<BTreeMap<usize,
     };
     let mut given = BTreeMap::new();
     for (name, field) in fields {
-        given.insert(column_of(columns, name)?, field);
+        given.insert(column_of(columns, name, at)?, field);
     }
     Ok(given)
 }

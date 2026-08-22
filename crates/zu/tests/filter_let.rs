@@ -261,18 +261,25 @@ fn an_item_may_be_named_after_what_was_written_inside_it() {
     assert_eq!(row.get_by_name::<i64>("n").expect("n"), 42);
 }
 
-/// `LET` is a word here and a name everywhere else, the way every
-/// context sensitive word in this grammar is: what makes it the
-/// expression is the definition behind it.
+/// The word after `LET` is read as a name, whatever the word is. `LET`
+/// itself is a reserved word (ISO 21.3), so the name that shows this is
+/// one the standard leaves alone, and writing the reserved word there
+/// is refused rather than read.
 #[test]
 fn let_is_still_a_name() {
     let mut fx = Fixture::open("let-expr-name.zu1");
     let rows = fx
         .conn
-        .query("LET let = 4 RETURN let + 1 AS id")
+        .query("LET tally = 4 RETURN tally + 1 AS id")
         .expect("query");
     let row = rows.iter().next().expect("one row");
     assert_eq!(row.get_by_name::<i64>("id").expect("id"), 5);
+
+    let e = fx
+        .conn
+        .query("LET let = 4 RETURN let + 1 AS id")
+        .expect_err("a reserved word is not a name");
+    assert!(format!("{e}").contains("reserved word"), "{e}");
 }
 
 /// The word that closes the definitions is the word a membership test

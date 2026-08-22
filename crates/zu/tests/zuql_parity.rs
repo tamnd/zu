@@ -106,7 +106,7 @@ fn both_engines_answer_the_corpus_identically() {
             &[("src", Value::Int(42))],
         ),
         (
-            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks",
             &[],
         ),
         // The cyclic close runs the galloping intersection by default
@@ -159,7 +159,7 @@ fn both_engines_answer_the_corpus_identically() {
         ),
         (
             "MATCH ALL SHORTEST (a:person {id: $src})-[r:knows*]->(b) \
-             RETURN count(b) AS paths, min(size(r)) AS nearest",
+             RETURN count(b) AS walks, min(size(r)) AS nearest",
             &[("src", Value::Int(3))],
         ),
         (

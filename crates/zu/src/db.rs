@@ -880,7 +880,7 @@ mod tests {
         let db = Database::open_with(&path, Config::new().read_only(true)).expect("open");
         let mut conn = db.connect().expect("connect");
         let err = conn
-            .query("CREATE PROPERTY GRAPH second ANY")
+            .query("CREATE PROPERTY GRAPH later ANY")
             .expect_err("refused");
         assert!(err.to_string().contains("read-only"), "{err}");
         let err = conn
@@ -911,13 +911,13 @@ mod tests {
         let (_dir, path) = scratch("write.zu1");
         let db = Database::open(&path).expect("open");
         let mut conn = db.connect().expect("connect");
-        conn.execute("CREATE PROPERTY GRAPH second ANY")
+        conn.execute("CREATE PROPERTY GRAPH later ANY")
             .expect("create");
         // The new graph is empty, so a statement against it gets past
         // the name and finds nothing, which is what says the catalog
         // took the write: an unknown graph is the error, and a graph
         // with nothing in it is an empty answer.
-        let seen = conn.query("USE second MATCH (p) RETURN p").expect("query");
+        let seen = conn.query("USE later MATCH (p) RETURN p").expect("query");
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
@@ -940,12 +940,12 @@ mod tests {
         let mut reader = db.connect().expect("connect");
 
         let missing = reader
-            .query("USE second MATCH (p) RETURN p")
+            .query("USE later MATCH (p) RETURN p")
             .expect_err("no such graph yet");
         assert!(missing.to_string().contains("is no graph"), "{missing}");
 
         writer
-            .execute("CREATE PROPERTY GRAPH second ANY")
+            .execute("CREATE PROPERTY GRAPH later ANY")
             .expect("create");
 
         // The new graph is empty, so a statement against it gets past
@@ -953,7 +953,7 @@ mod tests {
         // reached this connection: a moment ago the same text could not
         // resolve the name at all.
         let seen = reader
-            .query("USE second MATCH (p) RETURN p")
+            .query("USE later MATCH (p) RETURN p")
             .expect("the graph the other connection made");
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }

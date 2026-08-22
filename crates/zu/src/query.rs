@@ -1830,7 +1830,7 @@ mod tests {
             .sum();
         let r = run(
             "MATCH (a:person {id: $src})-[:follows]->(b)-[:follows]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &mut db,
             &[("src", Value::Int(i64::from(src)))],
         )
@@ -1921,7 +1921,7 @@ mod tests {
         let shortest_paths: i64 = reached.iter().map(|&v| ways[v as usize]).sum();
         let r = run(
             "MATCH ALL SHORTEST (a:person {id: $src})-[r:follows*]->(b) \
-             RETURN count(b) AS paths",
+             RETURN count(b) AS walks",
             &mut db,
             &[("src", Value::Int(i64::from(src)))],
         )
@@ -2555,7 +2555,7 @@ mod tests {
         // The unfiltered 2-hop count runs on degrees, not lists, all
         // the way through real storage.
         let text = explain_analyze(
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             &mut db,
             &[],
         )
@@ -2721,7 +2721,7 @@ mod tests {
 
         let mut db = Zu1File::open(&path).expect("open");
         let text = explain_analyze(
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             &mut db,
             &[],
         )
@@ -3378,7 +3378,7 @@ mod tests {
 
         let mut db = Zu1File::open(&path).expect("open");
         let sources = [
-            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS walks",
             "MATCH (a:person)-[:follows]->(b) RETURN a.id AS a, b.id AS b",
             "MATCH (a:person)-[:follows]->(b) \
              RETURN a.id AS a, count(*) AS deg ORDER BY deg DESC, a LIMIT 10",

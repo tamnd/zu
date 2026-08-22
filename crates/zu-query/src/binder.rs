@@ -72,6 +72,20 @@ fn guaranteed(schema: &Schema, tables: &[u32]) -> u64 {
 /// name in the statement does not resolve, or resolves to something
 /// already taken. The statement parses, so this is not 42001; it just
 /// mentions something that is not there.
+/// How many labels a label expression names, which is what the
+/// maximum in ISO 24.5.2 IL001 is counted against. A negation or a
+/// wildcard names none of its own and is counted through, because what
+/// the number is for is telling a reader how far over the limit they
+/// went rather than being arithmetic anything relies on.
+fn label_count(expr: &LabelExpr) -> usize {
+    match expr {
+        LabelExpr::Label(_) => 1,
+        LabelExpr::Wildcard => 1,
+        LabelExpr::Not(inner) => label_count(inner),
+        LabelExpr::And(l, r) | LabelExpr::Or(l, r) => label_count(l) + label_count(r),
+    }
+}
+
 fn bad_reference(detail: String) -> ZuError {
     ZuError::gql(codes::C42002, detail)
 }
@@ -5546,9 +5560,19 @@ impl Binder<'_> {
         }
         let [name] = pat.types.as_slice() else {
             return Err(match pat.types.is_empty() {
-                true => invalid(format!(
-                    "{verb} needs an edge type saying which table the edge goes in, and this one names none"
-                )),
+                // 22G0Q. An edge lives in a rel table and the table's
+                // own name is the edge's one label, so the smallest
+                // edge label set this engine holds has one label in it
+                // and an edge pattern that names none is under the
+                // minimum. ISO 24.5.2 leaves the number to the
+                // implementation; this one is 1, and it is 1 at both
+                // ends (see 22G0R below).
+                true => ZuError::gql(
+                    codes::C22G0Q,
+                    format!(
+                        "{verb} needs an edge type saying which table the edge goes in, and this one names none"
+                    ),
+                ),
                 false => invalid(format!(
                     "an edge goes in one table, and '{}' names {}",
                     pat.types.join("|"),
@@ -5668,15 +5692,33 @@ impl Binder<'_> {
     /// their clauses is the one that cannot run.
     fn insert_table(&self, pat: &NodePattern, verb: &str) -> Result<u32> {
         let Some(label) = &pat.label else {
-            return Err(invalid(format!(
-                "{verb} needs a label saying which table the element goes in, and '({})' names none",
-                pat.var.as_deref().unwrap_or("")
-            )));
+            // 22G0N. A row lands in a node table and the table's own
+            // name is the row's key label, so an element this engine
+            // holds carries at least one label and a pattern that
+            // names none is under the minimum. ISO 24.5.2 leaves the
+            // number to the implementation; this one is 1.
+            return Err(ZuError::gql(
+                codes::C22G0N,
+                format!(
+                    "{verb} needs a label saying which table the element goes in, and '({})' names none",
+                    pat.var.as_deref().unwrap_or("")
+                ),
+            ));
         };
         let LabelExpr::Label(name) = label else {
-            return Err(not_yet(&format!(
-                "{verb} of an element whose labels are written as anything but one name,"
-            )));
+            // 22G0P, the other end of the same item. The key label set
+            // of an element this engine creates is the one table it
+            // goes in, so the maximum an INSERT can write is 1 and a
+            // label expression naming more is over it. Secondary
+            // labels are a thing a row carries rather than somewhere
+            // it lives, and SET is where one is added.
+            return Err(ZuError::gql(
+                codes::C22G0P,
+                format!(
+                    "{verb} writes an element into the one table its label names, so it takes                      one label and this pattern writes {}; add the rest with SET",
+                    label_count(label)
+                ),
+            ));
         };
         // A row lands in a table, and the label a table gives every row
         // it holds is its own name, so that is the one that says where
@@ -6216,6 +6258,22 @@ impl Binder<'_> {
             }
             Expr::Property { base, key } => {
                 let (bound, ty) = self.bind_expr(base, ctx)?;
+                // GQ17 again, by the other road. A quantified edge
+                // variable is held as a list of elements in one slot
+                // rather than as a group over several, so the read that
+                // the arm above answers through slots this one answers
+                // through the value, and both answer a list.
+                if let Type::List(element) = &ty
+                    && matches!(**element, Type::Node | Type::Rel | Type::Any)
+                {
+                    return Ok((
+                        BoundExpr::Property {
+                            base: Box::new(bound),
+                            key: key.clone(),
+                        },
+                        Type::List(Box::new(Type::Any)),
+                    ));
+                }
                 if !matches!(ty, Type::Node | Type::Rel | Type::Record | Type::Any) {
                     return Err(invalid(format!(
                         "property access needs a node, rel, or record, got {ty} from {}",
@@ -8516,14 +8574,48 @@ mod tests {
 
     /// An element goes in one table, and the pattern has to say which:
     /// a label expression that names none, or names more than one, is
-    /// not a table.
+    /// not a table. Both are the label-count limit of ISO 24.5.2
+    /// IL001, which is one at each end here, so both carry the code
+    /// for the end they went over.
     #[test]
     fn an_insert_wants_one_plain_label_naming_a_table() {
         assert!(bind_err("INSERT (x)").contains("label"));
+        assert_eq!(
+            bind(&parse("INSERT (x)").expect("parse"), &schema())
+                .expect_err("no label")
+                .gqlstatus(),
+            Some(codes::C22G0N)
+        );
         let e = bind_err("INSERT (x:Person|Place)");
-        assert!(e.contains("one name"), "got: {e}");
+        assert!(e.contains("this pattern writes 2"), "got: {e}");
+        assert_eq!(
+            bind(&parse("INSERT (x:Person&Place)").expect("parse"), &schema())
+                .expect_err("two labels")
+                .gqlstatus(),
+            Some(codes::C22G0P)
+        );
         let e = bind_err("INSERT (x:Company)");
         assert!(e.contains("Company"), "got: {e}");
+    }
+
+    /// An edge label set holds one label here, so a step that names
+    /// none is under the minimum and a conjunction is over the
+    /// maximum. The second is caught while the statement is read, so
+    /// it carries the class 42 twin of the class 22 code.
+    #[test]
+    fn an_edge_label_set_holds_exactly_one_label() {
+        assert_eq!(
+            bind(
+                &parse("MATCH (a:Person), (b:Person) INSERT (a)-[]->(b)").expect("parse"),
+                &schema()
+            )
+            .expect_err("no type")
+            .gqlstatus(),
+            Some(codes::C22G0Q)
+        );
+        let e = parse("MATCH (a:Person)-[:KNOWS&LIKES]->(b:Person) RETURN a").expect_err("two");
+        assert_eq!(e.gqlstatus(), Some(codes::C42007));
+        assert!(e.to_string().contains("this step names 2"), "got: {e}");
     }
 
     #[test]

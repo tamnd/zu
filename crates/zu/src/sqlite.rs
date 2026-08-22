@@ -314,7 +314,7 @@ mod tests {
         );
 
         let r = run(
-            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks",
             &store,
             &[],
         )

@@ -215,17 +215,28 @@ fn a_stored_list_is_the_same_value_a_written_one_is() {
     assert_eq!(one(&mut db, source), Value::Bool(false));
 }
 
-/// A type name is a name until a type is what is being asked for, so a
-/// query may still call a variable `list` and a list a `list`.
+/// A type name is read as a type where a type is what is being asked
+/// for, and nowhere else, so an ordinary name in the same slot binds
+/// and reads the way any name does. `LIST` and `ARRAY` are themselves
+/// reserved words (ISO 21.3) and so are not among the names a query may
+/// pick, which is the other half of the same rule.
 #[test]
-fn list_is_still_a_name_where_a_name_is_what_is_wanted() {
+fn a_type_name_is_read_as_a_type_only_where_a_type_belongs() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    let source = "UNWIND [1, 2] AS list RETURN sum(list) AS v";
+    let source = "UNWIND [1, 2] AS items RETURN sum(items) AS v";
     assert_eq!(one(&mut db, source), Value::Int(3));
-    let source = "UNWIND [[1, 2], [3]] AS array RETURN CARDINALITY(array) AS v ORDER BY v DESC \
+    let source = "UNWIND [[1, 2], [3]] AS rows RETURN CARDINALITY(rows) AS v ORDER BY v DESC \
                   LIMIT 1";
     assert_eq!(one(&mut db, source), Value::Int(2));
+
+    for source in [
+        "UNWIND [1, 2] AS list RETURN sum(list) AS v",
+        "UNWIND [1, 2] AS array RETURN sum(array) AS v",
+    ] {
+        let err = run(source, &mut db, &[]).expect_err(source);
+        assert!(err.to_string().contains("reserved word"), "{source}: {err}");
+    }
 }
 
 /// GF10 and GF12. `size(collect(n))` is two things that run at two

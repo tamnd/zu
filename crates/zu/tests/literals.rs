@@ -326,10 +326,10 @@ fn a_duration_may_be_written_the_way_sql_writes_one() {
     );
     assert_eq!(code(&mut db, "RETURN INTERVAL 'P1D' AS v"), "42001");
 
-    // And INTERVAL is a name again wherever a literal does not follow
-    // it, which is what keeps a subtraction a subtraction.
+    // And INTERVAL is a reserved word (ISO 21.3), so no query binds it
+    // and the subtraction that would have read it never arises.
     assert_eq!(
-        one(&mut db, "LET interval = 3 RETURN interval - 1 AS v"),
-        Value::Int(2)
+        code(&mut db, "LET interval = 3 RETURN interval - 1 AS v"),
+        "42001"
     );
 }

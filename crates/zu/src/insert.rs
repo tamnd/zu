@@ -516,7 +516,7 @@ fn row(
             id: node.table,
         });
     }
-    fill("element", &node.props, columns, values)
+    fill("node", codes::C22G0S, &node.props, columns, values)
 }
 
 /// One edge: every column its table stores, in column order, filled
@@ -541,16 +541,22 @@ fn edge_row(
             id: rel.table,
         });
     }
-    fill("edge", &rel.props, columns, values)
+    fill("edge", codes::C22G0T, &rel.props, columns, values)
 }
 
 /// The cells of one new row of one table: every column of it, in column
 /// order, filled from the properties the pattern wrote.
 ///
 /// `noun` is what is being written, which is all that separates the
-/// message an element gets from the one an edge gets.
+/// message an element gets from the one an edge gets, and `over` is the
+/// condition raised when the pattern carries a property the table has no
+/// column for: 22G0S for a node and 22G0T for an edge, the two halves of
+/// ISO 24.5.2 item IL002. A table's columns are settled when it is
+/// created, so the property set an element can hold is the one its table
+/// declared and a key outside it is one property too many.
 fn fill(
     noun: &str,
+    over: zu_common::gqlstatus::GqlStatus,
     props: &[(String, BoundExpr)],
     columns: &[PropColumn],
     values: &[Value],
@@ -570,9 +576,14 @@ fn fill(
     }
     for (key, _) in props {
         if !columns.iter().any(|col| col.name == *key) {
-            return Err(ZuError::InvalidArgument(format!(
-                "the {noun} carries '{key}', which is not a column of the table it is created in"
-            )));
+            let names: Vec<&str> = columns.iter().map(|col| col.name.as_str()).collect();
+            return Err(ZuError::gql(
+                over,
+                format!(
+                    "a {noun} holds the properties its table declares, and '{key}' is not one of them: the table declares {}",
+                    names.join(", ")
+                ),
+            ));
         }
     }
     Ok(cells)
@@ -771,7 +782,7 @@ mod tests {
         let out = session
             .run(
                 "INSERT (x:person {age: 30, name: 'zoe'}), (y:person {age: 40, name: 'raj'}) \
-                 RETURN x.name AS first, y.name AS second",
+                 RETURN x.name AS first, y.name AS later",
                 &[],
             )
             .expect("insert");
@@ -922,7 +933,7 @@ mod tests {
         let out = session
             .run(
                 "INSERT (x:person {age: 30, name: 'zoe'})-[k:knows]->(y:person {age: 40, name: 'raj'}) \
-                 RETURN x.name AS from, y.name AS to",
+                 RETURN x.name AS src, y.name AS to",
                 &[],
             )
             .expect("insert an edge");
@@ -1094,7 +1105,7 @@ mod tests {
         // The fixture has ada knows kay, and now kay knows ada too.
         let out = session
             .run(
-                "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS from, b.name AS to ORDER BY from",
+                "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS src, b.name AS to ORDER BY src",
                 &[],
             )
             .expect("walk");
@@ -1111,7 +1122,7 @@ mod tests {
 
         let out = session
             .run(
-                "INSERT (a:person {age: 1, name: 'one'}) INSERT (a)-[:knows]->(b:person {age: 2, name: 'two'}) RETURN a.name AS first, b.name AS second",
+                "INSERT (a:person {age: 1, name: 'one'}) INSERT (a)-[:knows]->(b:person {age: 2, name: 'two'}) RETURN a.name AS first, b.name AS later",
                 &[],
             )
             .expect("insert");
@@ -1212,7 +1223,7 @@ mod tests {
 
         let out = session
             .run(
-                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS from, k.since AS since ORDER BY from",
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read the years back");
@@ -1245,7 +1256,7 @@ mod tests {
 
         let out = session
             .run(
-                "MATCH (a:person)-[k:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS from, k.since AS since ORDER BY from",
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read them back");

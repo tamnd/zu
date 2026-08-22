@@ -1569,8 +1569,8 @@ mod tests {
         let out = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, b.name AS to, k.since AS since, k.note AS note \
-                 ORDER BY from",
+                 RETURN a.name AS src, b.name AS to, k.since AS since, k.note AS note \
+                 ORDER BY src",
                 &[],
             )
             .expect("walk forward");
@@ -1607,7 +1607,7 @@ mod tests {
         let back = session
             .run(
                 "MATCH (a:person)<-[k:knows]-(b:person) WHERE a.name = 'ada' \
-                 RETURN b.name AS from, k.since AS since, k.note AS note",
+                 RETURN b.name AS src, k.since AS since, k.note AS note",
                 &[],
             )
             .expect("walk backward");
@@ -1638,7 +1638,7 @@ mod tests {
             session
                 .run(
                     "MATCH (a:person)-[k:knows]->(b:person) \
-                     RETURN a.name AS from, k.since AS since ORDER BY from",
+                     RETURN a.name AS src, k.since AS since ORDER BY src",
                     &[],
                 )
                 .expect("read")
@@ -1717,7 +1717,7 @@ mod tests {
         let all = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read every edge");
@@ -1740,7 +1740,7 @@ mod tests {
         let folded = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read every edge again");
@@ -1815,7 +1815,7 @@ mod tests {
             session
                 .run(
                     "MATCH (a:person)-[k:knows]->(b:person) \
-                     RETURN a.name AS from, k.note AS note ORDER BY from",
+                     RETURN a.name AS src, k.note AS note ORDER BY src",
                     &[],
                 )
                 .expect("read")
@@ -1994,8 +1994,8 @@ mod tests {
         let out = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, b.name AS to, k.since AS since, k.note AS note \
-                 ORDER BY from",
+                 RETURN a.name AS src, b.name AS to, k.since AS since, k.note AS note \
+                 ORDER BY src",
                 &[],
             )
             .expect("walk forward");
@@ -2024,7 +2024,7 @@ mod tests {
         let back = session
             .run(
                 "MATCH (a:person)<-[:knows]-(b:person) WHERE a.name = 'kay' \
-                 RETURN b.name AS from",
+                 RETURN b.name AS src",
                 &[],
             )
             .expect("walk backward");
@@ -2044,7 +2044,7 @@ mod tests {
         let folded = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read every edge again");
@@ -2092,7 +2092,7 @@ mod tests {
         let out = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, b.name AS to, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, b.name AS to, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("walk forward");
@@ -2120,7 +2120,7 @@ mod tests {
         let folded = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read every edge again");
@@ -2803,7 +2803,7 @@ mod tests {
         let out = session
             .run(
                 "MATCH (a:person)<-[k:knows]-(b:person) WHERE a.name = 'ada' \
-                 RETURN b.name AS from, k.since AS since, k.note AS note",
+                 RETURN b.name AS src, k.since AS since, k.note AS note",
                 &[],
             )
             .expect("read");
@@ -2882,7 +2882,7 @@ mod tests {
         let out = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) \
-                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
                 &[],
             )
             .expect("read");

@@ -189,12 +189,16 @@ fn the_trim_family_answers_over_a_column() {
         Value::Str("a".into())
     );
 
-    // The three words are ordinary names everywhere else, which is what
-    // keeps a query that bound one of them readable.
+    // The three words are reserved (ISO 21.3) and a variable is a
+    // regular identifier (ISO 16.4), so no query binds one of them and
+    // what tells the one argument form from the three word one is the
+    // shape of the call rather than the word in front of the string.
     assert_eq!(
-        one(&db, "LET leading = 'x' RETURN TRIM(leading) AS v"),
+        one(&db, "LET pad = 'x' RETURN TRIM(pad) AS v"),
         Value::Str("x".into())
     );
+    let says = refused(&db, "LET leading = 'x' RETURN TRIM(leading) AS v");
+    assert!(says.contains("reserved word"), "{says}");
 
     // One character, and the condition the standard names when it is
     // handed more, which is the whole reason the three above exist.

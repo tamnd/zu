@@ -2790,7 +2790,7 @@ mod tests {
             .expect("first");
         session
             .run("INSERT (p:person {name: 'raj'})", &[])
-            .expect("second");
+            .expect("later");
         // Read your own writes: each statement committed, so the next
         // one reads what it wrote.
         assert_eq!(count(&mut session, PEOPLE), 4);
@@ -2827,7 +2827,7 @@ mod tests {
             .expect("first");
         session
             .run("INSERT (p:person {name: 'raj'})", &[])
-            .expect("second");
+            .expect("later");
         assert_eq!(count(&mut session, PEOPLE), 4);
         std::mem::forget(session);
         crate::shared::forget(&path);
@@ -2863,7 +2863,7 @@ mod tests {
             .expect("first");
         session
             .run("INSERT (p:person {name: 'raj'})", &[])
-            .expect("second");
+            .expect("later");
         session.run("COMMIT", &[]).expect("commit");
         std::mem::forget(session);
         crate::shared::forget(&path);
@@ -3288,7 +3288,7 @@ mod tests {
         assert_eq!(session.snap.readers.len(), 1);
         session
             .run(source, &[("src", Value::Int(10))])
-            .expect("second");
+            .expect("later");
         assert_eq!(session.snap.readers.len(), 1);
 
         // A moved epoch describes a layout those readers were built
@@ -3542,15 +3542,15 @@ mod tests {
         // of its own, so it is no graph type the file holds.
         session
             .run(
-                "CREATE PROPERTY GRAPH typed { (:Person {name :: STRING}) }",
+                "CREATE PROPERTY GRAPH shaped { (:Person {name :: STRING}) }",
                 &[],
             )
             .expect("inline type");
         let typed = session
             .graph
             .catalog()
-            .graph("/", "typed")
-            .expect("typed")
+            .graph("/", "shaped")
+            .expect("shaped")
             .clone();
         let GraphTypeOf::Inline(ty) = &typed.graph_type else {
             panic!("a type written inline");
@@ -3576,7 +3576,7 @@ mod tests {
             Some(&GraphTypeOf::Named("social".to_string()))
         );
         session
-            .run("CREATE PROPERTY GRAPH mirror LIKE typed", &[])
+            .run("CREATE PROPERTY GRAPH mirror LIKE shaped", &[])
             .expect("like a graph");
         let GraphTypeOf::Inline(ty) = &session
             .graph

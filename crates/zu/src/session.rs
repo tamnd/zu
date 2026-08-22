@@ -85,14 +85,31 @@ enum Compiled {
     /// schema is built from says something about the moment rather
     /// than about the text, and remembering one would go on refusing a
     /// statement that has nothing wrong with it.
-    Refused(Box<DiagnosticRecord>),
+    ///
+    /// `declarable` is whether the text is worth offering to
+    /// [`Session::declaring`], which is the one thing that can turn a
+    /// refusal into an answer: a label under `INSERT` that names no
+    /// table yet. Nothing else in GQL makes a table, so a text with no
+    /// `INSERT` in it can never be rescued that way, and the answer is
+    /// a property of the text and the catalog, both of which this
+    /// cache is already keyed on.
+    ///
+    /// It is kept because it was costing a parse and a catalog walk on
+    /// every send. A client repeating a statement that names a variable
+    /// nothing bound was paying to rediscover that its statement has no
+    /// `INSERT` in it, which is what made refusing cost 0.69 of what
+    /// answering costs on the refusal gate.
+    Refused {
+        record: Box<DiagnosticRecord>,
+        declarable: bool,
+    },
 }
 
 impl Compiled {
     fn result(&self) -> Result<Arc<CachedPlan>> {
         match self {
             Compiled::Plan(plan) => Ok(plan.clone()),
-            Compiled::Refused(record) => Err(ZuError::Gql(record.clone())),
+            Compiled::Refused { record, .. } => Err(ZuError::Gql(record.clone())),
         }
     }
 }
@@ -1919,7 +1936,13 @@ impl Session {
             // statement in GQL that makes one, so this makes it. It is a
             // catalog change this statement makes, so it happens under
             // the savepoint the statement holds and goes back with it.
-            Err(err) => return self.declaring(source, params, err),
+            //
+            // A refusal the cache has already answered no for skips it,
+            // because `declaring` starts by parsing the text again and
+            // the answer cannot have changed under a cache the epoch
+            // empties.
+            Err(err) if self.declarable(source) => return self.declaring(source, params, err),
+            Err(err) => return Err(err),
         };
         let args = self.args_for(&cached.query.params, params)?;
         // A statement that writes runs as the parts it was split into,
@@ -2606,7 +2629,7 @@ impl Session {
             if let Some(compiled) = self.plans.get(&key) {
                 return compiled.result();
             }
-            return self.keep(key, source, graph);
+            return self.keep(key, source, graph, None);
         }
         // The text is parsed before anything is compiled because the
         // `USE` clause in front of it says which graph's tables the
@@ -2616,7 +2639,16 @@ impl Session {
         let parsed = match zu_query::parser::parse(source) {
             Ok(parsed) => parsed,
             Err(ZuError::Gql(record)) => {
-                self.remember(source.to_string(), Compiled::Refused(record.clone()));
+                // A text that will not parse has no `INSERT` clause in
+                // it, because it has no clauses at all, so there is
+                // nothing here for `declaring` to make.
+                self.remember(
+                    source.to_string(),
+                    Compiled::Refused {
+                        record: record.clone(),
+                        declarable: false,
+                    },
+                );
                 return Err(ZuError::Gql(record));
             }
             Err(other) => return Err(other),
@@ -2634,23 +2666,68 @@ impl Session {
         // call a plan against the graph the call before it passed.
         if let Some(zu_query::ast::GraphRef::Param(name)) = &parsed.use_graph {
             self.focused.insert(source.to_string(), name.clone());
-            return self.keep(focused_key(source, graph), source, graph);
+            return self.keep(focused_key(source, graph), source, graph, Some(&parsed));
         }
-        self.keep(source.to_string(), source, graph)
+        self.keep(source.to_string(), source, graph, Some(&parsed))
     }
 
     /// Compiles a text against one graph and holds what came of it
     /// under `key`, a GQL refusal included: a statement the standard
     /// refuses is refused the same way however often it is written.
-    fn keep(&mut self, key: String, source: &str, graph: u32) -> Result<Arc<CachedPlan>> {
+    ///
+    /// A refusal is asked once, here, whether it is the kind
+    /// [`Self::declaring`] can turn into an answer, and the answer is
+    /// held with it. `parsed` is what that question is asked of, and it
+    /// is `None` only where the caller has no parse to hand, which is
+    /// the text whose `USE` named a parameter and was seen before. That
+    /// one keeps the old cost, which is what it paid before this.
+    fn keep(
+        &mut self,
+        key: String,
+        source: &str,
+        graph: u32,
+        parsed: Option<&zu_query::ast::Query>,
+    ) -> Result<Arc<CachedPlan>> {
         let compiled = match self.compile(source, graph) {
             Ok(plan) => Compiled::Plan(plan),
-            Err(ZuError::Gql(record)) => Compiled::Refused(record),
+            Err(ZuError::Gql(record)) => Compiled::Refused {
+                record,
+                declarable: self.declares(graph, parsed),
+            },
             Err(other) => return Err(other),
         };
         let result = compiled.result();
         self.remember(key, compiled);
         result
+    }
+
+    /// Whether a refused text asks for a table the graph has not got,
+    /// which is the only thing [`Self::declaring`] can do about a
+    /// refusal. A parse it was not given, and a walk that raised on its
+    /// way through, are both answered yes, because that is the path the
+    /// refusal took before this was recorded.
+    fn declares(&self, graph: u32, parsed: Option<&zu_query::ast::Query>) -> bool {
+        let Some(parsed) = parsed else {
+            return true;
+        };
+        match crate::declare::wanted(self.graph.catalog(), graph, parsed) {
+            Ok(wanted) => !wanted.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether a text this session refused is worth handing to
+    /// [`Self::declaring`], which parses it again to find out.
+    ///
+    /// A text the cache does not hold under its own name is answered
+    /// yes, which covers the refusal that was raised before anything
+    /// was cached and the text whose `USE` named a parameter, since
+    /// that one is held under the graph as well.
+    fn declarable(&self, source: &str) -> bool {
+        match self.plans.get(source) {
+            Some(Compiled::Refused { declarable, .. }) => *declarable,
+            _ => true,
+        }
     }
 
     /// Puts one compiled text in the cache, emptying it first when it

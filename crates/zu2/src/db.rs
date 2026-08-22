@@ -2246,17 +2246,37 @@ impl<'a> Session<'a> {
         for (i, &(key, value)) in pairs.iter().enumerate() {
             let hash = index::hash(key);
             let tag = Index::tag(hash);
-            self.slot.protect();
-            let outcome = self.bucket_of(hash).and_then(|bucket| {
-                self.install(bucket, tag, key, value, false, record::KIND_VALUE)
-            });
-            self.slot.unprotect();
-            match outcome {
-                // An update that happened inside a record already in the
-                // log adds nothing to wait for, so it leaves the address
-                // where the last append put it.
-                Ok(next) => end = next.or(end),
-                Err(error) => return (i, self.finish(end).and(Err(error))),
+            loop {
+                self.slot.protect();
+                let outcome = self.bucket_of(hash).and_then(|bucket| {
+                    self.install(bucket, tag, key, value, false, record::KIND_VALUE)
+                });
+                self.slot.unprotect();
+                match outcome {
+                    // An update that happened inside a record already in
+                    // the log adds nothing to wait for, so it leaves the
+                    // address where the last append put it.
+                    Ok(next) => {
+                        end = next.or(end);
+                        break;
+                    }
+                    // A pass and another go at this pair, the way the
+                    // other three write paths do it, and this is the path
+                    // that meets a full log most often: a bulk load is a
+                    // writer that never stops long enough for the
+                    // maintenance thread to get in front of it. Going
+                    // round on the pair and not on the batch, because the
+                    // pairs before it are installed and a failed append
+                    // leaves nothing behind. #593, #566.
+                    Err(Error::LogFull { span, max }) => match self.make_room() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return (i, self.finish(end).and(Err(Error::LogFull { span, max })));
+                        }
+                        Err(error) => return (i, self.finish(end).and(Err(error))),
+                    },
+                    Err(error) => return (i, self.finish(end).and(Err(error))),
+                }
             }
         }
         (pairs.len(), self.finish(end))

@@ -21,7 +21,7 @@ use zu_common::{DurationKind, LogicalType, Result, ZuError};
 use crate::ast::{
     self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
     NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SortKey, TemporalFn, TrimSide, UnaryOp,
+    SetInto, SetItem, SortKey, TemporalFn, TrimSide, TruthValue, UnaryOp,
 };
 use crate::functions;
 use crate::procedures;
@@ -2128,6 +2128,15 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         negated: bool,
     },
+    /// `expr IS [NOT] TRUE`, ISO 20.20. The only construct in the
+    /// language that answers about unknown instead of carrying it, so
+    /// it is the one node here that can be handed a null and must not
+    /// give one back.
+    BooleanTest {
+        expr: Box<BoundExpr>,
+        truth: TruthValue,
+        negated: bool,
+    },
     /// `expr IS TYPED type`. The target keeps its lattice type for the
     /// same reason a cast's does: the width, the declared digits and
     /// the nullability are exactly what the predicate reads.
@@ -2892,7 +2901,9 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
             expr_slots(lhs, out);
             expr_slots(rhs, out);
         }
-        BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsNull { expr, .. } | BoundExpr::BooleanTest { expr, .. } => {
+            expr_slots(expr, out)
+        }
         BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
         BoundExpr::Call { args, .. } | BoundExpr::Fold { args, .. } => {
             for arg in args {
@@ -2988,7 +2999,7 @@ fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundE
             rewrite(lhs, f);
             rewrite(rhs, f);
         }
-        BoundExpr::IsNull { expr, .. } => rewrite(expr, f),
+        BoundExpr::IsNull { expr, .. } | BoundExpr::BooleanTest { expr, .. } => rewrite(expr, f),
         BoundExpr::IsTyped { expr, .. } => rewrite(expr, f),
         BoundExpr::Call { args, .. } | BoundExpr::Fold { args, .. } => {
             for arg in args {
@@ -6488,6 +6499,31 @@ impl Binder<'_> {
                     Type::Bool,
                 ))
             }
+            // The operand has to be a boolean, unlike IS NULL's, which
+            // takes anything: asking whether a string is TRUE is not a
+            // question with an answer, and ISO writes the test over a
+            // boolean primary for that reason.
+            Expr::BooleanTest {
+                expr,
+                truth,
+                negated,
+            } => {
+                let (bound, ty) = self.bind_expr(expr, ctx)?;
+                if !ty.is_bool() {
+                    return Err(bad_type(format!(
+                        "IS {} needs a boolean, got {ty}",
+                        truth.word()
+                    )));
+                }
+                Ok((
+                    BoundExpr::BooleanTest {
+                        expr: Box::new(bound),
+                        truth: *truth,
+                        negated: *negated,
+                    },
+                    Type::Bool,
+                ))
+            }
             // Both spellings of the same question reach the same call.
             // A negated predicate is a NOT around it rather than a flag
             // on it, because the function has an answer for every string
@@ -7396,6 +7432,14 @@ pub fn text(expr: &Expr) -> String {
             } else {
                 format!("{} IS NULL", text(expr))
             }
+        }
+        Expr::BooleanTest {
+            expr,
+            truth,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}{}", text(expr), truth.word())
         }
         Expr::Normalize { expr, form } => {
             format!("NORMALIZE({}, {})", text(expr), form.name())

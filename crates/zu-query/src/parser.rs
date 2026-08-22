@@ -24,7 +24,7 @@ use crate::ast::{
     MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
     Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
     Repeat, SchemaRef, Selector, SessionReset, SessionStmt, SetInto, SetItem, SetOp, Simple,
-    SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
+    SortKey, Statement, Subpath, TemporalFn, TrimSide, TruthValue, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -4564,7 +4564,23 @@ impl Parser<'_> {
                 negated,
             });
         }
-        self.expect_kw("NULL")?;
+        // ISO 20.20's boolean test. The three truth words are read
+        // here and not as an operator of their own because IS takes
+        // them all, and the word behind it is the whole of the
+        // difference: NULL asks whether there is a value at all and
+        // TRUE asks which one it is.
+        for truth in [TruthValue::True, TruthValue::False, TruthValue::Unknown] {
+            if self.eat_kw(truth.word()) {
+                return Ok(Expr::BooleanTest {
+                    expr: Box::new(lhs),
+                    truth,
+                    negated,
+                });
+            }
+        }
+        if !self.eat_kw("NULL") {
+            return Err(self.error("NULL, TRUE, FALSE, or UNKNOWN"));
+        }
         Ok(Expr::IsNull {
             expr: Box::new(lhs),
             negated,
@@ -4822,6 +4838,13 @@ impl Parser<'_> {
         }
         if name.eq_ignore_ascii_case("false") {
             return Ok(Expr::Literal(Literal::Bool(false)));
+        }
+        // ISO 21.2's third truth value. It is the null of the boolean
+        // type and not a fourth kind of value, so it reads as a null
+        // here: `UNKNOWN AND TRUE` is unknown for the same reason
+        // `NULL AND TRUE` is, and one three valued table answers both.
+        if name.eq_ignore_ascii_case("unknown") {
+            return Ok(Expr::Literal(Literal::Null));
         }
         // GE01. CASE is the one word in the expression grammar that
         // opens something with nothing behind it to tell it from a

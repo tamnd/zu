@@ -26,10 +26,18 @@
 //! Default options and `Durability::Async`, the same as every other
 //! measurement in this directory, and the record is the YCSB shape of
 //! ten fields of a hundred bytes so the numbers sit beside the sweep's.
+//!
+//! There are percentiles here as well as a rate, and getting them at all
+//! is awkward at this speed. See `common/hist.rs` for why they are sampled
+//! and what the sampling costs.
 
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[path = "common/hist.rs"]
+mod hist;
+use hist::{Hist, SAMPLE, clock_granularity, clock_overhead};
 
 use zu2::{Db, Durability, Options};
 
@@ -46,16 +54,22 @@ fn key(i: u64, into: &mut Vec<u8>) {
 
 /// Reads `ops` keys drawn uniformly from `[lo, lo + span)`, starting the
 /// sequence at `seed` so two threads on the same range are not in step.
-fn read_range(db: &Db, lo: u64, span: u64, ops: u64, seed: u64) {
+///
+/// `phase` picks which read of each group of `SAMPLE` gets timed. Every
+/// thread gets a different one, otherwise all of them time the same
+/// position in their loop and the histogram is a picture of one point in
+/// the iteration rather than of the read.
+fn read_range(db: &Db, lo: u64, span: u64, ops: u64, seed: u64, phase: u64, overhead: u64) -> Hist {
     let mut s = db.session();
     let mut out = Vec::with_capacity(VALUE);
     let mut k = Vec::with_capacity(32);
+    let mut hist = Hist::new();
     // splitmix64, so the key order is scattered rather than the order
     // the log was written in. Reading in insertion order is sequential
     // on the device and flatter than anything a client does, and it is
     // the mistake that makes a read benchmark look like a memcpy.
     let mut state = seed;
-    for _ in 0..ops {
+    for i in 0..ops {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -63,10 +77,23 @@ fn read_range(db: &Db, lo: u64, span: u64, ops: u64, seed: u64) {
         let at = (z ^ (z >> 31)) % span;
         key(lo + at, &mut k);
         out.clear();
-        if !s.read(&k, &mut out).expect("read") {
+        if i % SAMPLE == phase {
+            let started = Instant::now();
+            let hit = s.read(&k, &mut out).expect("read");
+            // Saturating, because a sample can come in under the
+            // calibrated overhead when the clock granularity is coarse
+            // or the branch predictor had a good day. Those belong in
+            // the bottom bucket rather than wrapping to u64::MAX.
+            let ns = (started.elapsed().as_nanos() as u64).saturating_sub(overhead);
+            hist.add(ns);
+            if !hit {
+                panic!("missing key {}", lo + at);
+            }
+        } else if !s.read(&k, &mut out).expect("read") {
             panic!("missing key {}", lo + at);
         }
     }
+    hist
 }
 
 fn main() {
@@ -118,7 +145,9 @@ fn main() {
                 let db = Arc::clone(&db);
                 let span = records / top as u64;
                 std::thread::spawn(move || {
-                    read_range(&db, t as u64 * span, span, span * 2, t as u64)
+                    // The warm up wants no sampling at all, so its
+                    // phase is one that `i % SAMPLE` can never equal.
+                    read_range(&db, t as u64 * span, span, span * 2, t as u64, SAMPLE, 0)
                 })
             })
             .collect();
@@ -127,8 +156,29 @@ fn main() {
         }
     }
 
+    let overhead = clock_overhead();
+    let tick = clock_granularity();
+
     println!("# records {records}, ops {ops}, value {VALUE} bytes, cores {top}");
-    println!("threads  keys      ops/s        per thread   speedup   ns/op");
+    println!(
+        "# one read in {SAMPLE} timed, clock overhead {overhead} ns subtracted from every sample"
+    );
+    println!("# clock granularity {tick} ns");
+    if tick > 10 {
+        println!(
+            "# that is coarse next to a point read, so every percentile below is a multiple of it \
+             and should be read as a bound; the mean is over millions of ops and is not affected"
+        );
+    }
+    // ns/op is the mean, wall over ops, and it is not the same
+    // measurement as p50 and will not match it. It carries the thread
+    // joins and every sampled read's clock cost, and a mean over a
+    // skewed distribution sits above its own median. Both are printed
+    // because a rate claim wants the mean and a latency claim wants the
+    // percentile, and quoting one as the other is how a benchmark lies.
+    println!(
+        "threads  keys      ops/s        per thread   speedup   ns/op   p50   p95   p99  p999"
+    );
 
     // The sweep runs up and then measures one thread again at the end.
     // If the two one thread rows disagree the host drifted under the
@@ -156,11 +206,15 @@ fn main() {
                         (0, records)
                     };
                     let seed = 0x5eed_0000 ^ t as u64;
-                    std::thread::spawn(move || read_range(&db, lo, span, each, seed))
+                    let phase = t as u64 % SAMPLE;
+                    std::thread::spawn(move || {
+                        read_range(&db, lo, span, each, seed, phase, overhead)
+                    })
                 })
                 .collect();
+            let mut hist = Hist::new();
             for w in workers {
-                w.join().expect("worker");
+                hist.merge(&w.join().expect("worker"));
             }
             let took = started.elapsed().as_secs_f64();
             let done = each * threads as u64;
@@ -169,11 +223,15 @@ fn main() {
                 base[which] = rate;
             }
             println!(
-                "{threads:7}  {:8}  {rate:9.0}  {:11.0}  {:8.2}x  {:6.0}",
+                "{threads:7}  {:8}  {rate:9.0}  {:11.0}  {:8.2}x  {:6.0}  {:4}  {:4}  {:4}  {:4}",
                 if disjoint { "disjoint" } else { "shared" },
                 rate / threads as f64,
                 rate / base[which],
-                took * 1e9 / done as f64
+                took * 1e9 / done as f64,
+                hist.quantile(0.50),
+                hist.quantile(0.95),
+                hist.quantile(0.99),
+                hist.quantile(0.999)
             );
         }
     }

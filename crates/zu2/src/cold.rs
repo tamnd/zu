@@ -399,14 +399,30 @@ impl Cold {
         // first is the wrong trade. SPECULATE covers the YCSB record and
         // everything smaller, and a record longer than it costs the
         // second read it would have cost anyway. #557.
+        //
+        // The ask is bounded by the page being filled and the answer is
+        // allowed to be shorter than the ask, which is not the same
+        // thing. A page whose last record left less than a header of
+        // room takes no pad record, so the file ends a few bytes below
+        // the page boundary, and asking for a whole speculation over the
+        // last record in that page is asking for bytes nobody has
+        // written. What comes back is the record, which is what this is
+        // for, and demanding the rest turned a good read into an
+        // unexpected end of file.
         let ceiling = (written - address) as usize;
-        let have = SPECULATE.min(ceiling).max(record::HEADER);
+        let ask = SPECULATE.min(ceiling).max(record::HEADER);
         into.clear();
-        into.resize(have.div_ceil(8), 0);
-        // SAFETY: the buffer is `have` bytes and 8 byte aligned.
+        into.resize(ask.div_ceil(8), 0);
+        // SAFETY: the buffer is `ask` bytes and 8 byte aligned.
         let speculated =
-            unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), have) };
-        file::read_exact_at(&self.file, speculated, self.at(address))?;
+            unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), ask) };
+        let have = file::read_upto_at(&self.file, speculated, self.at(address))?;
+        if have < record::HEADER {
+            return Err(Error::Malformed {
+                address,
+                why: "the cold file ends inside a record header",
+            });
+        }
         // SAFETY: as above, and the lengths are only used to size a
         // second read.
         let size = unsafe {

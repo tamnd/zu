@@ -463,6 +463,44 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
 }
 
+/// Reads as much as the file has, up to the length of `buf`, and returns
+/// how much that was.
+///
+/// The exact version above is the right one wherever the caller knows
+/// how many bytes it wants. A speculative read does not: it asks for
+/// more than the record it is after in the hope of getting the whole of
+/// it in one syscall, and a record near the end of the file has fewer
+/// bytes behind it than that. Short is the answer there, not an error.
+#[cfg(unix)]
+pub fn read_upto_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
+#[cfg(windows)]
+pub fn read_upto_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        match file.seek_read(&mut buf[done..], offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
 #[cfg(windows)]
 pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;

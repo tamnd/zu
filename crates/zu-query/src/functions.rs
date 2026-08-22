@@ -2028,7 +2028,7 @@ fn real_kernel(func: Func, args: &[Value]) -> Result<Value> {
                     format!("cot() has no answer for {x}, where the sine is nought"),
                 ));
             }
-            x.cos() / sin
+            zu_vector::kernels::cot(x)
         }
         Math::Asin | Math::Acos => {
             if !(-1.0..=1.0).contains(&x) && x.is_finite() {

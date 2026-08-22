@@ -555,8 +555,10 @@ fn real(op: MathOp, x: f64) -> f64 {
         MathOp::Tan => x.tan(),
         // The cotangent is the cosine over the sine, which is what the
         // row engine computes and why a sine of nought is a division by
-        // nought there rather than a condition of its own.
-        MathOp::Cot => x.cos() / x.sin(),
+        // nought there rather than a condition of its own. It is the
+        // one of these written out of line, for the reason [`cot`]
+        // gives.
+        MathOp::Cot => cot(x),
         MathOp::Asin => x.asin(),
         MathOp::Acos => x.acos(),
         MathOp::Atan => x.atan(),
@@ -564,6 +566,22 @@ fn real(op: MathOp, x: f64) -> f64 {
         MathOp::Radians => x.to_radians(),
         MathOp::Sign => unreachable!("sign answers an integer"),
     }
+}
+
+/// The cotangent, written once and called from both engines.
+///
+/// Every other function here is one libm call and rounds the same way
+/// wherever it is written. This one is a division of two of them, and
+/// that does not survive being written twice: the same expression in
+/// the row engine's crate and in this one comes out one place apart at
+/// 0.75, the optimizer being free to fold the pair of calls together
+/// in one and not in the other. Which of the two is the better answer
+/// is not the question. Nothing in a statement says which engine takes
+/// it, so the two have to agree, and the way to make two crates agree
+/// on a float is to give them one function rather than one formula.
+#[inline(never)]
+pub fn cot(x: f64) -> f64 {
+    x.cos() / x.sin()
 }
 
 #[inline(always)]

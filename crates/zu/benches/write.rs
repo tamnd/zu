@@ -151,18 +151,25 @@ const SAMPLE: u64 = 25;
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
+/// How large a region [`calibrate`] writes into, in bytes.
+///
+/// Past the last level cache of anything this runs on, so the round pays
+/// for the memory system and not only for the core. See the note on
+/// [`calibrate`] for why that is the part that matters.
+const CALIBRATION_TABLE: usize = 64 << 20;
+
 /// What one round of [`calibrate`] costs on the machine the target was
 /// written for, in nanoseconds. A laptop M4 with its cores to itself.
 ///
-/// Three consecutive runs on that host read 288, 330 and 343, so the
-/// middle one is the figure and the spread is about fifteen percent,
-/// which the floor of the clamp absorbs: a host at or under the
-/// reference reads the target exactly and never anything tighter.
+/// Three consecutive runs on that host read 566, 558 and 546, so the
+/// middle one is the figure and the spread is under four percent, which
+/// the floor of the clamp absorbs: a host at or under the reference
+/// reads the target exactly and never anything tighter.
 ///
 /// This is not a number to tune. It is a property of one host, and the
 /// only reason to change it is that the host it was taken on has been
 /// replaced.
-const CALIBRATION_REFERENCE_NS: f64 = 330.0;
+const CALIBRATION_REFERENCE_NS: f64 = 558.0;
 
 /// The most the host calibration is allowed to relax the write ceiling.
 ///
@@ -196,34 +203,53 @@ fn xorshift(state: &mut u64) -> u64 {
 ///
 /// The proxy has to be shaped like the write path or the ratio means
 /// nothing, and a write statement is three things: it formats a key and
-/// a value, it copies them into a buffer that grows, and it puts an
-/// entry in a map. So that is the round. No file and no syscall, on
-/// purpose, because a fitted ceiling for the disk is a different
-/// argument and the sync cost is already reported separately.
-fn calibrate() -> f64 {
+/// a value, it copies both into a table at an address it did not choose,
+/// and it puts an entry in a map. So that is the round. No file and no
+/// syscall, on purpose, because a fitted ceiling for the disk is a
+/// different argument and the sync cost is already reported separately.
+///
+/// `table` is how large the region the round writes into is, and it is a
+/// parameter because it turned out to be the whole question. The first
+/// version of this had a fixed buffer a few hundred bytes long, which
+/// lives in L1 on any machine, and it read a hosted runner as 1.17x the
+/// laptop while the write path on the same run read 2.19x. A proxy that
+/// only measures how fast the core retires instructions cannot stand in
+/// for a path that walks a store. Sized past the last level cache it
+/// measures the memory system too, which is what a shared vCPU is
+/// actually slower at.
+fn calibrate(table: usize) -> f64 {
     const ROUNDS: usize = 20_000;
     const KEYS: usize = 64;
     const VALUE: usize = 256;
+    const STRIDE: usize = 4096;
     let mut rng = 0x2064u64;
     let mut sink = 0usize;
-    let mut buf: Vec<u8> = Vec::new();
+    let mut region: Vec<u8> = vec![0; table];
+    // Touch every page before anything is timed. A fresh mapping faults
+    // in on first write, and at this size the random walk would still be
+    // meeting untouched pages well into the timed loop, which is how the
+    // first draft of this read 1284, 746 and 687 ns on three consecutive
+    // runs of the same host. What is wanted is the steady state cost of
+    // a write that misses cache, not the one time cost of the mapping.
+    for page in region.chunks_mut(STRIDE) {
+        page[0] = 1;
+    }
+    let slots = (table / STRIDE).max(1) as u64;
     let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    let round = |rng: &mut u64,
-                 sink: &mut usize,
-                 buf: &mut Vec<u8>,
-                 seen: &mut std::collections::HashMap<u64, usize>| {
-        // The buffer is cleared and not freed, which is what an append
-        // to a log frame does: the capacity is reached once and then the
-        // cost is the copy.
-        buf.clear();
+    let mut round = |rng: &mut u64, sink: &mut usize, seen: &mut std::collections::HashMap<u64, usize>| {
         for _ in 0..4 {
             let k = xorshift(rng) % KEYS as u64;
             let key = format!("person:{k:012}");
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(&[b'v'; VALUE]);
-            let n = seen.len();
-            seen.insert(k, n);
-            *sink += buf.len();
+            // A page the round did not choose, which is the part a
+            // small buffer cannot imitate: the store decides where the
+            // row goes and the writer follows it there.
+            let at = (xorshift(rng) % slots) as usize * STRIDE;
+            let n = key.len();
+            region[at..at + n].copy_from_slice(key.as_bytes());
+            region[at + n..at + n + VALUE].fill(b'v');
+            *sink += region[at] as usize;
+            let m = seen.len();
+            seen.insert(k, m);
         }
         // A fold reads back what it just wrote, so the round does too.
         for _ in 0..4 {
@@ -235,15 +261,22 @@ fn calibrate() -> f64 {
         }
     };
     for _ in 0..ROUNDS / 10 {
-        round(&mut rng, &mut sink, &mut buf, &mut seen);
+        round(&mut rng, &mut sink, &mut seen);
     }
-    let start = Instant::now();
-    for _ in 0..ROUNDS {
-        round(&mut rng, &mut sink, &mut buf, &mut seen);
+    // Best of a few, the same way the write measurements below take the
+    // best of PASSES: on a shared box a single pass reads whatever else
+    // was on the core at the time, and the cheapest pass is the one that
+    // got the fewest of those.
+    let mut ns = f64::MAX;
+    for _ in 0..PASSES {
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            round(&mut rng, &mut sink, &mut seen);
+        }
+        ns = ns.min(start.elapsed().as_nanos() as f64 / ROUNDS as f64);
     }
-    let ns = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
     std::hint::black_box(sink);
-    std::hint::black_box(&buf);
+    std::hint::black_box(&region);
     ns
 }
 
@@ -1536,7 +1569,18 @@ fn main() {
     // this is what lets that one target be enforced everywhere: it is
     // read at what the target says on the reference host and at the
     // ratio above it on a slower one. See #648 for what this replaced.
-    let cal_ns = calibrate();
+    let cal_ns = calibrate(CALIBRATION_TABLE);
+    // The other two footprints, printed and not used, so a run on a host
+    // where the scaled ceiling looks wrong says in its own log which
+    // sizes tracked the write path and which did not. Remove them once
+    // enough hosts have reported for the choice to be settled.
+    for probe in [64 << 10, 4 << 20] {
+        println!(
+            "host calibration probe: {} KiB table, {:.0} ns per round",
+            probe / 1024,
+            calibrate(probe)
+        );
+    }
     let raw = cal_ns / CALIBRATION_REFERENCE_NS;
     let scale = raw.clamp(1.0, CALIBRATION_CAP);
     println!(

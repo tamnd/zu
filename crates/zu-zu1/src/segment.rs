@@ -175,7 +175,17 @@ impl SegmentMeta {
         if start >= BLOCK_SIZE {
             return Err(corrupt("payload starts past the end of its block"));
         }
-        if (u64::from(start) + payload_len).div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
+        // Checked, because `payload_len` is a word off the disk and a
+        // file that claims one near u64::MAX makes this addition wrap.
+        // The wrapped sum then passes the block count check for some
+        // small count and the decode carries on with a length nothing
+        // in the file backs. libFuzzer found it as a panic under the
+        // overflow checks the fuzz profile turns on, which is the same
+        // arithmetic failing loudly in a build that watches for it.
+        let span = u64::from(start)
+            .checked_add(payload_len)
+            .ok_or_else(|| corrupt("payload length runs off the end of the address space"))?;
+        if span.div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
             return Err(corrupt("payload length disagrees with block count"));
         }
         // The claimed count must fit in the bytes actually present before
@@ -1315,6 +1325,36 @@ mod tests {
         meta.encode(&mut bytes);
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(format!("{err}").contains("zone min above max"));
+    }
+
+    /// A payload length near the top of the word is rejected rather
+    /// than added to the start and wrapped.
+    ///
+    /// The header carries the length as a plain `u64` and nothing has
+    /// checked it by the time the block count is compared against it,
+    /// so a file that says u64::MAX used to wrap the sum round to a
+    /// small number and take the comparison with it.
+    #[test]
+    fn hostile_payload_length_near_the_top_of_the_word_rejected() {
+        let meta = SegmentMeta {
+            value_count: 10,
+            payload_len: u64::MAX,
+            uncompressed_bytes: 80,
+            min: 0,
+            max: 10,
+            crc: 0,
+            structural: Structural::MiniBlock,
+            sorted: false,
+            start: 8,
+            blocks: vec![3],
+        };
+        let mut bytes = Vec::new();
+        meta.encode(&mut bytes);
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("runs off the end of the address space"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -362,17 +362,6 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     if journal::present(core) {
         return Ok(false);
     }
-    if core.ordered().is_some() {
-        // A checkpoint holds the index and the graph and not the key
-        // order, so taking the shortcut with a scan plane on would open
-        // a database whose keys are all there and whose key order is
-        // empty, and every scan would come back with nothing. The full
-        // scan is what rebuilds the order, so a scanning database pays
-        // for the whole log until the checkpoint carries the key set.
-        // That is the next box on #548 and it is a format change, which
-        // is why it is not this one.
-        return Ok(false);
-    }
     let len = core.log.file_len()?;
     if len <= FIRST {
         return Ok(false);

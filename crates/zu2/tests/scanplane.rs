@@ -158,7 +158,7 @@ fn a_reopen_gets_the_key_order_back_from_the_log() {
 }
 
 #[test]
-fn a_reopen_reads_the_whole_log_when_the_plane_is_on_even_with_a_checkpoint_beside_it() {
+fn a_checkpoint_carries_the_key_set_so_a_scanning_database_opens_from_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpointed.zu2");
     {
@@ -177,13 +177,61 @@ fn a_reopen_reads_the_whole_log_when_the_plane_is_on_even_with_a_checkpoint_besi
         drop(s);
         db.sync().unwrap();
     }
-    // The checkpoint holds the index and not the key order, so the open
-    // has to fall back to the log. What that costs is the whole point of
-    // the next box on #548, and what it must not do is come back with an
-    // index full of keys and a plane with none in it.
+    // The checkpoint carries the key set front coded, so the open adopts
+    // it and reads nothing above the boundary, and the plane is whole
+    // rather than empty.
     let db = Db::open(&path, options()).unwrap();
+    assert_eq!(
+        db.recovered()
+            .records
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the open read records, so it did not take the checkpoint"
+    );
     assert_eq!(db.ordered_keys(), Some(500));
-    assert_eq!(collect(&db, &key(0), 500).len(), 500);
+    let got = collect(&db, &key(0), 500);
+    assert_eq!(got.len(), 500);
+    let want: Vec<Vec<u8>> = (0..500).map(key).collect();
+    assert_eq!(got.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), want);
+}
+
+#[test]
+fn a_checkpoint_taken_without_a_plane_is_refused_by_an_open_that_wants_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("planeless.zu2");
+    {
+        // Written with no plane, so the checkpoint beside it says
+        // nothing about key order.
+        let db = Db::create(
+            &path,
+            Options {
+                durability: Durability::Async,
+                checkpoint_on_close: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut s = db.session();
+        for i in 0..300 {
+            s.upsert(&key(i), &value(i)).unwrap();
+        }
+        drop(s);
+        db.sync().unwrap();
+    }
+    // Adopting it would open a database whose index is full and whose
+    // key order is empty, and every scan would answer nothing. So the
+    // open turns it down and reads the log, which costs time and never
+    // an answer.
+    let db = Db::open(&path, options()).unwrap();
+    assert!(
+        db.recovered()
+            .records
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 300,
+        "the open took a checkpoint that could not describe its key order"
+    );
+    assert_eq!(db.ordered_keys(), Some(300));
+    assert_eq!(collect(&db, &key(0), 300).len(), 300);
 }
 
 #[test]

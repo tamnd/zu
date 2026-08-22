@@ -386,6 +386,27 @@ impl Ordered {
         }
     }
 
+    /// A builder for a plane being filled from a key set that is
+    /// already in order, which is what a checkpoint restore has.
+    ///
+    /// [`Ordered::insert`] costs a seek from the head per key, and a
+    /// seek is log N dereferences with a cache miss at most of them. A
+    /// restore does not need any of that: it knows the key is above
+    /// every key already in, so the node it links after is the last
+    /// node it linked at that level, which it can just remember. That
+    /// makes the build one allocation and a handful of stores a key
+    /// with no comparisons at all.
+    ///
+    /// Only valid on a plane nothing else is touching, which the open
+    /// is, and only valid for keys handed over in strictly ascending
+    /// order, which a checkpoint's key section is by construction.
+    pub(crate) fn builder(&self) -> Builder<'_> {
+        Builder {
+            list: self,
+            tails: [self.head; MAX_HEIGHT],
+        }
+    }
+
     /// A walk from the first key.
     pub fn first(&self) -> Cursor<'_> {
         Cursor {
@@ -393,6 +414,34 @@ impl Ordered {
             // SAFETY: the head is a full height node in the arena.
             at: unsafe { next_of(self.head, 0) },
         }
+    }
+}
+
+/// Fills a plane from keys already in order. See [`Ordered::builder`].
+pub(crate) struct Builder<'a> {
+    list: &'a Ordered,
+    /// The last node linked at each level, which is the node the next
+    /// key links after. Starts as the head at every level, which is
+    /// what an empty list's last node is.
+    tails: [*const u8; MAX_HEIGHT],
+}
+
+impl Builder<'_> {
+    /// Puts `key` on the end. The caller owes it that `key` is above
+    /// every key handed over before it; nothing here checks, because
+    /// the check is the comparison this exists to avoid.
+    pub(crate) fn push(&mut self, key: &[u8]) -> Result<()> {
+        let height = self.list.height();
+        let fresh = node(&self.list.arena, key, height)?;
+        for (level, tail) in self.tails.iter_mut().enumerate().take(height) {
+            // SAFETY: as on the accessors. Every tail is either the
+            // head, which has full height, or a node linked at this
+            // level, which therefore has at least this many links.
+            unsafe { link(*tail, level).store(fresh as u64, Ordering::Release) };
+            *tail = fresh;
+        }
+        self.list.keys.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 

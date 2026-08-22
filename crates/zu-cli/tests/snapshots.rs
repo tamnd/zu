@@ -102,13 +102,27 @@ fn a_session_over_one_graph_prints_what_it_always_printed() {
     let keyed = dir.path().join("keyed.zu1");
     let csv = dir.path().join("edges.csv");
     std::fs::write(&edges, "1 2\n1 3\n2 3\n3 1\n").expect("write edges");
-    let scrub: Scrub = vec![
+    let mut scrub: Scrub = vec![
         (path(&edges), "<edges>"),
         (path(&graph), "<graph>"),
         (path(&second), "<second>"),
         (path(&keyed), "<keyed>"),
         (path(&csv), "<csv>"),
     ];
+    // The feature list is a property of how the build was invoked and
+    // not of what the CLI does, so it goes out the same way the version
+    // and the ABI do and is asserted on its own below. Baked in, the
+    // snapshot passes under `--all-features` and fails under a plain
+    // `cargo test`, which is a test that reports the invocation rather
+    // than the code (#479).
+    scrub.push((
+        format!("features: {}", compiled_features_text()),
+        "features: <features>",
+    ));
+    scrub.push((
+        format!("\"features\":{}", compiled_features_json()),
+        "\"features\":<features>",
+    ));
 
     let mut out = String::new();
     let mut zu = |args: &[&str]| run(&mut out, args, &scrub);
@@ -234,10 +248,43 @@ fn a_failed_verify_reports_its_verdict_as_json_rather_than_as_a_diagnostic() {
     );
 }
 
+/// What the CLI says its features are, in both shapes, for whatever
+/// this build compiled in.
+fn compiled_features() -> Vec<&'static str> {
+    if cfg!(feature = "arrow") {
+        vec!["arrow"]
+    } else {
+        Vec::new()
+    }
+}
+
+fn compiled_features_text() -> String {
+    let features = compiled_features();
+    if features.is_empty() {
+        "none".to_owned()
+    } else {
+        features.join(", ")
+    }
+}
+
+fn compiled_features_json() -> String {
+    let features = compiled_features();
+    format!(
+        "[{}]",
+        features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// The revisions the snapshots scrub, asserted here instead, because a
 /// build that reports the wrong C ABI sends a caller to compile against
 /// the wrong header and the snapshot above cannot say so with the number
-/// taken out of it.
+/// taken out of it. The feature list is scrubbed for a different reason,
+/// that it depends on the cargo invocation, and it is asserted here for
+/// the same one.
 #[test]
 fn version_reports_the_revisions_this_build_actually_publishes() {
     let out = Command::new(ZU)
@@ -255,6 +302,18 @@ fn version_reports_the_revisions_this_build_actually_publishes() {
             "{field}"
         );
     }
+    let features: Vec<&str> = doc
+        .get("features")
+        .and_then(zu_json::Json::as_arr)
+        .expect("features is an array")
+        .iter()
+        .map(|f| f.as_str().expect("a feature is a string"))
+        .collect();
+    assert_eq!(
+        features,
+        compiled_features(),
+        "the binary reports features this build did not compile in"
+    );
 }
 
 /// The two spellings of the feature list say the same thing.

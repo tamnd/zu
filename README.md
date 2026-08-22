@@ -42,7 +42,7 @@ The snippet above is a program in this repository, `crates/zu-snippets/examples/
 Early. The specification is complete and lives in [docs/](docs/), starting with the [overview](docs/00-overview.md).
 Implementation is tracked by milestone issues: [M0](https://github.com/tamnd/zu/issues/1) encodings, [M1](https://github.com/tamnd/zu/issues/2) zu1 read/write, [M2](https://github.com/tamnd/zu/issues/3) query engine, [M3](https://github.com/tamnd/zu/issues/4) transactions and sqlite, [M4](https://github.com/tamnd/zu/issues/5) recursion and WCOJ, [M5](https://github.com/tamnd/zu/issues/6) s3 engine, [M6](https://github.com/tamnd/zu/issues/7) polish to v1.0.
 
-Nothing is usable yet. If you need an embedded graph database today, look at the Kùzu forks.
+Not ready for your data yet. Insert, read, scan, update and delete all work through the C API, prepare with bind works, and a full YCSB adapter runs against it: [tamnd/go-ycsb](https://github.com/tamnd/go-ycsb) loads and reads workloads A through F against zu2, the record engine ([Z0](https://github.com/tamnd/zu/issues/396)), on Linux, Windows and macOS. What is missing is not the engine, it is everything around one: the format is still moving, there is no upgrade path between versions, and the query surface covers a fraction of GQL. If you need an embedded graph database today, look at the Kùzu forks.
 
 ## Goals
 

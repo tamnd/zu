@@ -209,6 +209,21 @@ impl Graph for SqliteGraph<'_> {
 /// the store holds one connection, so there is no fork for morsel
 /// workers to ride.
 pub fn run(source: &str, store: &SqliteStore, params: &[(&str, Value)]) -> Result<QueryResult> {
+    // The environment is read in the one place the facade reads it
+    // rather than in the middle of a run, the same as the zu1 facade.
+    run_with(source, store, params, &crate::query::env_options())
+}
+
+/// [`run`] under switches the caller chose rather than the ones the
+/// environment names, so the parity corpus can hold both stores to the
+/// same join without putting it in the environment for every other test
+/// in the binary to find (#513).
+pub fn run_with(
+    source: &str,
+    store: &SqliteStore,
+    params: &[(&str, Value)],
+    options: &exec::Options,
+) -> Result<QueryResult> {
     let schema = schema_of(store)?;
     let parsed = parser::parse(source)?;
     let query: BoundQuery = binder::bind(&parsed, &schema)?;
@@ -230,14 +245,12 @@ pub fn run(source: &str, store: &SqliteStore, params: &[(&str, Value)]) -> Resul
         }
     }
     let mut graph = SqliteGraph::new(store)?;
+    // The caller's join and executor, and the defaults for the rest.
+    // The store holds one connection, so the thread count and the
+    // morsel size are not this facade's to take from anybody.
     let options = exec::Options {
-        // The same ZU_WCOJ override as the zu1 facade, so the parity
-        // corpus can pin either path on both engines.
-        wcoj: match std::env::var("ZU_WCOJ").as_deref() {
-            Ok("1") => exec::Wcoj::Force,
-            Ok("0") => exec::Wcoj::Off,
-            _ => exec::Wcoj::Auto,
-        },
+        wcoj: options.wcoj,
+        engine: options.engine,
         ..exec::Options::default()
     };
     exec::execute(&optimized, &query, &schema, &mut graph, &args, &options)

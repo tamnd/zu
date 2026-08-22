@@ -10,8 +10,11 @@
 //! single matching row value, so it costs two chunk decodes however many
 //! keys exist. Misses outside the key zone map cost nothing at all.
 //!
-//! The mutable hash overlay of §7 arrives with the updatable CSR; sealed
-//! bulk loads only need the static level.
+//! The mutable hash overlay of §7 arrives with the updatable CSR, and
+//! sealed bulk loads only need the static level. It is not only the CSR
+//! that is waiting on it any more: Y1 (#374) makes the overlay a
+//! dependency of the DML read path as well, so a point read of a row
+//! written since the last fold has nowhere to look until it lands.
 
 use std::sync::Arc;
 

@@ -533,15 +533,23 @@ impl Vocabulary {
                     (
                         "match",
                         str(&format!(
-                            "(?i)(\\bAS\\b|\\bTYPED\\b|::)\\s*({})\\b",
+                            "(?i)(?:(\\bAS\\b|\\bTYPED\\b)|(::))\\s*({})\\b",
                             self.words(Kind::Type).join("|")
                         )),
                     ),
+                    // Three groups and not two, because the two ways of
+                    // introducing a type are not the same kind of thing.
+                    // AS and TYPED are keywords and `::` is an operator,
+                    // and painting `::` as a keyword is the one thing
+                    // the corpus check catches here: it asked what kind
+                    // of word `::` is and the answer came back keyword,
+                    // which it is not.
                     (
                         "captures",
                         Json::Obj(vec![
                             ("1".into(), obj(&[("name", str(Kind::Keyword.scope()))])),
-                            ("2".into(), obj(&[("name", str(Kind::Type.scope()))])),
+                            ("2".into(), obj(&[("name", str("keyword.operator.gql"))])),
+                            ("3".into(), obj(&[("name", str(Kind::Type.scope()))])),
                         ]),
                     ),
                 ]),

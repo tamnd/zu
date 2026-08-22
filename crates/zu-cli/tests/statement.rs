@@ -41,6 +41,8 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+/// <!-- terms: allow attribute -->
+///
 /// Pulls the `<code>` and `<description>` pairs out of the artifact.
 ///
 /// Same reader as the register's, and correct on the same grounds: the

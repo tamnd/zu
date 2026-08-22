@@ -33,8 +33,9 @@ use crate::catalog::{Catalog, ElementKind, GraphType, RelTable, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::fullzip::{read_blob_segment, rewrite_blob_reordered, rewrite_blob_segment};
 use crate::graph::{
-    Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
-    free_directory_keeping_props, group_bases, group_rows, pad_direction,
+    Direction, Directory, GraphReader, GroupMeta, build_direction, build_direction_over,
+    free_chain, free_directory_keeping_edges, free_directory_keeping_props, group_bases,
+    group_rows, pad_direction,
 };
 use crate::keys::write_key_index_live;
 use crate::meta;
@@ -834,11 +835,32 @@ fn fold_rel(
     // leaves out. Node tables fold first, so the fold's own table index
     // already holds the merged set rather than the published one.
     let dead_rows = tombstones_of(db, index, rel.from)?;
-    free_directory_keeping_props(db, root)?;
-    let mut fwd = build_direction(db, "source", new_from, &edges)?;
+    let changed = mvcc.edge_updates(rel.id, epoch);
+    // Whether anything wrote an edge, which is not the same question as
+    // whether this fold has work to do. A rel table is rebuilt whenever
+    // either end table grows, because the row domain its CSR is keyed by
+    // has moved, and a row appended to that domain adds an offset and no
+    // neighbour. So the lists are the lists the base holds and the
+    // columns over them still name the same edges in the same order.
+    let stood = overlay.is_empty() && dead.is_empty() && changed.is_empty();
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
-    let mut bwd = build_direction(db, "destination", new_to, &rev)?;
+    let (mut fwd, mut bwd) = match stood {
+        true => {
+            free_directory_keeping_edges(db, root)?;
+            (
+                build_direction_over(db, "source", new_from, &edges, &old.groups, Direction::Fwd)?,
+                build_direction_over(db, "destination", new_to, &rev, &old.groups, Direction::Bwd)?,
+            )
+        }
+        false => {
+            free_directory_keeping_props(db, root)?;
+            (
+                build_direction(db, "source", new_from, &edges)?,
+                build_direction(db, "destination", new_to, &rev)?,
+            )
+        }
+    };
     drop(rev);
     let group_count = fwd.len().max(bwd.len());
     pad_direction(db, &mut fwd, group_count)?;
@@ -855,21 +877,16 @@ fn fold_rel(
             bwd,
         })
         .collect();
-    let changed = mvcc.edge_updates(rel.id, epoch);
-    // An edge property column is dense over the edge ordinal, so it is
-    // the edges that decide whether it has anything to say, and a fold
-    // gets here for reasons that are not about the edges at all: a row
-    // appended to either end table moves the row domain the CSR is
-    // keyed by, and every rel table over that label is rebuilt for it.
-    // Nothing about the edges moved, so nothing about the columns over
-    // them did either, and the old chain is already the answer. Writing
-    // it again would cost the whole of it: the value bytes are laid out
-    // in load order and a rewrite hands them all back to the allocator,
-    // which on the LinkBench shape is two and a half megabytes of
-    // identical bytes per fold, and folds land often.
+    // The columns go the same way the neighbour lists did, and for the
+    // same reason. A column is dense over the edge ordinal, the edges
+    // are where they were, and the values are in the order they were
+    // laid out in, so the old chain is already the answer. Writing it
+    // again would cost the whole of it: on the LinkBench shape that is
+    // two and a half megabytes of identical bytes handed back to the
+    // allocator per fold, and folds land often.
     let props = match old.props {
         NULL_BLOCK => NULL_BLOCK,
-        root if overlay.is_empty() && dead.is_empty() && changed.is_empty() => root,
+        root if stood => root,
         root => fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed)?,
     };
     let directory = Directory {
@@ -1842,13 +1859,16 @@ mod tests {
 
     /// And it comes through naming the same blocks, not just the same
     /// edges. A rel table is rebuilt whenever either end table grows,
-    /// because the row domain its CSR is keyed by has moved, but the
-    /// edges are where they were and so are the columns over them. The
-    /// old chain is the answer and writing it again would cost the
-    /// whole of it: on a table of any size that is the column's bytes
-    /// handed back to the allocator once a fold for nothing.
+    /// because the row domain its CSR is keyed by has moved, and a row
+    /// appended to that domain adds an offset and no neighbour. So the
+    /// neighbour lists are the lists the base holds and the columns
+    /// over them name the same edges in the same order, and only the
+    /// offsets have anything new to say. Writing the rest again would
+    /// cost the whole of it: the lists are a word an edge and the
+    /// columns are the values themselves, handed back to the allocator
+    /// once a fold for nothing.
     #[test]
-    fn a_grown_row_domain_leaves_the_edge_columns_in_their_blocks() {
+    fn a_grown_row_domain_leaves_the_edges_where_they_are() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("relgrow.zu1")).unwrap();
         bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
@@ -1862,10 +1882,10 @@ mod tests {
             .unwrap();
         let catalog = Catalog::load(&mut db).unwrap();
         let person = catalog.node_by_name("person").unwrap().id;
-        let before = GraphReader::load_table(&mut db, "knows")
+        let was = GraphReader::load_table(&mut db, "knows")
             .unwrap()
             .directory()
-            .props;
+            .clone();
         let mut wal = Wal::open(&dir.path().join("relgrow.wal")).unwrap();
         let mut mvcc = Mvcc::new(0);
         let mut txn = mvcc.begin();
@@ -1873,11 +1893,19 @@ mod tests {
             .unwrap();
         txn.commit(&mut wal).unwrap();
         checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
-        let after = GraphReader::load_table(&mut db, "knows")
+        let now = GraphReader::load_table(&mut db, "knows")
             .unwrap()
             .directory()
-            .props;
-        assert_eq!(before, after, "the fold rewrote a column nothing wrote to");
+            .clone();
+        assert_eq!(was.props, now.props, "a column nothing wrote to moved");
+        for (g, (before, after)) in was.groups.iter().zip(&now.groups).enumerate() {
+            assert_eq!(
+                (&before.fwd.neighbors, &before.bwd.neighbors),
+                (&after.fwd.neighbors, &after.bwd.neighbors),
+                "group {g} rewrote a neighbour list no edge went into"
+            );
+        }
+        assert_eq!(now.from_count, 5, "the row domain grew");
         let mut reader = PropsReader::new(
             crate::props::load_rel_props(&mut db, catalog.rel_by_name("knows").unwrap().id)
                 .unwrap()

@@ -925,6 +925,90 @@ pub(crate) fn build_direction(
     Ok(dirs)
 }
 
+/// The same, for a rebuild that no edge write went into: the neighbour
+/// lists are the lists `old` already holds, group for group, and only
+/// the offsets are written again.
+///
+/// A rel table is rebuilt when either end table grows, because the row
+/// domain the CSR is keyed by has moved, and a row appended to the end
+/// of that domain adds an offset and no neighbour. The offsets are one
+/// word a row and the neighbours are one word an edge, so on any graph
+/// with more than a couple of edges a node the neighbours are the whole
+/// of what the rebuild costs, and they are the part of it that has not
+/// changed.
+///
+/// The caller keeps the old segments out of the free list, since the
+/// directory it is about to write names them.
+pub(crate) fn build_direction_over(
+    db: &mut Zu1File,
+    end: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+    old: &[GroupMeta],
+    dir: Direction,
+) -> Result<Vec<DirectionMeta>> {
+    #[cfg(debug_assertions)]
+    for w in edges.windows(2) {
+        debug_assert!(w[0] <= w[1], "edges must be sorted");
+    }
+    // Every group the old directory had, even one past the end of this
+    // direction's row domain: the two directions are padded to a common
+    // count, so the shorter end holds empty groups, and carrying them
+    // is what keeps the segments they name from being lost.
+    let group_count = node_count
+        .div_ceil(GROUP_ROWS as u64)
+        .max(1)
+        .max(old.len() as u64) as usize;
+    let mut dirs = Vec::with_capacity(group_count);
+    let mut edge_ix = 0usize;
+    let mut offsets = Vec::new();
+    for g in 0..group_count as u64 {
+        let first_row = g * GROUP_ROWS as u64;
+        let row_count = group_rows(node_count, g);
+        offsets.clear();
+        offsets.push(0);
+        let mut count = 0u64;
+        for row in 0..u64::from(row_count) {
+            let node = (first_row + row) as u32;
+            while edge_ix < edges.len() && edges[edge_ix].0 == node {
+                count += 1;
+                edge_ix += 1;
+            }
+            offsets.push(count);
+        }
+        // A group the old directory never had holds no edges, because
+        // the rows are the ones the growth added and no edge was
+        // written. Anything else means the count above and the segment
+        // being carried disagree, which is a slip in the caller rather
+        // than a file that is wrong, and it says so here instead of
+        // writing a directory nobody can read.
+        let neighbors = match old.get(g as usize) {
+            Some(group) => group.dir(dir).neighbors.clone(),
+            None => write_segment(db, &[])?,
+        };
+        if neighbors.value_count != count {
+            return Err(ZuError::Corrupt {
+                what: "rel directory",
+                detail: format!(
+                    "group {g} carries {} neighbours over {count} the offsets name",
+                    neighbors.value_count
+                ),
+            });
+        }
+        dirs.push(DirectionMeta {
+            offsets: write_segment(db, &offsets)?,
+            neighbors,
+        });
+    }
+    if edge_ix != edges.len() {
+        return Err(ZuError::InvalidArgument(format!(
+            "{} edges name a {end} at or above the {node_count} rows of its node table",
+            edges.len() - edge_ix
+        )));
+    }
+    Ok(dirs)
+}
+
 /// The ordinal of each group's first edge: how many of `edges` name a
 /// source in an earlier group. The edges must be sorted, which is the
 /// contract of every caller that builds a direction out of them.
@@ -946,7 +1030,7 @@ pub(crate) fn group_bases(node_count: u64, edges: &[(u32, u32)]) -> Vec<u64> {
 /// at. The blocks recycle at the next checkpoint per the
 /// shadow-publishing rules.
 pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_directory_parts(db, root, true)
+    free_directory_parts(db, root, true, false)
 }
 
 /// [`free_directory`] leaving the edge property chain alone, for a
@@ -954,10 +1038,22 @@ pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
 /// caller owns the root from then on: nothing else names it once the old
 /// directory is gone.
 pub(crate) fn free_directory_keeping_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_directory_parts(db, root, false)
+    free_directory_parts(db, root, false, false)
 }
 
-fn free_directory_parts(db: &mut Zu1File, root: BlockPtr, props: bool) -> Result<()> {
+/// The same, leaving the neighbour lists alone too, for the rebuild
+/// [`build_direction_over`] does: the directory being written names
+/// those segments, so freeing them would hand out blocks it reads from.
+pub(crate) fn free_directory_keeping_edges(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_directory_parts(db, root, false, true)
+}
+
+fn free_directory_parts(
+    db: &mut Zu1File,
+    root: BlockPtr,
+    props: bool,
+    neighbors: bool,
+) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
     if props && directory.props != NULL_BLOCK {
         crate::props::free_props(db, directory.props)?;
@@ -970,12 +1066,16 @@ fn free_directory_parts(db: &mut Zu1File, root: BlockPtr, props: bool) -> Result
         }
     }
     for group in &directory.groups {
-        for seg in [
-            &group.fwd.offsets,
-            &group.fwd.neighbors,
-            &group.bwd.offsets,
-            &group.bwd.neighbors,
-        ] {
+        let segs = match neighbors {
+            true => vec![&group.fwd.offsets, &group.bwd.offsets],
+            false => vec![
+                &group.fwd.offsets,
+                &group.fwd.neighbors,
+                &group.bwd.offsets,
+                &group.bwd.neighbors,
+            ],
+        };
+        for seg in segs {
             for &ptr in &seg.blocks {
                 db.free_block(ptr)?;
             }

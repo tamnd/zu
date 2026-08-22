@@ -41,6 +41,8 @@ fn artifact(name: &str) -> PathBuf {
     manifest_dir().join("../zu-common/artifacts").join(name)
 }
 
+/// <!-- terms: allow attribute -->
+///
 /// Pulls the `<code>` and `<description>` pairs out of one artifact.
 ///
 /// Both documents carry a DTD in front of the data that declares

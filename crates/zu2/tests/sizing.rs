@@ -260,7 +260,10 @@ fn reopening_a_log_with_too_few_pages_names_the_number() {
         let db = Db::create(&path, roomy).expect("create");
         let mut session = db.session();
         let value = vec![b'x'; 400];
-        for i in 0..30_000u64 {
+        // Well past the reserve the write path is allowed to run into,
+        // so what this measures is a file nobody could open at these
+        // options rather than one a crash could have left (#570).
+        for i in 0..120_000u64 {
             session.upsert(&i.to_be_bytes(), &value).expect("upsert");
         }
         drop(session);

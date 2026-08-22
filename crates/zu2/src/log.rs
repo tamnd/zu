@@ -824,13 +824,21 @@ impl Log {
     /// resumed, so what it measures is the live span and not the file
     /// length: a compacted file is mostly hole and its pages below
     /// `begin` cost nothing.
+    ///
+    /// The reserve counts here for the same reason it exists on the
+    /// write path: a crash freezes the log wherever it was, and where it
+    /// was may be inside the reserve, mid pass. Turning that file away
+    /// would mean a database could write itself into a state it could
+    /// not reopen at the options it was written with (#570). It opens,
+    /// and the first write that runs out of room compacts the span back
+    /// under `max_pages` the way any other over-full log does.
     pub fn fits_the_file(&self) -> Result<()> {
         let len = self.file_len()?;
         if len <= self.begin() {
             return Ok(());
         }
         let needs = page_of(len - 1) - page_of(self.begin()) + 1;
-        if needs > self.max_pages {
+        if needs > self.max_pages + reserve_pages(self.max_pages) {
             return Err(Error::NeedsPages {
                 needs,
                 max: self.max_pages,

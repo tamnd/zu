@@ -307,6 +307,30 @@ impl<'a> Batch<'a> {
             .collect()
     }
 
+    /// The key every new row of a keyed table takes, as table, key and
+    /// the position in the statement the row came from, which is what
+    /// [`refuse_duplicate_keys`] checks against the store.
+    ///
+    /// A table whose rows carry no `id` column is not in here, and
+    /// neither is a row that named no `id`: the first has no key and
+    /// the second left its key null, and a null is not a value the
+    /// index holds.
+    pub(crate) fn new_keys(&self) -> Vec<(u32, u64)> {
+        let mut keys = Vec::new();
+        for node in &self.nodes {
+            let Some(cols) = self.columns.get(&node.table) else {
+                continue;
+            };
+            let Some(at) = cols.iter().position(|col| col.name == "id") else {
+                continue;
+            };
+            if let Some((_, Cell::Int(key))) = node.cols.iter().find(|(c, _)| *c as usize == at) {
+                keys.push((node.table, *key));
+            }
+        }
+        keys
+    }
+
     /// The rows this run is creating, as table and offset. They are not
     /// in the store yet, so nothing may be asked of the store about
     /// them.
@@ -379,6 +403,56 @@ pub(crate) fn refuse_duplicate_pairs(
                 .map_or("?", |rel| rel.name.as_str()),
             edge.src,
             edge.dst
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a row whose key a keyed table already holds, before the
+/// write reaches the log.
+///
+/// The index over a keyed table maps each key to the one row that has
+/// it, and it is rebuilt from the rows every time the table is folded.
+/// Two rows under one key have no such mapping, so the rebuild raises,
+/// and it raises during a fold rather than during the statement that
+/// caused it. What that leaves behind is a file whose every read of the
+/// table fails, from a write that was told it succeeded, and no
+/// statement can undo it because no statement can run. So the second
+/// row is refused here, where the statement is still in a position to
+/// be told which key was already taken.
+///
+/// Twice in one statement counts, and the store cannot be asked about
+/// the first of the two because it is not in it yet, so this walks in
+/// statement order and remembers what it has seen.
+///
+/// A table with no key index is not asked about at all, because under
+/// the dense-id contract every key names the row of the same number and
+/// so every key would look taken.
+pub(crate) fn refuse_duplicate_keys(
+    graph: &mut impl zu_query::exec::Graph,
+    catalog: &Catalog,
+    keys: &[(u32, u64)],
+) -> Result<()> {
+    let mut asked: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut written: BTreeSet<(u32, u64)> = BTreeSet::new();
+    for &(table, key) in keys {
+        let keyed = match asked.get(&table) {
+            Some(&known) => known,
+            None => {
+                let known = graph.keyed(table)?;
+                asked.insert(table, known);
+                known
+            }
+        };
+        if !keyed {
+            continue;
+        }
+        if written.insert((table, key)) && graph.lookup_key(table, key)?.is_none() {
+            continue;
+        }
+        return Err(ZuError::InvalidArgument(format!(
+            "'{}' keys its rows by 'id', and {key} is the id of a row it already holds",
+            name_of(catalog, table)
         )));
     }
     Ok(())

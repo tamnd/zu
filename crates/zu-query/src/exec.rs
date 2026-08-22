@@ -739,6 +739,19 @@ pub trait Graph {
         let _ = table;
         Ok(Some(key))
     }
+    /// Whether this table carries a primary-key index, which is the
+    /// question [`Self::lookup_key`] cannot be asked instead of: under
+    /// the dense-id contract it answers every key with the row of the
+    /// same number, so a caller trying to tell a taken key from a free
+    /// one would hear that every key is taken.
+    ///
+    /// An INSERT is what asks. A key the table already holds has to be
+    /// refused where the statement can be told why, and a table that is
+    /// not keyed has no key to refuse.
+    fn keyed(&mut self, table: u32) -> Result<bool> {
+        let _ = table;
+        Ok(false)
+    }
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;

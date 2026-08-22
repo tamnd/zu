@@ -950,18 +950,47 @@ impl Graph for Zu1Graph<'_> {
             }
             reader.lookup_key(db, key)?
         };
-        let row = match found {
-            Some(row) => row,
-            None => match self.appended_key(table, key)? {
-                Some(row) => row,
-                None => return Ok(None),
-            },
-        };
         // A fold takes the key of a deleted row out of the index as it
         // rebuilds the table, so a key lookup after one answers nothing.
         // An unfolded delete has not rebuilt anything, and the tombstone
         // is what says the row is gone either way.
+        if let Some(row) = found
+            && !self.ensure_gone()?.holds(table, row)
+        {
+            return Ok(Some(row));
+        }
+        // Gone is not the end of the question. The row the index names
+        // being gone leaves the key free, and a commit since then is
+        // free to have taken it, so a delete and an insert of the same
+        // key between two folds land here: the index still names the
+        // row that went, and the row that holds the key now is in the
+        // patch, exactly where a key the index never held would be.
+        let Some(row) = self.appended_key(table, key)? else {
+            return Ok(None);
+        };
         Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
+    }
+
+    fn keyed(&mut self, table: u32) -> Result<bool> {
+        // Asked the way [`Self::lookup_key`] asks it, because it is the
+        // same question one step earlier: a frame has no index over it,
+        // a table no rel table leaves keeps the dense contract, and
+        // otherwise the group directory of a rel table over these rows
+        // is where the index lives.
+        if self.frames.get(table).is_some() {
+            return Ok(false);
+        }
+        let Some(rel) = self
+            .catalog
+            .rel_tables()
+            .iter()
+            .find(|r| r.from == table)
+            .map(|r| r.id)
+        else {
+            return Ok(false);
+        };
+        self.ensure_reader(rel)?;
+        Ok(self.readers[&rel].directory().keys.is_some())
     }
 
     fn appended(&mut self, table: u32) -> Result<u64> {

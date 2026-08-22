@@ -680,7 +680,7 @@ mod tests {
         let mut session = open(&dir, "delete-value-name.zu1");
 
         session
-            .run("MATCH (value:person {name: 'zoe'}) DELETE value", &[])
+            .run("MATCH (holder:person {name: 'zoe'}) DELETE holder", &[])
             .expect("delete");
 
         assert_eq!(names(&mut session), ["ada", "kay"]);

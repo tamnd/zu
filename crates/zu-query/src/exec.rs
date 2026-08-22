@@ -3342,6 +3342,66 @@ struct StageCtx<'a> {
     notices: Vec<DiagnosticRecord>,
 }
 
+/// The property `key` of one value, which is a read of an element, a
+/// field of a record, or the same question asked of every element of a
+/// group (ISO 22.7, feature GQ17).
+///
+/// The group case is what makes this a function rather than a match
+/// arm. A name a quantifier bound stands for the elements of every
+/// repetition, so a property read on it is read of each of them and the
+/// row holds the list of the answers in the order the walk took them.
+/// The answer to a group is a list, which is why the recursion is
+/// element-wise and not flattening: a group of groups would answer a
+/// list of lists, and that is what it means.
+fn property_of(ctx: &mut StageCtx, base: Value, key: &str) -> Result<Value> {
+    match base {
+        // A delete leaves the element bound, so a clause after one
+        // can hold a reference to a row that is no longer there.
+        // Reading it is 22G11 rather than the value the row used to
+        // hold: a scan never hands one out, so a node that is in
+        // the deleted set here arrived across a write of this
+        // statement and nothing else.
+        Value::Node { table, offset } if deleted(ctx.gone, table, offset) => Err(gql(
+            codes::C22G11,
+            format!(
+                "'{key}' is being read off an element that a DELETE in this statement took away, row {offset} of table {table}"
+            ),
+        )),
+        Value::Node { table, offset } => ctx.graph.property(table, offset, key),
+        // A field the record does not have is null rather than an
+        // error, which is what a property a node does not have
+        // already answers. A record whose shape a query can rely
+        // on is one the query declared, and that is what a cast to
+        // a record type is for.
+        ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
+        // An edge with no stored row reads null here rather than in
+        // every engine, so an engine's `rel_property` only ever
+        // sees a row it holds.
+        Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
+        Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(property_of(ctx, item, key)?);
+            }
+            Ok(Value::List(out))
+        }
+        // A quantified edge variable is still a chain here, because
+        // settling happens where a value leaves the pipeline and this
+        // read is inside it. Settling one costs the walk of its links,
+        // which is the same walk the read would have to do anyway.
+        chain @ Value::Chain(_) => property_of(ctx, settle(chain), key),
+        Value::Null => Ok(Value::Null),
+        other => Err(gql(
+            codes::C22G03,
+            format!(
+                "a property is read off an element, a record or a group of them, and this is {}",
+                crate::cast::value_type(&other)
+            ),
+        )),
+    }
+}
+
 fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
     if let Some(v) = ctx.overlay.get(&slot) {
         return Ok(v.clone());
@@ -5519,7 +5579,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 if !next(descs, ctx, i - 1)? {
                     return Ok(false);
                 }
-                if truthy(&eval(ctx, expr)?) {
+                if holds(&eval(ctx, expr)?)? {
                     return Ok(true);
                 }
             },
@@ -5534,7 +5594,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         let mut keep = Vec::with_capacity(size);
                         for pos in 0..size {
                             ctx.chunks[*chunk].cur = Some(pos);
-                            keep.push(truthy(&eval(ctx, expr)?));
+                            keep.push(holds(&eval(ctx, expr)?)?);
                         }
                         ctx.chunks[*chunk].cur = None;
                         keep
@@ -5821,8 +5881,28 @@ fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
-fn truthy(v: &Value) -> bool {
-    matches!(v, Value::Bool(true))
+/// Whether a search condition holds, ISO 19.1.
+///
+/// Three-valued and then some. True keeps the row, false drops it and
+/// null drops it too, a condition nobody could answer not being a
+/// condition anything passes. A value that is not a boolean at all is
+/// none of those three: `WHERE p.age` is not a question with a wrong
+/// answer, it is not a question, and `22G03` is the condition for an
+/// operand of a type the operator does not take. Dropping every row
+/// quietly would answer a question nobody asked, and keeping them all
+/// would be worse.
+fn holds(v: &Value) -> Result<bool> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Null => Ok(false),
+        other => Err(gql(
+            codes::C22G03,
+            format!(
+                "a search condition is a boolean, and this one is {}",
+                crate::cast::value_type(other)
+            ),
+        )),
+    }
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
@@ -6463,7 +6543,7 @@ fn vector_filter(ctx: &mut StageCtx, expr: &BoundExpr, chunk: usize) -> Result<O
     ctx.graph.properties(table, &rows, key, &mut values)?;
     let mut keep = Vec::with_capacity(size);
     for value in values {
-        keep.push(truthy(&compare(op, &settle(value), &other)?));
+        keep.push(holds(&compare(op, &settle(value), &other)?)?);
     }
     Ok(Some(keep))
 }
@@ -6655,36 +6735,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 "PROPERTY_EXISTS asks about a node or an edge, got {other:?}"
             ))),
         },
-        BoundExpr::Property { base, key } => match eval(ctx, base)? {
-            // A delete leaves the element bound, so a clause after one
-            // can hold a reference to a row that is no longer there.
-            // Reading it is 22G11 rather than the value the row used to
-            // hold: a scan never hands one out, so a node that is in
-            // the deleted set here arrived across a write of this
-            // statement and nothing else.
-            Value::Node { table, offset } if deleted(ctx.gone, table, offset) => Err(gql(
-                codes::C22G11,
-                format!(
-                    "'{key}' is being read off an element that a DELETE in this statement took away, row {offset} of table {table}"
-                ),
-            )),
-            Value::Node { table, offset } => ctx.graph.property(table, offset, key),
-            // A field the record does not have is null rather than an
-            // error, which is what a property a node does not have
-            // already answers. A record whose shape a query can rely
-            // on is one the query declared, and that is what a cast to
-            // a record type is for.
-            ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
-            // An edge with no stored row reads null here rather than in
-            // every engine, so an engine's `rel_property` only ever
-            // sees a row it holds.
-            Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
-            Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
-            Value::Null => Ok(Value::Null),
-            other => Err(invalid(format!(
-                "property access on {other:?}, expected a node"
-            ))),
-        },
+        BoundExpr::Property { base, key } => {
+            let base = eval(ctx, base)?;
+            property_of(ctx, base, key)
+        }
         BoundExpr::Unary { op, expr } => {
             let v = eval(ctx, expr)?;
             match op {
@@ -6888,7 +6942,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             }
             Value::path(out)
         }
-        BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
+        BoundExpr::Cast { expr, ty } => {
+            let v = eval(ctx, expr)?;
+            crate::cast::cast_noting(v, ty, &mut ctx.notices)
+        }
         // GE01. The branches are asked in the order they were written
         // and the walk stops at the first that says yes, so a branch
         // below one that matched is never evaluated and neither is a
@@ -7626,7 +7683,7 @@ fn apply_post(sink: &SinkDef, ctx: &mut StageCtx, mut rows: Vec<Row>) -> Result<
                 let mut kept = Vec::with_capacity(rows.len());
                 for mut row in rows {
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
-                    let pass = truthy(&eval(ctx, expr)?);
+                    let pass = holds(&eval(ctx, expr)?)?;
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
                     if pass {
                         kept.push(row);
@@ -7870,7 +7927,7 @@ fn stream_batch(
                 let mut kept = Vec::with_capacity(rows.len());
                 for mut row in rows {
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
-                    let pass = truthy(&eval(ctx, expr)?);
+                    let pass = holds(&eval(ctx, expr)?)?;
                     std::mem::swap(&mut ctx.overlay, &mut row.extra);
                     if pass {
                         kept.push(row);
@@ -9647,7 +9704,7 @@ mod tests {
     fn two_hop_count_stays_factorized() {
         let r = run(
             "MATCH (a:Person {id: $src})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &[("src", Value::Int(0))],
         );
         assert_eq!(int_rows(&r), [[3]]);
@@ -10128,7 +10185,7 @@ mod tests {
         // join inner and drop the nine open 2-paths.
         let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
                       OPTIONAL MATCH (a)-[t:KNOWS]->(c) \
-                      RETURN count(*) AS paths, count(t) AS closed";
+                      RETURN count(*) AS walks, count(t) AS closed";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[10, 1]]);
         assert_eq!(r, run_opts(source, &[], no_wcoj()));
@@ -10250,7 +10307,7 @@ mod tests {
         let r = run(
             "CALL wcc('KNOWS') YIELD node, component \
              MATCH (node)-[:KNOWS]->(m) \
-             RETURN count(*) AS paths",
+             RETURN count(*) AS walks",
             &[],
         );
         assert_eq!(int_rows(&r), [[8]]);
@@ -11223,7 +11280,7 @@ mod tests {
     fn profile_shows_the_factorized_second_hop() {
         let (r, p) = profiled(
             "MATCH (a:Person {id: 0})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-             RETURN count(c) AS paths",
+             RETURN count(c) AS walks",
             &[],
         );
         assert_eq!(int_rows(&r), [[3]]);
@@ -11640,7 +11697,7 @@ mod tests {
             ),
             (
                 "MATCH (a:Person {id: $src})-[:KNOWS]->(b)-[:KNOWS]->(c) \
-                 RETURN count(c) AS paths",
+                 RETURN count(c) AS walks",
                 &[("src", Value::Int(0))],
             ),
             (
@@ -11717,7 +11774,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, b.id AS b ORDER BY b, a \
              SKIP 2 LIMIT 3",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT b.id AS b",
-            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS paths",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS walks",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, count(*) AS deg",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, collect(b.id) AS friends",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b.id) AS heads",

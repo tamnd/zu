@@ -303,17 +303,19 @@ fn paths_sort_and_group_the_same_way_twice() {
     assert_eq!(starts, sorted);
 }
 
-/// A type name is a name until a type is what is wanted, and PATH is
-/// now three things: a type, the constructor, and still a variable name.
+/// PATH is two things, the type and the constructor, and which one it
+/// is comes from where it stands. It is not a third thing: ISO 21.3
+/// reserves the word, so a query names the walk it builds something
+/// else.
 #[test]
-fn path_is_still_a_name_where_a_name_is_what_is_wanted() {
+fn path_is_the_type_and_the_constructor_and_not_a_name() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    assert_eq!(
-        one(&mut db, "UNWIND [1, 2] AS path RETURN sum(path) AS v"),
-        Value::Int(3)
-    );
-    let source = "MATCH (a:person) WHERE a.id = 0 WITH PATH [a] AS path \
-                  RETURN PATH_LENGTH(path) AS v";
+    let source = "MATCH (a:person) WHERE a.id = 0 WITH PATH [a] AS walk \
+                  RETURN PATH_LENGTH(walk) AS v";
     assert_eq!(one(&mut db, source), Value::Int(0));
+
+    let source = "UNWIND [1, 2] AS path RETURN sum(path) AS v";
+    let err = run(source, &mut db, &[]).expect_err(source);
+    assert!(err.to_string().contains("reserved word"), "{source}: {err}");
 }

@@ -28,6 +28,13 @@
 //! of the mapping, so only the script-specific exclusions have to be
 //! read.
 //!
+//! It reads the general category column twice, once for the characters
+//! an identifier may start with and once for the ones it may go on
+//! with. ISO/IEC 39075:2024 subclause 21.3 writes those two sets as
+//! lists of Unicode general category classes and nothing else, so the
+//! table is the artifact's own column filtered, and a range written as
+//! a First and a Last pair is expanded here rather than at runtime.
+//!
 //! It leaves Hangul out. The syllable block is eleven thousand
 //! characters that decompose and compose by arithmetic, and none of them
 //! carries a decomposition mapping in the artifact, so there is nothing
@@ -102,6 +109,73 @@ fn parse_unicode_data(text: &str) -> Database {
     db
 }
 
+/// The identifier ranges out of the general category column, as
+/// `(start, extend)`.
+///
+/// ISO 21.3: an identifier starts with a character of class Lu, Ll, Lt,
+/// Lm, Lo or Nl, and goes on with one of those or of class Mn, Mc, Nd,
+/// Pc or Cf. The underscore is a start as well, and it is Pc rather
+/// than a letter, so it is added by hand here the same way the standard
+/// adds it by hand.
+///
+/// Adjacent codes of the same kind are merged into one range, which is
+/// what makes the table a few hundred entries rather than a hundred and
+/// forty thousand.
+fn parse_ident(text: &str) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    const START: [&str; 6] = ["Lu", "Ll", "Lt", "Lm", "Lo", "Nl"];
+    const MORE: [&str; 5] = ["Mn", "Mc", "Nd", "Pc", "Cf"];
+
+    let mut start = Vec::new();
+    let mut extend = Vec::new();
+    let mut pending: Option<u32> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(';').collect();
+        let code = u32::from_str_radix(fields[0], 16).expect("codepoint");
+        let category = fields[2];
+        // A range is two lines and the fields on them agree, so the
+        // First line is remembered and the Last line closes it.
+        let (from, to) = if fields[1].ends_with("First>") {
+            pending = Some(code);
+            continue;
+        } else if fields[1].ends_with("Last>") {
+            (pending.take().expect("a First before every Last"), code)
+        } else {
+            (code, code)
+        };
+        let is_start = START.contains(&category) || from == u32::from('_');
+        if is_start {
+            push_range(&mut start, from, to);
+        }
+        if is_start || MORE.contains(&category) {
+            push_range(&mut extend, from, to);
+        }
+    }
+    push_range(&mut start, u32::from('_'), u32::from('_'));
+    push_range(&mut extend, u32::from('_'), u32::from('_'));
+    start.sort_unstable();
+    extend.sort_unstable();
+    (merge(start), merge(extend))
+}
+
+fn push_range(out: &mut Vec<(u32, u32)>, from: u32, to: u32) {
+    out.push((from, to));
+}
+
+/// Joins ranges that touch or overlap, over a list already in order.
+fn merge(ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match out.last_mut() {
+            Some(last) if from <= last.1.saturating_add(1) => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
 fn parse_exclusions(text: &str) -> Vec<u32> {
     text.lines()
         .filter_map(|line| {
@@ -166,9 +240,16 @@ struct Tables {
     compatibility: Vec<(u32, u32, u8)>,
     decomposed: Vec<u32>,
     composition: Vec<(u32, u32, u32)>,
+    ident_start: Vec<(u32, u32)>,
+    ident_extend: Vec<(u32, u32)>,
 }
 
-fn build(db: &Database, exclusions: &[u32], version: String) -> Tables {
+fn build(
+    db: &Database,
+    exclusions: &[u32],
+    version: String,
+    ident: (Vec<(u32, u32)>, Vec<(u32, u32)>),
+) -> Tables {
     let mut pool = Pool::default();
     let mut canonical = Vec::new();
     for &code in db.canonical.keys() {
@@ -210,6 +291,8 @@ fn build(db: &Database, exclusions: &[u32], version: String) -> Tables {
         compatibility,
         decomposed: pool.chars,
         composition,
+        ident_start: ident.0,
+        ident_extend: ident.1,
     }
 }
 
@@ -318,6 +401,39 @@ fn render(tables: &Tables) -> String {
             .iter()
             .map(|(a, b, c)| format!("({}, {}, {}),", ch(*a), ch(*b), ch(*c))),
     );
+    out.push_str("];\n\n");
+
+    out.push_str(
+        "/// The characters an identifier may start with, as inclusive\n\
+         /// ranges in code order: general category Lu, Ll, Lt, Lm, Lo or\n\
+         /// Nl, and the underscore (ISO 21.3).\n\
+         #[rustfmt::skip]\n\
+         pub(super) static IDENT_START: &[(char, char)] = &[\n",
+    );
+    rows(
+        &mut out,
+        4,
+        tables
+            .ident_start
+            .iter()
+            .map(|(a, b)| format!("({}, {}),", ch(*a), ch(*b))),
+    );
+    out.push_str("];\n\n");
+
+    out.push_str(
+        "/// The characters an identifier may go on with, read the same\n\
+         /// way: every start, and general category Mn, Mc, Nd, Pc or Cf.\n\
+         #[rustfmt::skip]\n\
+         pub(super) static IDENT_EXTEND: &[(char, char)] = &[\n",
+    );
+    rows(
+        &mut out,
+        4,
+        tables
+            .ident_extend
+            .iter()
+            .map(|(a, b)| format!("({}, {}),", ch(*a), ch(*b))),
+    );
     out.push_str("];\n");
     out
 }
@@ -380,6 +496,7 @@ fn tables() -> Tables {
         &db,
         &parse_exclusions(&exclusions),
         parse_version(&exclusions),
+        parse_ident(&data),
     )
 }
 

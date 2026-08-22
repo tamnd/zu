@@ -313,7 +313,7 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
         "MATCH (a:person)<-[:knows]-(b) RETURN count(b) AS n",
         "MATCH (a:person)-[:knows]-(b) RETURN count(b) AS n",
-        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks",
         "MATCH (a:person)-[:knows]->(b)<-[:knows]-(c) RETURN count(c) AS n",
         // Hub shapes: expands fanning out of one scanned level, the
         // plan the optimizer picks for an unseeded two-hop. The count

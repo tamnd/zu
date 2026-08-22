@@ -673,7 +673,7 @@ mod tests {
 
         let walked = session
             .run(
-                "MATCH (a:person)-[:lives_in]->(c:city) RETURN a.name AS who, c.name AS where",
+                "MATCH (a:person)-[:lives_in]->(c:city) RETURN a.name AS who, c.name AS place",
                 &[],
             )
             .expect("read");

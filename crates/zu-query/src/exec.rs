@@ -2751,6 +2751,48 @@ fn rewrite_count_expand(
     }
 }
 
+/// Whether every SKIP and LIMIT of a DISTINCT read takes its rows from
+/// an order that does not depend on the order they arrived in.
+///
+/// The rewrite below cannot change which rows a DISTINCT hands up,
+/// since that is a set either way. What it can change is which of two
+/// rows with equal sort keys comes first, and a SKIP or a LIMIT is what
+/// turns that into a different answer. It stops being a difference when
+/// the sort keys tell every pair of rows apart: two rows of a set
+/// differ in some projected value, so if every projected value is also
+/// a sort key then they differ in a key and neither the sort nor the
+/// cut has anything left to decide. The two sides agree on what equal
+/// means, because `OrdValue` and a sort key both read `value_order`.
+///
+/// A sort written before the DISTINCT settles nothing, and a cut with
+/// no sort between it and the DISTINCT settles nothing either, so both
+/// are refused.
+fn cut_reads_a_settled_order(items: &[BoundItem], post: &[PostOp], query: &BoundQuery) -> bool {
+    let mut distinct = false;
+    let mut settled = false;
+    for op in post {
+        match op {
+            PostOp::Distinct => distinct = true,
+            PostOp::Sort(keys) => {
+                settled = distinct
+                    && items.iter().all(|item| {
+                        let slot = item_slot(item, query);
+                        keys.iter().any(|key| {
+                            key.expr == item.expr
+                                || matches!(
+                                    (&key.expr, slot),
+                                    (BoundExpr::Var(s), Some(want)) if *s == want
+                                )
+                        })
+                    });
+            }
+            PostOp::Skip(_) | PostOp::Limit(_) if !settled => return false,
+            PostOp::Skip(_) | PostOp::Limit(_) | PostOp::Filter(_) => {}
+        }
+    }
+    true
+}
+
 /// The reachability rewrite over a finished stage: a variable-length
 /// expand whose paths the stage throws away walks each node once
 /// instead of once per path.
@@ -2781,16 +2823,15 @@ fn rewrite_reach_varlen(
     post: &[PostOp],
     extra: &BTreeSet<usize>,
     aggregate: bool,
+    query: &BoundQuery,
 ) {
     let a_set = if aggregate {
         !aggs.is_empty() && aggs.iter().all(|spec| spec.distinct)
     } else {
         post.iter().any(|op| matches!(op, PostOp::Distinct))
             // A window over rows that are a set is still a window over
-            // the order they arrive in, and this changes that order.
-            && !post
-                .iter()
-                .any(|op| matches!(op, PostOp::Skip(_) | PostOp::Limit(_)))
+            // the order they arrive in, unless the sort keys settle it.
+            && cut_reads_a_settled_order(items, post, query)
     };
     if !a_set {
         return;
@@ -3134,7 +3175,7 @@ fn build_stages(
                 // look like a slot nobody wants.
                 let read: Vec<BoundItem> = items.iter().chain(&order_aggs).cloned().collect();
                 rewrite_count_expand(&mut b, &read, &mut aggs, &post, &extra, aggregate);
-                rewrite_reach_varlen(&mut b, &read, &aggs, &post, &extra, aggregate);
+                rewrite_reach_varlen(&mut b, &read, &aggs, &post, &extra, aggregate, query);
 
                 let unflat = (0..b.chunk_flat.len())
                     .filter(|&c| !b.chunk_flat[c])

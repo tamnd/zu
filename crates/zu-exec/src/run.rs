@@ -1019,6 +1019,7 @@ fn column_sink(plan: &ExecPlan) -> Option<columns::ColumnSink> {
                 zu_query::snapshot::ColType::Int => ColumnType::Int,
                 zu_query::snapshot::ColType::Float => ColumnType::Float,
                 zu_query::snapshot::ColType::Str => ColumnType::Str,
+                zu_query::snapshot::ColType::Temporal(lane) => lane.column_type(),
             },
             // A list the query wrote whose own items are types no list
             // holds has no column, and it is the one thing here that
@@ -3846,6 +3847,23 @@ impl<'a> Worker<'a> {
                                     }
                                 }
                             }
+                            // A temporal column arrives as the words it
+                            // is stored as and leaves as values, which
+                            // is a cell of its own per row. The tight
+                            // buffer the row engine's columns have for
+                            // days and for nanoseconds is what this
+                            // wants and is a change of its own.
+                            zu_query::snapshot::ColType::Temporal(lane) => {
+                                let values = held.values::<i64>();
+                                for pos in active_positions(&set.chunks[last]) {
+                                    let idx = pinned.unwrap_or(pos);
+                                    if held.is_valid(idx) {
+                                        fill.push_value(Value::Temporal(lane.value(values[idx])));
+                                    } else {
+                                        fill.push_null();
+                                    }
+                                }
+                            }
                         }
                     }
                     ScalarRef::Const { .. } => unreachable!("a constant answered above"),
@@ -4290,6 +4308,9 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
                 Value::Float(chunk.vecs[vec].values::<f64>()[idx])
             }
             zu_query::snapshot::ColType::Str => Value::Str(str_at(&chunk.vecs[vec], idx)?),
+            zu_query::snapshot::ColType::Temporal(lane) => {
+                Value::Temporal(lane.value(chunk.vecs[vec].values::<i64>()[idx]))
+            }
         },
         ScalarRef::Const { .. } => unreachable!("a constant answered above"),
     })
@@ -4341,6 +4362,10 @@ fn part_kind(r: ScalarRef) -> PartKind {
         ScalarRef::Col { ty, .. } => match ty {
             zu_query::snapshot::ColType::Int => PartKind::Int,
             zu_query::snapshot::ColType::Str => PartKind::Str,
+            // A temporal key is the word it rides in, and the lane
+            // rides along so the group can be handed back as the value
+            // it was rather than as the count underneath it.
+            zu_query::snapshot::ColType::Temporal(lane) => PartKind::Temporal(lane),
             // The compiler declines a float key, so one never reaches
             // a packer. See `keyable`.
             zu_query::snapshot::ColType::Float => {
@@ -4398,7 +4423,10 @@ fn fill_key_col(
             zu_query::snapshot::ColType::Float => {
                 unreachable!("a float is not a key the compiler hands over")
             }
-            zu_query::snapshot::ColType::Int => {
+            // A temporal key is packed the way an integer one is,
+            // because the word is the whole of the value; see
+            // `part_kind`.
+            zu_query::snapshot::ColType::Int | zu_query::snapshot::ColType::Temporal(_) => {
                 if live {
                     fill_col(
                         batch,

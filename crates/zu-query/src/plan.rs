@@ -1219,10 +1219,11 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
             slots,
             ..
         } => {
-            let rel_name = schema
-                .rel_by_id(*rel)
-                .map(|r| r.name.as_str())
-                .unwrap_or("?");
+            // Anywhere and not this graph alone, because a procedure
+            // may have been handed a graph to read (GP15) and a
+            // listing that printed a question mark for it would be
+            // hiding the one thing the reader came for.
+            let rel_name = schema.rel_name_anywhere(*rel).unwrap_or("?");
             let cols: Vec<String> = slots.iter().map(|&s| named(s)).collect();
             PlanNode {
                 detail: format!("{}({rel_name}) YIELD {}", func.name(), cols.join(", ")),
@@ -1342,6 +1343,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Int(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Float(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        BoundExpr::Literal(Literal::Bytes(b)) => zu_common::bytes::literal(b),
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
         BoundExpr::Graph(handle) => handle.label(),

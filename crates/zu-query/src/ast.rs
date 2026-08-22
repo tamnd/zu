@@ -22,6 +22,17 @@ pub enum Statement {
     Query(Query),
     Catalog(CatalogStmt),
     Transaction(TxnStmt),
+    /// GP18. Several of them chained by `NEXT`, at least one of which
+    /// changes the catalog and at least one of which does not.
+    ///
+    /// A part is carried as its own text rather than as its tree. Every
+    /// part is a statement whose runner already exists, plan cache and
+    /// write splitting and all, and the text is what keys that cache,
+    /// so handing the runner the text is handing it the thing it takes.
+    /// The parts have all been parsed by the time this is built, so a
+    /// block holding a part that does not parse is a syntax error
+    /// before any of it runs.
+    Block(Vec<String>),
 }
 
 /// Where a transaction begins and ends (docs/08 §1, GT01, GT02).
@@ -95,6 +106,16 @@ pub enum CatalogStmt {
 /// a session may say otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphName {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+/// A procedure's name and the schema it is in, named the way a graph is
+/// named because a procedure is a catalog object the same way a graph
+/// is. A reference with no path in it is resolved in the schema the
+/// call says it is at, and in the root schema when it says nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcRef {
     pub schema: Option<String>,
     pub name: String,
 }
@@ -189,11 +210,131 @@ pub struct PropertyDef {
 /// bolted onto a flat clause list that has no room for them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// GP16, the `AT` schema clause: the schema a name written without
+    /// a path in it is resolved in. `None` is a query with no `AT`,
+    /// which resolves in the schema the session is working in.
+    pub at_schema: Option<SchemaRef>,
     /// GQ01: the graph the statements below run against, written as a
     /// `USE` clause in front of them. `None` is a query with no `USE`,
     /// which runs against whatever graph the session is working in.
     pub use_graph: Option<GraphRef>,
+    /// GP17, the binding variable definition block: the names the
+    /// statements below may read that no row carries. Empty for every
+    /// query written without one, which is most of them.
+    pub bindings: Vec<BindingDef>,
     pub body: Composite,
+}
+
+/// What a binding variable definition defines (ISO 13.3), which
+/// decides what the name may stand for and where it may be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// `VALUE v = ...`, GP05 through GP07. A value of any type a
+    /// column can hold, which is every type except the two below.
+    Value,
+    /// `BINDING TABLE t = ...`, GP08 through GP10. The rows of a
+    /// result, held once and read by whatever runs over them.
+    Table,
+    /// `GRAPH g = ...`, GP11 through GP13. A reference to a graph,
+    /// which is what a `USE` names and what a graph valued expression
+    /// answers.
+    Graph,
+}
+
+impl BindingKind {
+    /// How the kind reads in a diagnostic, which is how it is written.
+    pub fn word(self) -> &'static str {
+        match self {
+            BindingKind::Value => "VALUE",
+            BindingKind::Table => "BINDING TABLE",
+            BindingKind::Graph => "GRAPH",
+        }
+    }
+}
+
+/// One binding variable definition (ISO 13.3, GP05 through GP13 and
+/// GP17): a name, what kind of thing it stands for, and what it is.
+///
+/// A definition is worked out once, where it is written, and not once
+/// for each place the name is read. That is the difference between
+/// this and a `LET`, and it is why the initializer may be a whole
+/// query without the query becoming a correlated subquery: there is no
+/// row here for it to be correlated to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingDef {
+    pub kind: BindingKind,
+    pub name: String,
+    /// The type written between the name and the `=`, `None` when the
+    /// definition leaves the type to whatever it initializes with.
+    pub ty: Option<LogicalType>,
+    pub init: BindingInit,
+}
+
+/// What a binding variable is initialized with, which is either an
+/// expression or a query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingInit {
+    /// `= 1 + 1`, `= $t`, `= HOME_PROPERTY_GRAPH`. An expression, which
+    /// covers the reference forms of all three kinds since a graph
+    /// reference and a binding table reference are both expressions.
+    Expr(Expr),
+    /// `= { MATCH (p:Person) RETURN p.name AS name }`. A query, which
+    /// answers one value for a `VALUE` and its whole result for a
+    /// `BINDING TABLE`.
+    Query(Box<Query>),
+}
+
+impl BindingInit {
+    /// The graph reference a definition names, when it names one at all
+    /// (GP12 and GP13).
+    ///
+    /// The plain case is `GRAPH g = my_graph`, where the initializer is
+    /// the reference. The other case is `GRAPH g = VALUE { RETURN
+    /// CURRENT_PROPERTY_GRAPH }`, where it is a query, and a graph defined
+    /// by a query is settled when the definition runs rather than while
+    /// the statement is bound, which is too late for the `USE` that reads
+    /// the name. That is true of a query in general and is not true of
+    /// this one: a body that is a bare `RETURN` of a graph reference
+    /// answers what the reference answers, so the reference is read out
+    /// here and the name is as good as one written plainly. Anything the
+    /// answer could depend on, a clause, a second statement, a `GROUP BY`
+    /// or a page, puts the query back in the general case.
+    pub fn graph_ref(&self) -> Option<&GraphRef> {
+        let query = match self {
+            BindingInit::Expr(Expr::GraphRef(reference)) => return Some(reference),
+            BindingInit::Expr(Expr::ValueQuery(query)) => &**query,
+            BindingInit::Query(query) => &**query,
+            BindingInit::Expr(_) => return None,
+        };
+        if !query.bindings.is_empty() || query.use_graph.is_some() || query.at_schema.is_some() {
+            return None;
+        }
+        let Composite::Linear(linear) = &query.body else {
+            return None;
+        };
+        let [simple] = linear.statements.as_slice() else {
+            return None;
+        };
+        if !simple.clauses.is_empty() {
+            return None;
+        }
+        let projection = simple.result.as_ref()?;
+        if projection.star
+            || !projection.group_by.is_empty()
+            || !projection.order_by.is_empty()
+            || projection.skip.is_some()
+            || projection.limit.is_some()
+        {
+            return None;
+        }
+        let [item] = projection.items.as_slice() else {
+            return None;
+        };
+        match &item.expr {
+            Expr::GraphRef(reference) => Some(reference),
+            _ => None,
+        }
+    }
 }
 
 impl Query {
@@ -363,6 +504,26 @@ pub enum GraphRef {
     Param(String),
 }
 
+/// What an `AT` schema clause names (ISO 16.1, `at schema clause`),
+/// which is the schema a reference written without a path in it is
+/// resolved in.
+///
+/// A schema here is a directory of the catalog and not a graph type,
+/// so what the clause changes is where a name is looked up, not what
+/// the statement reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRef {
+    /// `AT CURRENT_SCHEMA`, the schema the session is resolving names
+    /// in already, which is what the clause names when it names no
+    /// path at all.
+    Current,
+    /// `AT HOME_SCHEMA`, the schema the session started in.
+    Home,
+    /// A schema by its path, `AT /app`, which is absolute, and the
+    /// root schema is written `/`.
+    Path(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
     Match {
@@ -488,10 +649,16 @@ pub enum Clause {
     /// It does not group and it does not drop a row, so the rows a
     /// match answered are the rows a yield answers, narrower.
     Yield { items: Vec<YieldItem> },
-    /// `CALL name(args) YIELD col [AS alias], ...`, a table function
-    /// producing rows (docs/07 §4).
+    /// `CALL [AT /schema] name(args) YIELD col [AS alias], ...`, the
+    /// named procedure call of ISO 13.1 and feature GP04.
+    ///
+    /// The name is a catalog object reference and not a word, so it may
+    /// be written in full as a path and it is resolved in a schema.
     Call {
-        name: String,
+        /// The `AT` clause, which says the schema the reference is
+        /// resolved in when the reference does not say it itself.
+        at: Option<String>,
+        proc: ProcRef,
         args: Vec<Expr>,
         /// `(column, alias)` pairs; the column names are fixed by the
         /// function, the alias is what later clauses see.
@@ -515,7 +682,14 @@ pub enum Clause {
     /// reader wrote (GP03). An empty list is a block that reads nothing
     /// of the row, which is a whole statement standing on its own, and
     /// it is written `CALL () { ... }`.
+    ///
+    /// `optional` is the `OPTIONAL` in front of the word (GP03). A block
+    /// written with it keeps the row when it answers no rows at all, and
+    /// every name it lets out is null on that row, which is what the
+    /// same word says in front of a `MATCH`. A block that answers rows
+    /// is the call it always was.
     CallInline {
+        optional: bool,
         scope: Option<Vec<String>>,
         body: Box<Query>,
     },
@@ -1534,6 +1708,12 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Str(String),
+    /// GL08, GV35. A byte string, the bytes an `X'00AB'` names. It is
+    /// its own arm and not a string holding the same bytes, because a
+    /// byte string is a sequence of octets and a character string is a
+    /// sequence of characters, and the two are measured, compared and
+    /// trimmed by different units.
+    Bytes(Vec<u8>),
     /// A temporal value written with its type, as in `DATE '2024-01-15'`.
     /// The text is read at parse time, so the plan carries the instant
     /// and never the spelling.

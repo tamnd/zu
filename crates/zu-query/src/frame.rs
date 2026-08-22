@@ -379,10 +379,13 @@ impl Frame {
     }
 
     /// What the vector layer would carry this column as, `None` for a
-    /// column it has no lane for. The three lanes are integers, doubles
-    /// and strings; a date or a boolean resolves to nothing here and
-    /// the statement reads it a row at a time, which is the same answer
-    /// a stored column of one gets.
+    /// column it has no lane for. The lanes a frame hands over are
+    /// integers, doubles and strings; a boolean or a temporal column
+    /// resolves to nothing here and the statement reads it a row at a
+    /// time. A stored temporal column does have a lane, because it is
+    /// written as the count it is and read back as one; a frame holds
+    /// whatever a caller lent it, and there is no temporal layout to
+    /// lend yet.
     pub fn lane(&self, col: ColId) -> Option<ColType> {
         match &self.cols.get(col as usize)?.ty {
             LogicalType::Int { .. } => Some(ColType::Int),

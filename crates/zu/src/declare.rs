@@ -456,6 +456,7 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
         Literal::Int(_) => PropValues::Int(&[]),
         Literal::Float(_) => PropValues::Float(&[]),
         Literal::Str(_) => PropValues::Str(&[]),
+        Literal::Bytes(_) => PropValues::Bytes(&[]),
         Literal::Temporal(Temporal::Date(_)) => PropValues::Date(&[]),
         Literal::Temporal(Temporal::LocalTime(_)) => PropValues::LocalTime(&[]),
         Literal::Temporal(Temporal::LocalDatetime(_)) => PropValues::LocalDatetime(&[]),

@@ -107,6 +107,11 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    /// GV35, a byte string: a sequence of octets and not of characters.
+    /// `X'0041'` is one byte string of two bytes and never the letter
+    /// A, which is the whole reason it is an arm here rather than a
+    /// `Str` holding the same bytes.
+    Bytes(Vec<u8>),
     Node {
         table: u32,
         offset: u64,
@@ -864,6 +869,11 @@ pub struct Options {
     pub sip: Sip,
     /// What the sink of a plain projection keeps.
     pub sink: Sink,
+    /// Which executor runs a plan the pipeline one covers. Read here
+    /// rather than from the environment so that one statement can ask
+    /// for the row executor without answering for every statement
+    /// running beside it (#513).
+    pub engine: Engine,
     /// The handle whoever asked for the statement can stop it through,
     /// and the count of rows it has read so far. Here rather than as a
     /// parameter of its own because every execution path already
@@ -921,6 +931,25 @@ pub enum Sip {
 pub enum Sink {
     #[default]
     Columns,
+    Rows,
+}
+
+/// Which executor runs a plan the pipeline one covers. `Pipeline` is
+/// every plan it takes, falling back to the row-at-a-time executor for
+/// the rest, and is the default. `Rows` pins the row executor for the
+/// whole statement, which is how the differential tests get an oracle
+/// to compare an answer against.
+///
+/// It is a switch on the options rather than a reading of the
+/// environment because the environment is one variable for a whole
+/// process and a test binary runs its tests in parallel threads: a
+/// test that set it for its own statement was setting it for whichever
+/// other test happened to be between plans, and that answered on the
+/// wrong engine (#513).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    #[default]
+    Pipeline,
     Rows,
 }
 
@@ -1398,26 +1427,31 @@ fn rank(v: &Value) -> u8 {
         Value::Bool(_) => 1,
         Value::Int(_) | Value::Float(_) => 2,
         Value::Str(_) => 3,
+        // A byte string sorts beside the character strings and after
+        // them. The two are not comparable values, so where one goes
+        // relative to the other is a choice, and next to the type it
+        // is most often mistaken for is where a reader will look.
+        Value::Bytes(_) => 4,
         // A temporal value sorts after the strings and before the
         // references, and two of different kinds sort by kind, because
         // a date and a duration have no order between them and the
         // total order still owes an answer.
-        Value::Temporal(_) => 4,
-        Value::Node { .. } => 5,
-        Value::Rel { .. } => 6,
-        Value::List(_) | Value::Chain(_) => 7,
+        Value::Temporal(_) => 5,
+        Value::Node { .. } => 6,
+        Value::Rel { .. } => 7,
+        Value::List(_) | Value::Chain(_) => 8,
         // A record sorts after every list, and two records sort by
         // their fields, name first and then value.
-        Value::Record(_) => 8,
+        Value::Record(_) => 9,
         // A path sorts after every record, and two paths sort by their
         // elements, which is the list order over the same sequence.
-        Value::Path(_) => 9,
+        Value::Path(_) => 10,
         // GV60 and GV61 sort last, after everything the language can
         // write down. They are handles rather than data, so where they
         // go is a choice with nothing to recommend one place over
         // another, and the end is the place that moves no other type.
-        Value::Graph(_) => 10,
-        Value::BindingTable(_) => 11,
+        Value::Graph(_) => 11,
+        Value::BindingTable(_) => 12,
     }
 }
 
@@ -1441,6 +1475,11 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
         (Value::Float(a), Value::Int(b)) => float_order(*a, *b as f64),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Str(a), Value::Str(b)) => a.cmp(b),
+        // Two byte strings order by their octets, which is the only
+        // order they have: there is no collation over bytes that are
+        // not text, and a shorter one that is a prefix of a longer one
+        // comes first, the way a shorter string does.
+        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
         (Value::Temporal(a), Value::Temporal(b)) => temporal_key(a).cmp(&temporal_key(b)),
         (
             Value::Node {
@@ -5579,14 +5618,34 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             // does not have, and the kernel counts nothing for those
             // rather than failing the query over them.
             if matches!(func, TableFunc::Betweenness) {
-                let Some(Value::List(items)) = vals.first() else {
-                    return Err(invalid(format!(
-                        "betweenness's sources must be a list of node ids, got {:?}",
-                        vals.first()
-                    )));
+                // GP14. The sources may be written as a list or handed
+                // in as a binding table, which is a column of node ids
+                // and so is the same thing said by a query rather than
+                // by hand. A table of any other shape is refused here
+                // rather than read down its first column, since a
+                // sample nobody meant is worse than a refusal.
+                let items = match vals.first() {
+                    Some(Value::List(items)) => items.clone(),
+                    Some(Value::BindingTable(table)) if table.columns().len() == 1 => {
+                        table.rows().iter().map(|row| row[0].clone()).collect()
+                    }
+                    Some(Value::BindingTable(table)) => {
+                        return Err(ZuError::gql(
+                            codes::C22G03,
+                            format!(
+                                "betweenness's sources are one column of node ids and this binding table has {}",
+                                table.columns().len()
+                            ),
+                        ));
+                    }
+                    other => {
+                        return Err(invalid(format!(
+                            "betweenness's sources must be a list of node ids, got {other:?}"
+                        )));
+                    }
                 };
                 let mut offsets = Vec::with_capacity(items.len());
-                for item in items {
+                for item in &items {
                     let Value::Int(key) = item else {
                         return Err(invalid(format!(
                             "betweenness's sources must be node ids, got {item:?}"
@@ -5812,6 +5871,13 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
         (Value::Float(x), Value::Int(y)) => Some(*x == (*y as f64)),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Str(x), Value::Str(y)) => Some(x == y),
+        // Two byte strings are equal when they hold the same octets in
+        // the same order. Nothing is padded away first: IA016 leaves
+        // an engine free to call two byte strings differing only in
+        // trailing X'00' equal, and zu does not, because a value whose
+        // last byte is nought is a different value from one without it
+        // and a query that meant to ignore it can trim.
+        (Value::Bytes(x), Value::Bytes(y)) => Some(x == y),
         // Two temporal values are equal when they are the same kind
         // and the same count. A zoned value carries UTC, so two
         // spellings of one instant are equal and the offset each was
@@ -6197,10 +6263,10 @@ fn shift(instant: &Temporal, kind: DurationKind, count: i64) -> Result<Value> {
             })?)
         }
         (Temporal::LocalTime(nanos), DurationKind::DayTime) => {
-            Temporal::LocalTime((nanos + count).rem_euclid(temporal::NANOS_PER_DAY))
+            Temporal::LocalTime(clock_shift(*nanos, count))
         }
         (Temporal::ZonedTime { nanos, offset }, DurationKind::DayTime) => Temporal::ZonedTime {
-            nanos: (nanos + count).rem_euclid(temporal::NANOS_PER_DAY),
+            nanos: clock_shift(*nanos, count),
             offset: *offset,
         },
         (Temporal::LocalDatetime(nanos), DurationKind::DayTime) => {
@@ -6247,6 +6313,20 @@ fn shift(instant: &Temporal, kind: DurationKind, count: i64) -> Result<Value> {
     Ok(Value::Temporal(out))
 }
 
+/// A time of day moved round the clock by any length of time at all.
+///
+/// A time has no date behind it, so a duration past the end of the day
+/// wraps rather than overflowing, and there is no length of time this
+/// cannot answer for: the answer is always a reading of a clock. The
+/// sum is taken a size up so that the wrap is the only thing that
+/// happens to it, since a time near midnight plus a duration near the
+/// top of the word is past the top of the word on the way to an answer
+/// that was never in doubt.
+fn clock_shift(nanos: i64, count: i64) -> i64 {
+    let day = i128::from(temporal::NANOS_PER_DAY);
+    ((i128::from(nanos) + i128::from(count)).rem_euclid(day)) as i64
+}
+
 /// An instant in nanoseconds shifted, refusing a result off the
 /// calendar rather than wrapping into a year the type cannot spell.
 fn add_nanos(nanos: i64, count: i64) -> Result<i64> {
@@ -6271,7 +6351,13 @@ fn add_months_to_nanos(nanos: i64, months: i64) -> Result<i64> {
         .ok()
         .and_then(|d| temporal::add_months(d, months))
         .ok_or_else(|| datetime_overflow("the shifted instant leaves the calendar".into()))?;
-    Ok(i64::from(days) * temporal::NANOS_PER_DAY + rest)
+    // The calendar is the wider of the two bounds. A date in the year
+    // 3000 is a date the standard has and a datetime this build cannot
+    // hold, so a shift that lands there passes the check above and
+    // fails here, and the two say different things because they are
+    // different limits.
+    temporal::instant_at(days, rest)
+        .ok_or_else(|| datetime_overflow("the shifted instant does not fit".into()))
 }
 
 /// `22012 data exception, division by zero`, for both `/` and `%`. The
@@ -6416,6 +6502,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Int(i) => Value::Int(*i),
             Literal::Float(f) => Value::Float(*f),
             Literal::Str(s) => Value::Str(s.clone()),
+            Literal::Bytes(b) => Value::Bytes(b.clone()),
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
@@ -8319,6 +8406,113 @@ fn one_value(
     }
 }
 
+/// The binding variables of a statement, worked out (ISO 13.3, GP05
+/// through GP13 and GP17).
+///
+/// Each one is a query and a parameter position: the query is run
+/// here, once, and its answer is written into the position, so
+/// everything that reads the name below this reads a parameter. They
+/// are done in written order because a definition may read the ones in
+/// front of it, and each is run against the parameters the ones before
+/// it filled.
+///
+/// What is read out of the run is the one thing the kind asks for. A
+/// value and a graph stand for one value, so they take the value the
+/// query answered the way a `VALUE { ... }` does. A binding table
+/// stands for the whole result, so it takes every row, and that is the
+/// one place in the engine where a query's rows become a value.
+fn fill_bindings(
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<Vec<Value>> {
+    let mut filled = params.to_vec();
+    if filled.len() < query.params.len() {
+        filled.resize(query.params.len(), Value::Null);
+    }
+    for binding in &query.bindings {
+        let built = crate::plan::build(&binding.query)?;
+        let plan = crate::optimizer::optimize(built, &binding.query, schema)?;
+        let value = match binding.kind {
+            crate::ast::BindingKind::Table if binding.collects => {
+                let result = run_stages(
+                    &plan,
+                    &binding.query,
+                    schema,
+                    graph,
+                    &filled,
+                    options,
+                    Extras::default(),
+                )?;
+                // Epoch nought, which is the one a table that outlives
+                // nothing is given. A handle records the epoch it was
+                // read at so that a session can say the snapshot under
+                // it has moved, and this table is made and read inside
+                // one statement, so there is no later for it to be
+                // stale in. A table the caller passed in is the one
+                // that needs a real epoch, and it arrives with one.
+                Value::BindingTable(crate::refs::BindingTable::new(
+                    result.columns.clone(),
+                    result.rows.into_vec(),
+                    0,
+                ))
+            }
+            _ => one_value(&plan, &binding.query, schema, graph, &filled, options)?,
+        };
+        // What it was written as and what it turned out to be have to
+        // agree, because the name is going to be read as one of the
+        // three and a reader that finds another thing there has no way
+        // to say so later.
+        let wrong = match binding.kind {
+            crate::ast::BindingKind::Graph => !matches!(value, Value::Graph(_) | Value::Null),
+            crate::ast::BindingKind::Value => {
+                matches!(value, Value::Graph(_) | Value::BindingTable(_))
+            }
+            // A table written as a nested query is whatever its rows
+            // are, so there is nothing to check. One written as an
+            // expression has to be a table already, because the name
+            // is going to be read as one.
+            crate::ast::BindingKind::Table => {
+                !binding.collects && !matches!(value, Value::BindingTable(_) | Value::Null)
+            }
+        };
+        if wrong {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                format!(
+                    "{} '{}' was defined with something that is not one: what it answered is {}",
+                    binding.kind.word(),
+                    binding.name,
+                    crate::cast::value_type(&value)
+                ),
+            ));
+        }
+        // A definition written with a type is a statement about what
+        // the query is going to answer, and it is checked here because
+        // here is where the answer is. `IS TYPED` decides it, so a
+        // declared type means the same thing in a definition as it
+        // means in a predicate and there is one place that meaning
+        // lives.
+        if let Some(ty) = &binding.ty
+            && !crate::typed::is_of(&value, ty)
+        {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                format!(
+                    "'{}' was defined as {} and what defines it answered {}",
+                    binding.name,
+                    ty,
+                    crate::cast::value_type(&value)
+                ),
+            ));
+        }
+        filled[binding.param] = value;
+    }
+    Ok(filled)
+}
+
 /// The warning a statement carries for every value query expression it
 /// could not decorrelate.
 ///
@@ -8374,6 +8568,18 @@ fn run_stages(
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }
+    // The binding variables written at the head of this statement and
+    // at the head of every block in it (GP17). They come first because
+    // everything after this may read one, and they are worked out
+    // before the first row exists because a definition cannot read a
+    // row.
+    let filled;
+    let params = if query.bindings.is_empty() {
+        params
+    } else {
+        filled = fill_bindings(query, schema, graph, params, options)?;
+        &filled
+    };
     // Every value query expression this query holds (GQ18). The ones
     // that read nothing from the rows around them are answered here,
     // once, which is the whole cost of one however many rows read it.
@@ -10081,11 +10287,30 @@ mod tests {
             ),
             (
                 "CALL nonsense('KNOWS') YIELD node, rank RETURN rank",
-                "unknown table function",
+                "no procedure 'nonsense' in the schema '/'",
+            ),
+            (
+                "CALL AT /app pagerank('KNOWS') YIELD node, rank RETURN rank",
+                "it is in the root schema",
+            ),
+            (
+                "CALL /app/pagerank('KNOWS') YIELD node, rank RETURN rank",
+                "it is in the root schema",
             ),
             (
                 "CALL pagerank('IS_LOCATED_IN') YIELD node, rank RETURN rank",
                 "over one node table",
+            ),
+            // GP15 against a schema built with no catalog behind it:
+            // a graph reference names a graph in the catalog, so
+            // there is nothing here for it to name.
+            (
+                "CALL pagerank(CURRENT_PROPERTY_GRAPH, 'KNOWS') YIELD node, rank RETURN rank",
+                "compiled without one behind it",
+            ),
+            (
+                "GRAPH g = { MATCH (p:Person) RETURN p.name AS g } CALL pagerank(g, 'KNOWS') YIELD node, rank RETURN rank",
+                "defined as a graph reference",
             ),
             (
                 "CALL pagerank('KNOWS', 1) YIELD node, rank RETURN rank",

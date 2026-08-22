@@ -53,7 +53,7 @@ use zu::zu1::graph::{
     Direction, GraphReader, bulk_load_keyed, densify_keyed, read_key_edge_list, read_key_list,
 };
 use zu::zu1::props::{PropValues, store_props};
-use zu_query::exec::{Value, Wcoj};
+use zu_query::exec::{Engine, Options, Value, Wcoj};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -397,9 +397,13 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
     // per call rather than through ZU_WCOJ: what a bench measures
     // should not depend on what else is in the environment when it
     // runs, and the two numbers printed here differ by the join and
-    // nothing else (#474).
-    let binary =
-        |db: &mut _| zu::query::run_pinned(source, db, &[], zu::query::Engine::Pipeline, Wcoj::Off);
+    // nothing else (#513).
+    let pinned = Options {
+        engine: Engine::Pipeline,
+        wcoj: Wcoj::Off,
+        ..Options::default()
+    };
+    let binary = |db: &mut _| zu::query::run_with(source, db, &[], &pinned);
     for _ in 0..3 {
         binary(&mut db).expect("binary warmup run");
     }

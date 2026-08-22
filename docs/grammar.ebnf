@@ -6,8 +6,39 @@
    assembles every arrow from single characters. Changes here require a
    spec change to docs/07 first. *)
 
-statement       = query | catalog_statement ;
-query           = [ use_clause ] , composite_query , [ ";" ] ;
+statement       = statement_block | transaction_statement ;
+
+(* GP18, ISO 13.6. A statement block is the parts of a procedure body,
+   and what a session is handed is a procedure body. A part is a query
+   or a catalog statement, so a block may hold both, which is the whole
+   of the feature: nothing about the syntax says a chain has to be all
+   one kind. A catalog statement hands nothing to the part behind it,
+   so the parts of a mixed block do not share rows; a run of query
+   statements is a linear query and shares them the way it always did.
+   The block answers what its last part answered. *)
+statement_block = block_part , { "NEXT" , block_part } , [ ";" ] ;
+block_part      = query | catalog_statement ;
+query           = [ at_schema_clause ] , [ use_clause ] ,
+                  { binding_variable_definition } , [ use_clause ] ,
+                  composite_query ;
+(* The graph clause is written on either side of the definitions and
+   once in all, ISO putting it on the statement rather than on the head
+   the definitions are. It has to be readable behind them: a clause
+   naming a graph a definition above it defined can be written nowhere
+   else. *)
+
+(* GT01 and GT02, ISO 15.1 to 15.3. Where a transaction begins and
+   ends. These three are not parts of a block: a block runs as one
+   transaction, so a word among its parts that began or ended one
+   would be saying the unit is two. ISO writes the characteristics as
+   a list because it has more of them to come, and the two that mean
+   something here are the access modes; a list naming both names
+   neither. *)
+transaction_statement
+                = "START" , "TRANSACTION" ,
+                  [ access_mode , { "," , access_mode } ]
+                | "COMMIT" | "ROLLBACK" ;
+access_mode     = "READ" , ( "ONLY" | "WRITE" ) ;
 
 (* GQ02 to GQ07, ISO 12.1. A composite query meets two result tables.
    Every conjunction is at one level and the fold is to the left, so
@@ -28,10 +59,31 @@ set_operator    = "UNION" | "EXCEPT" | "INTERSECT" ;
    are the last statement's. A statement in front of a NEXT ends with
    RETURN unless it writes; a write ends without projecting anything,
    the way it does at the end of a query, and hands on the rows it was
-   given. *)
+   given. The chain is query statements and nothing else, so a NEXT
+   handing over to a catalog statement ends it and the statement block
+   above carries on from there. *)
 linear_query    = simple_query , { "NEXT" , simple_query } ;
 simple_query    = { reading_clause } , return_clause
                 | { reading_clause } ;
+
+(* GP16, ISO 16.1. The schema every catalog name written without a path
+   in it is resolved in, which today is every procedure name a call
+   inside the statement writes. It stands in front of the graph clause
+   and reaches the whole statement, so a call that names a schema of
+   its own wins: a path says where a thing lives and the clause is only
+   the default for a name that gave none. CURRENT_SCHEMA and
+   HOME_SCHEMA both name the schema the session opened in, nothing
+   moving a session out of one yet.
+
+   Whitespace is nothing to the lexer, so `AT / MATCH (p)` is the same
+   tokens as `AT /MATCH (p)` and the path would otherwise swallow the
+   word the query begins with. A segment is therefore a name that does
+   not open a clause, which makes the root what a clause word straight
+   after the slash leaves behind, and a schema really called MATCH is
+   written in quotes. *)
+at_schema_clause
+                = "AT" , ( "CURRENT_SCHEMA" | "HOME_SCHEMA"
+                           | [ "SCHEMA" ] , schema_path ) ;
 
 (* GQ01, ISO 16.2. The graph the clauses after it are against. ISO
    writes it as a graph expression, and the four forms here are the
@@ -40,11 +92,52 @@ simple_query    = { reading_clause } , return_clause
    in. A parameter is what makes this a reference rather than a word,
    because which graph it is is settled when the parameter arrives and
    not while the statement is being read. A query with no USE is
-   against the graph the session is working in. *)
+   against the graph the session is working in.
+
+   A name here is a graph variable's before it is the catalog's (GP12
+   and GP13), a definition being the nearer of the two, so one graph
+   variable may be defined as another and a USE may read either. Which
+   graph a statement runs against is settled before the statement is
+   compiled, the schema of that graph being what the names in it are
+   bound against, so a variable a USE reads has to be defined as a
+   graph reference; one defined by a query is refused by name. *)
 use_clause      = "USE" , graph_ref ;
 graph_ref       = "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
                   | "HOME_PROPERTY_GRAPH" | "HOME_GRAPH"
                   | [ [ "PROPERTY" ] , "GRAPH" ] , ( graph_name | parameter ) ;
+
+(* GP05 to GP13 and GP17, ISO 13.3. The binding variable definition
+   block: names the statements below it may read that no row carries.
+   A definition stands for a value, a binding table or a graph, and
+   what defines it is either an expression or a whole query in braces.
+   Each one is worked out once, before the first row, and in the order
+   written, so a definition may read the ones in front of it and not
+   itself. It may not read a row, because there is none yet, and it may
+   not write, because a statement taken apart at its write runs in
+   parts and a definition is worked out once per part. A definition
+   whose kind is not BINDING TABLE has to answer one column, and one
+   whose kind is VALUE has to answer something that is not a table or a
+   graph. The block a CALL body carries is its own: the names go out of
+   scope with the block.
+
+   GP06 is the type: a definition may be written with one, and it is
+   checked against what the definition answered rather than used to
+   shape it. ISO writes the separator in front of it two ways and lets
+   the type be written with neither, so all three spellings are one
+   definition and the equals is what says the type is over. *)
+binding_variable_definition
+                = value_variable_definition | table_variable_definition
+                | graph_variable_definition ;
+typed_as        = "::" | "TYPED" | (* nothing *) ;
+value_variable_definition
+                = "VALUE" , name , [ typed_as , value_type ] , "=" ,
+                  ( [ "VALUE" ] , "{" , query , "}" | expression ) ;
+table_variable_definition
+                = [ "BINDING" ] , "TABLE" , name , [ typed_as , value_type ] ,
+                  "=" , ( "{" , query , "}" | expression ) ;
+graph_variable_definition
+                = [ "PROPERTY" ] , "GRAPH" , name , [ typed_as , value_type ] ,
+                  "=" , ( "{" , query , "}" | graph_ref ) ;
 
 (* Catalog statements (docs/07 §9). They change what the file declares
    and answer no rows, so they are told apart from a query by their
@@ -135,13 +228,80 @@ reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
    the names the reader wrote (GP03), and an empty list is a block that
    reads nothing, which is a whole statement standing on its own.
 
-   The word is a table function's too, and that reading is the one a
-   name after CALL gets. Which of the two a call is is settled by the
-   one token after the word: a brace or a parenthesis is this, and a
-   name is the other. *)
-call_clause     = "CALL" , [ variable_scope ] , "{" ,
-                  [ use_clause ] , composite_query , "}" ;
+   The word is a named call's too, and that reading is the one a name
+   after CALL gets. Which of the two a call is is settled by the one
+   token after the word: a brace or a parenthesis is the inline call,
+   and a name, a path or AT is the named one.
+
+   OPTIONAL in front says the row survives the block answering nothing,
+   and every name the block lets out is null on that row, which is what
+   the same word says in front of a MATCH. It is written in front of an
+   inline call only: a named procedure answers a table of its own rather
+   than more of the row, so there is no row of the statement for the
+   word to keep. The word is a match's too, and the token behind it is
+   what says which clause is coming. *)
+call_clause     = [ "OPTIONAL" ] , "CALL" , inline_procedure_call
+                | "CALL" , named_procedure_call ;
+inline_procedure_call
+                = [ variable_scope ] , "{" , [ leading_catalog_part ] ,
+                  [ at_schema_clause ] , [ use_clause ] ,
+                  { binding_variable_definition } , [ use_clause ] ,
+                  composite_query , "}" ;
+leading_catalog_part
+                = catalog_statement , "NEXT" ,
+                  { catalog_statement , "NEXT" } ;
+(* GP18 again. A call body is a procedure body, so a catalog statement
+   may open one, and where it does the parts are taken out of the body
+   and put in front of the statement. That only holds for a call the
+   statement begins with, which runs for the one row a statement starts
+   from; anywhere else the body runs once for every row that reaches
+   it, a thing is made once or not at all, and a catalog statement in
+   there is refused rather than hoisted out of the loop it was written
+   in. Behind the data statements of a body it is refused too, since
+   taking it out would run it before the statements it follows.
+
+   The schema clause travels the same road. A call the statement begins
+   with is taken out of the call whole, so the clause its body carries
+   becomes the clause of the query the statements land in; a body that
+   is spliced into the statement around it resolves names where that
+   statement does, so a clause there is refused rather than ignored.
+
+   The graph clause has to travel it, a spliced body running against
+   the graph the statement around it does and a body that named one not
+   doing that, and its definitions come out with it since the clause
+   may read one. What that costs is that the clause governs the whole
+   chain the statements land in, zu running one graph per query, so a
+   statement written behind such a call may only project what the call
+   answered: one that reads the graph was written outside the call and
+   against another graph, and it is refused rather than read against
+   the graph nobody wrote it for.
+
+   A call written with OPTIONAL is never taken out of the statement it
+   begins, the word being a token in front of it: what a hoisted body
+   answers is the statement's own rows and there is no row left over
+   for the word to keep. *)
 variable_scope  = "(" , [ name , { "," , name } ] , ")" ;
+
+(* GP04, ISO 13.1. The named procedure call. The name is a catalog
+   object reference, so it is read the way a graph's name is: a bare
+   name, or a path saying which schema it is in. The AT clause says
+   that schema instead, and the two are never both written, since
+   whitespace is nothing to the lexer and a path after a path reads as
+   one longer path. What a procedure takes and what it yields are the
+   procedure's own, so the arguments and the YIELD columns are checked
+   against the catalog and not against this grammar.
+
+   An argument is an expression, and two of the things an expression may
+   be are not values: a graph reference or a name standing for one says
+   which graph the procedure reads (GP15), and a name standing for a
+   binding table stands where a list of arguments stands (GP14). Neither
+   is a shape of its own here, since both are already expressions, and
+   which procedure takes which is the catalog's to say. *)
+named_procedure_call
+                = [ "AT" , schema_path ] , procedure_ref , "(" ,
+                  [ expression , { "," , expression } ] , ")" ,
+                  yield_clause ;
+procedure_ref   = name | "/" , { name , "/" } , name ;
 
 match_clause    = ( "MATCH" , pattern , [ where_clause ]
                   | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]

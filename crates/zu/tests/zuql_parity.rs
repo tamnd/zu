@@ -8,10 +8,10 @@
 //! verbatim with no translation.
 
 use zu::query::run as run_zu1;
-use zu::query::{Engine, run_pinned as run_zu1_pinned};
+use zu::query::run_with as run_zu1_with;
 use zu::sqlite::run as run_sqlite;
-use zu::sqlite::run_pinned as run_sqlite_pinned;
-use zu_query::exec::{Value, Wcoj};
+use zu::sqlite::run_with as run_sqlite_with;
+use zu_query::exec::{Engine, Options, Value, Wcoj};
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
@@ -193,12 +193,17 @@ fn both_engines_answer_the_corpus_identically() {
     // intersection run the corpus just did. Pinned per call rather than
     // through ZU_WCOJ: the environment is process wide and setting one
     // here would pick the join for whatever else the binary is running
-    // at the time (#474).
+    // at the time (#513).
     let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
                   RETURN count(*) AS triangles";
     let fused = run_zu1(source, &mut zu, &[]).unwrap();
-    let z = run_zu1_pinned(source, &mut zu, &[], Engine::Pipeline, Wcoj::Off).unwrap();
-    let s = run_sqlite_pinned(source, &sq, &[], Wcoj::Off).unwrap();
+    let binary = Options {
+        engine: Engine::Pipeline,
+        wcoj: Wcoj::Off,
+        ..Options::default()
+    };
+    let z = run_zu1_with(source, &mut zu, &[], &binary).unwrap();
+    let s = run_sqlite_with(source, &sq, &[], &binary).unwrap();
     assert_eq!(z.rows, s.rows, "binary parity diverged on: {source}");
     assert_eq!(
         z.rows, fused.rows,

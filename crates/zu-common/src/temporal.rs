@@ -51,6 +51,26 @@ pub const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 pub const MIN_DAY: i32 = -719_162;
 pub const MAX_DAY: i32 = 2_932_896;
 
+/// The instant `days` days after the epoch and `nanos` into that day,
+/// or `None` where it does not fit.
+///
+/// A datetime is nanoseconds since the epoch in one signed word, and
+/// that word runs out long before the calendar does: the last instant
+/// it spells is in 2262 and the first is in 1677, while a date runs
+/// from year 1 to year 9999. So there are dates that are perfectly
+/// good dates and name no datetime at all, and every place that builds
+/// a datetime out of a day has to say so rather than wrap into a year
+/// on the other side of the epoch.
+///
+/// This is the one place that multiplication is written. It was
+/// written in five places before, none of them checked, and each one
+/// was a panic in a debug build and a wrong answer in a release one.
+pub fn instant_at(days: i32, nanos: i64) -> Option<i64> {
+    i64::from(days)
+        .checked_mul(NANOS_PER_DAY)?
+        .checked_add(nanos)
+}
+
 /// What a statement answers the datetime value functions with: the
 /// instant it is running at and the displacement its session keeps.
 ///
@@ -635,6 +655,11 @@ fn split_offset(text: &str) -> Option<(&str, Option<i16>)> {
 
 /// `yyyy-mm-ddThh:mm:ss` as nanoseconds since the epoch, plus the
 /// offset when one is written.
+///
+/// A date the calendar has and the word does not reads as no datetime,
+/// which the caller reports as a string that is not a value of the
+/// type. That is the truth about it: `9999-12-31T00:00:00` names an
+/// instant this build cannot hold, so there is nothing to hand back.
 fn parse_datetime(text: &str) -> Option<(i64, Option<i16>)> {
     let Some((date, time)) = text
         .split_once('T')
@@ -646,11 +671,11 @@ fn parse_datetime(text: &str) -> Option<(i64, Option<i16>)> {
         // `CAST('2024-01-15' AS DATETIME)`. There is no offset to read
         // out of a date, so the value is local until a zoned type asks
         // for one and gets UTC.
-        return Some((i64::from(parse_date(text)?) * NANOS_PER_DAY, None));
+        return Some((instant_at(parse_date(text)?, 0)?, None));
     };
     let days = parse_date(date)?;
     let (nanos, offset) = parse_time(time)?;
-    Some((i64::from(days) * NANOS_PER_DAY + nanos, offset))
+    Some((instant_at(days, nanos)?, offset))
 }
 
 /// An ISO 8601 duration, `PnYnMnDTnHnMnS`.
@@ -1126,5 +1151,36 @@ mod tests {
         assert!(seconds("1.123", Some(3)));
         assert!(!seconds("1.1234", Some(3)));
         assert!(!seconds("100.1", Some(3)));
+    }
+
+    /// The word a datetime rides in runs out long before the calendar
+    /// does, and every place that builds a datetime out of a day has to
+    /// say so. These are the ends of it: the last instant the count
+    /// reaches is in 2262 and the first is in 1677, and a day on either
+    /// side of that has no datetime however good a date it is.
+    #[test]
+    fn a_datetime_stops_where_the_word_does_and_not_where_the_calendar_does() {
+        let datetime = |text: &str| Temporal::parse(&LogicalType::LocalDatetime, text);
+
+        assert!(datetime("2262-04-11T00:00:00").is_some());
+        assert!(datetime("1677-09-22T00:00:00").is_some());
+        assert_eq!(datetime("9999-12-31T00:00:00"), None);
+        assert_eq!(datetime("1677-09-21T00:00:00"), None);
+        // A date on its own is midnight and takes the same bound, which
+        // is the other arm of the same parse and was the other unchecked
+        // multiplication.
+        assert_eq!(datetime("9999-12-31"), None);
+        assert!(datetime("2262-04-11").is_some());
+
+        // The last day is not whole. The count stops partway through it,
+        // so an instant late enough on 2262-04-11 has nowhere to go
+        // either, and that is the boundary rather than the day boundary.
+        assert!(datetime("2262-04-11T23:47:16").is_some());
+        assert_eq!(datetime("2262-04-11T23:47:17"), None);
+
+        assert_eq!(instant_at(0, 0), Some(0));
+        assert_eq!(instant_at(1, 5), Some(NANOS_PER_DAY + 5));
+        assert_eq!(instant_at(MAX_DAY, 0), None);
+        assert_eq!(instant_at(MIN_DAY, 0), None);
     }
 }

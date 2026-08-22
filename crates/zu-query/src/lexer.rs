@@ -38,6 +38,11 @@ pub enum TokenKind {
     Int(u64),
     Float(f64),
     Str(String),
+    /// GL08, a byte string literal: `X'00AB'`, the bytes the hexits
+    /// name. It is a separate token from a string because the two are
+    /// separate types, and reading one as the other would make
+    /// `X'0041'` the letter A.
+    Bytes(Vec<u8>),
     /// `$name` or `$0` parameter, the `$` stripped.
     Param(String),
     LParen,
@@ -91,6 +96,7 @@ impl TokenKind {
             TokenKind::Int(v) => format!("'{v}'"),
             TokenKind::Float(v) => format!("'{v}'"),
             TokenKind::Str(_) => "string literal".into(),
+            TokenKind::Bytes(_) => "byte string literal".into(),
             TokenKind::Param(p) => format!("'${p}'"),
             TokenKind::LParen => "'('".into(),
             TokenKind::RParen => "')'".into(),
@@ -255,6 +261,24 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                     tokens.push(single(TokenKind::Dot));
                     ix += 1;
                 }
+                continue;
+            }
+            // GL08. An `X` against a quote opens a byte string, which
+            // is the one place a letter in front of a quote means
+            // something: everywhere else an identifier and a string
+            // written next to each other are two tokens the parser has
+            // no rule for. The quote has to be the very next byte, so
+            // `X 'ab'` is still a name and a string, and a query that
+            // wants the bytes writes them where the standard writes
+            // them.
+            b'X' | b'x' if bytes.get(ix + 1) == Some(&b'\'') => {
+                let (bin, end) = lex_bytes(source, ix + 1, start)?;
+                tokens.push(Token {
+                    kind: TokenKind::Bytes(bin),
+                    start,
+                    end,
+                });
+                ix = end;
                 continue;
             }
             // A grave accent opens a delimited identifier and the other
@@ -432,6 +456,54 @@ fn lex_quoted(source: &str, open: usize, escapes: bool, report: usize) -> Result
         "string"
     };
     Err(err(source, report, &format!("unterminated {noun}")))
+}
+
+/// Lexes GL08's byte string: the hexits between the quotes, two to a
+/// byte.
+///
+/// ISO 21.3 lets space stand anywhere inside the quotes, including
+/// between the two hexits of one byte, so the digits are gathered and
+/// paired rather than read two at a time off the source. An odd number
+/// of them names half a byte and is refused, which is the whole of what
+/// can go wrong here beyond a digit that is not a hexit.
+///
+/// `report` is where a failure points, which is the `X` and not the
+/// quote, since that is where the literal began.
+fn lex_bytes(source: &str, open: usize, report: usize) -> Result<(Vec<u8>, usize)> {
+    let bytes = source.as_bytes();
+    let mut hexits: Vec<u8> = Vec::new();
+    let mut ix = open + 1;
+    while ix < bytes.len() {
+        let c = bytes[ix];
+        if c == b'\'' {
+            if !hexits.len().is_multiple_of(2) {
+                return Err(err(
+                    source,
+                    report,
+                    "a byte string is written two hexits to a byte and this one has an odd number of them",
+                ));
+            }
+            let out = hexits.chunks(2).map(|p| (p[0] << 4) | p[1]).collect();
+            return Ok((out, ix + 1));
+        }
+        if c.is_ascii_whitespace() {
+            ix += 1;
+            continue;
+        }
+        let Some(digit) = (c as char).to_digit(16) else {
+            return Err(err(
+                source,
+                ix,
+                &format!(
+                    "'{}' is not a hexit and a byte string is written in hexits",
+                    c as char
+                ),
+            ));
+        };
+        hexits.push(digit as u8);
+        ix += 1;
+    }
+    Err(err(source, report, "unterminated byte string"))
 }
 
 /// The radix a `0x`, `0o` or `0b` prefix asks for, and the word for it

@@ -1461,6 +1461,12 @@ fn write_json_value(out: &mut String, v: &Value) {
         }
         Value::Float(_) => out.push_str("null"),
         Value::Str(s) => write_json_str(out, s),
+        // A byte string goes out as the hexits it is written with,
+        // which is a string as far as JSON is concerned. JSON has no
+        // byte string, and base64 would be a second spelling of the
+        // same value for a reader that already has the one the query
+        // language uses.
+        Value::Bytes(b) => write_json_str(out, &zu::bytes::hexits(b)),
         // A temporal value goes out as the text it was written
         // with. JSON has no date, and a reader that gets a number of
         // days has to know which epoch to count from.
@@ -1613,6 +1619,7 @@ fn display_value(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Str(s) => s.clone(),
+        Value::Bytes(b) => zu::bytes::literal(b),
         Value::Node { table, offset } => format!("({table}:{offset})"),
         Value::Rel {
             table, src, dst, ..

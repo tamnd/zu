@@ -709,11 +709,12 @@ mod tests {
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
         // dx/02 §8 is the v0.5 restructure, and the error model, the
         // cancellation calls, the transaction boundaries, the appender,
-        // the diagnostics and the frames added to it are all additive,
-        // so this is 0.12: the number a binding tests for when it wants
-        // to know whether zu_result_arrow is there. The two parts are
-        // counts rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.13".to_string(), "0.13".to_string()));
+        // the diagnostics, the frames and the byte string of #543 added
+        // to it are all additive, so this is 0.14: the number a binding
+        // tests for when it wants to know whether zu_result_arrow is
+        // there. The two parts are counts rather than a decimal, so
+        // 0.10 is the one after 0.9.
+        assert_eq!(abi.revision, ("0.14".to_string(), "0.14".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

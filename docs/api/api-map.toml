@@ -72,6 +72,11 @@ tier = 2
 reason = "which of the two durations a value is, year-month or day-time, which a binding needs only where it hands a duration back as something other than a string"
 
 [[group]]
+prefix = "zu::Engine"
+tier = 3
+reason = "which of the two executors takes a plan the pipeline one covers, which is a switch that exists while the port is unfinished and answers the same rows either way; a binding exposing it would be exposing a migration to its users"
+
+[[group]]
 prefix = "zu::Field"
 tier = 1
 reason = "one value on its way into a column, which is the appender's half of the conversion code every binding writes"
@@ -142,6 +147,11 @@ tier = 2
 reason = "one operator's line of a PROFILE: rows in, rows out, the time it spent and how far its estimate was off, which a binding exposing profiling gives back and the rest do not"
 
 [[group]]
+prefix = "zu::Options"
+tier = 3
+reason = "the execution switches a statement runs under: the thread count, the morsel size, the join and sink strategies and the executor. zu::Config is the supported half of this, the two settings a caller has a reason to choose, and the rest are knobs the differential tests and the perf gates turn to measure one path against another"
+
+[[group]]
 prefix = "zu::PlanNode"
 tier = 2
 reason = "one operator of a plan as a node rather than as the line EXPLAIN prints, for a binding that draws the tree instead of printing it"
@@ -182,6 +192,16 @@ tier = 1
 reason = "whether a condition stopped the statement, which decides whether a binding raises or warns"
 
 [[group]]
+prefix = "zu::Sink"
+tier = 3
+reason = "what the sink of a plain projection keeps, one of those knobs: the columnar answer and the row answer have to match, so this is how a run is measured against the other one rather than something a caller chooses"
+
+[[group]]
+prefix = "zu::Sip"
+tier = 3
+reason = "whether a join hands what it knows about its keys to its probe side, one of those knobs and a baseline switch for the same reason"
+
+[[group]]
 prefix = "zu::Snapshot"
 tier = 3
 reason = "the engine's read view at a fixed epoch, an interface the executor uses and no caller holds"
@@ -202,6 +222,11 @@ tier = 2
 reason = "a date, a time, a datetime or a duration as the engine holds one, which a binding converting into its own language's temporal types reads and one handing them back as text does not"
 
 [[group]]
+prefix = "zu::Wcoj"
+tier = 3
+reason = "how a closing edge reaches the multiway intersect, the last of those knobs: the optimizer decides this and the switch is here to pin the binary join a measurement is against"
+
+[[group]]
 prefix = "zu::ZuError"
 tier = 1
 reason = "the error every call can return, mapped onto each language's own exception type"
@@ -220,6 +245,11 @@ reason = "the trait that lets a tuple be a row, which is how Rust spells a varia
 prefix = "zu::append::RowSink"
 tier = 3
 reason = "where a row writes its fields on the way into the column buffers, an implementation detail of that trait and never named by a caller"
+
+[[group]]
+prefix = "zu::bytes"
+tier = 2
+reason = "writing a byte string down and reading one back, GV35. A binding that hands its user a byte string value and has to print it, or that takes an X'..' literal from its user, wants these; one that only passes octets through never names them"
 
 [[group]]
 prefix = "zu::catalog_stmt"

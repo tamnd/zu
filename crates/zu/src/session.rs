@@ -160,10 +160,6 @@ pub struct Session {
     /// other part of the process last put in the environment, and
     /// [`crate::db::Config`] is the way a caller sets them on purpose.
     options: exec::Options,
-    /// Which executor this session's reads run on, read from the
-    /// environment once at open for the same reason the options above
-    /// are. [`Self::set_engine`] is the way a caller pins one.
-    engine: query::Engine,
     /// The one write side of this file in this process, shared with
     /// every other connection that has it open.
     handle: Arc<FileHandle>,
@@ -269,7 +265,6 @@ impl Session {
                 interrupt: Interrupt::armed(),
                 ..query::env_options()
             },
-            engine: query::Engine::from_env(),
             seen: published.version(),
             lease: Some(lease),
             handle,
@@ -1021,18 +1016,6 @@ impl Session {
         };
     }
 
-    /// Which executor this session's reads run on.
-    pub fn engine(&self) -> query::Engine {
-        self.engine
-    }
-
-    /// Pins one. The differential tests read the same statement twice
-    /// and compare, and this is how they ask for the second reading
-    /// without announcing it to every other test in the process (#474).
-    pub fn set_engine(&mut self, engine: query::Engine) {
-        self.engine = engine;
-    }
-
     /// The handle a statement on this session can be stopped through.
     ///
     /// One handle for the life of the session, so a caller can take it
@@ -1085,7 +1068,7 @@ impl Session {
         // streaming API for the wrong reason. It has handed nothing over
         // when it answers false, so the fallback below starts on a
         // handoff nothing has been fed through.
-        if self.engine == query::Engine::Pipeline {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1138,6 +1121,16 @@ impl Session {
                 self.settle(out, held)?;
                 return Ok(QueryResult::new(Vec::new(), Vec::new()));
             }
+            // GP18. The parts run in order under one savepoint, so the
+            // graph a `CREATE` in the middle made is there for the
+            // statements behind it and a part that raises takes the
+            // whole block back, catalog and rows together.
+            Some(NotAQuery::Block(parts)) => {
+                self.refuse_a_write()?;
+                let held = self.hold()?;
+                let out = self.run_block(&parts, params);
+                return self.settle(out, held);
+            }
             None => {}
         }
         let cached = match self.plan_for(source, params) {
@@ -1166,7 +1159,7 @@ impl Session {
             return self.settle(out, held);
         }
         let options = self.options.clone();
-        if self.engine == query::Engine::Pipeline {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1192,6 +1185,23 @@ impl Session {
             &args,
             &options,
         )
+    }
+
+    /// Runs a statement block, which is the parts of it in the order
+    /// they were written (GP18, ISO 13.6).
+    ///
+    /// A part is run the way a statement sent on its own is run, plan
+    /// cache and write splitting and all, because that is what it is:
+    /// what a block adds is the order and the one savepoint around it,
+    /// and the caller holds that. A catalog statement hands nothing to
+    /// the part behind it, so the parts do not share rows, and the
+    /// block answers what its last part answered.
+    fn run_block(&mut self, parts: &[String], params: &[(&str, Value)]) -> Result<QueryResult> {
+        let mut last = QueryResult::new(Vec::new(), Vec::new());
+        for part in parts {
+            last = self.run(part, params)?;
+        }
+        Ok(last)
     }
 
     /// Runs a statement that writes, one part at a time: the clauses
@@ -1494,7 +1504,7 @@ impl Session {
         args: &[Value],
         options: &exec::Options,
     ) -> Result<QueryResult> {
-        if self.engine == query::Engine::Pipeline {
+        if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
@@ -1655,7 +1665,7 @@ impl Session {
         source: &str,
         params: &[(&str, Value)],
     ) -> Result<Option<zu_exec::decide::Decisions>> {
-        if self.engine != query::Engine::Pipeline {
+        if self.options.engine != exec::Engine::Pipeline {
             return Ok(None);
         }
         let cached = self.plan_for(source, params)?;
@@ -2312,6 +2322,69 @@ mod tests {
             .expect("insert");
         session.run("ROLLBACK", &[]).expect("rollback");
 
+        assert!(session.graph.catalog().graph_type("social").is_none());
+        assert_eq!(count(&mut session, PEOPLE), 2);
+        drop(session);
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert!(reopened.graph.catalog().graph_type("social").is_none());
+        assert_eq!(count(&mut reopened, PEOPLE), 2);
+    }
+
+    /// GP18, the same mixing written as one statement. A block chained
+    /// by `NEXT` needs no words around it: the graph a `CREATE` in the
+    /// middle made is there for the parts behind it, and the block
+    /// answers what its last part answered.
+    #[test]
+    fn a_statement_block_mixes_catalog_and_data_and_the_parts_see_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("block.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        assert_eq!(
+            count(
+                &mut session,
+                "CREATE GRAPH TYPE social { (:person) } \
+                 NEXT INSERT (p:person {name: 'zoe'}) \
+                 NEXT MATCH (q:person) RETURN count(q) AS n",
+            ),
+            3,
+            "the write in the middle is there for the read behind it",
+        );
+        assert!(session.graph.catalog().graph_type("social").is_some());
+        assert_eq!(count(&mut session, PEOPLE), 3);
+
+        // The graph the first part made is the graph the third part
+        // reads, which is what the transaction local catalog is for.
+        assert_eq!(
+            count(
+                &mut session,
+                "CREATE GRAPH twin ANY AS COPY OF CURRENT_PROPERTY_GRAPH \
+                 NEXT USE twin MATCH (p:person) RETURN count(p) AS n",
+            ),
+            3,
+        );
+    }
+
+    /// A part that raises takes the whole block back, the catalog it
+    /// changed and the rows it wrote together, because the block is one
+    /// transaction and not several.
+    #[test]
+    fn a_block_that_raises_halfway_leaves_the_file_as_it_found_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("block-undone.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        let err = session
+            .run(
+                "CREATE GRAPH TYPE social { (:person) } \
+                 NEXT INSERT (p:person {name: 'zoe'}) \
+                 NEXT RETURN 1 / 0 AS boom",
+                &[],
+            )
+            .expect_err("the last part raises");
+        assert_eq!(err.gqlstatus(), Some(codes::C22012));
         assert!(session.graph.catalog().graph_type("social").is_none());
         assert_eq!(count(&mut session, PEOPLE), 2);
         drop(session);

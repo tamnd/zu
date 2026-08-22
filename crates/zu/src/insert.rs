@@ -516,7 +516,7 @@ fn row(
             id: node.table,
         });
     }
-    fill(node.table, "element", &node.props, columns, values)
+    fill("element", &node.props, columns, values)
 }
 
 /// One edge: every column its table stores, in column order, filled
@@ -541,7 +541,7 @@ fn edge_row(
             id: rel.table,
         });
     }
-    fill(rel.table, "edge", &rel.props, columns, values)
+    fill("edge", &rel.props, columns, values)
 }
 
 /// The cells of one new row of one table: every column of it, in column
@@ -550,7 +550,6 @@ fn edge_row(
 /// `noun` is what is being written, which is all that separates the
 /// message an element gets from the one an edge gets.
 fn fill(
-    table: u32,
     noun: &str,
     props: &[(String, BoundExpr)],
     columns: &[PropColumn],
@@ -558,17 +557,6 @@ fn fill(
 ) -> Result<Vec<(u32, Cell)>> {
     let mut cells = Vec::with_capacity(columns.len());
     for (ci, col) in columns.iter().enumerate() {
-        // A fold rewrites a column out of its old values and the cells
-        // the overlay holds, and an overlay cell is a value and never
-        // an absence, so a column that may hold a null is one no
-        // statement can append to yet. Saying so here names the column;
-        // reaching the fold would name the table.
-        if col.validity.is_some() {
-            return Err(ZuError::Unsupported {
-                what: "creating an element in a table whose columns may hold a null",
-                id: table,
-            });
-        }
         let written = props
             .iter()
             .position(|(key, _)| *key == col.name)
@@ -624,6 +612,12 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
             }
         }
         (LogicalType::Str { .. }, Value::Str(s)) => Cell::Str(s.as_bytes().to_vec()),
+        // A byte string goes down the same side of the store a
+        // character string does, which is the blob side, because the
+        // store keeps a run of bytes and a run of bytes is what both
+        // of them are. What tells the two apart is the column's own
+        // type, and this pairing is the whole of the telling.
+        (LogicalType::Bytes { .. }, Value::Bytes(b)) => Cell::Str(b.clone()),
         (LogicalType::Date, Value::Temporal(Temporal::Date(d))) => Cell::Int(*d as i64 as u64),
         (LogicalType::LocalTime, Value::Temporal(Temporal::LocalTime(t))) => Cell::Int(*t as u64),
         (LogicalType::LocalDatetime, Value::Temporal(Temporal::LocalDatetime(t))) => {
@@ -634,12 +628,13 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
         {
             Cell::Int(*n as u64)
         }
-        (_, Value::Null) => {
-            return Err(ZuError::Unsupported {
-                what: "creating an element with a property written as null",
-                id: 0,
-            });
-        }
+        // A null goes in whatever the column holds, because an absence
+        // is not a value of a type and no type refuses one. The store
+        // keeps it the way it keeps every other one, as a clear
+        // validity bit beside a placeholder the reader never looks at,
+        // so a column with a null in it stores a mask and a column
+        // without one stores none.
+        (_, Value::Null) => Cell::Null,
         _ => return Err(wrong()),
     })
 }
@@ -652,6 +647,7 @@ pub(crate) fn describe(value: &Value) -> &'static str {
         Value::Int(_) => "an integer",
         Value::Float(_) => "a float",
         Value::Str(_) => "a string",
+        Value::Bytes(_) => "a byte string",
         Value::Node { .. } => "a node",
         Value::Rel { .. } => "an edge",
         Value::List(_) => "a list",

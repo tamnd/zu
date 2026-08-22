@@ -32,11 +32,13 @@ Epoch   = u64   monotonically increasing commit sequence number
 | DECIMAL(p,s) ≤ 128b | int128 + FOR | exact money |
 | STRING | dict + FSST, offsets mini-block | UTF-8 |
 | BLOB | full-zip | |
-| DATE / TIMESTAMP / INTERVAL | int32/int64 days/µs + delta | UTC canonical |
+| DATE / TIMESTAMP / INTERVAL | int32/int64 days/ns + delta | UTC canonical, see the range note below |
 | UUID | 2×u64 bitpack | |
 | LIST<T>, MAP<K,V>, STRUCT | offsets + child columns (Arrow-style) | nesting ≤ 8 |
 | VECTOR(dim, f32|f16|i8) | full-zip, 64-B aligned | feature `vector` |
 | NULL | validity bitmap per segment | any type nullable |
+
+A date is a day count in 32 bits and reaches the whole of the standard's calendar, year 1 to year 9999. A datetime is a nanosecond count in 64 bits and reaches from 1677-09-22 to 2262-04-11, which is narrower, so there are dates that are perfectly good dates and name no datetime at all. Every place that builds a datetime out of a day says so with 22008 rather than wrapping into a year on the far side of the epoch, and `temporal::instant_at` is the one place the multiplication is written. A time of day does not take the limit, since it has no date behind it and a shift by any length of time at all wraps round the clock.
 
 Type system mirrors Arrow so `arrow` feature interop is zero-copy for fixed-width columns and offset-compatible for strings/lists.
 

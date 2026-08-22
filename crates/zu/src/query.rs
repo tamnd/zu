@@ -3,6 +3,7 @@
 //! frontend. The binder itself is engine-agnostic; this is where zu1
 //! table definitions become labels and relationship types.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
@@ -80,6 +81,25 @@ pub fn schema_of_graph(catalog: &Catalog, graph: u32, epoch: u64) -> Result<Sche
         })
         .collect();
     let mut schema = Schema::with_labels(nodes, rels, catalog.labels().to_vec())?;
+    // GP15. The rel tables of the other graphs, for a procedure handed
+    // a graph to read. They are not tables a pattern may match: a
+    // statement matches the graph it runs against and no other, and
+    // what a procedure needs of another graph is which table to walk.
+    let mut others: BTreeMap<u32, Vec<RelDef>> = BTreeMap::new();
+    for rel in catalog.rel_tables() {
+        if rel.graph == graph {
+            continue;
+        }
+        others.entry(rel.graph).or_default().push(RelDef {
+            id: rel.id,
+            name: rel.name.clone(),
+            from: rel.from,
+            to: rel.to,
+            edge_count: rel.edge_count,
+            undirected: rel.undirected,
+        });
+    }
+    schema.set_graph_rels(others);
     // GE01. Every graph in the catalog and not only the one being
     // bound against, because `GRAPH other` names a graph this
     // statement is not running against and answering it is the point:
@@ -586,6 +606,14 @@ fn column_value(
                 detail: format!("'{key}' row {row} is not UTF-8"),
             })?;
             Ok(Value::Str(text))
+        }
+        // A byte string is the same blob read without the decode: the
+        // octets are the value, so there is nothing to check them
+        // against and a column of them can hold anything.
+        LogicalType::Bytes { .. } => {
+            let mut bytes = Vec::new();
+            reader.read_str(db, col, row, &mut bytes)?;
+            Ok(Value::Bytes(bytes))
         }
         // A stored list comes back as the list value the rest of the
         // engine already has, element by element through the same
@@ -1177,23 +1205,104 @@ pub(crate) fn graph_of(
     query: &zu_query::ast::Query,
     params: &[(&str, Value)],
 ) -> Result<u32> {
+    let Some(named) = &query.use_graph else {
+        return Ok(working);
+    };
+    graph_of_ref(catalog, working, named, &query.bindings, params)
+}
+
+/// The graph one reference names, which is the body of [`graph_of`]
+/// and is separate from it so that a graph variable's definition can
+/// be resolved with the same four answers its reader had (GP11).
+///
+/// `bindings` are the definitions the statement was written with, and
+/// they are what a name is looked up in before the catalog is: a
+/// definition is a name the statement itself gave, so it stands in
+/// front of a graph the catalog happens to hold under that name.
+fn graph_of_ref(
+    catalog: &Catalog,
+    working: u32,
+    named: &zu_query::ast::GraphRef,
+    bindings: &[zu_query::ast::BindingDef],
+    params: &[(&str, Value)],
+) -> Result<u32> {
     use zu_query::ast::GraphRef;
-    match &query.use_graph {
-        None | Some(GraphRef::Current) => Ok(working),
-        Some(GraphRef::Home) => Ok(catalog.home_graph_id()),
-        Some(GraphRef::Named(name)) => {
-            let schema = name.schema.as_deref().unwrap_or("/");
-            catalog
-                .graph(schema, &name.name)
-                .map(|g| g.id)
-                .ok_or_else(|| {
-                    ZuError::gql(
-                        codes::C42002,
-                        format!("USE names '{}', which is no graph in '{schema}'", name.name),
-                    )
-                })
+    match named {
+        GraphRef::Current => Ok(working),
+        GraphRef::Home => Ok(catalog.home_graph_id()),
+        GraphRef::Named(name) if name.schema.is_none() => {
+            match graph_variable(bindings, &name.name) {
+                Some(upto) => graph_of_variable(catalog, working, upto, params),
+                None => graph_of_name(catalog, "/", &name.name),
+            }
         }
-        Some(GraphRef::Param(name)) => graph_of_param(catalog, name, params),
+        GraphRef::Named(name) => {
+            graph_of_name(catalog, name.schema.as_deref().unwrap_or("/"), &name.name)
+        }
+        GraphRef::Param(name) => graph_of_param(catalog, name, params),
+    }
+}
+
+/// The graph the catalog holds in that schema under that name.
+fn graph_of_name(catalog: &Catalog, schema: &str, name: &str) -> Result<u32> {
+    catalog.graph(schema, name).map(|g| g.id).ok_or_else(|| {
+        ZuError::gql(
+            codes::C42002,
+            format!("USE names '{name}', which is no graph in '{schema}'"),
+        )
+    })
+}
+
+/// The definition of the graph variable of that name, and the ones
+/// written in front of it, which are the ones it may read.
+///
+/// A definition may only read what stands above it, so the search is
+/// over the definitions in written order and what it answers carries
+/// the head of the list with it.
+fn graph_variable<'a>(
+    bindings: &'a [zu_query::ast::BindingDef],
+    name: &str,
+) -> Option<&'a [zu_query::ast::BindingDef]> {
+    let at = bindings
+        .iter()
+        .position(|def| def.name == name && def.kind == zu_query::ast::BindingKind::Graph)?;
+    Some(&bindings[..=at])
+}
+
+/// The graph a `GRAPH g = ...` definition names (GP11 through GP13).
+///
+/// Which graph a statement runs against is settled before the
+/// statement is compiled, the schema of that graph being what the
+/// names in it are bound against, so a definition read by a `USE` has
+/// to answer here rather than where the other definitions are worked
+/// out. That is the whole of what it may be written as: a graph
+/// reference, which is a word or a name or a parameter and is settled
+/// in the same breath. GP13's query form counts as one exactly as far
+/// as `BindingInit::graph_ref` says it does, which is a query that
+/// returns a reference and nothing else. Any other query is refused,
+/// and by name, because the alternative is compiling the statement
+/// against one graph and running it against another.
+fn graph_of_variable(
+    catalog: &Catalog,
+    working: u32,
+    upto: &[zu_query::ast::BindingDef],
+    params: &[(&str, Value)],
+) -> Result<u32> {
+    let (def, above) = upto.split_last().expect("a definition was found");
+    if let Some(named) = def.init.graph_ref() {
+        return graph_of_ref(catalog, working, named, above, params);
+    }
+    match &def.init {
+        zu_query::ast::BindingInit::Expr(zu_query::ast::Expr::Param(name)) => {
+            graph_of_param(catalog, name, params)
+        }
+        _ => Err(ZuError::gql(
+            codes::C42001,
+            format!(
+                "USE names '{}', which is defined with something other than a graph reference: which graph a statement runs against is settled before the statement is compiled, so a graph variable a USE reads is written as CURRENT_PROPERTY_GRAPH, HOME_PROPERTY_GRAPH, a name in the catalog, another graph variable, or a parameter",
+                def.name
+            ),
+        )),
     }
 }
 
@@ -1290,6 +1399,9 @@ pub(crate) enum NotAQuery {
     Catalog(zu_query::ast::CatalogStmt),
     /// One that says where a transaction begins or ends.
     Transaction(zu_query::ast::TxnStmt),
+    /// GP18. Several statements chained by `NEXT`, one of which changes
+    /// the catalog, each carried as its own text.
+    Block(Vec<String>),
 }
 
 /// What this source is when it is not a query, `None` when it is one.
@@ -1301,6 +1413,7 @@ pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
     match zu_query::parser::parse_statement(source)? {
         zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
         zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
+        zu_query::ast::Statement::Block(parts) => Ok(Some(NotAQuery::Block(parts))),
         zu_query::ast::Statement::Query(_) => Ok(None),
     }
 }
@@ -1347,60 +1460,28 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// environment overrides the count, `ZU_THREADS=1` forces sequential
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
-    run_on(source, db, params, Engine::from_env())
+    run_with(source, db, params, &env_options())
 }
 
-/// Which executor a read runs on.
+/// The same read under switches the caller chose rather than the ones
+/// the environment names.
 ///
-/// The pipeline executor covers most plans and hands the rest to the row
-/// at a time one, which is what [`run`] does. Pinning the row executor
-/// is how the differential tests get their oracle rows, and a caller
-/// says so here rather than through the environment: a variable is
-/// process wide, cargo runs a file's tests in one process and in
-/// parallel, and a test that set one was changing what its siblings
-/// were measuring while they ran (#474).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Engine {
-    /// The pipeline executor wherever it covers the plan.
-    Pipeline,
-    /// The row at a time executor, whatever the plan.
-    Rows,
-}
-
-impl Engine {
-    /// What the environment asks for. `ZU_EXEC2=0` pins the row
-    /// executor and anything else takes the pipeline one.
-    pub fn from_env() -> Engine {
-        if std::env::var("ZU_EXEC2").as_deref() == Ok("0") {
-            Engine::Rows
-        } else {
-            Engine::Pipeline
-        }
-    }
-}
-
-/// [`run`], on the executor the caller names.
-pub fn run_on(
+/// [`run`] is this with [`env_options`], and everything true of one is
+/// true of the other. What this adds is a statement that can ask for
+/// something the environment cannot say per statement: the row
+/// executor as a differential oracle, a thread count for one query, a
+/// pinned clock. A test binary runs its tests in parallel threads and
+/// an environment variable belongs to the process, so a test that set
+/// one was setting it for every test running beside it (#513).
+///
+/// A session takes its switches once, at open, and
+/// [`crate::session::Session::set_options`] replaces them. This is the
+/// same thing for the entry point that has no session behind it.
+pub fn run_with(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
-    engine: Engine,
-) -> Result<QueryResult> {
-    run_pinned(source, db, params, engine, env_options().wcoj)
-}
-
-/// [`run_on`] with the join pinned as well, for a caller comparing the
-/// fused close against the binary pair.
-///
-/// Same reason the engine is an argument: `ZU_WCOJ` is process wide and
-/// a test that set it was choosing the join for every other test in the
-/// binary for as long as the call took (#474).
-pub fn run_pinned(
-    source: &str,
-    db: &mut Zu1File,
-    params: &[(&str, Value)],
-    engine: Engine,
-    wcoj: exec::Wcoj,
+    options: &exec::Options,
 ) -> Result<QueryResult> {
     match not_a_query(source)? {
         Some(NotAQuery::Catalog(stmt)) => {
@@ -1416,35 +1497,28 @@ pub fn run_pinned(
                 "a transaction runs across statements, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
+        // A block is several statements taken back together when one of
+        // them raises, which is a transaction and needs the same thing.
+        Some(NotAQuery::Block(_)) => {
+            return Err(ZuError::InvalidArgument(
+                "a statement block runs its parts as one transaction, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
+            ));
+        }
         None => {}
     }
     let p = prepare(source, db, params)?;
-    let how = How {
-        options: exec::Options {
-            wcoj,
-            ..env_options()
-        },
-        engine,
-    };
     // A match written several ways is a plan per way over the rows the
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a
     // read gets this far: a write was refused while it was prepared.
     if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
         return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
-            read_one(plan, query, &p.schema, db, &p.catalog, args, &how)
+            read_one(plan, query, &p.schema, db, &p.catalog, args, options)
         });
     }
-    read_one(&p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, &how)
-}
-
-/// How a read runs: the switches the environment set and the executor
-/// the caller named. One argument because they travel together and a
-/// call site that had to carry them apart would be one place for the
-/// two to disagree.
-struct How {
-    options: exec::Options,
-    engine: Engine,
+    read_one(
+        &p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, options,
+    )
 }
 
 /// Runs one plan against an open file, the pipeline executor first and
@@ -1458,16 +1532,32 @@ fn read_one(
     db: &mut Zu1File,
     catalog: &Catalog,
     args: &[Value],
-    how: &How,
+    options: &exec::Options,
 ) -> Result<QueryResult> {
-    if how.engine == Engine::Pipeline {
+    if options.engine == exec::Engine::Pipeline {
         let mut snap = crate::snapshot::Zu1Snapshot::new(db, catalog.clone());
-        if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, &how.options)? {
+        if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, options)? {
             return Ok(r);
         }
     }
     let mut graph = Zu1Graph::new(db, catalog.clone());
-    exec::execute(plan, query, schema, &mut graph, args, &how.options)
+    exec::execute(plan, query, schema, &mut graph, args, options)
+}
+
+/// Which executor the environment asks for. On the pipeline by
+/// default; `ZU_EXEC2=0` pins the whole process to the old executor.
+///
+/// This is read once, when the switches for a statement or a session
+/// are built, and the answer is carried on [`exec::Options`] from
+/// there. A caller wanting one statement on the other engine sets the
+/// option rather than the variable: the variable belongs to the
+/// process and a test setting it was setting it for every test running
+/// beside it (#513).
+fn env_engine() -> exec::Engine {
+    match std::env::var("ZU_EXEC2").as_deref() {
+        Ok("0") => exec::Engine::Rows,
+        _ => exec::Engine::Pipeline,
+    }
 }
 
 /// The execution options both entry points honor, so a profile always
@@ -1502,6 +1592,7 @@ pub(crate) fn env_options() -> exec::Options {
         Ok("rows") => exec::Sink::Rows,
         _ => exec::Sink::Columns,
     };
+    options.engine = env_engine();
     options
 }
 
@@ -1511,18 +1602,22 @@ pub(crate) fn env_options() -> exec::Options {
 /// stage. The grammar has no EXPLAIN keyword yet, so this is the API
 /// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
-    explain_analyze_on(source, db, params, Engine::from_env())
+    analyze_with(source, db, params, &env_options())
 }
 
-/// [`explain_analyze`], on the executor the caller names.
-pub fn explain_analyze_on(
+/// The same listing under switches the caller chose, which is what
+/// [`run_with`] is to [`run`] and is here for the same reason: the
+/// engine a statement is pinned to changes the listing, and pinning it
+/// through the environment pins it for every statement in the process
+/// (#513).
+fn analyze_with(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
-    engine: Engine,
+    options: &exec::Options,
 ) -> Result<String> {
-    let (profile, notes) = profile_noted(source, db, params)?;
-    let listing = match decisions(source, db, params, engine)? {
+    let (profile, notes) = profile_noted(source, db, params, options)?;
+    let listing = match decisions(source, db, params, options)? {
         Some(d) => format!("{}decisions:\n{}", profile.render(), d.render()),
         None => profile.render(),
     };
@@ -1539,21 +1634,15 @@ fn decisions(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
-    engine: Engine,
+    options: &exec::Options,
 ) -> Result<Option<zu_exec::decide::Decisions>> {
-    if engine != Engine::Pipeline {
+    if options.engine != exec::Engine::Pipeline {
         return Ok(None);
     }
     let p = prepare(source, db, params)?;
     let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
-    let run = zu_exec::try_execute_profiled(
-        &p.plan,
-        &p.query,
-        &p.schema,
-        &mut snap,
-        &p.args,
-        &env_options(),
-    )?;
+    let run =
+        zu_exec::try_execute_profiled(&p.plan, &p.query, &p.schema, &mut snap, &p.args, options)?;
     Ok(run.map(|(_, d)| d))
 }
 
@@ -1561,7 +1650,7 @@ fn decisions(
 /// rendering. The cardinality phase of the LDBC bench reads q-error
 /// off this (perf/12 §4).
 pub fn profile(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<exec::Profile> {
-    Ok(profile_noted(source, db, params)?.0)
+    Ok(profile_noted(source, db, params, &env_options())?.0)
 }
 
 /// The profiled run plus the optimizer's notes, which the rendering
@@ -1570,17 +1659,12 @@ fn profile_noted(
     source: &str,
     db: &mut Zu1File,
     params: &[(&str, Value)],
+    options: &exec::Options,
 ) -> Result<(exec::Profile, Vec<String>)> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
-    let (_, profile) = exec::execute_profiled(
-        &p.plan,
-        &p.query,
-        &p.schema,
-        &mut graph,
-        &p.args,
-        &env_options(),
-    )?;
+    let (_, profile) =
+        exec::execute_profiled(&p.plan, &p.query, &p.schema, &mut graph, &p.args, options)?;
     Ok((profile, p.notes))
 }
 
@@ -2460,12 +2544,17 @@ mod tests {
         );
 
         // Pinned to the old engine there is no pipeline to report on,
-        // and the listing says nothing rather than saying zero.
-        let text = explain_analyze_on(
+        // and the listing says nothing rather than saying zero. Pinned
+        // on this call, so the tests running beside it in this binary
+        // keep the engine they asked for (#513).
+        let text = analyze_with(
             "MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n",
             &mut db,
             &[],
-            Engine::Rows,
+            &exec::Options {
+                engine: exec::Engine::Rows,
+                ..exec::Options::default()
+            },
         )
         .expect("explain analyze");
         assert!(!text.contains("decisions:"), "got:\n{text}");

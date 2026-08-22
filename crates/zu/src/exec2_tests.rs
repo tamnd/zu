@@ -68,6 +68,24 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
         })
         .collect();
     let tag_refs: Vec<&[u8]> = tags.iter().map(|v| v.as_slice()).collect();
+    // The temporal lanes: a date and a day-time duration, which are the
+    // two shapes of the four that a query is most likely to ask about.
+    // The dates run either side of the epoch so that the sign of the
+    // count is exercised rather than assumed away, and the durations
+    // repeat so that grouping on one has groups to make.
+    let born: Vec<i32> = (0..N).map(|i| (i as i32 * 97) - 100_000).collect();
+    let shift: Vec<i64> = (0..N)
+        .map(|i| ((i % 7) as i64) * 3_600_000_000_000)
+        .collect();
+    // An instant, an hour apart per row, starting at 2020-09-13. A
+    // datetime is nanoseconds since the epoch and a date is days, so
+    // the two lanes are different widths of the same idea and the
+    // arithmetic over them is not: a length of time between two of
+    // these is a subtraction, and between two of the dates above it is
+    // a multiplication first, which is where the answers stop fitting.
+    let seen: Vec<i64> = (0..N)
+        .map(|i| 1_600_000_000_000_000_000 + (i as i64) * 3_600_000_000_000)
+        .collect();
     store_props(
         &mut db,
         "person",
@@ -76,6 +94,12 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
             ("score", PropValues::Int(&score)),
             ("name", PropValues::Str(&name_refs)),
             ("tag", PropValues::Str(&tag_refs)),
+            ("born", PropValues::Date(&born)),
+            (
+                "shift",
+                PropValues::Duration(zu_common::DurationKind::DayTime, &shift),
+            ),
+            ("seen", PropValues::LocalDatetime(&seen)),
         ],
     )
     .unwrap();
@@ -686,6 +710,13 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.age AS age, count(*) AS n",
         "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
          RETURN a.id AS a, b.id AS b LIMIT 4",
+        // GP03. An OPTIONAL CALL over a block that lets out an element
+        // it bound is the group above with a block around it: the name
+        // is the slot the group left null, so there is nothing left of
+        // the block after the binder and the executor sees the same
+        // plan it sees for the match.
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS node } \
+         RETURN a.id AS a, node.id AS b",
         // EXISTS blocks, which are the same bracket asked a yes or no
         // question: the outer row comes out once on a match for a semi
         // bracket and once on a miss for an anti one, and the block's
@@ -1078,6 +1109,49 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
          AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age AND c.id > 3 }) \
          RETURN count(*) AS n",
+        // The temporal lanes. A date is days and a duration is a count
+        // of its own unit, and both ride the word an integer rides, so
+        // what these check is that the meaning survives the trip: the
+        // filter compares counts, the projection hands back values, and
+        // the group keys off a word.
+        "MATCH (p:person) WHERE p.born < DATE '1970-01-01' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.born >= DATE '1980-06-15' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.born = DATE '1970-01-02' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age = 13 RETURN p.born AS born",
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.born AS born ORDER BY id",
+        "MATCH (p:person) WHERE p.shift = DURATION 'PT3H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 30 RETURN p.shift AS shift, count(p) AS n ORDER BY shift",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 AND b.born > DATE '1970-01-01' \
+         RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.id < 50 RETURN DISTINCT p.shift AS shift ORDER BY shift",
+        "MATCH (p:person) WHERE p.id < 50 RETURN p.born AS born ORDER BY born DESC LIMIT 5",
+        "MATCH (p:person) RETURN count(p.born) AS n",
+        "MATCH (p:person) WHERE p.born < DATE '1970-01-01' RETURN p.born AS born ORDER BY born \
+         LIMIT 3",
+        // Two durations of one kind, which add and subtract the way the
+        // counts under them do. The answer is a duration rather than a
+        // number, so what these check is that the kind rides out of the
+        // kernel as well as into it: the projection has to name one and
+        // the grouping has to key off one.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.shift + DURATION 'PT1H' AS s \
+         ORDER BY id",
+        "MATCH (p:person) WHERE p.shift - DURATION 'PT1H' = DURATION 'PT2H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 30 RETURN p.shift + p.shift AS s, count(p) AS n ORDER BY s",
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, \
+         p.shift + DURATION 'PT1H' - DURATION 'PT30M' AS s ORDER BY id",
+        // A length of time between two instants, which is what the
+        // stored column and the literal have between them once both are
+        // counts. The datetime pair counts in nanoseconds and is a
+        // subtraction; the date pair counts in months and is a walk
+        // over the calendar, and both are the same call with the same
+        // two operands.
+        "MATCH (p:person) \
+         WHERE DURATION_BETWEEN(LOCAL DATETIME '2020-09-13T12:26:40', p.seen) \
+         > DURATION 'PT1000H' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE DURATION_BETWEEN(p.born, DATE '2000-01-01') YEAR TO MONTH \
+         > DURATION 'P30Y' RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.id < 40 \
+         AND DURATION_BETWEEN(p.seen, p.seen) = DURATION 'PT0S' RETURN count(p) AS n",
     ]
 }
 
@@ -1086,6 +1160,48 @@ fn covered_queries() -> &'static [&'static str] {
 /// to. Sharded the same way and for the same reason.
 fn fallback_queries() -> &'static [&'static str] {
     &[
+        // An extreme or a total over a temporal column. The
+        // accumulators hold words and answer integers, so a minimum
+        // over a column of days would come back as a number of days
+        // rather than as the date it stands for. Only the count, which
+        // answers a number whatever it counted, is claimed.
+        "MATCH (p:person) RETURN min(p.born) AS d",
+        "MATCH (p:person) RETURN max(p.born) AS d",
+        "MATCH (p:person) RETURN min(p.shift) AS d",
+        // An instant shifted by a length of time. The kernel adds two
+        // words and a date plus a duration is not that: a month has to
+        // land on a day the month has, a day-time duration has to keep
+        // the time of day it made, and the end of the calendar has to
+        // be an error rather than a wrap. All three are conditions the
+        // arithmetic kernel has no op for, so the shape declines.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.born + DURATION 'P1D' AS d \
+         ORDER BY id",
+        // A length of time in a projection rather than behind a filter.
+        // A date the calendar has is not always a number of
+        // nanoseconds, so a pair of ordinary dates can have no day-time
+        // duration between them, and a computed column is filled before
+        // the filter that would have dropped the row it happened on.
+        // The old engine reaches the call only for the rows the filter
+        // kept, so the shape goes back to it rather than raising where
+        // it never would.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, \
+         DURATION_BETWEEN(p.born, DATE '2000-01-01') YEAR TO MONTH AS d ORDER BY id",
+        // A duration scaled by a number. The kernel would multiply the
+        // words happily and the result is a duration, but the operands
+        // are a duration and a number, and a register pair that does
+        // not agree on a lane declines rather than guessing which one
+        // the answer takes.
+        "MATCH (p:person) WHERE p.id < 20 RETURN p.id AS id, p.shift * 2 AS d ORDER BY id",
+        // A byte string, which the vector layer has no lane for: the
+        // ten physical types are the ten a kernel computes over, and a
+        // sequence of octets is a blob the way a string is without
+        // being the string lane, since a kernel over the string lane
+        // folds and normalizes and a byte string does neither. Both the
+        // value and the trim over it go back to the row engine, which
+        // is where the whole of GF07 lives.
+        "MATCH (p:person) WHERE p.id < 5 RETURN p.id AS id, X'00AB00' AS b ORDER BY id",
+        "MATCH (p:person) WHERE p.id < 5 RETURN p.id AS id, \
+         OCTET_LENGTH(TRIM(BOTH X'00' FROM X'00AB00')) AS n ORDER BY id",
         // ORDER BY over something the projection does not return has
         // no output column to read, so it stays with the old engine.
         "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",
@@ -1250,6 +1366,31 @@ fn fallback_queries() -> &'static [&'static str] {
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
+        // GP03. An OPTIONAL CALL that lets out anything but an element
+        // it bound. The value has to be asked for under whether the
+        // block matched, or the row the block matched nothing for would
+        // carry it as though it had, and a case expression is not one
+        // this executor has a kernel for yet, so the statement goes
+        // back whole. The last of them is the same thing under a set
+        // function, where the null decides the count.
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b.id AS bid } \
+         RETURN a.id AS a, bid AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN 1 AS one } \
+         RETURN a.id AS a, one AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) WHERE b.age > 90 \
+         RETURN b.id AS bid } RETURN a.id AS a, bid AS b",
+        "MATCH (a:person) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b.id AS bid } \
+         RETURN count(bid) AS n",
+        // GF10 and GF12. An item that reads a set function without being
+        // one is a grouping and a projection standing behind it, and the
+        // stage this pipeline runs above a grouping emits columns of the
+        // tuple the sink holds rather than working anything out of them.
+        // A column that is a sum times ten is not one of those, so the
+        // statement goes back whole. Once bare, once with a key, and
+        // once where the same set function is written twice.
+        "MATCH (p:person) RETURN count(p) * 10 AS n",
+        "MATCH (p:person) RETURN p.age AS age, count(p) + 1 AS n ORDER BY age LIMIT 20",
+        "MATCH (p:person) RETURN sum(p.age) + count(p) AS n, sum(p.age) AS s",
         // A trim set that is a column is a different set a row, and
         // the kernel prepares one set for the chunk.
         "MATCH (p:person) RETURN btrim(p.name, p.name) AS b, p.id AS id ORDER BY id LIMIT 20",
@@ -1706,6 +1847,56 @@ fn a_secondary_label_falls_back_and_still_answers() {
     )
     .unwrap();
     assert_eq!(r.rows, [[Value::Int(managers)]]);
+}
+
+/// GP05 and GP17. A binding variable definition is a query run before
+/// the plan starts, whose answer goes into a parameter position, so an
+/// engine that does not run one reads a position the caller left null.
+/// The pipeline does not run one yet, so it hands the statement back
+/// rather than putting the null on the plan as the value of the name.
+#[test]
+fn a_binding_variable_definition_falls_back_and_still_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bindings.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    let n = 64u32;
+    let mut edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i * 7 + 3) % n)).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    bulk_load_keyed(&mut db, "person", "knows", u64::from(n), &edges, None).unwrap();
+    let age: Vec<u64> = (0..u64::from(n)).map(|i| i % 100).collect();
+    store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).unwrap();
+    drop(db);
+
+    let mut db = Zu1File::open(&path).unwrap();
+    let (catalog, schema) = query::load_schema(&mut db).unwrap();
+    let source = "VALUE t = 3 MATCH (p:person) WHERE p.age > 60 \
+                  RETURN t AS t, p.age AS age ORDER BY age";
+    // Not `falls_back`: a definition makes a parameter position of its
+    // own and that helper is for the statements that take none.
+    {
+        let (query, plan, _) =
+            query::compile_parsed(&zu_query::parser::parse(source).unwrap(), &schema).unwrap();
+        let args = vec![Value::Null; query.params.len()];
+        let mut snap = Zu1Snapshot::new(&mut db, catalog.clone());
+        let new = zu_exec::try_execute(
+            &plan,
+            &query,
+            &schema,
+            &mut snap,
+            &args,
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(new.is_none(), "the pipeline does not work out a definition");
+    }
+    let r = query::run(source, &mut db, &[]).unwrap();
+    assert!(!r.rows.is_empty(), "the fixture has rows over the bound");
+    assert!(
+        r.rows.iter().all(|row| row[0] == Value::Int(3)),
+        "the definition reaches the projection: {:?}",
+        r.rows
+    );
 }
 
 #[test]

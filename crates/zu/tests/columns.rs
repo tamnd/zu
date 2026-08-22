@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use zu::dataset::{NodeFile, RelFile, load_dataset};
 use zu::query::column::{ColumnData, ColumnType};
-use zu::query::{Engine, QueryResult, run, run_on};
+use zu::query::{QueryResult, run, run_with};
+use zu::{Engine, Options};
 use zu_query::exec::Value;
 use zu_zu1::file::Zu1File;
 
@@ -62,6 +63,20 @@ fn graph(dir: &Path) -> Zu1File {
 
 fn answer(db: &mut Zu1File, source: &str) -> QueryResult {
     run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"))
+}
+
+/// The same statement pinned to the row executor, the oracle every
+/// comparison below is against. It is a switch on this call rather
+/// than a variable in the environment because the environment belongs
+/// to the process and this binary runs its tests in parallel: setting
+/// it here was setting it for whichever test was between plans, and
+/// that one answered on the wrong engine (#513).
+fn on_rows(db: &mut Zu1File, source: &str) -> QueryResult {
+    let options = Options {
+        engine: Engine::Rows,
+        ..Options::default()
+    };
+    run_with(source, db, &[], &options).unwrap_or_else(|e| panic!("{source}: {e}"))
 }
 
 #[test]
@@ -130,8 +145,7 @@ fn the_rows_read_off_the_columns_are_the_rows_the_row_sink_pushed() {
         );
         // The same statement through the old executor, which has no
         // sink but the row one.
-        let rows =
-            run_on(source, &mut db, &[], Engine::Rows).unwrap_or_else(|e| panic!("{source}: {e}"));
+        let rows = on_rows(&mut db, source);
         assert!(rows.rows.columns().is_none(), "{source} on the old engine");
         assert_eq!(held.columns, rows.columns, "{source} projected the same");
         assert_eq!(held.rows, rows.rows, "{source} answered the same");

@@ -15,8 +15,10 @@
 
 use std::sync::Arc;
 
-use zu_common::{Result, ZuError};
-use zu_vector::{MorselArena, SelVector, ValueVector};
+use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError};
+use zu_vector::{MorselArena, PhysType, SelVector, ValueVector};
+
+use crate::column::ColumnType;
 
 /// What a backend that resolved no edge column says if it is asked to
 /// read one anyway, which is a compiler bug rather than a query error.
@@ -44,7 +46,7 @@ pub enum Dir {
     Bwd,
 }
 
-/// The storage type of a property column, the three the props
+/// The storage type of a property column, the ones the props
 /// directory hands the vector layer today; the full typed catalog is
 /// M3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,104 @@ pub enum ColType {
     /// read and only the type on the vector differs.
     Float,
     Str,
+    /// A date, a time, a datetime or a duration, all of which are one
+    /// count in one word and differ only in what the count is of. The
+    /// tag says which, so the lane stays the integer lane and only the
+    /// value the sink hands back is different.
+    Temporal(TemporalLane),
+}
+
+/// Which temporal type a one word lane holds.
+///
+/// The zoned types are not here. A zoned value is a count and an offset
+/// from UTC, which is two numbers, and a lane is one word: reading one
+/// through a lane would drop the offset and answer an instant that
+/// prints somewhere else. Those columns stay off the vector path until
+/// there is somewhere to put the second number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalLane {
+    /// Days since 1970-01-01, widened from the 32 bits they are stored
+    /// in, since a lane is a word wide whatever it holds.
+    Date,
+    /// Nanoseconds since midnight.
+    LocalTime,
+    /// Nanoseconds since 1970-01-01T00:00:00.
+    LocalDatetime,
+    /// Months for a year-month duration, nanoseconds for a day-time
+    /// one, which is what the kind says.
+    Duration(DurationKind),
+}
+
+impl TemporalLane {
+    /// The temporal type this lane is a lane of.
+    pub fn logical_type(self) -> LogicalType {
+        match self {
+            TemporalLane::Date => LogicalType::Date,
+            TemporalLane::LocalTime => LogicalType::LocalTime,
+            TemporalLane::LocalDatetime => LogicalType::LocalDatetime,
+            TemporalLane::Duration(kind) => LogicalType::Duration(kind),
+        }
+    }
+
+    /// The lane a temporal type takes, `None` for the zoned types,
+    /// which take none.
+    pub fn of(ty: &LogicalType) -> Option<TemporalLane> {
+        match ty {
+            LogicalType::Date => Some(TemporalLane::Date),
+            LogicalType::LocalTime => Some(TemporalLane::LocalTime),
+            LogicalType::LocalDatetime => Some(TemporalLane::LocalDatetime),
+            LogicalType::Duration(kind) => Some(TemporalLane::Duration(*kind)),
+            _ => None,
+        }
+    }
+
+    /// The physical lane the words ride in. A date counts days and the
+    /// other three count one thing each, so the width is a word either
+    /// way and the type is what a kernel reads to know the ordering is
+    /// the integer ordering.
+    pub fn phys(self) -> PhysType {
+        match self {
+            TemporalLane::Date => PhysType::Date,
+            TemporalLane::LocalTime | TemporalLane::LocalDatetime => PhysType::Timestamp,
+            TemporalLane::Duration(_) => PhysType::Interval,
+        }
+    }
+
+    /// The value one word of this lane holds.
+    pub fn value(self, word: i64) -> Temporal {
+        match self {
+            TemporalLane::Date => Temporal::Date(word as i32),
+            TemporalLane::LocalTime => Temporal::LocalTime(word),
+            TemporalLane::LocalDatetime => Temporal::LocalDatetime(word),
+            TemporalLane::Duration(kind) => Temporal::Duration(kind, word),
+        }
+    }
+
+    /// The word a value of this lane rides as, `None` for a value of
+    /// some other temporal type: a date is not a datetime and a lane
+    /// that took one for the other would answer the wrong instant.
+    pub fn word(self, value: &Temporal) -> Option<i64> {
+        match (self, value) {
+            (TemporalLane::Date, Temporal::Date(days)) => Some(i64::from(*days)),
+            (TemporalLane::LocalTime, Temporal::LocalTime(nanos)) => Some(*nanos),
+            (TemporalLane::LocalDatetime, Temporal::LocalDatetime(nanos)) => Some(*nanos),
+            (TemporalLane::Duration(kind), Temporal::Duration(had, nanos)) if kind == *had => {
+                Some(*nanos)
+            }
+            _ => None,
+        }
+    }
+
+    /// What a result column of this lane is called.
+    pub fn column_type(self) -> ColumnType {
+        match self {
+            TemporalLane::Date => ColumnType::Date,
+            TemporalLane::LocalTime => ColumnType::LocalTime,
+            TemporalLane::LocalDatetime => ColumnType::LocalDatetime,
+            TemporalLane::Duration(DurationKind::YearMonth) => ColumnType::YearMonth,
+            TemporalLane::Duration(DurationKind::DayTime) => ColumnType::DayTime,
+        }
+    }
 }
 
 /// A pinned CSR group: shared handles on the decoded offset and

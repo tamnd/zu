@@ -24,10 +24,18 @@ use crate::ast::{
     SetInto, SetItem, SortKey, TemporalFn, TrimSide, UnaryOp,
 };
 use crate::functions;
+use crate::procedures;
 use crate::refs::GraphHandle;
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// Whether an expression is a set function and nothing else, which is
+/// what an item of a grouping may be: the accumulator answers the
+/// column, so there is nothing left over to work out per group.
+fn is_set_function(expr: &BoundExpr) -> bool {
+    matches!(expr, BoundExpr::Call { func, .. } if func.is_aggregate())
 }
 
 /// A small count written the way a sentence writes it, since a refusal
@@ -633,6 +641,12 @@ pub struct Schema {
     /// from a catalog carries that catalog's order rather than one of
     /// its own.
     labels: Vec<String>,
+    /// GP15. The rel tables of every other graph in the catalog, by
+    /// graph id, for a procedure that was handed a graph to read.
+    /// Empty for a schema built without a catalog behind it, and a
+    /// call naming another graph is then refused rather than answered
+    /// against the wrong table.
+    graph_rels: BTreeMap<u32, Vec<RelDef>>,
     /// GV60 and GE01. The graphs a graph reference expression may
     /// name, which is every graph in the catalog the statement was
     /// bound against, with the working one and the home one called out
@@ -682,6 +696,7 @@ impl Schema {
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
             labels,
+            graph_rels: BTreeMap::new(),
             graphs: Vec::new(),
             working_graph: None,
             home_graph: None,
@@ -851,6 +866,46 @@ impl Schema {
         self.graphs.iter().find(|g| g.id == id)
     }
 
+    /// Tells the schema the rel tables of the other graphs in the
+    /// catalog, by graph id (GP15).
+    ///
+    /// A statement reads the tables of the graph it runs against and
+    /// no others, which is what lets two graphs in one file both hold
+    /// a `person`, and none of that changes here: these are not tables
+    /// a pattern may match. They are here for the one thing that names
+    /// a graph and a table in the same breath, which is a procedure
+    /// handed a graph, and all it needs is the id of the rel table and
+    /// the node table under it.
+    pub fn set_graph_rels(&mut self, rels: BTreeMap<u32, Vec<RelDef>>) {
+        self.graph_rels = rels;
+    }
+
+    /// The rel table of that name in that graph. The graph the
+    /// statement runs against answers out of its own tables, so a call
+    /// that named the graph it is already in is the call that did not
+    /// name one.
+    pub fn rel_in_graph(&self, graph: u32, name: &str) -> Option<&RelDef> {
+        if self.working_graph == Some(graph) {
+            return self.rel_by_name(name);
+        }
+        self.graph_rels.get(&graph)?.iter().find(|r| r.name == name)
+    }
+
+    /// The name of a rel table by id, looked for in every graph the
+    /// schema knows about. It is what a listing prints, and a listing
+    /// of a procedure that read another graph would otherwise have
+    /// nothing to print.
+    pub fn rel_name_anywhere(&self, id: u32) -> Option<&str> {
+        if let Some(rel) = self.rel_by_id(id) {
+            return Some(&rel.name);
+        }
+        self.graph_rels
+            .values()
+            .flatten()
+            .find(|r| r.id == id)
+            .map(|r| r.name.as_str())
+    }
+
     /// How far the ceilings may run past the estimates before the join
     /// order DP reruns on the ceilings.
     pub fn bound_disagreement(&self) -> f64 {
@@ -904,6 +959,12 @@ pub enum Type {
     Int,
     Float,
     Str,
+    /// GV35, a byte string. It is beside `Str` and not under it: the
+    /// two have different lengths for the same value, order by
+    /// different units, and the standard gives the byte string its own
+    /// functions, so a rule written for one is not a rule for the
+    /// other.
+    Bytes,
     Node,
     Rel,
     Path,
@@ -938,6 +999,7 @@ impl fmt::Display for Type {
             Type::Int => write!(f, "INT"),
             Type::Float => write!(f, "FLOAT"),
             Type::Str => write!(f, "STRING"),
+            Type::Bytes => write!(f, "BYTES"),
             Type::Node => write!(f, "NODE"),
             Type::Rel => write!(f, "REL"),
             Type::Path => write!(f, "PATH"),
@@ -1004,6 +1066,19 @@ pub struct BoundQuery {
     /// from the rows around it answers the same value for all of them
     /// and is worked out once.
     pub captures: Vec<Capture>,
+    /// GP05 through GP13 and GP17. The binding variables defined at
+    /// the head of this statement and at the head of every block in
+    /// it, in the order they were written, which is the order they are
+    /// worked out in.
+    ///
+    /// They gather onto the outermost query rather than staying where
+    /// they were written because that is where they are run: a
+    /// definition is worked out once, before the first row of anything
+    /// exists, and a nested one is no different since a definition may
+    /// not read a row. Where it was written decides who may read the
+    /// name, and the binder has already settled that by the time this
+    /// list is made.
+    pub bindings: Vec<BoundBinding>,
     /// True when what is written around this query asks only whether it
     /// answered a row, which is what `EXISTS { ... }` says (ISO 19.4).
     ///
@@ -1032,6 +1107,62 @@ pub struct Capture {
     pub slot: usize,
     /// The parameter position this query reads that value at.
     pub param: usize,
+}
+
+/// One binding variable definition, bound (ISO 13.3).
+///
+/// It is a query and a parameter position, and that pairing is the
+/// whole implementation. The query is what the definition says, bound
+/// on its own with no row in scope, and the position is where its
+/// answer is put before the statement runs, so every reader of the
+/// name reads a parameter and nothing below the binder has to know
+/// that a binding variable is a different thing from a value the
+/// caller passed in. That is also what makes "worked out once" true
+/// rather than aspirational: there is one place the value is written
+/// and it is written before the first row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundBinding {
+    /// The name as written, for the message and the EXPLAIN line.
+    pub name: String,
+    /// Which of the three kinds it is, which decides how the query's
+    /// answer is read and what type the answer has to be.
+    pub kind: ast::BindingKind,
+    /// The parameter position the value is written into.
+    pub param: usize,
+    /// The type the definition was written with, if it was written with
+    /// one. It is checked against the answer rather than used to shape
+    /// it, because a definition already has a shape: whatever the query
+    /// answered. A declared type that the answer does not have is a
+    /// statement about the graph that turned out to be wrong, and
+    /// saying so where the definition was made is worth more than
+    /// letting a reader further in find a value of the wrong kind.
+    pub ty: Option<LogicalType>,
+    /// Whether the rows the query answers are the binding table, which
+    /// is true of a definition written with a nested query and false
+    /// of one written with an expression. A nested query is the one
+    /// place in the engine where a result becomes a value, and that is
+    /// GP10. An expression already stands for a table, GP09, and
+    /// collecting its rows would build a one row table holding a
+    /// table rather than reading the table it names. Always false for
+    /// the other two kinds, which stand for one value however they
+    /// were written.
+    pub collects: bool,
+    /// What the definition says, as a query. An initializer that was
+    /// written as an expression is the query that returns it, because
+    /// one shape here is one path through the executor.
+    pub query: BoundQuery,
+}
+
+/// The parameter name a binding variable is given, which is its own
+/// name behind a nul byte and a mark saying which of the two kinds of
+/// engine filled position this is.
+///
+/// The name is in it so that a diagnostic and an EXPLAIN line can say
+/// which variable a position stands for, and the mark is in it so that
+/// a capture of a row variable called `g` and a binding variable
+/// called `g` cannot land on one position.
+fn binding_param(name: &str) -> String {
+    format!("\0b:{name}")
 }
 
 /// The parameter name a capture is given, which is the variable's own
@@ -1618,22 +1749,6 @@ pub enum TableFunc {
 }
 
 impl TableFunc {
-    fn resolve(name: &str) -> Option<TableFunc> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "pagerank" => TableFunc::Pagerank,
-            "wcc" => TableFunc::Wcc,
-            "bfs" => TableFunc::Bfs,
-            "sssp" => TableFunc::Sssp,
-            "sssp_weighted" => TableFunc::SsspWeighted,
-            "cdlp" => TableFunc::Cdlp,
-            "lcc" => TableFunc::Lcc,
-            "triangle_count" => TableFunc::TriangleCount,
-            "betweenness" => TableFunc::Betweenness,
-            "louvain" => TableFunc::Louvain,
-            _ => return None,
-        })
-    }
-
     /// The engine-facing kernel name.
     pub fn name(self) -> &'static str {
         match self {
@@ -1647,23 +1762,6 @@ impl TableFunc {
             TableFunc::TriangleCount => "triangle_count",
             TableFunc::Betweenness => "betweenness",
             TableFunc::Louvain => "louvain",
-        }
-    }
-
-    /// The YIELD column after the leading `node`, with its type. The
-    /// distance column is an integer that comes back null for nodes
-    /// the source does not reach.
-    fn value_column(self) -> (&'static str, Type) {
-        match self {
-            TableFunc::Pagerank => ("rank", Type::Float),
-            TableFunc::Wcc => ("component", Type::Int),
-            TableFunc::Bfs => ("level", Type::Int),
-            TableFunc::Sssp | TableFunc::SsspWeighted => ("distance", Type::Int),
-            TableFunc::Cdlp => ("community", Type::Int),
-            TableFunc::Lcc => ("coefficient", Type::Float),
-            TableFunc::TriangleCount => ("triangles", Type::Int),
-            TableFunc::Betweenness => ("centrality", Type::Float),
-            TableFunc::Louvain => ("community", Type::Int),
         }
     }
 }
@@ -2138,6 +2236,20 @@ enum Projected {
     Answer,
 }
 
+/// The schema an `AT` clause names, written as a catalog path (GP16).
+///
+/// `CURRENT_SCHEMA` and `HOME_SCHEMA` both answer the root, because
+/// nothing moves a session out of it: the schema a session opens in is
+/// the schema it works in for as long as it lives, so the two words
+/// name the same directory and always will until a statement that
+/// changes the working schema exists.
+fn at_path(at: &Option<ast::SchemaRef>) -> Option<&str> {
+    match at.as_ref()? {
+        ast::SchemaRef::Current | ast::SchemaRef::Home => Some(procedures::ROOT),
+        ast::SchemaRef::Path(path) => Some(path),
+    }
+}
+
 /// Binds a parsed query against a schema.
 ///
 /// A composite is bound operand by operand, left to right. Each gets a
@@ -2146,13 +2258,305 @@ enum Projected {
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
+    let at = at_path(&query.at_schema);
     let mut params = Vec::new();
-    let mut bound = bind_body(&query.body, schema, &mut params, &[])?;
+    // The binding variable definition block at the head of the
+    // statement (GP17), bound before anything that could read one of
+    // the names. A definition may read the definitions in front of it
+    // and nothing else, so binding them in written order is all the
+    // scoping this level needs.
+    let mut defined = Vec::new();
+    let mut visible = Vec::new();
+    bind_bindings(
+        &query.bindings,
+        schema,
+        at,
+        &mut params,
+        &mut defined,
+        &mut visible,
+    )?;
+    let mut bound = bind_body(&query.body, schema, at, &mut params, &[], &visible)?;
+    // Every definition written inside the statement as well, which is
+    // one written at the head of a block. They are worked out where
+    // these are, before the first row, because a definition cannot
+    // read a row wherever it stands.
+    gather_bindings(&mut bound, &mut defined);
+    defined.sort_by_key(|b| b.param);
+    bound.bindings = defined;
     // The parameter list is the statement's, so every operand's plan
     // reads the same positions the caller filled in.
     let all = params.clone();
     spread_params(&mut bound, &all);
     Ok(bound)
+}
+
+/// The handle a graph reference names, out of the graphs the schema
+/// was told about.
+///
+/// A parameter is refused rather than resolved, and the reason is
+/// worth writing down: `USE $g` is settled when the statement runs
+/// because the clause is read before anything is bound, while an
+/// expression is bound once and read many times, so a parameter in
+/// this position would have to be a handle carried to the executor
+/// instead of a handle settled here. That is GE04's work and not this
+/// one's.
+///
+/// It is a free function because two callers need it and only one of
+/// them is a binder: a graph reference in an expression is bound by
+/// the binder, and a graph written as the whole of a binding
+/// variable's definition is resolved while that definition is being
+/// bound, which is before any binder exists.
+fn graph_of_ref(schema: &Schema, reference: &GraphRef) -> Result<GraphHandle> {
+    if schema.graphs.is_empty() {
+        return Err(ZuError::gql(
+            codes::C42002,
+            "a graph reference names a graph in the catalog, and this statement was compiled without one behind it".to_string(),
+        ));
+    }
+    let by_id = |id: Option<u32>, which: &str| -> Result<GraphHandle> {
+        id.and_then(|id| schema.graph_by_id(id))
+            .cloned()
+            .ok_or_else(|| {
+                ZuError::gql(
+                    codes::C42002,
+                    format!("{which} is no graph this statement can name"),
+                )
+            })
+    };
+    match reference {
+        GraphRef::Current => by_id(schema.working_graph, "the working graph"),
+        GraphRef::Home => by_id(schema.home_graph, "the home graph"),
+        GraphRef::Named(name) => {
+            let path = name.schema.as_deref().unwrap_or("/");
+            schema
+                .graphs
+                .iter()
+                .find(|g| g.schema == path && g.name == name.name)
+                .cloned()
+                .ok_or_else(|| {
+                    ZuError::gql(
+                        codes::C42002,
+                        format!("'{}' is no graph in '{path}'", name.name),
+                    )
+                })
+        }
+        GraphRef::Param(name) => Err(not_yet(
+            format!("a graph parameter in an expression, ${name}").as_str(),
+        )),
+    }
+}
+
+/// The same, with the binding variables in scope where the reference
+/// was written looked in first (GP13).
+///
+/// A bare name is a graph variable's before it is the catalog's,
+/// because a definition is a name the statement itself gave and it is
+/// the nearer of the two. That is what lets one graph variable be
+/// defined as another, and it is why a `USE` and a procedure argument
+/// both reach a name a definition above them made.
+///
+/// A variable defined by a query has no handle here: which graph it is
+/// is settled when the definition runs, and this is being asked while
+/// the statement is being bound. It is refused by name rather than
+/// looked for in the catalog, where a graph of that name would be the
+/// wrong graph and a silent one.
+fn graph_of_ref_in(
+    schema: &Schema,
+    visible: &[Visible],
+    reference: &GraphRef,
+) -> Result<GraphHandle> {
+    let GraphRef::Named(name) = reference else {
+        return graph_of_ref(schema, reference);
+    };
+    if name.schema.is_some() {
+        return graph_of_ref(schema, reference);
+    }
+    let Some(found) = visible
+        .iter()
+        .rev()
+        .find(|v| v.name == name.name && v.kind == ast::BindingKind::Graph)
+    else {
+        return graph_of_ref(schema, reference);
+    };
+    found.graph.clone().ok_or_else(|| {
+        invalid(format!(
+            "'{}' is a graph variable defined by a query, so which graph it is is settled when the definition runs and not while the statement is being bound: define it as a graph reference to name it here",
+            name.name
+        ))
+    })
+}
+
+/// Binds one binding variable definition block, appending a parameter
+/// position and a definition for each name it defines.
+///
+/// The order is the point. A definition is bound against the
+/// parameters that already exist, so it may read the names in front of
+/// it and cannot read itself or the ones behind it, and its own
+/// position is made only once it is bound. Nothing else is in scope:
+/// the query a definition holds is bound with no outer names at all,
+/// which is what says a definition may not read a row and is what lets
+/// every one of them be worked out before the first row exists.
+fn bind_bindings(
+    defs: &[ast::BindingDef],
+    schema: &Schema,
+    at: Option<&str>,
+    params: &mut Vec<String>,
+    out: &mut Vec<BoundBinding>,
+    visible: &mut Vec<Visible>,
+) -> Result<()> {
+    for def in defs {
+        if visible.iter().any(|v| v.name == def.name) {
+            return Err(bad_reference(format!(
+                "'{}' is defined twice in one binding variable definition block, and a definition is worked out once, so the second would have nothing to say",
+                def.name
+            )));
+        }
+        let query = match &def.init {
+            ast::BindingInit::Query(query) => (**query).clone(),
+            ast::BindingInit::Expr(expr) => returning(expr.clone(), &def.name),
+        };
+        // A block of its own, since a query may carry one, and it is
+        // bound here so that its names are in reach inside that query
+        // and out of reach after it.
+        // A definition holding a query of its own may say which schema
+        // that query resolves in, and one that does not resolves where
+        // the statement around it does.
+        let at = at_path(&query.at_schema).or(at);
+        let mut inner = visible.clone();
+        bind_bindings(&query.bindings, schema, at, params, out, &mut inner)?;
+        let mut bound = bind_body(&query.body, schema, at, params, &[], &inner)?;
+        // A block written inside the definition defines names of its
+        // own, and they are worked out where every definition is. They
+        // land in front of this one because their positions were made
+        // while this one was being bound.
+        gather_bindings(&mut bound, out);
+        // A definition says what a name stands for, and a statement
+        // that is taken apart at its write runs in parts, each of
+        // which fills the parameter positions it reads. So a
+        // definition that wrote would write once per part, which is
+        // the sort of thing that is right until the day the statement
+        // grows a second part. Reading a graph twice answers the same
+        // thing; writing to it twice does not.
+        if bound.clauses.iter().any(writes) {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "the definition of '{}' writes to the graph, and a binding variable is worked out where nothing else has run yet: write the statement on its own",
+                    def.name
+                ),
+            ));
+        }
+        for scalar in &bound.scalars {
+            if !scalar.captures.is_empty() {
+                return Err(bad_reference(format!(
+                    "the definition of '{}' reads a name from outside itself, and a binding variable is worked out once before the first row, so there is no row for it to read",
+                    def.name
+                )));
+            }
+        }
+        if def.kind != ast::BindingKind::Table && bound.columns.len() != 1 {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{} '{}' stands for one value, so what defines it has to answer one column and this one answers {}",
+                    def.kind.word(),
+                    def.name,
+                    bound.columns.len()
+                ),
+            ));
+        }
+        let param = params.len();
+        params.push(binding_param(&def.name));
+        // GP15. A graph defined as a reference says which graph while
+        // the statement is being bound, and a procedure handed the
+        // name needs it then, because the rel table it walks is
+        // resolved then. A graph defined by a query says it when the
+        // definition runs, which is later, so the handle is absent and
+        // a call that wanted one is refused by name.
+        let graph = match (&def.kind, def.init.graph_ref()) {
+            (ast::BindingKind::Graph, Some(reference)) => {
+                graph_of_ref_in(schema, visible, reference).ok()
+            }
+            _ => None,
+        };
+        visible.push(Visible {
+            name: def.name.clone(),
+            param,
+            kind: def.kind,
+            graph,
+        });
+        out.push(BoundBinding {
+            name: def.name.clone(),
+            kind: def.kind,
+            param,
+            ty: def.ty.clone(),
+            collects: def.kind == ast::BindingKind::Table
+                && matches!(def.init, ast::BindingInit::Query(_)),
+            query: bound,
+        });
+    }
+    Ok(())
+}
+
+/// A binding variable a reference may resolve to (GP05 through GP15).
+///
+/// The name and the parameter position are what every reader needs: a
+/// definition is worked out once, before the first row, and reading
+/// the name is reading the position its value was written into. The
+/// kind and the graph are for the one reader that needs more than a
+/// value. A procedure that reads a graph has to know which graph while
+/// the statement is being bound, because the rel table it walks is
+/// resolved then, so a graph written as a reference carries its handle
+/// here and one written as a query does not.
+#[derive(Debug, Clone)]
+struct Visible {
+    name: String,
+    param: usize,
+    kind: ast::BindingKind,
+    graph: Option<GraphHandle>,
+}
+
+/// The query `RETURN expr AS name`, which is what an initializer
+/// written as an expression means.
+///
+/// One shape reaches the executor rather than two: a definition is a
+/// query whatever it was written as, so there is one way to work one
+/// out and one place for that to be wrong.
+fn returning(expr: ast::Expr, name: &str) -> ast::Query {
+    ast::Query {
+        at_schema: None,
+        use_graph: None,
+        bindings: Vec::new(),
+        body: ast::Composite::Linear(ast::Linear {
+            statements: vec![ast::Simple {
+                clauses: Vec::new(),
+                result: Some(ast::Projection {
+                    distinct: false,
+                    star: false,
+                    items: vec![ast::ProjectionItem {
+                        expr,
+                        alias: Some(name.to_string()),
+                    }],
+                    group_by: Vec::new(),
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                }),
+            }],
+        }),
+    }
+}
+
+/// Takes the definitions written inside `query` and puts them in
+/// `out`, which is where they are run from.
+fn gather_bindings(query: &mut BoundQuery, out: &mut Vec<BoundBinding>) {
+    out.append(&mut query.bindings);
+    for joined in &mut query.conjoined {
+        gather_bindings(&mut joined.query, out);
+    }
+    for scalar in &mut query.scalars {
+        gather_bindings(scalar, out);
+    }
 }
 
 /// Binds the operands of a composite query against one parameter list.
@@ -2165,15 +2569,17 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
 fn bind_body(
     body: &ast::Composite,
     schema: &Schema,
+    at: Option<&str>,
     params: &mut Vec<String>,
     outer: &[String],
+    visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut operands = Vec::new();
     collect_operands(body, &mut operands);
-    let mut bound = bind_linear(operands[0].0, schema, params, outer)?;
+    let mut bound = bind_linear(operands[0].0, schema, at, params, outer, visible)?;
     for (linear, how) in &operands[1..] {
         let how = how.expect("only the leftmost operand has no conjunction");
-        let right = bind_linear(linear, schema, params, outer)?;
+        let right = bind_linear(linear, schema, at, params, outer, visible)?;
         // A statement that writes is taken apart at its write and run
         // in parts, and a part is one pipeline. An operand of a
         // composite is a second one, so the two cannot be the same
@@ -2213,6 +2619,9 @@ fn spread_params(query: &mut BoundQuery, all: &[String]) {
     }
     for scalar in &mut query.scalars {
         spread_params(scalar, all);
+    }
+    for binding in &mut query.bindings {
+        spread_params(&mut binding.query, all);
     }
 }
 
@@ -2550,11 +2959,14 @@ fn rewrite(expr: &mut BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Option<BoundE
 fn bind_linear(
     linear: &ast::Linear,
     schema: &Schema,
+    at: Option<&str>,
     params: &mut Vec<String>,
     outer: &[String],
+    visible: &[Visible],
 ) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
+        at: at.map(str::to_string),
         variables: Vec::new(),
         scope: HashMap::new(),
         params: std::mem::take(params),
@@ -2568,6 +2980,8 @@ fn bind_linear(
         groups: HashMap::new(),
         forked: BTreeSet::new(),
         hidden: Vec::new(),
+        bindings: Vec::new(),
+        visible: visible.to_vec(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -2616,12 +3030,18 @@ fn bind_linear(
         conjoined: Vec::new(),
         scalars: binder.scalars,
         captures: binder.captures,
+        bindings: binder.bindings,
         exists: false,
     })
 }
 
 struct Binder<'a> {
     schema: &'a Schema,
+    /// The schema the `AT` clause of the query named, which is where a
+    /// procedure name written without a path in it is looked up
+    /// (GP16). `None` is a query with no `AT`, and a name in one is
+    /// looked up in the root.
+    at: Option<String>,
     variables: Vec<VarDef>,
     /// Name to slot for everything visible right now. `WITH` replaces
     /// it wholesale; slots stay in `variables` either way.
@@ -2672,6 +3092,18 @@ struct Binder<'a> {
     /// because a binding nothing reads is a binding nothing can tell
     /// apart from any other.
     forked: BTreeSet<String>,
+    /// The binding variables defined at the head of a block in this
+    /// statement (GP17), which gather onto the whole query and are
+    /// worked out before it runs.
+    bindings: Vec<BoundBinding>,
+    /// The binding variables a reference here may resolve to, by name
+    /// and by the parameter position their value is written into.
+    ///
+    /// It is a list rather than a map because a block puts names on
+    /// the end of it and takes them off again when the block closes,
+    /// which is the whole of the lexical scoping: what a definition
+    /// can be read from is where it stands in this list.
+    visible: Vec<Visible>,
     /// The names an enclosing `CALL` scope clause took out of reach,
     /// and the slots they are in.
     ///
@@ -2983,10 +3415,22 @@ impl Binder<'_> {
     /// through the projection and the new ones follow them.
     fn bind_call_inline(
         &mut self,
+        optional: bool,
         scope: &Option<Vec<String>>,
         body: &ast::Query,
     ) -> Result<BoundClause> {
         let simple = self.splicable(body)?;
+        // GP03. A block written with OPTIONAL matches whole or not at
+        // all, so what it is written out of is bound as one bracketed
+        // group, which is the same all-or-nothing an OPTIONAL MATCH is.
+        let held = match optional {
+            true => Some(self.optional_body(simple)?),
+            false => None,
+        };
+        let clauses: &[Clause] = match &held {
+            Some(clauses) => clauses,
+            None => &simple.clauses,
+        };
         let outer_scope = self.scope.clone();
         let outer_groups = std::mem::take(&mut self.groups);
         let outer_forked = std::mem::take(&mut self.forked);
@@ -3017,10 +3461,40 @@ impl Binder<'_> {
         // `RETURN *` stands for and what tells a returned name from a
         // name the row already carried.
         let own = self.variables.len();
+        // The block's own binding variable definitions (GP17), which
+        // are in reach inside it and gone after it. They are worked out
+        // where every definition is, before the first row, so what the
+        // block keeps of one is the parameter position its value went
+        // into.
+        let defined = self.visible.len();
+        let mut theirs = Vec::new();
+        let mut params = std::mem::take(&mut self.params);
+        // A spliced block resolves names where the statement around it
+        // does, which is what `splicable` says by refusing an `AT` of
+        // its own.
+        let at = self.at.clone();
+        let block = bind_bindings(
+            &body.bindings,
+            self.schema,
+            at.as_deref(),
+            &mut params,
+            &mut theirs,
+            &mut self.visible,
+        );
+        self.params = params;
+        if let Err(e) = block {
+            self.scope = outer_scope;
+            self.groups = outer_groups;
+            self.forked = outer_forked;
+            self.hidden.truncate(put_away);
+            self.visible.truncate(defined);
+            return Err(e);
+        }
+        self.bindings.append(&mut theirs);
 
         let mut bound = Vec::new();
         let outcome = (|| -> Result<()> {
-            for clause in &simple.clauses {
+            for clause in clauses {
                 bound.push(self.bind_clause(clause)?);
                 bound.append(&mut self.pending);
             }
@@ -3034,17 +3508,22 @@ impl Binder<'_> {
             self.groups = outer_groups;
             self.forked = outer_forked;
             self.hidden.truncate(put_away);
+            self.visible.truncate(defined);
             return Err(e);
         }
 
-        let escaping = match &simple.result {
+        let mut escaping = match &simple.result {
             Some(projection) => self.bind_call_result(projection, own)?,
             None => Vec::new(),
         };
+        if optional {
+            escaping = self.kept_with_nulls(&bound, escaping, own)?;
+        }
         self.scope = outer_scope;
         self.groups = outer_groups;
         self.forked = outer_forked;
         self.hidden.truncate(put_away);
+        self.visible.truncate(defined);
         if let Some(clause) = self.wider(escaping)? {
             bound.push(clause);
         }
@@ -3068,6 +3547,12 @@ impl Binder<'_> {
     /// those is a block that needs a plan of its own, which is the next
     /// piece of this work rather than a thing to get half right here.
     fn splicable<'q>(&self, body: &'q ast::Query) -> Result<&'q ast::Simple> {
+        if body.at_schema.is_some() {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "the block of a CALL cannot name a schema of its own: a spliced block resolves names where the statement around it does, so take the AT out of it, or write the block as the one the statement begins with".to_string(),
+            ));
+        }
         if body.use_graph.is_some() {
             return Err(invalid(
                 "the block of a CALL cannot name a graph of its own yet: take the USE out of it, or write the block as a statement of its own".into(),
@@ -3102,6 +3587,117 @@ impl Binder<'_> {
             }
         }
         Ok(simple)
+    }
+
+    /// The clauses an `OPTIONAL` block is bound out of, which is the
+    /// one it is written out of with the word passed down to it.
+    ///
+    /// What the word says is that the row survives the block answering
+    /// nothing, and the only thing that can answer nothing here is the
+    /// match, so binding it as an optional one is what the word means:
+    /// the pattern matches whole and the block runs on, or it does not
+    /// and every name it would have bound is null.
+    ///
+    /// A block written out of anything else is refused by name rather
+    /// than bound as though the word were not there. A second clause
+    /// behind the match reads names the match may not have bound, and
+    /// what it does with the nulls is a decision this owes the reader
+    /// rather than one to make quietly.
+    fn optional_body(&self, simple: &ast::Simple) -> Result<Vec<Clause>> {
+        let [
+            Clause::Match {
+                optional: false,
+                patterns,
+                alts,
+                distinct,
+                filter,
+            },
+        ] = simple.clauses.as_slice()
+        else {
+            return Err(not_yet(
+                "an OPTIONAL CALL over a block written out of anything but one MATCH, which is the clause the word has something to say about,",
+            ));
+        };
+        if !alts.is_empty() {
+            return Err(not_yet(
+                "an OPTIONAL CALL over a block whose match is written with alternatives,",
+            ));
+        }
+        Ok(vec![Clause::Match {
+            optional: true,
+            patterns: patterns.clone(),
+            alts: Vec::new(),
+            distinct: *distinct,
+            filter: filter.clone(),
+        }])
+    }
+
+    /// The items an `OPTIONAL` block lets out, each one null on a row
+    /// the block did not match.
+    ///
+    /// A name for a slot the block bound is null on such a row already,
+    /// the group having left it that way, so it goes out as it is and
+    /// the call still costs nothing. Anything else is a value the row
+    /// would carry as though the block had answered a row, which is
+    /// what `RETURN 1 AS n` would do and what a lowering to a bare
+    /// optional match gets wrong, so it is asked for under whether the
+    /// block matched and null where it did not.
+    ///
+    /// What says the block matched is a slot the block bound itself,
+    /// and a pattern written out of nothing but names the row already
+    /// carried has none: there the two cases are the same row and are
+    /// refused rather than told apart wrongly.
+    fn kept_with_nulls(
+        &self,
+        bound: &[BoundClause],
+        escaping: Vec<(String, BoundExpr, Type)>,
+        own: usize,
+    ) -> Result<Vec<(String, BoundExpr, Type)>> {
+        if escaping
+            .iter()
+            .all(|(_, e, _)| matches!(e, BoundExpr::Var(slot) if *slot >= own))
+        {
+            return Ok(escaping);
+        }
+        let Some(BoundClause::Match { patterns, .. }) = bound.first() else {
+            unreachable!("an optional block is bound out of its match")
+        };
+        let matched = patterns
+            .iter()
+            .flat_map(|path| {
+                std::iter::once(path.start.slot).chain(
+                    path.steps
+                        .iter()
+                        .flat_map(|(rel, node)| [rel.slot, node.slot]),
+                )
+            })
+            .find(|slot| *slot >= own);
+        let Some(matched) = matched else {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "the block of an OPTIONAL CALL binds nothing of its own, so nothing on the row says whether it matched and what it lets out cannot be made null: name an element of the pattern, or take the OPTIONAL off".to_string(),
+            ));
+        };
+        Ok(escaping
+            .into_iter()
+            .map(|(name, expr, ty)| {
+                if matches!(&expr, BoundExpr::Var(slot) if *slot >= own) {
+                    return (name, expr, ty);
+                }
+                let expr = BoundExpr::Case {
+                    subject: None,
+                    branches: vec![(
+                        BoundExpr::IsNull {
+                            expr: Box::new(BoundExpr::Var(matched)),
+                            negated: true,
+                        },
+                        expr,
+                    )],
+                    otherwise: None,
+                };
+                (name, expr, ty)
+            })
+            .collect())
     }
 
     /// The items a block's `RETURN` lets out, bound in the block's own
@@ -3382,8 +3978,22 @@ impl Binder<'_> {
                     ordinal,
                 })
             }
-            Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
-            Clause::CallInline { scope, body } => self.bind_call_inline(scope, body),
+            Clause::Call {
+                at,
+                proc,
+                args,
+                yields,
+            } => {
+                // The schema the call names itself, or failing that
+                // the one the query names (GP16).
+                let at = at.clone().or_else(|| self.at.clone());
+                self.bind_table_call(at.as_deref(), proc, args, yields)
+            }
+            Clause::CallInline {
+                optional,
+                scope,
+                body,
+            } => self.bind_call_inline(*optional, scope, body),
             // A FILTER is the WHERE of a MATCH with no pattern under
             // it, which is a shape the binder already has: a mark's
             // predicate is queued as exactly this. Binding it to that
@@ -3540,36 +4150,128 @@ impl Binder<'_> {
         })
     }
 
+    /// A named procedure call (ISO 13.1, feature GP04).
+    ///
+    /// The name is resolved against the catalog before anything else is
+    /// looked at, because what the call takes and what it yields are
+    /// the procedure's to say and there is nothing to check an argument
+    /// against until the procedure is known. Everything after the
+    /// lookup is read off the descriptor, so a procedure is a row in a
+    /// table rather than an arm in three matches, and the refusals are
+    /// built out of the same words the row holds.
+    /// The graph a named call was handed, and the arguments past it
+    /// (GP15, ISO 13.1).
+    ///
+    /// A graph goes in front because it says which graph the rest is
+    /// read in: the rel table named next is that graph's table, and a
+    /// call that names no graph reads the graph the statement runs
+    /// against, which is what every call written before this could do
+    /// and all most of them ever want.
+    ///
+    /// It has to be a reference or a name defined as one, and the
+    /// reason is the same reason the rel table is a literal: which
+    /// table the kernel walks is settled while the statement is being
+    /// bound, so a graph that is only known once the statement is
+    /// running is a graph the call cannot be planned against. A graph
+    /// defined by a query is that, and it is refused by name rather
+    /// than read as a rel table and refused for the wrong reason.
+    fn call_graph<'e>(
+        &mut self,
+        proc: &str,
+        args: &'e [Expr],
+    ) -> Result<(Option<GraphHandle>, &'e [Expr])> {
+        match args.first() {
+            Some(Expr::GraphRef(reference)) => {
+                Ok((Some(self.resolve_graph_ref(reference)?), &args[1..]))
+            }
+            Some(Expr::Variable(name)) => {
+                let Some(found) = self.visible.iter().rev().find(|v| v.name == *name) else {
+                    return Ok((None, args));
+                };
+                if found.kind != ast::BindingKind::Graph {
+                    return Ok((None, args));
+                }
+                match &found.graph {
+                    Some(handle) => Ok((Some(handle.clone()), &args[1..])),
+                    None => Err(invalid(format!(
+                        "{proc} reads the graph '{name}' names, and which rel table it walks is settled while the statement is bound, so '{name}' has to be defined as a graph reference rather than by a query"
+                    ))),
+                }
+            }
+            _ => Ok((None, args)),
+        }
+    }
+
     fn bind_table_call(
         &mut self,
-        name: &str,
+        at: Option<&str>,
+        reference: &ast::ProcRef,
         args: &[Expr],
         yields: &[(String, Option<String>)],
     ) -> Result<BoundClause> {
-        let func = TableFunc::resolve(name).ok_or_else(|| {
-            invalid(format!(
-                "unknown table function '{name}', the v0 functions are \
-                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, \
-                 triangle_count, betweenness, louvain"
-            ))
+        // Where the name is looked up: what the name itself says, then
+        // what the AT clause says, then the root. A name written out as
+        // a path is never one the AT clause could disagree with, since
+        // a path after a path reads as one longer path and the parser
+        // has already settled which of them it is.
+        let schema = reference
+            .schema
+            .as_deref()
+            .or(at)
+            .unwrap_or(procedures::ROOT);
+        let proc = procedures::resolve(schema, &reference.name).ok_or_else(|| {
+            // A procedure that is somewhere else is a different refusal
+            // from a procedure that is nowhere, because the caller
+            // spelled the name right and looked in the wrong place.
+            if procedures::resolve(procedures::ROOT, &reference.name).is_some() {
+                bad_reference(format!(
+                    "no procedure '{}' in the schema '{schema}', it is in the root schema",
+                    reference.name
+                ))
+            } else {
+                bad_reference(format!(
+                    "no procedure '{}' in the schema '{schema}', the ones there are {}",
+                    reference.name,
+                    match procedures::in_schema(schema).join(", ").as_str() {
+                        "" => "none".to_string(),
+                        list => list.to_string(),
+                    }
+                ))
+            }
         })?;
+        let func = proc.func;
+        // GP15. A graph in front of the arguments says which graph the
+        // procedure reads, and leaving it out is the graph the
+        // statement runs against.
+        let (graph, args) = self.call_graph(proc.name, args)?;
         // The rel table must resolve at bind time, so the first
-        // argument is a string literal, not an expression.
+        // argument past the graph is a string literal, not an
+        // expression.
         let Some(Expr::Literal(Literal::Str(rel_name))) = args.first() else {
             return Err(invalid(format!(
                 "{}'s first argument must be a string naming a rel table",
-                func.name()
+                proc.name
             )));
         };
-        let rel = self
-            .schema
-            .rel_by_name(rel_name)
-            .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?;
+        let rel = match &graph {
+            Some(handle) => self
+                .schema
+                .rel_in_graph(handle.id, rel_name)
+                .ok_or_else(|| {
+                    bad_reference(format!(
+                        "the graph '{}' holds no rel table '{rel_name}'",
+                        handle.name
+                    ))
+                })?,
+            None => self
+                .schema
+                .rel_by_name(rel_name)
+                .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?,
+        };
         if rel.from != rel.to {
             return Err(invalid(format!(
                 "{} needs a rel table over one node table, '{}' connects two",
-                func.name(),
-                rel.name
+                proc.name, rel.name
             )));
         }
         let (rel_id, table) = (rel.id, rel.from);
@@ -3579,86 +4281,42 @@ impl Binder<'_> {
             let (expr, ty) = self.bind_expr(arg, &mut ctx)?;
             bound_args.push((expr, ty));
         }
-        match func {
-            TableFunc::Bfs | TableFunc::Sssp => {
-                let name = func.name();
-                if bound_args.len() != 1 {
-                    return Err(invalid(format!(
-                        "{name} takes the rel table and a source node id"
-                    )));
+        let (least, most) = proc.arity();
+        if bound_args.len() < least || bound_args.len() > most {
+            return Err(invalid(format!("{} takes {}", proc.name, proc.takes())));
+        }
+        for (i, param) in proc.params.iter().enumerate() {
+            let Some((_, ty)) = bound_args.get(i) else {
+                break;
+            };
+            let fits = match param.ty {
+                procedures::ParamTy::Int => matches!(ty, Type::Int | Type::Any),
+                procedures::ParamTy::List => matches!(ty, Type::List(_) | Type::Any),
+                // A literal is checked on what was written and not on
+                // what it works out to, since what it names is settled
+                // while the statement is being bound.
+                procedures::ParamTy::StrLiteral => {
+                    matches!(args[i + 1], Expr::Literal(Literal::Str(_)))
                 }
-                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
-                    return Err(invalid(format!(
-                        "{name}'s source must be a node id, got {}",
-                        bound_args[0].1
-                    )));
-                }
+            };
+            if !fits && param.ty == procedures::ParamTy::StrLiteral {
+                return Err(invalid(format!(
+                    "{}'s {} must be {}",
+                    proc.name, param.noun, param.expect
+                )));
             }
-            TableFunc::SsspWeighted => {
-                // The weight column is named rather than assumed: a rel
-                // table can carry several numeric columns and which one
-                // is a distance is the caller's to say.
-                if bound_args.len() != 2 {
-                    return Err(invalid(
-                        "sssp_weighted takes the rel table, a source node id, and the name of \
-                         the weight column"
-                            .into(),
-                    ));
-                }
-                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
-                    return Err(invalid(format!(
-                        "sssp_weighted's source must be a node id, got {}",
-                        bound_args[0].1
-                    )));
-                }
-                if !matches!(args[2], Expr::Literal(Literal::Str(_))) {
-                    return Err(invalid(
-                        "sssp_weighted's weight column must be a string literal".into(),
-                    ));
-                }
-            }
-            TableFunc::Betweenness => {
-                // The sources are a list and not a single node,
-                // because the score a node gets is a sum over the
-                // sample and running the sample one source at a time
-                // would be one pass of the graph per source with the
-                // adding left to the caller.
-                if bound_args.len() != 1 {
-                    return Err(invalid(
-                        "betweenness takes the rel table and a list of source node ids".into(),
-                    ));
-                }
-                if !matches!(bound_args[0].1, Type::List(_) | Type::Any) {
-                    return Err(invalid(format!(
-                        "betweenness's sources must be a list of node ids, got {}",
-                        bound_args[0].1
-                    )));
-                }
-            }
-            TableFunc::Cdlp => {
-                // The round count is what makes label propagation
-                // reproducible, so it is spellable, and the default is
-                // the one Graphalytics fixed.
-                if bound_args.len() > 1 {
-                    return Err(invalid(
-                        "cdlp takes the rel table and an optional round count".into(),
-                    ));
-                }
-                if let Some((_, ty)) = bound_args.first()
-                    && !matches!(ty, Type::Int | Type::Any)
-                {
-                    return Err(invalid(format!(
-                        "cdlp's round count must be an integer, got {ty}"
-                    )));
-                }
-            }
-            _ => {
-                if !bound_args.is_empty() {
-                    return Err(invalid(format!("{} takes only the rel table", func.name())));
-                }
+            if !fits {
+                return Err(invalid(format!(
+                    "{}'s {} must be {}, got {ty}",
+                    proc.name, param.noun, param.expect
+                )));
             }
         }
-        let (value_name, value_ty) = func.value_column();
+        let (value_name, value_ty) = proc.column;
+        let value_ty = match value_ty {
+            procedures::ColTy::Int => Type::Int,
+            procedures::ColTy::Float => Type::Float,
+        };
         let expected = ["node", value_name];
         if yields.len() != expected.len()
             || yields
@@ -3668,7 +4326,7 @@ impl Binder<'_> {
         {
             return Err(invalid(format!(
                 "{} yields the columns node, {value_name}",
-                func.name()
+                proc.name
             )));
         }
         let mut slots = Vec::new();
@@ -3764,6 +4422,14 @@ impl Binder<'_> {
         }
         let mut has_aggregate = items.iter().any(|i| i.aggregate);
         let mut grouped_without_aggregate = false;
+        // GF10 and GF12. An item that reads a set function without being
+        // one, `CARDINALITY(COLLECT_LIST(v.n))`, is a scalar read of
+        // what the grouping answered rather than an accumulator of its
+        // own, so the set functions come out into items of their own and
+        // what is left of the expression becomes a projection standing
+        // behind the grouping. What comes back is that grouping, and
+        // `items` is what reads it.
+        let grouping = self.lift_over_the_grouping(&mut items);
 
         // An explicit GROUP BY says what a group is, and the items say
         // what a row of one holds, so the two have to agree: every
@@ -3783,6 +4449,14 @@ impl Binder<'_> {
                 let (bound, _) = self.bind_expr(key, &mut ctx)?;
                 keys.push((bound, text(key)));
             }
+            // Where the clause was split in two, the grouping is the
+            // half that groups, so that is the half the keys are asked
+            // about: what stands behind it reads columns rather than
+            // rows and has no say in what a group is.
+            let items: &[BoundItem] = match &grouping {
+                Some(grouping) => grouping,
+                None => &items,
+            };
             for item in items.iter().filter(|item| !item.aggregate) {
                 if !keys.iter().any(|(key, _)| *key == item.expr) {
                     return Err(invalid(format!(
@@ -3842,6 +4516,11 @@ impl Binder<'_> {
             let mut ctx = ExprCtx::new(true);
             let (mut bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
             if ctx.saw_aggregate {
+                if grouping.is_some() {
+                    return Err(not_yet(
+                        "a sort key holding a set function beside an item that reads one without being one, which is a value the grouping would answer and the projection behind it would sort by,",
+                    ));
+                }
                 self.hoist_sort_aggregates(&mut bound, &items, &mut order_aggs);
             }
             order_by.push(key.with_expr(bound));
@@ -3896,7 +4575,7 @@ impl Binder<'_> {
                 item.slot = None;
             }
         }
-        Ok(BoundClause::Project {
+        let projected = BoundClause::Project {
             distinct: projection.distinct || grouped_without_aggregate,
             items,
             order_by,
@@ -3904,7 +4583,95 @@ impl Binder<'_> {
             skip,
             limit,
             filter,
+        };
+        let Some(grouping) = grouping else {
+            return Ok(projected);
+        };
+        // The half that reads runs behind the half that groups, which
+        // is where `pending` puts it. Everything the clause was written
+        // with is on the half that reads, the grouping being only what
+        // the accumulators answer.
+        self.pending.push(projected);
+        Ok(BoundClause::Project {
+            distinct: false,
+            items: grouping,
+            order_by: Vec::new(),
+            order_aggs: Vec::new(),
+            skip: None,
+            limit: None,
+            filter: None,
         })
+    }
+
+    /// Takes the set functions out of the items that read one without
+    /// being one, and answers the grouping they become.
+    ///
+    /// A set function answers one value per group and a scalar function
+    /// reads one value, so `CARDINALITY(COLLECT_LIST(v.n))` is two
+    /// things that run at two times: the list is accumulated over the
+    /// rows of the group and the count is taken of what came out. One
+    /// clause cannot be both, an accumulator reading a row at a time and
+    /// a projection reading a group at a time, so the clause becomes
+    /// two. The grouping carries the keys and every set function under
+    /// the items, each in a column of its own, and the items that come
+    /// back read those columns.
+    ///
+    /// Nothing happens where no item reads a set function without being
+    /// one, which is nearly every projection there is, and then the
+    /// clause stays the one clause it was written as.
+    ///
+    /// A key and a bare set function are columns of the grouping
+    /// already, so what stands behind it is the name for the column and
+    /// costs nothing. Their slots are settled here rather than where the
+    /// other items get theirs, since the expressions being lifted need a
+    /// slot to read.
+    fn lift_over_the_grouping(&mut self, items: &mut Vec<BoundItem>) -> Option<Vec<BoundItem>> {
+        if !items
+            .iter()
+            .any(|item| item.aggregate && !is_set_function(&item.expr))
+        {
+            return None;
+        }
+        let mut grouping: Vec<BoundItem> = Vec::new();
+        let mut hoisted: Vec<BoundItem> = Vec::new();
+        let mut behind: Vec<BoundItem> = Vec::new();
+        for item in std::mem::take(items) {
+            if !item.aggregate || is_set_function(&item.expr) {
+                let slot = match item.expr {
+                    BoundExpr::Var(slot) => slot,
+                    _ => self.new_slot(item.name.clone(), item.ty.clone()),
+                };
+                behind.push(BoundItem {
+                    expr: BoundExpr::Var(slot),
+                    ty: item.ty.clone(),
+                    name: item.name.clone(),
+                    slot: None,
+                    aggregate: false,
+                });
+                grouping.push(BoundItem {
+                    slot: Some(slot),
+                    ..item
+                });
+                continue;
+            }
+            // The same hoist a sort key gets, and for the same reason:
+            // what is left where the call stood is a column the grouping
+            // fills, and an item already carrying that call is the
+            // column, so the statement pays for one accumulator however
+            // many times the query wrote it.
+            let mut expr = item.expr;
+            self.hoist_sort_aggregates(&mut expr, &grouping, &mut hoisted);
+            behind.push(BoundItem {
+                expr,
+                ty: item.ty,
+                name: item.name,
+                slot: None,
+                aggregate: false,
+            });
+        }
+        grouping.extend(hoisted);
+        *items = behind;
+        Some(grouping)
     }
 
     /// GF20. Takes the aggregates out of one sort key and leaves a name
@@ -5349,54 +6116,11 @@ impl Binder<'_> {
         ))
     }
 
-    /// The handle a graph reference expression names, out of the
-    /// graphs the schema was told about.
-    ///
-    /// A parameter is refused rather than resolved, and the reason is
-    /// worth writing down: `USE $g` is settled when the statement runs
-    /// because the clause is read before anything is bound, while an
-    /// expression is bound once and read many times, so a parameter in
-    /// this position would have to be a handle carried to the executor
-    /// instead of a handle settled here. That is GE04's work and not
-    /// this one's.
+    /// The handle a graph reference expression names, which is
+    /// [`graph_of_ref_in`] against this binder's schema and the
+    /// definitions in scope where the reference was written.
     fn resolve_graph_ref(&self, reference: &GraphRef) -> Result<GraphHandle> {
-        if self.schema.graphs.is_empty() {
-            return Err(ZuError::gql(
-                codes::C42002,
-                "a graph reference names a graph in the catalog, and this statement was compiled without one behind it".to_string(),
-            ));
-        }
-        let by_id = |id: Option<u32>, which: &str| -> Result<GraphHandle> {
-            id.and_then(|id| self.schema.graph_by_id(id))
-                .cloned()
-                .ok_or_else(|| {
-                    ZuError::gql(
-                        codes::C42002,
-                        format!("{which} is no graph this statement can name"),
-                    )
-                })
-        };
-        match reference {
-            GraphRef::Current => by_id(self.schema.working_graph, "the working graph"),
-            GraphRef::Home => by_id(self.schema.home_graph, "the home graph"),
-            GraphRef::Named(name) => {
-                let schema = name.schema.as_deref().unwrap_or("/");
-                self.schema
-                    .graphs
-                    .iter()
-                    .find(|g| g.schema == schema && g.name == name.name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ZuError::gql(
-                            codes::C42002,
-                            format!("'{}' is no graph in '{schema}'", name.name),
-                        )
-                    })
-            }
-            GraphRef::Param(name) => Err(not_yet(
-                format!("a graph parameter in an expression, ${name}").as_str(),
-            )),
-        }
+        graph_of_ref_in(self.schema, &self.visible, reference)
     }
 
     fn bind_expr(&mut self, expr: &Expr, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
@@ -5408,6 +6132,7 @@ impl Binder<'_> {
                     Literal::Int(_) => Type::Int,
                     Literal::Float(_) => Type::Float,
                     Literal::Str(_) => Type::Str,
+                    Literal::Bytes(_) => Type::Bytes,
                     // The static lattice has no temporal type yet, so a
                     // temporal literal is only known to be a value. It
                     // reaches the runtime typed and the checks that
@@ -5440,6 +6165,14 @@ impl Binder<'_> {
                 }
                 if self.forked.contains(name) {
                     return Err(out_of_reach(name));
+                }
+                // A binding variable (GP05 through GP13). It is worked
+                // out once, before the first row, so what stands here
+                // is the parameter its value was written into and the
+                // reader costs a parameter read however many rows
+                // there are.
+                if let Some(found) = self.visible.iter().rev().find(|v| v.name == *name) {
+                    return Ok((BoundExpr::Param(found.param), Type::Any));
                 }
                 // A name the query around this one defined, which this
                 // query may read: it makes the value query expression
@@ -5972,7 +6705,17 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
+        let at = at_path(&query.at_schema)
+            .map(str::to_string)
+            .or_else(|| self.at.clone());
+        let mut bound = bind_body(
+            &query.body,
+            self.schema,
+            at.as_deref(),
+            &mut params,
+            &outer,
+            &self.visible,
+        )?;
         self.params = params;
         // A name the query around this one already has is read out of
         // that row, so a pattern in here that writes the same name
@@ -6379,6 +7122,7 @@ pub fn text(expr: &Expr) -> String {
         Expr::Literal(Literal::Int(v)) => v.to_string(),
         Expr::Literal(Literal::Float(v)) => v.to_string(),
         Expr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        Expr::Literal(Literal::Bytes(b)) => zu_common::bytes::literal(b),
         Expr::Literal(Literal::Temporal(t)) => t.to_string(),
         Expr::Param(p) => format!("${p}"),
         Expr::Variable(v) => v.clone(),
@@ -7976,5 +8720,62 @@ mod tests {
         assert!(e.contains("'a' is already defined"), "got: {e}");
         let e = bind_err("MATCH (a:Person) LET n = count(*) RETURN n AS v");
         assert!(e.contains("cannot be an aggregate"), "got: {e}");
+    }
+
+    /// What a binding variable compiles to is a parameter position, so
+    /// a name read anywhere in the statement is a parameter read and
+    /// the definition is nowhere in the plan. That is the whole of the
+    /// implementation and it is worth saying in a test, because it is
+    /// what makes "worked out once" a fact about the shape rather than
+    /// a promise about the executor.
+    #[test]
+    fn a_binding_variable_compiles_to_a_parameter_position() {
+        let q = bound("VALUE cut = 30 MATCH (p:Person) WHERE p.age > cut RETURN cut AS a");
+        assert_eq!(q.bindings.len(), 1);
+        let cut = &q.bindings[0];
+        assert_eq!(cut.name, "cut");
+        assert_eq!(q.params[cut.param], binding_param("cut"));
+        let BoundClause::Project { items, .. } = q.clauses.last().expect("a projection") else {
+            panic!("a projection");
+        };
+        assert_eq!(items[0].expr, BoundExpr::Param(cut.param));
+    }
+
+    /// The definitions gather onto the outermost query in the order
+    /// they are worked out, and a definition written inside another one
+    /// lands in front of it, because it has to be worked out before the
+    /// one that reads it can be.
+    #[test]
+    fn the_definitions_come_out_in_the_order_they_are_worked_out() {
+        let q = bound(
+            "VALUE a = 1 VALUE b = { VALUE inner = 2 RETURN inner + a AS v } RETURN a + b AS x",
+        );
+        assert_eq!(
+            q.bindings
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "inner", "b"]
+        );
+        assert!(
+            q.bindings.windows(2).all(|w| w[0].param < w[1].param),
+            "the positions run the way the list does"
+        );
+    }
+
+    /// A definition is not a source of rows and cannot read one, so a
+    /// pattern is not a way to smuggle a row into a place where none
+    /// has been matched yet, and the refusals say which name it was.
+    #[test]
+    fn a_definition_reads_no_row_and_writes_nothing() {
+        let e = bind_err("VALUE v = { INSERT (:Person) RETURN 1 AS a } RETURN v AS x");
+        assert!(e.contains("writes to the graph"), "got: {e}");
+        let e =
+            bind_err("MATCH (p:Person) CALL (p) { VALUE v = p.age RETURN v AS a } RETURN p AS x");
+        assert!(e.contains("'p'"), "got: {e}");
+        let e = bind_err("VALUE v = 1 VALUE v = 2 RETURN v AS x");
+        assert!(e.contains("defined twice"), "got: {e}");
+        let e = bind_err("VALUE v = { MATCH (p:Person) RETURN p.a AS a, p.b AS b } RETURN v AS x");
+        assert!(e.contains("one column"), "got: {e}");
     }
 }

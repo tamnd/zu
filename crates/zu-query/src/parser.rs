@@ -17,13 +17,13 @@ use zu_common::{
 };
 
 use crate::ast::{
-    BinaryOp, Brackets, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd,
-    ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef,
-    GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern,
-    NullOrder, Ordinal, PathMode, PathPattern, PatternList, Projection, ProjectionItem,
-    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto,
-    SetItem, SetOp, Simple, SortKey, Statement, Subpath, TemporalFn, TrimSide, TxnStmt, UnaryOp,
-    YieldItem,
+    BinaryOp, BindingDef, BindingInit, BindingKind, Brackets, CatalogStmt, Clause, Composite,
+    Conjunction, DeleteTarget, EdgeEnd, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
+    GraphRef, GraphTypeRef, GraphTypeSource, Group, GroupKind, LabelExpr, LetItem, Linear, Literal,
+    MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, PatternList, ProcRef,
+    Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed,
+    Repeat, SchemaRef, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
+    TemporalFn, TrimSide, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -417,6 +417,28 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
 
+/// Every word that can stand where a query begins once the schema
+/// clause is read: the graph clause, the three that open a binding
+/// variable definition, and the clauses themselves.
+///
+/// One reader, [`Parser::at_path_segment`], and one job: telling the
+/// end of an `AT` path from the query behind it. The list being a
+/// little long is the price of the lexer knowing nothing about
+/// keywords, and a word missing from it costs a refusal rather than a
+/// wrong answer, since the path would then swallow the word and no
+/// schema of that name exists.
+const OPENS_A_CLAUSE: &[&str] = &[
+    "USE", "VALUE", "TABLE", "BINDING", "GRAPH", "PROPERTY", "MATCH", "OPTIONAL", "CALL", "INSERT",
+    "MERGE", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "UNWIND", "FOR", "FILTER", "LET",
+    "WITH", "ORDER", "OFFSET", "SKIP", "LIMIT", "FINISH", "RETURN", "NEXT",
+];
+
+fn opens_a_clause(word: &str) -> bool {
+    OPENS_A_CLAUSE
+        .iter()
+        .any(|kw| word.eq_ignore_ascii_case(kw))
+}
+
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,11 +467,17 @@ pub fn parse(source: &str) -> Result<Query> {
             codes::C42001,
             "a transaction statement says where a transaction begins or ends and reads nothing, so it runs through the session rather than the query path".to_string(),
         )),
+        Statement::Block(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a statement block holds a catalog statement among its parts, so it runs through the session rather than the query path".to_string(),
+        )),
     }
 }
 
-/// Parses one statement, which is either a query or a catalog
-/// statement. The first word tells them apart.
+/// Parses one statement: a query, a catalog statement, a transaction
+/// statement, or a block of them chained by `NEXT`. The first word
+/// tells the first three apart, and a `NEXT` handing over to a catalog
+/// statement is what makes it the fourth.
 pub fn parse_statement(source: &str) -> Result<Statement> {
     let tokens = lex(source)?;
     let mut parser = Parser {
@@ -462,16 +490,34 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         lengths: Vec::new(),
         taken: 0,
         spans: Vec::new(),
+        lifted: Vec::new(),
+        hoisted: None,
+        hoisted_at: None,
+        hoisted_use: None,
+        hoisted_bindings: Vec::new(),
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
         return Ok(Statement::Transaction(stmt));
     }
-    if parser.at_catalog_stmt() {
-        let stmt = parser.parse_catalog_stmt()?;
-        return Ok(Statement::Catalog(stmt));
+    // GP18, ISO 13.6. A linear statement is all query or all catalog,
+    // so a chain that is neither is a statement block, and this is the
+    // one place it can be told: the parts have been read and one of
+    // them changes the catalog.
+    let start = parser.here();
+    let (first, mut ending) = parser.parse_block_part()?;
+    let mut spans = vec![(start, parser.here())];
+    while parser.eat_kw("NEXT") {
+        let at = parser.here();
+        let (_, next) = parser.parse_block_part()?;
+        ending = next;
+        spans.push((at, parser.here()));
     }
-    Ok(Statement::Query(parser.parse_query()?))
+    parser.finish(ending)?;
+    if spans.len() == 1 && parser.lifted.is_empty() {
+        return Ok(first);
+    }
+    Ok(Statement::Block(parser.block_parts(&spans)))
 }
 
 struct Parser<'a> {
@@ -514,6 +560,41 @@ struct Parser<'a> {
     /// The range each of those stretches was written with, gathered as
     /// they are read, which is what the choices are made out of.
     spans: Vec<(usize, usize)>,
+    /// The catalog statements taken out of a call body at the head of
+    /// the statement and put in front of it (GP18).
+    lifted: Vec<Lift>,
+    /// The statements of the body of a call the statement begins with,
+    /// waiting for the chain they go in, and how the last of them
+    /// ended. See `hoist_a_leading_call`.
+    hoisted: Option<(Vec<Simple>, Ending)>,
+    /// The schema clause that body was written with, which belongs to
+    /// the query the statements go into.
+    hoisted_at: Option<SchemaRef>,
+    /// The graph clause that body was written with, and how many
+    /// statements came out of the body with it.
+    ///
+    /// The count is what says which statements of the chain the clause
+    /// was written around: zu runs one graph per query, so a graph
+    /// clause taken out of a body governs everything in the chain, and
+    /// the statements behind the body were written outside it. Those
+    /// may only project what the body answered, and the count is how
+    /// [`Parser::parse_query_body`] finds them to say so.
+    hoisted_use: Option<(GraphRef, usize)>,
+    /// The definitions that body was written with, which come out with
+    /// the graph clause because the clause may read one of them.
+    hoisted_bindings: Vec<BindingDef>,
+}
+
+/// A catalog statement lifted out of a call body (GP18).
+///
+/// `from` and `to` are the statement itself, which becomes a part of
+/// the block, and `from` to `cut` is what comes out of the text the
+/// rest of the statement is made of: the statement and the `NEXT`
+/// handing over to what follows it.
+struct Lift {
+    from: usize,
+    to: usize,
+    cut: usize,
 }
 
 impl Parser<'_> {
@@ -675,10 +756,16 @@ impl Parser<'_> {
     /// GRAPH` and `OR REPLACE` ahead of either, are all catalog
     /// statements.
     fn at_catalog_stmt(&self) -> bool {
-        if !self.at_kw("CREATE") && !self.at_kw("DROP") {
+        self.catalog_stmt_at(0)
+    }
+
+    /// The same test, `offset` tokens further on, which is what the
+    /// word after a `NEXT` is asked (GP18).
+    fn catalog_stmt_at(&self, offset: usize) -> bool {
+        if !self.kw_at(offset, "CREATE") && !self.kw_at(offset, "DROP") {
             return false;
         }
-        let mut at = 1;
+        let mut at = offset + 1;
         if self.kw_at(at, "OR") && self.kw_at(at + 1, "REPLACE") {
             at += 2;
         }
@@ -686,6 +773,15 @@ impl Parser<'_> {
             at += 1;
         }
         self.kw_at(at, "GRAPH") || self.kw_at(at, "SCHEMA")
+    }
+
+    /// Whether the `NEXT` standing here hands over to a catalog
+    /// statement, which is where a linear query statement ends and a
+    /// statement block carries on (GP18). A linear query statement is
+    /// query statements and nothing else, so the chain stops here and
+    /// the entry point picks the next part up.
+    fn next_hands_to_catalog(&self) -> bool {
+        self.at_kw("NEXT") && self.catalog_stmt_at(1)
     }
 
     /// The five statements that change what a file declares: a schema
@@ -718,17 +814,27 @@ impl Parser<'_> {
                 self.parse_graph_stmt(creating, or_replace)?
             }
         };
-        self.eat(&TokenKind::Semicolon);
-        if let Some(token) = self.peek() {
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                token.start,
-                format_args!(
-                    "nothing may follow a catalog statement, found {}",
-                    token.kind.describe()
-                ),
-            ));
+        // Three things may follow and all of them belong to the
+        // caller: the semicolon that ends the text, a `NEXT` handing
+        // over to the rest of a statement block (GP18), and the brace
+        // closing a call body, which the call names better than this
+        // could. None is eaten here, so the block reads a part that
+        // stops where the part stops; anything else is a mistake named
+        // here rather than left to a caller that would have to guess
+        // what was written.
+        if !self.at_kw("NEXT") && !self.at(&TokenKind::RBrace) {
+            let past = usize::from(self.at(&TokenKind::Semicolon));
+            if let Some(token) = self.tokens.get(self.pos + past) {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    token.start,
+                    format_args!(
+                        "nothing may follow a catalog statement, found {}",
+                        token.kind.describe()
+                    ),
+                ));
+            }
         }
         Ok(stmt)
     }
@@ -839,11 +945,51 @@ impl Parser<'_> {
     /// A graph's name, which may be written as a path saying which
     /// schema it is in.
     fn parse_graph_name(&mut self) -> Result<GraphName> {
+        let (schema, name) = self.parse_object_name("a graph name")?;
+        Ok(GraphName { schema, name })
+    }
+
+    /// The schema an `AT` clause names and the procedure name after it.
+    ///
+    /// Whitespace is nothing to the lexer, so `AT / pagerank` and
+    /// `AT /pagerank` are the same tokens and the path swallows the
+    /// name. What tells them apart is what comes next: a call's name is
+    /// followed by its arguments, so a path with nothing but a
+    /// parenthesis behind it was a schema and a name written together,
+    /// and it is split back into the two. A call that did write both,
+    /// `AT /algo pagerank(...)`, never reaches the split, because the
+    /// path stops where the name begins.
+    fn parse_at_and_name(&mut self) -> Result<(Option<String>, ProcRef)> {
+        let path = self.parse_schema_path()?;
+        if !self.at(&TokenKind::LParen) {
+            return Ok((Some(path), self.parse_proc_ref()?));
+        }
+        let cut = path.rfind('/').expect("a path begins with a slash");
+        let name = path[cut + 1..].to_string();
+        if name.is_empty() {
+            return Err(self.error("a procedure name after AT and the schema"));
+        }
+        let schema = if cut == 0 {
+            "/".to_string()
+        } else {
+            path[..cut].to_string()
+        };
+        Ok((Some(schema), ProcRef { schema: None, name }))
+    }
+
+    /// A procedure's name, which is a catalog object reference and so is
+    /// read exactly the way a graph's name is.
+    fn parse_proc_ref(&mut self) -> Result<ProcRef> {
+        let (schema, name) = self.parse_object_name("a procedure name after CALL")?;
+        Ok(ProcRef { schema, name })
+    }
+
+    /// A catalog object's name, either bare or written out as a path.
+    /// The schema is what the path says without its last segment, and a
+    /// name with one segment is in the root.
+    fn parse_object_name(&mut self, what: &str) -> Result<(Option<String>, String)> {
         if !self.at(&TokenKind::Slash) {
-            return Ok(GraphName {
-                schema: None,
-                name: self.expect_name("a graph name")?,
-            });
+            return Ok((None, self.expect_name(what)?));
         }
         let mut segments = Vec::new();
         while self.eat(&TokenKind::Slash) {
@@ -855,10 +1001,7 @@ impl Parser<'_> {
         } else {
             format!("/{}", segments.join("/"))
         };
-        Ok(GraphName {
-            schema: Some(schema),
-            name,
-        })
+        Ok((Some(schema), name))
     }
 
     /// An absolute directory path, which is what a schema is named by.
@@ -1374,14 +1517,47 @@ impl Parser<'_> {
         Ok(LetItem { name, expr })
     }
 
-    /// A composite query statement: the `USE` in front of it, and the
-    /// linear query statements it joins.
+    /// Where the parser stands, as a byte offset into the source, which
+    /// is the end of the text when it has read all of it. It is what
+    /// cuts one part of a statement block out of the whole (GP18).
+    fn here(&self) -> usize {
+        self.peek().map_or(self.source.len(), |t| t.start)
+    }
+
+    /// The text of each part of a statement block, in the order the
+    /// parts run (GP18).
     ///
-    /// The conjunctions are left associative and share one level, so
-    /// this is a fold rather than a precedence climb: each operand read
-    /// joins onto everything read before it.
-    fn parse_query(&mut self) -> Result<Query> {
-        let (query, ending) = self.parse_query_body()?;
+    /// The spans are the parts as they were written, one per link of
+    /// the `NEXT` chain. Anything lifted out of a call body comes
+    /// first, since a lift only happens at the head of the statement,
+    /// and the text it was cut from is what is left of the span it fell
+    /// in. Cuts do not overlap and are gathered in the order they were
+    /// read, so one walk over each span is enough.
+    fn block_parts(&self, spans: &[(usize, usize)]) -> Vec<String> {
+        let mut parts: Vec<String> = self
+            .lifted
+            .iter()
+            .map(|lift| self.source[lift.from..lift.to].trim().to_string())
+            .collect();
+        for &(from, to) in spans {
+            let mut text = String::new();
+            let mut at = from;
+            for lift in &self.lifted {
+                if lift.from < at || lift.cut > to {
+                    continue;
+                }
+                text.push_str(&self.source[at..lift.from]);
+                at = lift.cut;
+            }
+            text.push_str(&self.source[at..to]);
+            parts.push(text.trim().to_string());
+        }
+        parts
+    }
+
+    /// The end of the text, which is where a statement ends: the
+    /// optional semicolon after it, and nothing else past that.
+    fn finish(&mut self, ending: Ending) -> Result<()> {
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
             let what = match ending {
@@ -1396,7 +1572,33 @@ impl Parser<'_> {
                 format_args!("nothing may follow {what}, found {}", token.kind.describe()),
             ));
         }
-        Ok(query)
+        Ok(())
+    }
+
+    /// One part of a statement block: a catalog statement or a query,
+    /// and how it ended.
+    ///
+    /// A transaction statement is not one of them. A block runs as a
+    /// unit, so it is already inside a transaction, and a word that
+    /// began or ended one halfway through would be saying the unit is
+    /// two.
+    fn parse_block_part(&mut self) -> Result<(Statement, Ending)> {
+        if self.at_txn_stmt() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.here(),
+                format_args!(
+                    "a statement block runs as one transaction, so a word that begins or ends one is written on its own rather than among its parts"
+                ),
+            ));
+        }
+        if self.at_catalog_stmt() {
+            let stmt = self.parse_catalog_stmt()?;
+            return Ok((Statement::Catalog(stmt), Ending::Write));
+        }
+        let (query, ending) = self.parse_query_body()?;
+        Ok((Statement::Query(query), ending))
     }
 
     /// The query a `VALUE { ... }` carries, the brace unconsumed
@@ -1459,20 +1661,327 @@ impl Parser<'_> {
     /// with a `RETURN`, because a block that returns nothing is a
     /// perfectly good one. It says the row it ran for goes on unchanged
     /// or, where the block wrote something, that the writing happened.
-    fn parse_call_block(&mut self) -> Result<Query> {
+    ///
+    /// `head` says the call is the whole front of the statement, with
+    /// nothing written before the word, which is what lets a catalog
+    /// statement open the body (GP18). See `lift_catalog_out_of_a_call`
+    /// for why it is only allowed there.
+    fn parse_call_block(&mut self, head: bool) -> Result<(Query, Ending)> {
         self.expect(&TokenKind::LBrace)?;
-        let (query, _) = self.parse_query_body()?;
+        while self.at_catalog_stmt() {
+            self.lift_catalog_out_of_a_call(head)?;
+        }
+        let (query, ending) = self.parse_query_body()?;
+        self.refuse_catalog_in_a_call()?;
         self.expect(&TokenKind::RBrace)?;
-        Ok(query)
+        Ok((query, ending))
+    }
+
+    /// Takes a catalog statement standing at the top of a call body out
+    /// of the body and puts it in front of the statement (GP18).
+    ///
+    /// ISO lets a procedure body hold a catalog statement among its
+    /// data statements, and the corpus writes the mix inside a `CALL`,
+    /// which is a procedure body too. The trouble with a call body is
+    /// that it runs once for every row that reaches it, and a graph is
+    /// made once or not at all, so a body that made one would work for
+    /// a call over one row and raise for a call over two. A call
+    /// written as the front of the statement has exactly one row to run
+    /// for, the unit row every statement starts from, so there the mix
+    /// means something, and `CALL { A NEXT B } rest` says what
+    /// `A NEXT CALL { B } rest` says. That rewrite is what this does,
+    /// which is why the lift is refused anywhere else: it is not that
+    /// the standard forbids the mix further in, it is that lifting it
+    /// there would move a statement out of the loop it was written in.
+    fn lift_catalog_out_of_a_call(&mut self, head: bool) -> Result<()> {
+        if !head {
+            return self.refuse_catalog_in_a_call();
+        }
+        let from = self.here();
+        self.parse_catalog_stmt()?;
+        let to = self.here();
+        if !self.eat_kw("NEXT") {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.here(),
+                format_args!(
+                    "a call body answers the rows the call adds to the row it ran for and a catalog statement answers none, so one written in a body hands over to a statement that does"
+                ),
+            ));
+        }
+        self.lifted.push(Lift {
+            from,
+            to,
+            cut: self.here(),
+        });
+        Ok(())
+    }
+
+    /// Takes the body of a call the statement begins with out of the
+    /// call and puts its statements in the `NEXT` chain around it,
+    /// answering `None` where it did and the body back where it did
+    /// not.
+    ///
+    /// A call adds what its body answers to the row it ran for. The
+    /// row a call at the front of a statement runs for is the unit row
+    /// every statement starts from, which carries nothing, so what the
+    /// row becomes is what the body answered and `CALL { A } rest` says
+    /// what `A NEXT rest` says. Written the second way it is a chain of
+    /// statements, and a statement of a chain may do the things a
+    /// spliced body may not: count its rows, order them, take a page of
+    /// them, or be several statements itself.
+    ///
+    /// Three things hold it back. A scope clause naming variables is
+    /// asking about a row that has none, and it is refused rather than
+    /// quietly made to mean nothing. A body written out of set
+    /// operators is not a chain to be put in one. And a body that does
+    /// not end with `RETURN` answers no rows for a `NEXT` to read, so
+    /// it stays where it was written.
+    ///
+    /// A body naming a graph of its own (GP11 through GP13) has to come
+    /// out here, since a spliced body runs against the graph the
+    /// statement around it does and this one does not. Its definitions
+    /// come out with it, the graph clause being allowed to read one,
+    /// and what that costs is checked in
+    /// [`Self::parse_query_body`]: the clause governs the whole chain
+    /// the statements go into, so the statements written behind the
+    /// call may only project what it answered.
+    fn hoist_a_leading_call(
+        &mut self,
+        scope: &Option<Vec<String>>,
+        body: Query,
+        ending: Ending,
+    ) -> Option<Query> {
+        if scope.as_ref().is_some_and(|names| !names.is_empty())
+            || ending != Ending::Result
+            // A body carrying definitions and no graph clause is left
+            // where it was written, a spliced block already being able
+            // to define names of its own (GP17).
+            || (body.use_graph.is_none() && !body.bindings.is_empty())
+        {
+            return Some(body);
+        }
+        let Query {
+            at_schema,
+            use_graph,
+            bindings,
+            body,
+        } = body;
+        match body {
+            Composite::Linear(linear) => {
+                // The schema clause of the body becomes the schema
+                // clause of the query the statements go into. There is
+                // nothing to lose there: a call the statement begins
+                // with is one whose word is the first token written, so
+                // no clause of the query in front of it wrote one.
+                self.hoisted_at = at_schema;
+                self.hoisted_use = use_graph.map(|graph| (graph, linear.statements.len()));
+                self.hoisted_bindings = bindings;
+                self.hoisted = Some((linear.statements, ending));
+                None
+            }
+            body => Some(Query {
+                at_schema,
+                use_graph,
+                bindings,
+                body,
+            }),
+        }
+    }
+
+    /// A catalog statement inside a call body is refused (GP18) where
+    /// it cannot be lifted out of one.
+    ///
+    /// That is a call the statement does not begin with, which runs for
+    /// every row that reaches it, and a catalog statement written
+    /// behind the data statements of a body rather than in front of
+    /// them, where taking it out would run it before the statements it
+    /// was written after.
+    fn refuse_catalog_in_a_call(&self) -> Result<()> {
+        if !self.at_catalog_stmt() && !self.next_hands_to_catalog() {
+            return Ok(());
+        }
+        Err(ZuError::gql_in(
+            codes::C42001,
+            self.source,
+            self.here(),
+            format_args!(
+                "a call body runs once for every row that reaches it and a catalog statement makes or unmakes a thing once, so it is written beside the call, or at the front of the body of a call the statement begins with"
+            ),
+        ))
+    }
+
+    /// The binding variable definition block (ISO 13.3, GP17): the
+    /// definitions written between the `USE` and the first statement.
+    ///
+    /// Three words open one and none of them can open a statement, so
+    /// no lookahead past the first token is needed to know a definition
+    /// is coming: nothing that runs begins with `VALUE`, `TABLE` or
+    /// `GRAPH`, the statements that name a graph beginning with the
+    /// verb instead. `BINDING` and `PROPERTY` are the optional long
+    /// spellings the standard allows on the two reference types, and
+    /// they are read the same way here as in a type.
+    fn parse_binding_block(&mut self) -> Result<Vec<BindingDef>> {
+        let mut out = Vec::new();
+        loop {
+            let kind = if self.at_kw("VALUE") {
+                self.pos += 1;
+                BindingKind::Value
+            } else if self.at_kw("TABLE") || (self.at_kw("BINDING") && self.kw_at(1, "TABLE")) {
+                self.eat_kw("BINDING");
+                self.pos += 1;
+                BindingKind::Table
+            } else if self.at_kw("GRAPH") || (self.at_kw("PROPERTY") && self.kw_at(1, "GRAPH")) {
+                self.eat_kw("PROPERTY");
+                self.pos += 1;
+                BindingKind::Graph
+            } else {
+                return Ok(out);
+            };
+            out.push(self.parse_binding_def(kind)?);
+        }
+    }
+
+    /// One definition: the name, the type it was written with if any,
+    /// and what it is initialized with.
+    ///
+    /// The initializer is where the three kinds part company. A brace
+    /// is a query for a table and for a graph, ISO's nested binding
+    /// table query and nested graph query, and is the one place a brace
+    /// after an equals is not a map. A value takes an expression, which
+    /// is enough for it: the query form of a value is `VALUE { ... }`,
+    /// already an expression, so a value variable defined out of a
+    /// query is that expression written after the equals rather than a
+    /// second rule here.
+    fn parse_binding_def(&mut self, kind: BindingKind) -> Result<BindingDef> {
+        let name = self.expect_name("a binding variable name")?;
+        // GP06, the typed definition. ISO writes the separator two
+        // ways, `::` and the word `TYPED`, and allows the type to be
+        // written with neither, so all three are read here and the
+        // equals is what says the type is over.
+        if self.at_double_colon() {
+            self.pos += 2;
+        } else {
+            self.eat_kw("TYPED");
+        }
+        let ty = if self.at(&TokenKind::Eq) {
+            None
+        } else {
+            Some(self.parse_value_type()?)
+        };
+        self.expect(&TokenKind::Eq)?;
+        // `VALUE v = VALUE { ... }` is the standard's spelling and the
+        // word is redundant here, the equals having already said a
+        // definition is coming, so it is read and dropped.
+        let word = kind == BindingKind::Value
+            && self.at_kw("VALUE")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
+        if word {
+            self.pos += 1;
+        }
+        // GP13. A graph expression is a graph reference or an object
+        // expression, and `VALUE { ... }` is the one object expression
+        // that carries a query, so it is read as an expression rather
+        // than handed to the reference reader, which has no rule that
+        // begins with a brace and would refuse it for the wrong
+        // reason. Everything else written after a `GRAPH` names a
+        // graph, so it still goes to the reference reader.
+        let value_query = self.at_kw("VALUE")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
+        let init = if self.at(&TokenKind::LBrace) {
+            BindingInit::Query(Box::new(self.parse_call_block(false)?.0))
+        } else if kind == BindingKind::Graph && !value_query {
+            BindingInit::Expr(Expr::GraphRef(self.parse_graph_ref()?))
+        } else {
+            BindingInit::Expr(self.parse_expr()?)
+        };
+        Ok(BindingDef {
+            kind,
+            name,
+            ty,
+            init,
+        })
     }
 
     /// The body of a composite query and how its last statement ended,
-    /// stopping wherever the operands run out. What may follow is the
-    /// caller's business: the end of the text for a statement, a
+    /// stopping wherever the operands run out: the `USE` in front of
+    /// it, and the linear query statements it joins. What may follow is
+    /// the caller's business: the end of the text for a statement, a
     /// closing brace for a nested query.
+    ///
+    /// The conjunctions are left associative and share one level, so
+    /// this is a fold rather than a precedence climb: each operand read
+    /// joins onto everything read before it.
     fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
+        // Anything a call body has already given up belongs to the
+        // query being read around this one, which is the query this is
+        // written inside rather than this one, so it is put aside for
+        // the length of this read and handed back at the end.
+        let waiting = (
+            self.hoisted_at.take(),
+            self.hoisted_use.take(),
+            std::mem::take(&mut self.hoisted_bindings),
+        );
+        let read = self.parse_query_body_inner();
+        (self.hoisted_at, self.hoisted_use, self.hoisted_bindings) = waiting;
+        read
+    }
+
+    fn parse_query_body_inner(&mut self) -> Result<(Query, Ending)> {
+        // ISO 9.2 writes the schema clause in front of the graph
+        // clause, and both in front of the definitions.
+        let at_schema = self.parse_at_schema()?;
         let use_graph = self.parse_use_graph()?;
+        let mut bindings = self.parse_binding_block()?;
+        // The graph clause belongs to the statement rather than to the
+        // head, so ISO lets it stand behind the definitions as well as
+        // in front of them, and it has to: a clause naming a graph a
+        // definition above it defined can only be written there.
+        let use_graph = match (use_graph, self.here(), self.parse_use_graph()?) {
+            (None, _, behind) => behind,
+            (front, _, None) => front,
+            (Some(_), at, Some(_)) => {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format_args!(
+                        "a statement runs against one graph, so it names one once: there is a USE in front of the definitions already"
+                    ),
+                ));
+            }
+        };
         let (linear, ending) = self.parse_linear()?;
+        // The schema clause of a body taken out of a call the statement
+        // begins with, which is this query's now.
+        let at_schema = at_schema.or_else(|| self.hoisted_at.take());
+        // The graph clause and the definitions of that body, which are
+        // this query's for the same reason. The clause governs every
+        // statement of the chain, so the ones written behind the call
+        // may only project what it answered.
+        let mut hoisted_a_use = false;
+        let use_graph = match (use_graph, self.hoisted_use.take()) {
+            (Some(_), Some(_)) => {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "the block of a CALL names a graph and so does the statement it begins, and a statement runs against one graph: take one of the two USE clauses out".to_string(),
+                ));
+            }
+            (None, Some((graph, hoisted))) => {
+                self.refuse_a_read_behind_a_hoisted_use(&linear, hoisted)?;
+                bindings.append(&mut self.hoisted_bindings);
+                hoisted_a_use = true;
+                Some(graph)
+            }
+            (mine, None) => mine,
+        };
         let mut body = Composite::Linear(linear);
         let mut ending = ending;
         loop {
@@ -1491,6 +2000,17 @@ impl Parser<'_> {
                     ),
                 ));
             }
+            if hoisted_a_use {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format_args!(
+                        "the graph the block of the leading CALL named governs the whole statement, so there is nothing for {} to join it to: write the call as a statement of its own",
+                        conjunction_name(how)
+                    ),
+                ));
+            }
             let (right, next) = self.parse_linear()?;
             ending = next;
             body = Composite::Conjoined {
@@ -1499,7 +2019,41 @@ impl Parser<'_> {
                 right,
             };
         }
-        Ok((Query { use_graph, body }, ending))
+        Ok((
+            Query {
+                at_schema,
+                use_graph,
+                bindings,
+                body,
+            },
+            ending,
+        ))
+    }
+
+    /// Refuses a statement written behind a leading call whose body
+    /// named a graph, where that statement reads the graph.
+    ///
+    /// `hoisted` is how many statements of the chain came out of the
+    /// body. What the body named governs all of them, zu running one
+    /// graph per query, and the statements behind it were written
+    /// outside the call and against the graph the session is working
+    /// in. A statement that only projects what the call answered
+    /// cannot tell the two apart, so it is let through, and one that
+    /// reads the graph is refused rather than quietly read against a
+    /// graph nobody wrote it for.
+    fn refuse_a_read_behind_a_hoisted_use(&self, linear: &Linear, hoisted: usize) -> Result<()> {
+        if linear
+            .statements
+            .iter()
+            .skip(hoisted)
+            .all(|simple| simple.clauses.is_empty())
+        {
+            return Ok(());
+        }
+        Err(ZuError::gql(
+            codes::C42001,
+            "the block of the leading CALL names a graph, and the graph a statement names is the graph the whole statement runs against, so what is written behind the call may only project what the call answered: write the call as a statement of its own".to_string(),
+        ))
     }
 
     /// A linear query statement: simple statements chained by `NEXT`,
@@ -1508,6 +2062,24 @@ impl Parser<'_> {
         let mut statements = Vec::new();
         loop {
             let (simple, ending) = self.parse_simple()?;
+            // The body of a call the statement began with, which goes
+            // in this chain in front of what was written after the
+            // call. Where the call was the whole statement what is left
+            // of it is empty, and the last statement of the body is the
+            // one this chain ends with.
+            let (simple, ending) = match self.hoisted.take() {
+                None => (simple, ending),
+                Some((mut body, theirs)) => {
+                    let mine = simple.clauses.is_empty() && simple.result.is_none();
+                    let last = if mine {
+                        body.pop().expect("a call block holds a statement")
+                    } else {
+                        simple
+                    };
+                    statements.append(&mut body);
+                    (last, if mine { theirs } else { ending })
+                }
+            };
             statements.push(simple);
             if self.at_kw("NEXT") && ending == Ending::Finish {
                 return Err(ZuError::gql_in(
@@ -1519,7 +2091,10 @@ impl Parser<'_> {
                     ),
                 ));
             }
-            if !self.eat_kw("NEXT") {
+            // A catalog statement past the NEXT is not part of this
+            // chain, so the NEXT is left where it is for the statement
+            // block to read (GP18).
+            if self.next_hands_to_catalog() || !self.eat_kw("NEXT") {
                 return Ok((Linear { statements }, ending));
             }
         }
@@ -1558,7 +2133,10 @@ impl Parser<'_> {
     fn parse_simple(&mut self) -> Result<(Simple, Ending)> {
         let mut clauses = Vec::new();
         loop {
-            if self.at_kw("MATCH") || self.at_kw("OPTIONAL") {
+            // An OPTIONAL takes a match or a call, so the word alone
+            // does not say which clause this is: the token behind it
+            // does, and a call is read where a call is read.
+            if self.at_kw("MATCH") || (self.at_kw("OPTIONAL") && !self.kw_at(1, "CALL")) {
                 let optional = self.eat_kw("OPTIONAL");
                 // GQ21. An OPTIONAL takes either one match statement or
                 // a braced block of them. The block is one operand, so
@@ -1631,21 +2209,63 @@ impl Parser<'_> {
                     targets.push(self.parse_delete_target()?);
                 }
                 clauses.push(Clause::Delete { targets, detach });
-            } else if self.eat_kw("CALL") {
+            } else if self.at_kw("CALL") || self.at_kw("OPTIONAL") {
+                // GP03. The word in front says the row is kept where
+                // the block answers nothing, which is a thing only the
+                // inline call does: a table function answers what it
+                // answers and there is no row of the statement for it
+                // to keep.
+                let optional = self.eat_kw("OPTIONAL");
+                self.expect_kw("CALL")?;
                 // Which of the two calls this is, read off the one
                 // token after the word. A block or a scope clause is
                 // the inline call, and a name is the table function,
                 // there being nothing else a call can start with.
                 if self.at(&TokenKind::LBrace) || self.at(&TokenKind::LParen) {
+                    // The word was the first token of the statement, so
+                    // the body runs for the one row a statement starts
+                    // from and a catalog statement may open it (GP18).
+                    // An OPTIONAL is never that, the word being a token
+                    // of its own in front: what a hoisted body answers
+                    // is the statement's own rows, and there would be
+                    // no row left over to keep.
+                    let head = self.pos == 1;
                     let scope = self.parse_variable_scope()?;
-                    let body = self.parse_call_block()?;
+                    let (body, ending) = self.parse_call_block(head)?;
+                    let Some(body) = (if head {
+                        self.hoist_a_leading_call(&scope, body, ending)
+                    } else {
+                        Some(body)
+                    }) else {
+                        continue;
+                    };
                     clauses.push(Clause::CallInline {
+                        optional,
                         scope,
                         body: Box::new(body),
                     });
                     continue;
                 }
-                let name = self.expect_name("a table function name after CALL")?;
+                if optional {
+                    return Err(ZuError::gql_in(
+                        codes::C42001,
+                        self.source,
+                        self.here(),
+                        format_args!(
+                            "OPTIONAL says the row is kept where what follows answers nothing, and a procedure named in the catalog answers a table of its own rather than more of the row: write the call without the word, or write the body out as a block"
+                        ),
+                    ));
+                }
+                // `AT` names the schema the reference is resolved in,
+                // which is what a call written without a path in its
+                // name is asking about. It comes before the name, the
+                // way it does in the standard, because it is part of
+                // reading the name and not part of the call.
+                let (at, proc) = if self.eat_kw("AT") {
+                    self.parse_at_and_name()?
+                } else {
+                    (None, self.parse_proc_ref()?)
+                };
                 self.expect(&TokenKind::LParen)?;
                 let mut args = Vec::new();
                 if !self.at(&TokenKind::RParen) {
@@ -1669,7 +2289,12 @@ impl Parser<'_> {
                         break;
                     }
                 }
-                clauses.push(Clause::Call { name, args, yields });
+                clauses.push(Clause::Call {
+                    at,
+                    proc,
+                    args,
+                    yields,
+                });
             } else if self.eat_kw("UNWIND") {
                 // The Cypher spelling, which names the value after the
                 // list rather than before it and carries no counter,
@@ -1888,6 +2513,77 @@ impl Parser<'_> {
             ));
         }
         Ok(name)
+    }
+
+    /// An `AT` clause in front of a query, which says which schema a
+    /// name written without a path in it is resolved in (GP16, ISO
+    /// 16.1).
+    ///
+    /// The word also opens the schema of a named procedure call,
+    /// `CALL AT /algo pagerank(...)`, and the two never collide: this
+    /// one is read where a query begins and that one where a call
+    /// does, which is behind the `CALL`.
+    fn parse_at_schema(&mut self) -> Result<Option<SchemaRef>> {
+        if !self.eat_kw("AT") {
+            return Ok(None);
+        }
+        if self.eat_kw("CURRENT_SCHEMA") {
+            return Ok(Some(SchemaRef::Current));
+        }
+        if self.eat_kw("HOME_SCHEMA") {
+            return Ok(Some(SchemaRef::Home));
+        }
+        // `SCHEMA` before the path is the long spelling and says
+        // nothing the path does not.
+        self.eat_kw("SCHEMA");
+        Ok(Some(SchemaRef::Path(self.parse_head_schema_path()?)))
+    }
+
+    /// The path an `AT` clause at the head of a query names.
+    ///
+    /// Whitespace is nothing to the lexer, so `AT / MATCH (p)` and
+    /// `AT /MATCH (p)` are the same tokens and the path would swallow
+    /// the word the query begins with, which is the ambiguity
+    /// [`Self::parse_at_and_name`] meets at a call and settles by what
+    /// follows. Here the word itself settles it: a segment that opens
+    /// a clause was never a segment, so the path ends in front of it
+    /// and the root is what a clause word straight after the slash
+    /// leaves behind. A schema really called `MATCH` is still
+    /// reachable, written in quotes, since a quoted name is a name and
+    /// nothing else.
+    fn parse_head_schema_path(&mut self) -> Result<String> {
+        if !self.eat(&TokenKind::Slash) {
+            return Err(self.error("an absolute directory path"));
+        }
+        let mut path = String::new();
+        while self.at_path_segment(0) {
+            path.push('/');
+            path.push_str(&self.expect_name("a name in a path")?);
+            // A slash with no segment behind it ends the path and
+            // belongs to whatever follows, so it is taken only when
+            // one does.
+            if !self.at(&TokenKind::Slash) || !self.at_path_segment(1) {
+                break;
+            }
+            self.pos += 1;
+        }
+        Ok(if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        })
+    }
+
+    /// Whether the token this many ahead can be a segment of the path
+    /// above: a name that is not one of the words a clause begins
+    /// with. A quoted name is always one, which is how a schema named
+    /// after a keyword is written.
+    fn at_path_segment(&self, ahead: usize) -> bool {
+        match self.tokens.get(self.pos + ahead).map(|t| &t.kind) {
+            Some(TokenKind::QuotedIdent(_)) => true,
+            Some(TokenKind::Ident(word)) => !opens_a_clause(word),
+            _ => false,
+        }
     }
 
     /// A `USE` clause in front of a query, which says which graph the
@@ -3648,6 +4344,10 @@ impl Parser<'_> {
                 self.pos += 1;
                 Ok(Expr::Literal(Literal::Str(s)))
             }
+            TokenKind::Bytes(b) => {
+                self.pos += 1;
+                Ok(Expr::Literal(Literal::Bytes(b)))
+            }
             TokenKind::Param(p) => {
                 self.pos += 1;
                 Ok(Expr::Param(p))
@@ -4598,19 +5298,23 @@ impl Parser<'_> {
     /// have to be adjacent: `a : : INT` is not a field and reading it
     /// as one would let a typo through as a type.
     fn expect_double_colon(&mut self) -> Result<()> {
-        let adjacent = match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
+        if !self.at_double_colon() {
+            return Err(self.error("'::'"));
+        }
+        self.pos += 2;
+        Ok(())
+    }
+
+    /// Whether a `::` stands here, without taking it.
+    fn at_double_colon(&self) -> bool {
+        match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
             (Some(first), Some(second)) => {
                 first.kind == TokenKind::Colon
                     && second.kind == TokenKind::Colon
                     && first.start + 1 == second.start
             }
             _ => false,
-        };
-        if !adjacent {
-            return Err(self.error("'::'"));
         }
-        self.pos += 2;
-        Ok(())
     }
 
     /// One number inside a type's parentheses: a digit count, a scale
@@ -5525,6 +6229,243 @@ mod tests {
         );
     }
 
+    fn block_parts(source: &str) -> Vec<String> {
+        match parse_statement(source).expect("parse") {
+            Statement::Block(parts) => parts,
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// GP18. A `NEXT` handing over to a catalog statement is where a
+    /// linear query statement ends, so the chain is cut there and each
+    /// side of the cut is a part of the block.
+    #[test]
+    fn a_next_onto_a_catalog_statement_cuts_the_statement_into_parts() {
+        assert_eq!(
+            block_parts(
+                "CREATE GRAPH TYPE t { (:Person) } NEXT INSERT (p:Person) \
+                 NEXT MATCH (q:Person) RETURN q AS q NEXT DROP GRAPH TYPE t"
+            ),
+            vec![
+                "CREATE GRAPH TYPE t { (:Person) }",
+                "INSERT (p:Person) NEXT MATCH (q:Person) RETURN q AS q",
+                "DROP GRAPH TYPE t",
+            ],
+        );
+        assert_eq!(
+            block_parts("MATCH (p:Person) RETURN p AS p NEXT CREATE GRAPH g ANY;"),
+            vec!["MATCH (p:Person) RETURN p AS p", "CREATE GRAPH g ANY"],
+        );
+    }
+
+    /// The cut is only made where a catalog statement stands, so a
+    /// chain of query statements is the one statement it always was.
+    #[test]
+    fn a_next_onto_a_query_stays_inside_the_one_statement() {
+        let q = parsed("MATCH (p:Person) RETURN p AS p NEXT MATCH (p)-[:KNOWS]->(f) RETURN f AS f");
+        assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// A block runs as one transaction, so a word that begins or ends
+    /// one is not a part of it.
+    #[test]
+    fn a_transaction_word_is_not_a_part_of_a_block() {
+        assert!(
+            catalog_err("CREATE GRAPH g ANY NEXT COMMIT").contains("runs as one transaction"),
+            "the refusal says why the word has no place there"
+        );
+    }
+
+    /// GP18. A call body is a procedure body too, so a catalog
+    /// statement may open one, and where the call is the front of the
+    /// statement it is taken out and run in front of what is left.
+    #[test]
+    fn a_catalog_statement_at_the_front_of_a_call_body_is_lifted_out_of_it() {
+        assert_eq!(
+            block_parts(
+                "CALL {\n  CREATE PROPERTY GRAPH mixed ANY\n  NEXT\n  \
+                 MATCH (p:Person)\n  RETURN COUNT(*) AS n\n}\nRETURN n AS n"
+            ),
+            vec![
+                "CREATE PROPERTY GRAPH mixed ANY",
+                "CALL {\n  MATCH (p:Person)\n  RETURN COUNT(*) AS n\n}\nRETURN n AS n",
+            ],
+        );
+        assert_eq!(
+            block_parts(
+                "CALL () { CREATE GRAPH a ANY NEXT DROP GRAPH b NEXT MATCH (p) RETURN p AS p } \
+                 RETURN p AS p NEXT DROP GRAPH a"
+            ),
+            vec![
+                "CREATE GRAPH a ANY",
+                "DROP GRAPH b",
+                "CALL () { MATCH (p) RETURN p AS p } RETURN p AS p",
+                "DROP GRAPH a",
+            ],
+        );
+    }
+
+    /// A catalog statement is refused where taking it out of the body
+    /// would change what it means: in a call the statement does not
+    /// begin with, which runs for every row that reaches it, and behind
+    /// the data statements of a body rather than in front of them.
+    #[test]
+    fn a_catalog_statement_is_not_written_deeper_inside_a_call_body() {
+        for source in [
+            "MATCH (p:Person) CALL (p) { CREATE GRAPH g ANY NEXT INSERT (:Person) } RETURN p AS p",
+            "CALL { INSERT (:Person) NEXT DROP GRAPH g }",
+            "MATCH (p:Person) CALL (p) { INSERT (:Person) NEXT DROP GRAPH g } RETURN p AS p",
+        ] {
+            assert!(
+                catalog_err(source).contains("written beside the call"),
+                "{source}"
+            );
+        }
+    }
+
+    /// A body answers rows and a catalog statement answers none, so a
+    /// body that is only a catalog statement is refused.
+    #[test]
+    fn a_call_body_that_is_only_a_catalog_statement_is_refused() {
+        assert!(
+            catalog_err("CALL () { CREATE GRAPH g ANY }").contains("hands over to a statement"),
+            "the refusal says what is missing behind it"
+        );
+    }
+
+    /// GP06. ISO writes the separator between a binding variable and
+    /// its type two ways and lets the type be written with neither, so
+    /// all three spellings say the same thing here.
+    #[test]
+    fn a_binding_variable_takes_its_type_however_the_separator_is_written() {
+        for source in [
+            "VALUE t :: INT = 3 MATCH (p:Person) RETURN t AS t",
+            "VALUE t TYPED INT = 3 MATCH (p:Person) RETURN t AS t",
+            "VALUE t INT = 3 MATCH (p:Person) RETURN t AS t",
+        ] {
+            let def = &parsed(source).bindings[0];
+            assert_eq!(def.name, "t", "{source}");
+            assert!(def.ty.is_some(), "{source}");
+        }
+        // The equals is what says the type is over, so a definition
+        // written without one has no type rather than a missing one.
+        assert!(
+            parsed("VALUE t = 3 MATCH (p:Person) RETURN t AS t").bindings[0]
+                .ty
+                .is_none()
+        );
+    }
+
+    /// GP16. The `AT` clause stands in front of the query, ahead of the
+    /// graph clause and the definitions, and names a schema three ways.
+    #[test]
+    fn an_at_clause_names_the_schema_a_query_resolves_in() {
+        for (source, want) in [
+            (
+                "AT CURRENT_SCHEMA MATCH (p) RETURN p AS p",
+                SchemaRef::Current,
+            ),
+            ("AT HOME_SCHEMA MATCH (p) RETURN p AS p", SchemaRef::Home),
+            (
+                "AT /app MATCH (p) RETURN p AS p",
+                SchemaRef::Path("/app".into()),
+            ),
+            // `SCHEMA` in front of the path is the long spelling and
+            // says nothing the path does not.
+            (
+                "AT SCHEMA /app MATCH (p) RETURN p AS p",
+                SchemaRef::Path("/app".into()),
+            ),
+        ] {
+            assert_eq!(parsed(source).at_schema, Some(want), "{source}");
+        }
+        assert_eq!(parsed("MATCH (p) RETURN p AS p").at_schema, None);
+    }
+
+    /// The word opens the schema of a named procedure call as well, and
+    /// the two never collide: this one is read where a query begins and
+    /// that one behind the `CALL`.
+    #[test]
+    fn an_at_clause_and_the_schema_of_a_call_are_read_apart() {
+        let q = parsed("AT /app CALL AT / pagerank() YIELD rank RETURN rank AS rank");
+        assert_eq!(q.at_schema, Some(SchemaRef::Path("/app".into())));
+        let Some(Clause::Call { at, .. }) = linear_body(&q).statements[0].clauses.first() else {
+            panic!("the first clause is the call");
+        };
+        assert_eq!(at.as_deref(), Some("/"));
+    }
+
+    /// GP16 again. A call the statement begins with is taken out of the
+    /// call and put in the chain around it, so an `AT` written on the
+    /// body is the schema the query it lands in resolves in.
+    #[test]
+    fn an_at_clause_on_a_hoisted_call_body_becomes_the_querys_own() {
+        let q = parsed("CALL { AT /app MATCH (p:Person) RETURN COUNT(*) AS n } RETURN n AS n");
+        assert_eq!(q.at_schema, Some(SchemaRef::Path("/app".into())));
+        assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// GP12. The graph clause belongs to the statement rather than to
+    /// the head, so ISO lets it stand behind the definitions as well as
+    /// in front of them, and a clause naming a graph a definition above
+    /// it defined can only be written there.
+    #[test]
+    fn a_use_clause_stands_on_either_side_of_the_definitions() {
+        let front = parsed("USE g MATCH (p:Person) RETURN p AS p");
+        let behind =
+            parsed("GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p:Person) RETURN p AS p");
+        assert!(matches!(front.use_graph, Some(GraphRef::Named(_))));
+        assert_eq!(front.use_graph, behind.use_graph);
+        assert_eq!(behind.bindings.len(), 1);
+        // A statement runs against one graph, so it names one once.
+        let err = parse("USE h GRAPH g = CURRENT_PROPERTY_GRAPH USE g MATCH (p) RETURN p AS p")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names one once"), "{err}");
+    }
+
+    /// GP11 through GP13. A body naming a graph of its own comes out of
+    /// the call the way a schema clause does, and its definitions come
+    /// with it, the clause being allowed to read one.
+    #[test]
+    fn a_use_clause_on_a_hoisted_call_body_becomes_the_querys_own() {
+        let q = parsed(
+            "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g \
+             MATCH (p:Person) RETURN COUNT(*) AS n } RETURN n AS n",
+        );
+        assert_eq!(
+            q.use_graph,
+            Some(GraphRef::Named(GraphName {
+                schema: None,
+                name: "g".to_string(),
+            }))
+        );
+        assert_eq!(q.bindings.len(), 1);
+        assert_eq!(linear_body(&q).statements.len(), 2);
+    }
+
+    /// What that costs. The clause governs the whole chain the
+    /// statements go into, so a statement written behind the call, and
+    /// therefore outside it, may only project what the call answered.
+    #[test]
+    fn a_read_behind_a_hoisted_use_is_refused() {
+        let err = parse(
+            "CALL { PROPERTY GRAPH g = CURRENT_PROPERTY_GRAPH USE g RETURN 1 AS n } \
+             MATCH (p:Person) RETURN COUNT(*) AS c",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may only project"), "{err}");
+        // A statement that only projects cannot tell the two graphs
+        // apart, so it is let through.
+        assert!(
+            parse("CALL { USE g RETURN 1 AS n } RETURN n AS n")
+                .unwrap()
+                .use_graph
+                .is_some()
+        );
+    }
+
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes
     /// them, so reserving statement keywords at the head of a clause
     /// must not reach inside a RETURN that is parsing normally.
@@ -6427,10 +7368,18 @@ mod tests {
     #[test]
     fn call_parses_args_and_yield_aliases() {
         let q = parsed("CALL sssp('KNOWS', 42) YIELD node AS n, distance RETURN n, distance");
-        let Clause::Call { name, args, yields } = &q.clauses()[0] else {
+        let Clause::Call {
+            at,
+            proc,
+            args,
+            yields,
+        } = &q.clauses()[0]
+        else {
             panic!("CALL");
         };
-        assert_eq!(name, "sssp");
+        assert_eq!(*at, None);
+        assert_eq!(proc.schema, None, "a bare name says no schema");
+        assert_eq!(proc.name, "sssp");
         assert_eq!(
             *args,
             vec![
@@ -6444,6 +7393,39 @@ mod tests {
                 ("node".to_string(), Some("n".to_string())),
                 ("distance".to_string(), None),
             ]
+        );
+    }
+
+    /// A procedure's name is a catalog object reference, so it may be
+    /// written out as a path, and the schema it is looked up in may be
+    /// said with AT instead. Both spellings reach the binder as a
+    /// schema and a name, which is what makes them one thing there.
+    #[test]
+    fn a_procedure_is_named_by_a_path_or_by_the_schema_it_is_at() {
+        let named = |source: &str| {
+            let q = parsed(source);
+            let Clause::Call { at, proc, .. } = &q.clauses()[0] else {
+                panic!("CALL in {source}");
+            };
+            (at.clone(), proc.schema.clone(), proc.name.clone())
+        };
+        assert_eq!(
+            named("CALL /pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (None, Some("/".to_string()), "pagerank".to_string()),
+            "one segment is a name in the root schema"
+        );
+        assert_eq!(
+            named("CALL /algo/pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (None, Some("/algo".to_string()), "pagerank".to_string())
+        );
+        assert_eq!(
+            named("CALL AT /algo pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (Some("/algo".to_string()), None, "pagerank".to_string())
+        );
+        assert_eq!(
+            named("CALL AT / pagerank('KNOWS') YIELD node, rank RETURN rank"),
+            (Some("/".to_string()), None, "pagerank".to_string()),
+            "the root schema is one slash and nothing else"
         );
     }
 
@@ -6465,7 +7447,7 @@ mod tests {
             ),
         ] {
             let q = parsed(source);
-            let Clause::CallInline { scope, body } = &q.clauses()[1] else {
+            let Clause::CallInline { scope, body, .. } = &q.clauses()[1] else {
                 panic!("an inline CALL in {source}");
             };
             assert_eq!(*scope, want, "{source}");
@@ -6497,6 +7479,52 @@ mod tests {
             panic!("an inline CALL");
         };
         assert!(body.result().is_none());
+    }
+
+    /// GP03. The word in front of a call says the row is kept where the
+    /// block answers nothing, and the same word in front of a match is
+    /// a different clause, so what tells the two apart is the token
+    /// behind the word and nothing else.
+    #[test]
+    fn an_optional_call_is_a_call_and_not_a_match() {
+        for source in [
+            "MATCH (a) OPTIONAL CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS f } RETURN a",
+            "MATCH (a) OPTIONAL CALL { MATCH (b) RETURN b AS f } RETURN a",
+        ] {
+            let q = parsed(source);
+            let Clause::CallInline { optional, .. } = &q.clauses()[1] else {
+                panic!("an inline CALL in {source}");
+            };
+            assert!(*optional, "{source}");
+        }
+        let q = parsed("MATCH (a) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a");
+        assert!(
+            matches!(&q.clauses()[1], Clause::Match { optional: true, .. }),
+            "an OPTIONAL MATCH is still a match"
+        );
+        let q = parsed("MATCH (a) CALL (a) { MATCH (a)-[:knows]->(b) RETURN b AS f } RETURN a");
+        let Clause::CallInline { optional, .. } = &q.clauses()[1] else {
+            panic!("an inline CALL");
+        };
+        assert!(!optional, "a call written without the word");
+    }
+
+    /// A procedure named in the catalog answers a table of its own, so
+    /// there is no row of the statement for the word to keep and it is
+    /// refused where it is written rather than read and dropped.
+    #[test]
+    fn an_optional_call_of_a_named_procedure_is_refused() {
+        let err = parse("OPTIONAL CALL pagerank('knows') YIELD node").unwrap_err();
+        assert!(err.to_string().contains("OPTIONAL"), "{err}");
+    }
+
+    /// The word alone does not say which clause is coming, so a word
+    /// with neither behind it is the match it always was, and the
+    /// message says so rather than naming both.
+    #[test]
+    fn an_optional_that_begins_nothing_is_still_a_match() {
+        let err = parse("MATCH (a) OPTIONAL RETURN a").unwrap_err();
+        assert!(err.to_string().contains("MATCH"), "{err}");
     }
 
     #[test]

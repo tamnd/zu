@@ -596,3 +596,87 @@ cases:
       - values:
           - type: INT64
             value: "1"
+
+  - name: a-scalar-function-over-a-set-function
+    doc: GF10 with GF12 over it. A set function answers one value per group and a scalar function reads one value, so the two run at two times: the list is built out of the rows of the group and the count is taken of what came out. It is one item of the projection and a client cannot see the seam, which is the point of the case.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN cardinality(collect_list(n)) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: arithmetic-over-a-set-function
+    doc: The same thing with no function around the call at all, which is the shape a reader is far more likely to write. What is read once per group is the whole expression and not only the call in it.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN sum(n) * 2 AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "20"
+
+  - name: two-set-functions-in-one-expression
+    doc: An expression may read more than one of them, and each is worked out over the same group before the arithmetic between them runs. Ten over four is the average written out longhand, which is what makes the answer checkable against a set function this does not use.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN sum(n) / count(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-set-function-read-and-returned
+    doc: The same call written twice, once read by an expression and once returned as it stands. Nothing here can tell one accumulator from two, and that is the point: the case is here so that an engine which accumulated per reading would still have to answer this.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN sum(n) AS s, sum(n) + 1 AS t
+    columns:
+      - s
+      - t
+    rows:
+      - values:
+          - type: INT64
+            value: "10"
+          - type: INT64
+            value: "11"
+
+  - name: an-expression-over-a-set-function-with-a-group
+    doc: The read runs once per group rather than once for the answer, so the keys are what a projection behind a grouping has beside the accumulators. Two odd numbers and two even ones, and the arithmetic is done on each group's count.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN n % 2 AS parity, count(n) * 10 AS c ORDER BY parity
+    columns:
+      - parity
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+          - type: INT64
+            value: "20"
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "20"
+
+  - name: a-filter-over-an-expression-over-a-set-function
+    doc: What a WITH's WHERE judges is the projected row, so it reads the name the expression was given and runs behind the grouping the same way the expression does. One of the two groups is over the cut.
+    query: "UNWIND [1, 1, 1, 2] AS n WITH n AS n, count(*) * 10 AS c WHERE c > 10 RETURN n AS n, c AS c"
+    columns:
+      - n
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "30"
+
+  - name: an-expression-over-a-set-function-of-no-rows
+    doc: A count of nothing is zero and the expression is read once for the one row a grouping with no keys answers, so the arithmetic runs on the zero rather than being skipped along with the rows.
+    query: UNWIND [] AS n RETURN count(n) + 5 AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "5"

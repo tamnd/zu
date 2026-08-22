@@ -8,15 +8,16 @@
 
 use std::sync::Arc;
 
+use zu_common::types::LogicalType;
 use zu_common::unicode::NormalForm;
-use zu_common::{Result, ZuError};
+use zu_common::{DurationKind, Result, ZuError};
 
 use crate::arena::MorselArena;
 use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
     BinOp, CmpOp, MathOp, MathPair, StrCut, StrFold, StrLen, StrTrim, TrimSet, binary, compare,
-    cut, element_ids, fold, length, normalize, normalized, pair, trim, unary,
+    cut, duration_between, element_ids, fold, length, normalize, normalized, pair, trim, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -33,7 +34,18 @@ pub enum OwnedValue {
     Int(i64),
     Float(f64),
     Str(Box<[u8]>),
-    Node { table: u16, row: u64 },
+    Node {
+        table: u16,
+        row: u64,
+    },
+    /// A temporal value: one word, and the lane that says what the
+    /// count in it is a count of. The lane is on the constant rather
+    /// than worked out from the word because nothing about a number of
+    /// days tells you it is days.
+    Lane {
+        phys: PhysType,
+        word: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +147,18 @@ pub enum ExprOp {
         src: Reg,
         dst: Reg,
     },
+    /// The length of time from one instant to another. The op carries
+    /// the type both operands hold and the kind of duration asked for,
+    /// which is everything the kernel needs to pick its loop, so the
+    /// choice is made once a chunk and no value in the loop carries a
+    /// tag.
+    Between {
+        of: LogicalType,
+        kind: DurationKind,
+        from: Reg,
+        to: Reg,
+        dst: Reg,
+    },
     /// Comparison produces a predicate bitmap register.
     Compare {
         op: CmpOp,
@@ -216,6 +240,21 @@ impl Program {
                     let out = {
                         let v = resolve(&regs, *src, chunk)?;
                         unary(arena, *op, v, sel)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::Between {
+                    of,
+                    kind,
+                    from,
+                    to,
+                    dst,
+                } => {
+                    let out = {
+                        let a = resolve(&regs, *from, chunk)?;
+                        let b = resolve(&regs, *to, chunk)?;
+                        duration_between(arena, of, *kind, a, b, sel)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
                     last = *dst;
@@ -411,6 +450,7 @@ fn const_vector(arena: &mut MorselArena, v: &OwnedValue, len: usize) -> Result<V
             len,
         ),
         OwnedValue::Str(bytes) => const_str(arena, bytes, len),
+        OwnedValue::Lane { phys, word } => ValueVector::constant(arena, *phys, *word, len),
         OwnedValue::Bool(_) | OwnedValue::Null => {
             return Err(ZuError::InvalidArgument(
                 "bool and null constants land with the executor port".into(),

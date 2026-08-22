@@ -6,7 +6,8 @@
 //! the types with structure in them parse where a name would do, and
 //! that a value type predicate is a boolean in a real row.
 
-use zu::query::{Engine, Value, run, run_on};
+use zu::query::{Value, run, run_with};
+use zu::{Engine, Options};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
@@ -31,6 +32,19 @@ fn yes(db: &mut Zu1File, predicate: &str) {
 fn no(db: &mut Zu1File, predicate: &str) {
     let source = format!("RETURN ({predicate}) AS v");
     assert_eq!(row(db, &source), vec![Value::Bool(false)], "{predicate}");
+}
+
+/// The same statement pinned to the row executor, which is the oracle
+/// the pipeline answer is compared against. A switch on the call
+/// rather than a variable in the environment: the environment belongs
+/// to the process and this binary runs its tests in parallel, so
+/// setting it here set it for whichever test was between plans (#513).
+fn on_rows(db: &mut Zu1File, source: &str) -> zu::query::QueryResult {
+    let options = Options {
+        engine: Engine::Rows,
+        ..Options::default()
+    };
+    run_with(source, db, &[], &options).unwrap_or_else(|e| panic!("{source}: {e}"))
 }
 
 #[test]
@@ -142,7 +156,7 @@ fn a_predicate_in_a_filter_agrees_between_the_two_executors() {
     let mut db = graph(dir.path());
     let source = "MATCH (p:person) WHERE 1 IS TYPED INT RETURN count(p) AS n";
     let with_exec2 = run(source, &mut db, &[]).unwrap();
-    let without = run_on(source, &mut db, &[], Engine::Rows).unwrap();
+    let without = on_rows(&mut db, source);
     assert_eq!(with_exec2.rows, without.rows);
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }
@@ -192,8 +206,7 @@ fn a_cast_and_a_type_test_over_a_stored_column_answer_the_same_either_way() {
     for (predicate, want) in counts {
         let source = format!("MATCH (p:person) WHERE {predicate} RETURN count(p) AS n");
         let vectorised = run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"));
-        let rows = run_on(&source, &mut db, &[], Engine::Rows)
-            .unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        let rows = on_rows(&mut db, &source);
         assert_eq!(vectorised.rows, rows.rows, "{predicate}");
         assert_eq!(vectorised.rows[0][0], Value::Int(want), "{predicate}");
     }

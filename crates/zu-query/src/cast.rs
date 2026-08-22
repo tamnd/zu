@@ -13,7 +13,7 @@
 //! 22004, which is what makes `CAST` usable on optional properties.
 
 use zu_common::gqlstatus::codes;
-use zu_common::temporal::{NANOS_PER_DAY, NANOS_PER_MINUTE};
+use zu_common::temporal::{self, NANOS_PER_DAY, NANOS_PER_MINUTE};
 use zu_common::{FloatBits, IntBits, LogicalType, Result, Temporal, ZuError};
 
 use crate::exec::Value;
@@ -90,12 +90,12 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         // value of `NULL` and the top of this function has already
         // answered it, and no value at all has type `NOTHING`.
         LogicalType::Null | LogicalType::Nothing => Err(forbidden(&v, ty.base())),
-        // GV35 to GV38. There is no byte string value in this executor
-        // yet and no syntax to write one with, and a cast that picked an
-        // encoding for a character string on the user's behalf would be
-        // a wrong answer rather than a missing one, so the whole column
-        // refuses until the value exists.
-        LogicalType::Bytes { .. } => Err(forbidden(&v, ty.base())),
+        // GV35 to GV38. A byte string casts to a byte string and
+        // nothing else casts to one: a cast that picked an encoding for
+        // a character string on the user's behalf would be a wrong
+        // answer rather than a missing one, and picking one is the whole
+        // of what such a cast would have to do.
+        LogicalType::Bytes { min, max, .. } => to_bytes(v, *min, *max),
         // `base()` above has already removed the wrapper, and matching
         // on it here rather than on a catch-all is what makes a new
         // member of the lattice a compile error in this function.
@@ -175,6 +175,14 @@ fn forbidden(v: &Value, target: &LogicalType) -> ZuError {
     forbidden_named(v, &target.to_string())
 }
 
+/// `22008 datetime field overflow`, for a conversion the pair of types
+/// allows and this value has no room for. It is the condition the
+/// operators raise for the same thing, so a query that hits the end of
+/// the datetime range hits it under one code however it was written.
+fn datetime_overflow(detail: String) -> ZuError {
+    ZuError::gql(codes::C22008, detail)
+}
+
 /// [`forbidden`] where the target is spelled rather than built, for the
 /// conversions that are handed a width or a length instead of the type
 /// the user wrote.
@@ -197,6 +205,7 @@ pub(crate) fn value_type(v: &Value) -> String {
         Value::Int(_) => "INT64".into(),
         Value::Float(_) => "FLOAT64".into(),
         Value::Str(_) => "STRING".into(),
+        Value::Bytes(_) => "BYTES".into(),
         Value::Node { .. } => "NODE".into(),
         Value::Rel { .. } => "EDGE".into(),
         Value::List(_) => "LIST".into(),
@@ -236,7 +245,7 @@ fn to_temporal(v: Value, target: &LogicalType) -> Result<Value> {
                 format!("'{s}' is not a value of type '{target}'"),
             )),
         },
-        Value::Temporal(from) => match convert(from, target) {
+        Value::Temporal(from) => match convert(from, target)? {
             Some(t) => Ok(Value::Temporal(t)),
             None => Err(forbidden(&Value::Temporal(from), target)),
         },
@@ -244,8 +253,18 @@ fn to_temporal(v: Value, target: &LogicalType) -> Result<Value> {
     }
 }
 
-/// One temporal value read as another temporal type, `None` where the
-/// pair has no conversion at all.
+/// One temporal value read as another temporal type.
+///
+/// Three answers and not two, because there are three things that can
+/// happen. `Ok(Some)` converted. `Ok(None)` says the pair has no
+/// conversion at all, which is a fact about the two types and which
+/// the caller reports in its own words. `Err` says the pair converts
+/// and this value does not fit the target, which is 22008 and a fact
+/// about the value: a date runs to 9999 and a datetime is nanoseconds
+/// in a word that stops in 2262, so `CAST(DATE '9999-12-31' AS LOCAL
+/// DATETIME)` is a legal cast of a legal date with no answer. Saying
+/// that with the same `None` the missing pairs use would report a
+/// forbidden conversion, which would be a lie about the type.
 ///
 /// The rules are ISO's and each one is a different kind of loss. A
 /// datetime truncates to its date and to its time of day, and a date
@@ -259,26 +278,42 @@ fn to_temporal(v: Value, target: &LogicalType) -> Result<Value> {
 /// The two duration kinds never convert into each other. Months and
 /// nanoseconds have no ratio: a month is 28, 29, 30 or 31 days and
 /// which one depends on a date the duration does not carry.
-pub(crate) fn convert(from: Temporal, target: &LogicalType) -> Option<Temporal> {
+pub(crate) fn convert(from: Temporal, target: &LogicalType) -> Result<Option<Temporal>> {
     use LogicalType as L;
     // The local reading of a value and the offset it was written with,
-    // which is what every conversion below is stated in.
-    let local_datetime = |nanos: i64, offset: i16| nanos + i64::from(offset) * NANOS_PER_MINUTE;
-    Some(match (from, target) {
+    // which is what every conversion below is stated in. It is worked
+    // out a size up, because an instant at the top of the word plus an
+    // offset of eighteen hours is past the top of the word, and the
+    // three targets that read a day or a time of day out of it have a
+    // perfectly good answer that the intermediate would have lost.
+    let local_datetime = |nanos: i64, offset: i16| {
+        i128::from(nanos) + i128::from(offset) * i128::from(NANOS_PER_MINUTE)
+    };
+    // The instant a date starts at, which the calendar has and the word
+    // may not.
+    let midnight = |days: i32| {
+        temporal::instant_at(days, 0).ok_or_else(|| {
+            datetime_overflow(format!(
+                "{} is a date this build cannot spell as a datetime",
+                Temporal::Date(days)
+            ))
+        })
+    };
+    Ok(Some(match (from, target) {
         (t, target) if t.logical_type() == *target => t,
 
-        (Temporal::Date(days), L::LocalDatetime) => {
-            Temporal::LocalDatetime(i64::from(days) * NANOS_PER_DAY)
-        }
+        (Temporal::Date(days), L::LocalDatetime) => Temporal::LocalDatetime(midnight(days)?),
         (Temporal::Date(days), L::ZonedDatetime) => Temporal::ZonedDatetime {
-            nanos: i64::from(days) * NANOS_PER_DAY,
+            nanos: midnight(days)?,
             offset: 0,
         },
 
-        (Temporal::LocalDatetime(nanos), L::Date) => Temporal::Date(day_of(nanos)),
-        (Temporal::LocalDatetime(nanos), L::LocalTime) => Temporal::LocalTime(time_of(nanos)),
+        (Temporal::LocalDatetime(nanos), L::Date) => Temporal::Date(day_of(i128::from(nanos))),
+        (Temporal::LocalDatetime(nanos), L::LocalTime) => {
+            Temporal::LocalTime(time_of(i128::from(nanos)))
+        }
         (Temporal::LocalDatetime(nanos), L::ZonedTime) => Temporal::ZonedTime {
-            nanos: time_of(nanos),
+            nanos: time_of(i128::from(nanos)),
             offset: 0,
         },
         (Temporal::LocalDatetime(nanos), L::ZonedDatetime) => {
@@ -292,7 +327,12 @@ pub(crate) fn convert(from: Temporal, target: &LogicalType) -> Option<Temporal> 
             Temporal::LocalTime(time_of(local_datetime(nanos, offset)))
         }
         (Temporal::ZonedDatetime { nanos, offset }, L::LocalDatetime) => {
-            Temporal::LocalDatetime(local_datetime(nanos, offset))
+            let local = local_datetime(nanos, offset);
+            Temporal::LocalDatetime(i64::try_from(local).map_err(|_| {
+                datetime_overflow(
+                    "the clock reading in that zone is past the end of the datetime range".into(),
+                )
+            })?)
         }
         (Temporal::ZonedDatetime { nanos, offset }, L::ZonedTime) => Temporal::ZonedTime {
             nanos: time_of(local_datetime(nanos, offset)),
@@ -302,20 +342,27 @@ pub(crate) fn convert(from: Temporal, target: &LogicalType) -> Option<Temporal> 
         (Temporal::LocalTime(nanos), L::ZonedTime) => Temporal::ZonedTime { nanos, offset: 0 },
         (Temporal::ZonedTime { nanos, .. }, L::LocalTime) => Temporal::LocalTime(nanos),
 
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 /// The day a datetime falls on, counting a day that starts before the
 /// epoch as the day it started rather than the one it ends in.
-fn day_of(nanos: i64) -> i32 {
-    (nanos.div_euclid(NANOS_PER_DAY)) as i32
+///
+/// The reading arrives a size up, since a zoned instant plus its offset
+/// can be. The day it lands on cannot be: a word of nanoseconds is a
+/// hundred and seven thousand days either side of the epoch and an
+/// offset moves that by one, so the count fits an `i32` with room to
+/// spare.
+fn day_of(nanos: i128) -> i32 {
+    nanos.div_euclid(i128::from(NANOS_PER_DAY)) as i32
 }
 
 /// The time of day a datetime shows, which is always at or after
-/// midnight even when the instant is before the epoch.
-fn time_of(nanos: i64) -> i64 {
-    nanos.rem_euclid(NANOS_PER_DAY)
+/// midnight even when the instant is before the epoch. A remainder of a
+/// day is a day, whatever it was taken of, so this one always fits.
+fn time_of(nanos: i128) -> i64 {
+    nanos.rem_euclid(i128::from(NANOS_PER_DAY)) as i64
 }
 
 /// A cast to a list type is the elementwise cast, GV50.
@@ -640,6 +687,39 @@ fn to_str(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
     Ok(Value::Str(s))
 }
 
+/// GV35 to GV38, a cast to a byte string, which only a byte string
+/// takes.
+///
+/// The two lengths are counted in octets and behave the way the two
+/// lengths of a character string do: too long is `22001`, and too short
+/// is padded, with `X'00'` here rather than a space, since a byte string
+/// has no space to pad with and `X'00'` is the octet ISO fixes a short
+/// one out with.
+fn to_bytes(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
+    let mut bytes = match &v {
+        Value::Bytes(bytes) => bytes.clone(),
+        other => return Err(forbidden_named(other, "BYTES")),
+    };
+    if let Some(max) = max
+        && bytes.len() > max as usize
+    {
+        return Err(ZuError::gql(
+            codes::C22001,
+            format!(
+                "{} is {} octets and the target holds {max}",
+                zu_common::bytes::literal(&bytes),
+                bytes.len()
+            ),
+        ));
+    }
+    if let Some(min) = min
+        && bytes.len() < min as usize
+    {
+        bytes.resize(min as usize, 0);
+    }
+    Ok(Value::Bytes(bytes))
+}
+
 /// The canonical spelling of a width, for messages.
 fn name(signed: bool, bits: IntBits) -> String {
     format!("{}INT{}", if signed { "" } else { "U" }, bits.bits())
@@ -843,6 +923,10 @@ mod tests {
             "22G03 22G03 22018 22018 22018 22018 . 22G03 . 22007 22007 . . 22G0H 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22018",
         ),
         (
+            "bytes",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . 22G03 22G03",
+        ),
+        (
             "list",
             "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V . 22G03 . . 22G03 22G03",
         ),
@@ -916,6 +1000,7 @@ mod tests {
             Value::Str("1".into()),
             Value::Str("true".into()),
             Value::Str("2024-01-15".into()),
+            Value::Bytes(vec![0x00, 0xAB]),
             Value::List(vec![Value::Int(1)]),
             Value::record(vec![("a".into(), Value::Int(1))]),
             Value::Node {
@@ -1060,6 +1145,7 @@ mod tests {
             Value::Chain(_) => "chain",
             Value::Graph(_) => "graph",
             Value::BindingTable(_) => "binding table",
+            Value::Bytes(_) => "bytes",
         }
     }
 

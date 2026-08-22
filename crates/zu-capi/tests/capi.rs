@@ -259,7 +259,13 @@ fn a_c_host_can_open_query_prepare_and_read_columns() {
     seeded(&path);
 
     unsafe {
-        assert_eq!(CStr::from_ptr(zu_version()).to_str(), Ok("0.0.1"));
+        // Against the manifest rather than against a spelling, because
+        // a test holding the second copy of a version is the thing that
+        // makes a bump fail for no reason anybody wants to read.
+        assert_eq!(
+            CStr::from_ptr(zu_version()).to_str(),
+            Ok(env!("CARGO_PKG_VERSION"))
+        );
 
         let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();

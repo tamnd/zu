@@ -19,7 +19,7 @@ use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 use zu_query::frame::FrameSet;
 pub use zu_query::snapshot::{
     ColId, ColType, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, ScanChunk, Snapshot, TableId,
-    ZonePred,
+    TemporalLane, ZonePred,
 };
 
 use crate::deleted::Deleted;
@@ -432,7 +432,11 @@ fn lane_type(ty: &LogicalType) -> Option<ColType> {
             ..
         } => Some(ColType::Float),
         LogicalType::Str { .. } => Some(ColType::Str),
-        _ => None,
+        // A temporal column is a count in a word, so the read is the
+        // integer read and the lane tag is what says what the count
+        // means. The zoned types have no lane, since the offset they
+        // carry is a second number.
+        ty => TemporalLane::of(ty).map(ColType::Temporal),
     }
 }
 
@@ -443,6 +447,7 @@ fn lane_type(ty: &LogicalType) -> Option<ColType> {
 fn lane_phys(ty: &LogicalType) -> PhysType {
     match lane_type(ty) {
         Some(ColType::Float) => PhysType::Float64,
+        Some(ColType::Temporal(lane)) => lane.phys(),
         _ => PhysType::Int64,
     }
 }

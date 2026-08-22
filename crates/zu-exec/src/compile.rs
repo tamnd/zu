@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use zu_common::types::LogicalType;
-use zu_common::{IdMap, Result};
+use zu_common::{IdMap, Result, Temporal};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey, UnaryOp};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundItem, BoundQuery, Cut, Func, Math, Schema, TableFunc, Trim,
@@ -25,7 +25,7 @@ use zu_query::binder::{
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{
-    ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
+    ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, TemporalLane, ZonePred,
 };
 use zu_vector::{
     BinOp, CmpOp, ExprOp, MathOp, MathPair, MorselArena, OwnedValue, PhysType, Program, Reg,
@@ -834,6 +834,22 @@ fn is_window(node: &LogicalPlan) -> bool {
 /// one group. Neither is a group anybody writes on purpose, and a
 /// stored column can hold both, so the grouping goes back to the
 /// engine that already agrees with itself about them.
+/// A temporal value as a constant of its lane, `None` for a zoned one,
+/// which is two numbers and does not fit a lane. The lane comes back
+/// alongside, since a register that holds the constant carries it the
+/// same way a register that read a column does.
+fn lane_const(t: &Temporal) -> Option<(OwnedValue, TemporalLane)> {
+    let lane = TemporalLane::of(&t.logical_type())?;
+    let word = lane.word(t)?;
+    Some((
+        OwnedValue::Lane {
+            phys: lane.phys(),
+            word,
+        },
+        lane,
+    ))
+}
+
 fn keyable(r: ScalarRef) -> bool {
     !matches!(
         r,
@@ -899,6 +915,17 @@ pub(crate) fn compile(
     // does and this one has no place for yet, so the whole statement
     // goes back there (GQ18).
     if !query.scalars.is_empty() {
+        return Ok(None);
+    }
+    // A binding variable is the same story from the other side (GP05
+    // through GP17): the definition is a query run before this plan
+    // starts and its answer is written into a parameter position, so an
+    // engine that does not run it reads a position the caller left
+    // null. Reading it is what makes this worth declining rather than
+    // leaving alone: `VALUE t = 3 MATCH (p:Person) RETURN t AS t`
+    // compiles here, the null goes on the plan as a constant, and the
+    // answer comes out null instead of three.
+    if !query.bindings.is_empty() {
         return Ok(None);
     }
     let mut c = Compiler {
@@ -1174,6 +1201,18 @@ impl Compiler<'_> {
             let Some(col) = self.snap.table_function(func.name(), *rel, &vals)? else {
                 return Ok(None);
             };
+            // A kernel answers for the rel table's node domain, which
+            // is what the adjacency was built over, and the node table
+            // may have grown since: a node inserted after the edges
+            // were loaded is in the table and not in the domain. The
+            // old engine yields what the kernel answered and stops
+            // there, so a scan of the whole table beside a shorter
+            // answer is a shape this engine does not have, and it
+            // hands the statement back rather than reading past the
+            // end of the column.
+            if col.values.len() < self.snap.table_rows(*table)? as usize {
+                return Ok(None);
+            }
             it.next();
             self.slot_level.insert(node_slot, 0);
             self.slot_level.insert(value_slot, 0);
@@ -3320,10 +3359,7 @@ impl Compiler<'_> {
         let Some(level) = self.expr_level(expr) else {
             return Ok(None);
         };
-        let mut b = ProgBuilder {
-            ops: Vec::new(),
-            types: Vec::new(),
-        };
+        let mut b = ProgBuilder::new();
         let Some(root) = self.value_reg(&mut b, expr, level, false)? else {
             return Ok(None);
         };
@@ -3334,6 +3370,17 @@ impl Compiler<'_> {
             // bytes it made along with the views, so the sink reads one
             // back exactly the way it reads a stored column.
             PhysType::Str => ColType::Str,
+            // A temporal value, whose word is a count of something the
+            // physical type alone does not name: an interval counts
+            // months or nanoseconds and a timestamp counts nanoseconds
+            // into a day or since the epoch. The lane names it, and a
+            // register only carries one where the compiler knew it the
+            // whole way through, so a program that lost the lane
+            // declines here rather than handing back the bare number.
+            PhysType::Date | PhysType::Timestamp | PhysType::Interval => match b.lane(root) {
+                Some(lane) => ColType::Temporal(lane),
+                None => return Ok(None),
+            },
             _ => return Ok(None),
         };
         if may_raise(&b.ops) {
@@ -3983,10 +4030,7 @@ impl Compiler<'_> {
     /// when the expression needs anything beyond comparisons, boolean
     /// combinators, and integer arithmetic over this level's columns.
     fn build_prog(&mut self, expr: &BoundExpr, level: usize) -> Result<Option<Program>> {
-        let mut b = ProgBuilder {
-            ops: Vec::new(),
-            types: Vec::new(),
-        };
+        let mut b = ProgBuilder::new();
         let root = self.pred_reg(&mut b, expr, level)?;
         match root {
             Some(_) => Ok(Some(Program {
@@ -4378,21 +4422,23 @@ impl Compiler<'_> {
         level: usize,
         outer: bool,
     ) -> Result<Option<Reg>> {
-        let (from, mut col, ty) = match r {
+        let (from, mut col, ty, lane) = match r {
             // A property is never a constant, so this is the arm
             // nothing reaches rather than a shape to build a program
             // out of.
             ScalarRef::Const { .. } => return Ok(None),
-            ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
-            ScalarRef::Col { level, vec, ty } => (
-                level,
-                vec,
-                match ty {
-                    ColType::Int => PhysType::Int64,
-                    ColType::Float => PhysType::Float64,
-                    ColType::Str => PhysType::Str,
-                },
-            ),
+            ScalarRef::RowId { level } => (level, 0, PhysType::Int64, None),
+            ScalarRef::Col { level, vec, ty } => match ty {
+                ColType::Int => (level, vec, PhysType::Int64, None),
+                ColType::Float => (level, vec, PhysType::Float64, None),
+                ColType::Str => (level, vec, PhysType::Str, None),
+                // The column knows what its words are a count of and
+                // the register takes it from there, so an operator over
+                // two of them can check they agree and the sink can
+                // hand back what it read rather than the number under
+                // it.
+                ColType::Temporal(lane) => (level, vec, lane.phys(), Some(lane)),
+            },
             ScalarRef::Node { .. } => return Ok(None),
         };
         if from != level {
@@ -4417,7 +4463,7 @@ impl Compiler<'_> {
         let Ok(col) = u8::try_from(col) else {
             return Ok(None);
         };
-        let dst = b.push_type(ty)?;
+        let dst = b.push_reg(ty, lane)?;
         b.ops.push(ExprOp::LoadCol { col, dst });
         Ok(Some(dst))
     }
@@ -4444,10 +4490,22 @@ impl Compiler<'_> {
             BoundExpr::Literal(Literal::Str(s)) => {
                 b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some)
             }
+            // A temporal literal is the word its lane rides in, which is
+            // what the column it is compared against holds. A zoned one
+            // has no lane and declines here, the same way a zoned column
+            // never resolves in the first place.
+            BoundExpr::Literal(Literal::Temporal(t)) => match lane_const(t) {
+                Some((v, lane)) => b.push_const_lane(v, lane).map(Some),
+                None => Ok(None),
+            },
             BoundExpr::Param(ix) => match self.params.get(*ix) {
                 Some(Value::Int(n)) => b.push_const(OwnedValue::Int(*n)).map(Some),
                 Some(Value::Float(f)) => b.push_const(OwnedValue::Float(*f)).map(Some),
                 Some(Value::Str(s)) => b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some),
+                Some(Value::Temporal(t)) => match lane_const(t) {
+                    Some((v, lane)) => b.push_const_lane(v, lane).map(Some),
+                    None => Ok(None),
+                },
                 _ => Ok(None),
             },
             // A property, or a variable that stands for a column: the
@@ -4533,10 +4591,34 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 let ty = b.types[l as usize];
-                if !matches!(ty, PhysType::Int64 | PhysType::Float64) {
+                // Two durations of one kind add and subtract, and that
+                // is the whole of the temporal arithmetic that is a
+                // kernel. The words are counts of the same unit, so the
+                // sum is the integer sum and the answer is a duration
+                // of the kind both sides were.
+                //
+                // Two of different kinds do not add, which is what the
+                // kinds exist to say, and a lane on each register is
+                // what lets this notice. An instant shifted by a
+                // duration is not here either: it clamps a month onto
+                // a day, refuses a time of day landing on a date, and
+                // stops at the end of the calendar, none of which the
+                // arith kernel has an op for.
+                let lane = match (b.lane(l), b.lane(r)) {
+                    (None, None) => None,
+                    (Some(a), Some(c))
+                        if a == c
+                            && matches!(a, TemporalLane::Duration(_))
+                            && matches!(bin, BinOp::Add | BinOp::Sub) =>
+                    {
+                        Some(a)
+                    }
+                    _ => return Ok(None),
+                };
+                if !matches!(ty, PhysType::Int64 | PhysType::Float64 | PhysType::Interval) {
                     return Ok(None);
                 }
-                let dst = b.push_type(ty)?;
+                let dst = b.push_reg(ty, lane)?;
                 b.ops.push(ExprOp::Binary { op: bin, l, r, dst });
                 Ok(Some(dst))
             }
@@ -4617,6 +4699,49 @@ impl Compiler<'_> {
                 };
                 let dst = b.push_type(ty)?;
                 b.ops.push(ExprOp::StrLen { op, src, dst });
+                Ok(Some(dst))
+            }
+            // DURATION_BETWEEN, ISO 20.28, over two instants of the
+            // same type. Both operands are counts and the answer is a
+            // count, so the whole call is arithmetic over words once
+            // the type is known, and the type is known here rather than
+            // in the loop: the op carries it and the kernel picks its
+            // loop once a chunk.
+            //
+            // The two sides have to agree on a lane, which is what says
+            // they are instants of one type. A date and a datetime do
+            // not have a duration between them, the row engine refusing
+            // that pair rather than reading one as the other, and two
+            // registers that disagree decline here for the same reason.
+            // A duration is not an instant either, so a lane that is
+            // one is not this call.
+            BoundExpr::Call {
+                func: Func::DurationBetween(kind),
+                args,
+                distinct: false,
+                star: false,
+                ..
+            } if args.len() == 2 => {
+                let Some(from) = self.value_reg(b, &args[0], level, false)? else {
+                    return Ok(None);
+                };
+                let Some(to) = self.value_reg(b, &args[1], level, false)? else {
+                    return Ok(None);
+                };
+                let (Some(a), Some(c)) = (b.lane(from), b.lane(to)) else {
+                    return Ok(None);
+                };
+                if a != c || matches!(a, TemporalLane::Duration(_)) {
+                    return Ok(None);
+                }
+                let dst = b.push_lane(TemporalLane::Duration(*kind))?;
+                b.ops.push(ExprOp::Between {
+                    of: a.logical_type(),
+                    kind: *kind,
+                    from,
+                    to,
+                    dst,
+                });
                 Ok(Some(dst))
             }
             // GF04's other half, the two folds. These are the first
@@ -4961,13 +5086,40 @@ fn narrow_float(op: BinaryOp, c: f64) -> Option<(CmpOp, i64)> {
 }
 
 /// Register and type bookkeeping for one program build.
+///
+/// Every register has a physical type and some of them have a lane
+/// besides. The physical type is what the kernels read: it says how
+/// wide the register is and how it compares. The lane is what the sink
+/// reads, and only the temporal registers carry one, because
+/// `PhysType::Interval` is a word of either months or nanoseconds and
+/// `PhysType::Timestamp` is a word of either a time of day or an
+/// instant. Nothing about the word says which, so the answer of a
+/// program that ends on one would be a bare number without this.
 struct ProgBuilder {
     ops: Vec<ExprOp>,
     types: Vec<PhysType>,
+    lanes: Vec<Option<TemporalLane>>,
 }
 
 impl ProgBuilder {
+    fn new() -> ProgBuilder {
+        ProgBuilder {
+            ops: Vec::new(),
+            types: Vec::new(),
+            lanes: Vec::new(),
+        }
+    }
+
     fn push_type(&mut self, ty: PhysType) -> Result<Reg> {
+        self.push_reg(ty, None)
+    }
+
+    /// A register holding a temporal value of a known lane.
+    fn push_lane(&mut self, lane: TemporalLane) -> Result<Reg> {
+        self.push_reg(lane.phys(), Some(lane))
+    }
+
+    fn push_reg(&mut self, ty: PhysType, lane: Option<TemporalLane>) -> Result<Reg> {
         if self.types.len() >= usize::from(Reg::MAX) {
             // A 255-register filter is not a query anyone writes; the
             // fallback handles it if one ever shows up.
@@ -4976,7 +5128,14 @@ impl ProgBuilder {
             ));
         }
         self.types.push(ty);
+        self.lanes.push(lane);
         Ok((self.types.len() - 1) as Reg)
+    }
+
+    /// The lane of a register, or `None` for one that holds a number,
+    /// a string or a temporal value nobody named the lane of.
+    fn lane(&self, reg: Reg) -> Option<TemporalLane> {
+        self.lanes[reg as usize]
     }
 
     fn push_const(&mut self, v: OwnedValue) -> Result<Reg> {
@@ -4984,9 +5143,18 @@ impl ProgBuilder {
             OwnedValue::Int(_) => PhysType::Int64,
             OwnedValue::Float(_) => PhysType::Float64,
             OwnedValue::Str(_) => PhysType::Str,
+            OwnedValue::Lane { phys, .. } => *phys,
             _ => PhysType::Int64,
         };
         let dst = self.push_type(ty)?;
+        self.ops.push(ExprOp::LoadConst { v, dst });
+        Ok(dst)
+    }
+
+    /// A temporal constant, which carries its lane the way a temporal
+    /// column does, so the two can meet in an operator.
+    fn push_const_lane(&mut self, v: OwnedValue, lane: TemporalLane) -> Result<Reg> {
+        let dst = self.push_lane(lane)?;
         self.ops.push(ExprOp::LoadConst { v, dst });
         Ok(dst)
     }
@@ -5079,6 +5247,14 @@ fn may_raise(ops: &[ExprOp]) -> bool {
             ..
         } => !written_nonzero(&ops[..i], *r),
         ExprOp::MathPair { .. } => true,
+        // A length of time between two instants, which has a condition
+        // no fold over the operands settles: a date the calendar has is
+        // not always a number of nanoseconds, so a pair of perfectly
+        // ordinary dates can have no day-time duration between them.
+        // The call stands behind a filter, where the row engine
+        // evaluates it too, and not in a computed column, which is
+        // filled before the filter that would have dropped the row.
+        ExprOp::Between { .. } => true,
         // A count has an answer for every string there is, so it is a
         // computed column like a floor or an angle. So does a fold, and
         // so does a trim: the trim family's one condition is about the

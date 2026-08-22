@@ -31,21 +31,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// What the milestone asks for, from the press to the shell saying it
-/// stopped.
+/// stopped. Fifty milliseconds is roughly where a person stops
+/// believing the key did anything.
 const BUDGET: Duration = Duration::from_millis(50);
 
-/// How many presses the budget is measured over, of which the fastest
-/// counts.
+/// How many times the press is measured, with the best one reported.
 ///
-/// The number being asserted is the shell's, and what a single press
-/// measures is the shell's plus however long this test and the shell
-/// spent off the processor. `cargo test --workspace` runs every other
-/// test binary at the same time as this one, and 50 ms of scheduling
-/// delay on a loaded machine is ordinary, so one press was failing
-/// here for reasons that had nothing to do with the shell (#480).
-/// The fastest of several is the reading with the least of that in it,
-/// and a shell that had actually got slow would be slow on every
-/// press, so nothing is given up by taking it.
+/// One sample was a wall clock assertion on whatever machine happened
+/// to run it, and on the hosted macOS runner, the most oversubscribed
+/// row of the matrix, it lost: 53.27 ms against the budget, on a push
+/// that touched neither the shell nor the executor (#503). An idle
+/// M-series laptop measures 7.55, 12.35, 12.65, 12.43 and 10.84 ms for
+/// the same span, so there was about four times of margin and the
+/// runner ate all of it.
+///
+/// The span is not zu's alone. It holds signal delivery, the executor
+/// reaching its next cancellation check, the shell writing the line,
+/// the pty round trip and the poll of the thread reading it, and every
+/// one of those waits on a scheduler that owes this process nothing.
+/// Best of several is how `benches/cli.rs` reports startup for the same
+/// reason, and it keeps the budget at the number the milestone asks for
+/// rather than raising it until a busy machine fits under it.
 const PRESSES: usize = 5;
 
 /// Enough people that every pair of them is minutes of work, so the
@@ -101,10 +107,19 @@ struct Screen {
 }
 
 impl Screen {
-    /// The moment the whole of `wanted` had arrived, counting only what
-    /// was painted from `from` on, or `None` while it has not. The time
-    /// is the end of the chunk that completed it, which is when a person
-    /// would have seen it.
+    /// How much has arrived, which is where a later search starts.
+    ///
+    /// The press is measured several times over and the shell paints
+    /// the same words every round, so a round that searched from the
+    /// top would find the round before it and report a press that
+    /// landed seconds ago as instant.
+    fn mark(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The moment the whole of `wanted` had arrived after `from`, or
+    /// `None` while it has not. The time is the end of the chunk that
+    /// completed it, which is when a person would have seen it.
     fn when(&self, wanted: &str, from: usize) -> Option<Instant> {
         let mut seen = String::new();
         for (at, chunk) in self.chunks.iter().skip(from) {
@@ -118,16 +133,6 @@ impl Screen {
 
     fn text(&self) -> String {
         self.chunks.iter().map(|(_, c)| c.as_str()).collect()
-    }
-
-    /// How much has been painted, as somewhere a later wait can start
-    /// from. This is how a round of the measurement waits for its own
-    /// words instead of finding the last round's still on the screen,
-    /// and it is a mark rather than a clear because the prompt a round
-    /// ends on and the one the next round waits for are the same
-    /// prompt, and clearing races whichever chunk it arrived in.
-    fn mark(&self) -> usize {
-        self.chunks.len()
     }
 }
 
@@ -151,8 +156,9 @@ fn watch(mut master: File) -> Arc<Mutex<Screen>> {
     screen
 }
 
-/// Waits for `wanted` to appear on the screen and answers when it did,
-/// or gives up after `patience` and says what was there instead.
+/// Waits for `wanted` to appear on the screen after `from` and answers
+/// when it did, or gives up after `patience` and says what was there
+/// instead.
 fn until(screen: &Mutex<Screen>, wanted: &str, from: usize, patience: Duration) -> Instant {
     let start = Instant::now();
     while start.elapsed() < patience {
@@ -227,7 +233,11 @@ fn a_press_stops_a_long_statement_inside_the_budget() {
     // opening the file.
     until(&screen, "zu>", 0, Duration::from_secs(30));
 
-    let mut took = Vec::with_capacity(PRESSES);
+    // Every round is the same press, and the shell coming back to the
+    // prompt afterwards is what makes a second one possible: a session
+    // that did not survive the first press cannot answer the second,
+    // and the wait for the progress line below is where that fails.
+    let mut takes = Vec::with_capacity(PRESSES);
     for _ in 0..PRESSES {
         let mark = screen.lock().expect("screen").mark();
         typed(
@@ -241,15 +251,16 @@ fn a_press_stops_a_long_statement_inside_the_budget() {
         until(&screen, "running", mark, Duration::from_secs(30));
 
         let pressed = Instant::now();
-        // Safety: a signal to a child this test spawned and has not reaped.
+        // Safety: a signal to a child this test spawned and has not
+        // reaped.
         assert_eq!(unsafe { kill(pid, SIGINT) }, 0, "kill");
         let stopped = until(&screen, "interrupted at", mark, Duration::from_secs(30));
-        took.push(stopped.duration_since(pressed));
+        takes.push(stopped.duration_since(pressed));
     }
-    let best = took.iter().min().expect("a press was measured");
+    let best = takes.iter().min().copied().expect("a press");
     assert!(
-        *best < BUDGET,
-        "the fastest of {PRESSES} presses took {best:?} to arrive, all of them {took:?}"
+        best < BUDGET,
+        "the best of {takes:?} did not arrive in {BUDGET:?}"
     );
 
     // And the session is the one it was: the shell says so, and then

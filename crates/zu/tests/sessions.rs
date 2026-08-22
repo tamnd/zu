@@ -12,10 +12,11 @@
 //! anything is to run a second statement and read what it says.
 
 use zu::query::Value;
-use zu::session::Session;
+use zu::session::{Session, Stale};
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
 use zu_common::Temporal;
+use zu_common::gqlstatus::codes;
 
 /// The same four people the binding variable tests use, so a number
 /// here can be checked against a number there.
@@ -335,4 +336,165 @@ fn if_not_exists_leaves_a_parameter_the_session_already_holds() {
     assert_eq!(one(&mut session, "RETURN $n AS n"), Value::Int(1));
     run(&mut session, "SESSION SET VALUE $n = 2");
     assert_eq!(one(&mut session, "RETURN $n AS n"), Value::Int(2));
+}
+
+/// The graph a session works in is a reference and not a name, so it
+/// survives an epoch, and what it does not survive is the graph being
+/// dropped (plan/06 §2).
+#[test]
+fn the_working_graph_survives_an_epoch_and_a_dropped_one_is_refused() {
+    let (_dir, mut session) = opened("droppedgraph.zu1");
+    run(&mut session, "CREATE PROPERTY GRAPH scratch");
+    run(&mut session, "SESSION SET PROPERTY GRAPH scratch");
+    let moved = session.working_graph();
+    // A catalog statement publishes a new epoch, and the session is
+    // still working where it was put. Resolving the graph by name again
+    // is what must not happen here: it would put a session that had
+    // moved back home for no reason it could see.
+    run(&mut session, "CREATE PROPERTY GRAPH other");
+    assert_eq!(session.working_graph(), moved);
+
+    run(&mut session, "DROP PROPERTY GRAPH scratch");
+    let refused = failure(&mut session, "MATCH (p:person) RETURN count(*) AS n");
+    assert!(refused.contains("42002"), "{refused}");
+    assert!(refused.contains("has been dropped"), "{refused}");
+    // A statement that names its own graph is unaffected, since it is
+    // not asking the session where to run.
+    run(&mut session, "USE other MATCH (n) RETURN count(*) AS n");
+    // And the session is not stuck: the reset is the way back.
+    run(&mut session, "SESSION RESET PROPERTY GRAPH");
+    assert_eq!(
+        rows(&mut session, "MATCH (p:person) RETURN count(*) AS n"),
+        vec![vec![Value::Int(4)]]
+    );
+}
+
+/// Session state is not transactional (ISO 7.1). A `SESSION SET` inside
+/// a transaction that rolls back keeps what it set, because what it set
+/// is not in the database.
+#[test]
+fn a_session_set_survives_a_rollback() {
+    let (_dir, mut session) = opened("rollback.zu1");
+    run(&mut session, "START TRANSACTION");
+    run(&mut session, "SESSION SET VALUE $cut = 35");
+    run(&mut session, "SESSION SET TIME ZONE '+02:00'");
+    run(&mut session, "INSERT (:person {name: 'ed', age: 20})");
+    run(&mut session, "ROLLBACK");
+    // The insert went with the transaction and the two settings did
+    // not, which is the whole of the rule.
+    assert_eq!(
+        one(&mut session, "MATCH (p:person) RETURN count(*) AS n"),
+        Value::Int(4)
+    );
+    assert_eq!(one(&mut session, "RETURN $cut AS c"), Value::Int(35));
+    assert_eq!(session.time_zone(), 120);
+}
+
+/// A held graph parameter whose graph has been dropped is a warning on
+/// the next statement and a refusal on the statement that reads it,
+/// which is the difference between being told and being stopped.
+#[test]
+fn a_held_graph_parameter_says_so_once_its_graph_is_dropped() {
+    let (_dir, mut session) = opened("pinnedgraph.zu1");
+    run(&mut session, "CREATE PROPERTY GRAPH scratch");
+    run(&mut session, "SESSION SET PROPERTY GRAPH $g = scratch");
+    let pins = session.pins();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].name, "g");
+    assert_eq!(pins[0].kind, "GRAPH");
+    assert_eq!(pins[0].stale, Stale::Fresh);
+    assert_eq!(session.pinned_epoch(), Some(pins[0].epoch));
+
+    run(&mut session, "DROP PROPERTY GRAPH scratch");
+    assert_eq!(session.pins()[0].stale, Stale::Gone);
+    // A statement that never mentions it still runs, and comes back
+    // with the warning rather than with a refusal.
+    let answered = session.run("RETURN 1 AS n", &[]).expect("run");
+    assert_eq!(answered.rows.into_vec(), vec![vec![Value::Int(1)]]);
+    assert_eq!(answered.notices.len(), 1);
+    assert_eq!(answered.notices[0].status, codes::C01G03);
+    assert!(answered.notices[0].severity().is_success());
+    // The statement that reads it is refused.
+    let refused = failure(&mut session, "USE $g MATCH (n) RETURN count(*) AS n");
+    assert!(refused.contains("42002"), "{refused}");
+    // And the session can put itself right.
+    run(&mut session, "SESSION RESET PARAMETER $g");
+    assert!(session.pins().is_empty());
+    assert_eq!(session.pinned_epoch(), None);
+}
+
+/// A held binding table pins the epoch it was read at, and a table
+/// holding element references stops meaning what it meant once the
+/// snapshot under it moves.
+///
+/// The write here is a label set, because that is a write that folds.
+/// An appended row is handed to the readers on a patch and leaves the
+/// rows that were already there where they were, so a table taken
+/// before one still names what it named.
+#[test]
+fn a_held_binding_table_pins_the_epoch_it_was_read_at() {
+    let (_dir, mut session) = opened("pinnedtable.zu1");
+    run(
+        &mut session,
+        "SESSION SET BINDING TABLE $t = { MATCH (p:person) RETURN p AS p }",
+    );
+    // A value parameter beside it, to show that a value pins nothing:
+    // a number is a number at every epoch.
+    run(&mut session, "SESSION SET VALUE $n = 1");
+    let pins = session.pins();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].name, "t");
+    assert_eq!(pins[0].kind, "BINDING TABLE");
+    assert_eq!(pins[0].epoch, session.epoch());
+    assert_eq!(pins[0].stale, Stale::Fresh);
+
+    run(&mut session, "MATCH (p:person) WHERE p.age = 30 SET p:bot");
+    assert_eq!(session.pins()[0].stale, Stale::Gone);
+    // A statement that never reads it still runs, and comes back with
+    // the warning rather than with a refusal.
+    let answered = session.run("RETURN 1 AS n", &[]).expect("run");
+    assert_eq!(answered.rows.into_vec(), vec![vec![Value::Int(1)]]);
+    assert_eq!(answered.notices.len(), 1);
+    assert_eq!(answered.notices[0].status, codes::C01000);
+    assert!(answered.notices[0].severity().is_success());
+    // The statement that reads it is refused.
+    let refused = failure(&mut session, "FOR r IN $t RETURN count(*) AS n");
+    assert!(refused.contains("older snapshot"), "{refused}");
+}
+
+/// A held table of scalars carries forward across an epoch, since
+/// there is nothing in it that names a row, and the session mentions
+/// it only once it has fallen behind the bound.
+#[test]
+fn a_held_table_of_scalars_is_only_mentioned_once_it_is_old() {
+    let (_dir, mut session) = opened("oldtable.zu1");
+    run(
+        &mut session,
+        "SESSION SET BINDING TABLE $t = { MATCH (p:person) RETURN p.name AS name }",
+    );
+    session.set_stale_bound(1);
+    // Any statement that publishes moves the epoch, and a catalog one
+    // moves it without touching a row, which is what makes it the
+    // clean way to say "time has passed" in a test.
+    run(&mut session, "CREATE PROPERTY GRAPH one");
+    // One epoch behind is inside the bound, and nothing is said.
+    let answered = session.run("RETURN 1 AS n", &[]).expect("run");
+    assert!(answered.notices.is_empty());
+    assert_eq!(
+        one(&mut session, "FOR r IN $t RETURN count(*) AS n"),
+        Value::Int(4)
+    );
+
+    run(&mut session, "CREATE PROPERTY GRAPH two");
+    run(&mut session, "CREATE PROPERTY GRAPH three");
+    assert_eq!(session.pins()[0].stale, Stale::Old);
+    let answered = session.run("RETURN 1 AS n", &[]).expect("run");
+    assert_eq!(answered.notices.len(), 1);
+    assert_eq!(answered.notices[0].status, codes::C01000);
+    // Old is not gone: the rows say what they said, and reading them
+    // is no error.
+    assert_eq!(
+        one(&mut session, "FOR r IN $t RETURN count(*) AS n"),
+        Value::Int(4)
+    );
 }

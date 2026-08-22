@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_result_with_no_rows_still_has_its_columns() {
-        let batches = ran("MATCH (n:nothing) RETURN n.uid AS uid");
+        let batches = ran("MATCH (n:absent) RETURN n.uid AS uid");
         assert_eq!(batches.len(), 1, "an empty result is one empty batch");
         assert_eq!(batches[0].num_rows(), 0);
         assert_eq!(batches[0].schema().field(0).name(), "uid");

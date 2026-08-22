@@ -476,6 +476,24 @@ const NOTES: &[&str] = &[
      both refused by name rather than reading what the row used to hold",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
+    "six of the standard's conditions are ones no statement reaches here, and none of the six \
+     is a gap a case could close. 22G04 says two values are not comparable, and zu supports \
+     GA04, so every pair of values has an order and an engine whose x < y said unknown while \
+     its ORDER BY x put x first would have two orders and be wrong in one of them. 22G13 says \
+     a group variable stood where one value belongs, and zu supports GQ17, so a property read \
+     off a group is the list of that property over the group. 25G02 says catalog and data \
+     statements do not mix in one transaction, and they do here, under GP18. 25G04 says two \
+     graphs do not, and they do, under GT03. 08007 needs the connection to die between a \
+     commit and its answer, and 40003 needs a rollback after which the engine cannot say \
+     whether a statement completed, and both are states reached by losing track of work \
+     rather than by anything a statement said",
+    "two implementation-defined items zu declares no value for, which is the whole reason the \
+     conditions hanging off them are unreachable rather than untested: IL015, the maximum \
+     cardinality of a constructed value, because a path or a list built by a query is bounded \
+     by the row it is built for and not by a number worth publishing, so 22G10 has no length \
+     to exceed; and IW014, the test for visually confusable identifiers, which zu does not \
+     apply, so no two identifiers it reads are confusable and 42004 has nothing to raise on. \
+     Both answers are conformant and both are choices rather than omissions",
 ];
 
 /// Renders the declaration as TOML.

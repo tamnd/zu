@@ -86,7 +86,6 @@
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench write
 
-use std::io::{Seek, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -163,15 +162,15 @@ const CALIBRATION_TABLE: usize = 4 << 20;
 /// What one round of [`calibrate`] costs on the machine the target was
 /// written for, in nanoseconds. A laptop M4 with its cores to itself.
 ///
-/// Three consecutive runs on that host read 8002, 8260 and 8620, so the
-/// middle one is the figure and the spread is under four percent, which
+/// Three consecutive runs on that host read 279, 287 and 293, so the
+/// middle one is the figure and the spread is under three percent, which
 /// the floor of the clamp absorbs: a host at or under the reference
 /// reads the target exactly and never anything tighter.
 ///
 /// This is not a number to tune. It is a property of one host, and the
 /// only reason to change it is that the host it was taken on has been
 /// replaced.
-const CALIBRATION_REFERENCE_NS: f64 = 8260.0;
+const CALIBRATION_REFERENCE_NS: f64 = 287.0;
 
 /// The most the host calibration is allowed to relax the write ceiling.
 ///
@@ -210,41 +209,37 @@ fn xorshift(state: &mut u64) -> u64 {
 /// that is the round. No sync, because the metric this scales is the
 /// unsynced one and the sync cost is reported separately.
 ///
-/// Two of those four are here because the runners said so, and it is
-/// worth writing down what each draft read against the write path on the
-/// same run, laptop against hosted runner:
+/// The size of the table is the whole question, and it took four drafts
+/// to settle, so here is what each one read against the write path on
+/// the same run, laptop against hosted runner:
 ///
 /// | draft | proxy | write path |
 /// |---|---|---|
-/// | a few hundred bytes of buffer, wall clock, no file | 1.17x | 2.19x |
-/// | 64 MiB table, wall clock, no file | 1.14x | 3.24x |
-/// | 4 MiB table, wall clock, no file | 2.02x | 3.24x |
+/// | a few hundred bytes of buffer | 1.17x | 2.19x |
+/// | 64 MiB table | 1.14x | 3.24x |
+/// | 4 MiB table | 2.02x | 3.24x |
+/// | 4 MiB table and an unsynced append, on processor time | 0.33x | 2.10x |
 ///
-/// So a proxy that only measures how fast the core retires instructions
-/// cannot stand in for a path that walks a store, and a table sized past
-/// the last level cache overshoots in the other direction: the laptop
-/// has a very fast core and ordinary memory, so at 64 MiB its own
-/// advantage washes out and the ratio collapses. A few megabytes is the
-/// footprint that reads the difference between the two boxes rather than
-/// the difference between a cache and a DIMM.
+/// A proxy that only measures how fast the core retires instructions
+/// cannot stand in for a path that walks a store, so the first is out. A
+/// table sized past the last level cache overshoots the other way: the
+/// laptop has a very fast core and ordinary memory, so at 64 MiB its own
+/// advantage washes out and the ratio collapses. A few megabytes reads
+/// the difference between the two boxes rather than the difference
+/// between a cache and a DIMM.
 ///
-/// The rest of the gap is the file. `write_cpu_nosync_us` is processor
-/// time, and an unsynced append still costs a `write` and a page cache
-/// copy, which a hosted runner on network backed storage pays far more
-/// for than a laptop on NVMe does. Timing this on the same `getrusage`
-/// clock the gated number uses, rather than on wall clock, matters for
-/// the same reason: on a shared vCPU the two disagree, and the ceiling
-/// is scaled against the one being enforced.
-fn calibrate(table: usize, dir: &Path) -> f64 {
+/// The append was the obvious thing to try next, since the ceiling this
+/// scales is the cost of a write that is not synced, and it was wrong:
+/// on processor time a Linux runner absorbed the appends at 2711 ns a
+/// round against the laptop's 8260, so the proxy read the difference
+/// between two kernels instead of the difference between two boxes. The
+/// file is out and the ratio is taken on wall clock, which is what the
+/// four other calibrated numbers in this file are taken on.
+fn calibrate(table: usize) -> f64 {
     const ROUNDS: usize = 20_000;
     const KEYS: usize = 64;
     const VALUE: usize = 256;
     const STRIDE: usize = 4096;
-    // How much of the file to keep before it is truncated and written
-    // again. Enough that the appends are a real stream of pages and not
-    // one page dirtied over and over, small enough that the whole proxy
-    // never puts more than this on the disk.
-    const FILE_BYTES: u64 = 16 << 20;
     let mut rng = 0x2064u64;
     let mut sink = 0usize;
     let mut region: Vec<u8> = vec![0; table];
@@ -258,51 +253,34 @@ fn calibrate(table: usize, dir: &Path) -> f64 {
         page[0] = 1;
     }
     let slots = (table / STRIDE).max(1) as u64;
-    let path = dir.join(format!("calibrate-{table}"));
-    let mut file = std::fs::File::create(&path).expect("calibration file");
-    let mut written = 0u64;
     let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    let mut round = |rng: &mut u64,
-                     sink: &mut usize,
-                     seen: &mut std::collections::HashMap<u64, usize>,
-                     file: &mut std::fs::File,
-                     written: &mut u64| {
-        for _ in 0..4 {
-            let k = xorshift(rng) % KEYS as u64;
-            let key = format!("person:{k:012}");
-            // A page the round did not choose, which is the part a
-            // small buffer cannot imitate: the store decides where the
-            // row goes and the writer follows it there.
-            let at = (xorshift(rng) % slots) as usize * STRIDE;
-            let n = key.len();
-            region[at..at + n].copy_from_slice(key.as_bytes());
-            region[at + n..at + n + VALUE].fill(b'v');
-            *sink += region[at] as usize;
-            let m = seen.len();
-            seen.insert(k, m);
-            // The append, unsynced, which is the part the earlier drafts
-            // left out and the part a hosted runner is slowest at.
-            file.write_all(&region[at..at + n + VALUE])
-                .expect("calibration append");
-            *written += (n + VALUE) as u64;
-            if *written >= FILE_BYTES {
-                file.set_len(0).expect("calibration truncate");
-                file.seek(std::io::SeekFrom::Start(0))
-                    .expect("calibration rewind");
-                *written = 0;
+    let mut round =
+        |rng: &mut u64, sink: &mut usize, seen: &mut std::collections::HashMap<u64, usize>| {
+            for _ in 0..4 {
+                let k = xorshift(rng) % KEYS as u64;
+                let key = format!("person:{k:012}");
+                // A page the round did not choose, which is the part a
+                // small buffer cannot imitate: the store decides where the
+                // row goes and the writer follows it there.
+                let at = (xorshift(rng) % slots) as usize * STRIDE;
+                let n = key.len();
+                region[at..at + n].copy_from_slice(key.as_bytes());
+                region[at + n..at + n + VALUE].fill(b'v');
+                *sink += region[at] as usize;
+                let m = seen.len();
+                seen.insert(k, m);
             }
-        }
-        // A fold reads back what it just wrote, so the round does too.
-        for _ in 0..4 {
-            let k = xorshift(rng) % KEYS as u64;
-            *sink += seen.get(&k).copied().unwrap_or(0);
-        }
-        if seen.len() > KEYS {
-            seen.clear();
-        }
-    };
+            // A fold reads back what it just wrote, so the round does too.
+            for _ in 0..4 {
+                let k = xorshift(rng) % KEYS as u64;
+                *sink += seen.get(&k).copied().unwrap_or(0);
+            }
+            if seen.len() > KEYS {
+                seen.clear();
+            }
+        };
     for _ in 0..ROUNDS / 10 {
-        round(&mut rng, &mut sink, &mut seen, &mut file, &mut written);
+        round(&mut rng, &mut sink, &mut seen);
     }
     // Best of a few, the same way the write measurements below take the
     // best of PASSES: on a shared box a single pass reads whatever else
@@ -310,23 +288,14 @@ fn calibrate(table: usize, dir: &Path) -> f64 {
     // got the fewest of those.
     let mut ns = f64::MAX;
     for _ in 0..PASSES {
-        let (_, before) = peak_rss_and_cpu();
+        let start = Instant::now();
         for _ in 0..ROUNDS {
-            round(&mut rng, &mut sink, &mut seen, &mut file, &mut written);
+            round(&mut rng, &mut sink, &mut seen);
         }
-        let (_, after) = peak_rss_and_cpu();
-        ns = ns.min((after - before) as f64 * 1000.0 / ROUNDS as f64);
+        ns = ns.min(start.elapsed().as_nanos() as f64 / ROUNDS as f64);
     }
     std::hint::black_box(sink);
     std::hint::black_box(&region);
-    // Flush before returning, outside anything timed. The appends leave
-    // dirty pages behind, and a writeback still in flight when the first
-    // statement below is measured lands on that statement instead. It
-    // showed up as insert_fold_x reading 2.01 and 2.13 against a ceiling
-    // of 2.00 on a laptop that reads 1.85 with nothing in front of it.
-    let _ = file.sync_all();
-    drop(file);
-    let _ = std::fs::remove_file(&path);
     ns
 }
 
@@ -1620,7 +1589,7 @@ fn main() {
     // read at what the target says on the reference host and at the
     // ratio above it on a slower one. See #648 for what this replaced.
     let root = tempfile::tempdir().expect("tempdir");
-    let cal_ns = calibrate(CALIBRATION_TABLE, root.path());
+    let cal_ns = calibrate(CALIBRATION_TABLE);
     // The other two footprints, printed and not used, so a run on a host
     // where the scaled ceiling looks wrong says in its own log which
     // sizes tracked the write path and which did not. Remove them once
@@ -1629,7 +1598,7 @@ fn main() {
         println!(
             "host calibration probe: {} KiB table, {:.0} ns per round",
             probe / 1024,
-            calibrate(probe, root.path())
+            calibrate(probe)
         );
     }
     let raw = cal_ns / CALIBRATION_REFERENCE_NS;
@@ -1797,7 +1766,20 @@ fn main() {
         sustained.window_x
     );
 
-    let unsynced = run_unsynced(SMALL, ramp, window);
+    // Best of PASSES, the way every other number in this file is taken.
+    // This one was a single pass and it is the one the gate reads, which
+    // is why it kept coming back with a different answer: three runs of
+    // the same hosted runner read 53.5, 75.1 and 50.3 us a statement,
+    // and no ceiling scaled off a host measurement can absorb a fifty
+    // percent spread that is contention on the box rather than the write
+    // path. The lowest pass is the one that got the fewest neighbours.
+    let mut unsynced = run_unsynced(SMALL, ramp, window);
+    for _ in 1..PASSES {
+        let again = run_unsynced(SMALL, ramp, window);
+        if again.cost.cpu < unsynced.cost.cpu {
+            unsynced = again;
+        }
+    }
     unsynced
         .cost
         .report(&format!("SET unsynced, {SMALL} rows"), 0.0);

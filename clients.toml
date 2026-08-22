@@ -139,7 +139,7 @@ package = "github.com/tamnd/zu-go"
 registry = "Go modules"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = ["quickstart", "reference", "idiom", "conditions", "misuse"]
+holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "stability"]
 doc = "cgo with a purego path. Its publish is a git tag, which is the one that cannot be taken back."
 
 [[client]]

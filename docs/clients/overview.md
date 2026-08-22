@@ -51,7 +51,7 @@ The practice score, today, out of what the client's tier asks for. What is missi
 |---|---|---|---|---|
 | [zu-python](https://github.com/tamnd/zu-python) | 1 | 90 | 90 | `api-map`, `perf` |
 | [zu-node](https://github.com/tamnd/zu-node) | 1 | 90 | 90 | `api-map`, `perf` |
-| [zu-go](https://github.com/tamnd/zu-go) | 1 | 60 | 90 | `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-go](https://github.com/tamnd/zu-go) | 1 | 70 | 90 | `leaks`, `install`, `api-map`, `perf` |
 | [zu-java](https://github.com/tamnd/zu-java) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
 | [zu-c](https://github.com/tamnd/zu-c) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability` |
 | [zu-dotnet](https://github.com/tamnd/zu-dotnet) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |

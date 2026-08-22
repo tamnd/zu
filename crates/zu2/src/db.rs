@@ -28,6 +28,7 @@ use crate::graph::Graph;
 use crate::index::{self, Bucket, Claim, EMPTY, Index, Migration, SLOTS};
 use crate::log::{self, Durability, Log};
 use crate::record::{self, RecordRef};
+use crate::scan::Ordered;
 use crate::{compact, file, recover};
 
 /// Records a split reads out of one chain before it gives up on
@@ -164,6 +165,17 @@ pub struct Options {
     /// Off is for a run that is about to throw the file away, and for
     /// measuring what recovery costs without one.
     pub checkpoint_on_close: bool,
+    /// Whether the scan plane is kept, which is what a range scan runs
+    /// on. See [`crate::scan`].
+    ///
+    /// Off. The plane is a node per key held in memory for as long as
+    /// the database is open, and a host that only ever does point
+    /// operations should not be paying for keys in an order it never
+    /// asks for. A host that scans turns it on, and it has to be on for
+    /// the whole life of the data rather than for the run that scans:
+    /// the plane is built as keys arrive, so a database loaded with it
+    /// off has no key set to hand a later run.
+    pub ordered: bool,
 }
 
 impl Default for Options {
@@ -184,6 +196,7 @@ impl Default for Options {
             cold_target_percent: 200,
             salvage: false,
             checkpoint_on_close: true,
+            ordered: false,
         }
     }
 }
@@ -533,6 +546,9 @@ pub struct Core {
     /// recovery that read a checkpoint and left zero by every other
     /// open. See [`warm`].
     pub(crate) warm_upto: AtomicU64,
+    /// The key set in order, when the options asked for one. See
+    /// [`crate::scan`].
+    pub(crate) ordered: Option<Ordered>,
 }
 
 impl Core {
@@ -615,6 +631,30 @@ impl Core {
     pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
         &self.log.epochs
     }
+
+    /// A key nothing had an entry for until now. Counts it for the
+    /// index's growth rule and, when there is a scan plane, puts it in
+    /// the key order.
+    ///
+    /// One call rather than two because the two have to agree: a key
+    /// the index has an entry for and the scan plane has never heard of
+    /// is a key a scan walks straight past. Every place that installs
+    /// a first entry for a key comes through here, which is the two
+    /// branches of [`Session::install`] and the two in
+    /// [`crate::recover`].
+    #[inline]
+    pub(crate) fn note_key(&self, key: &[u8]) -> Result<()> {
+        self.index.note_key();
+        match &self.ordered {
+            Some(ordered) => ordered.insert(key).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// The key order, when the options asked for one.
+    pub fn ordered(&self) -> Option<&Ordered> {
+        self.ordered.as_ref()
+    }
 }
 
 pub struct Db {
@@ -689,6 +729,11 @@ impl Db {
         };
         Ok(Arc::new(Core {
             cold,
+            ordered: if options.ordered {
+                Some(Ordered::new()?)
+            } else {
+                None
+            },
             log: Log::new(
                 handle,
                 path,
@@ -1013,6 +1058,19 @@ impl Db {
 
     /// Buckets in the index as it stands, which is the size it was
     /// opened with doubled once per [`Db::index_grows`].
+    /// What the scan plane is holding, in bytes, or nothing when the
+    /// database has no scan plane. This is memory and not disk: the
+    /// plane is rebuilt from the log rather than written to it.
+    pub fn ordered_bytes(&self) -> Option<usize> {
+        self.core.ordered.as_ref().map(crate::scan::Ordered::bytes)
+    }
+
+    /// Keys the scan plane has ever been told about, which is not the
+    /// number that are live: a deleted key keeps its node.
+    pub fn ordered_keys(&self) -> Option<usize> {
+        self.core.ordered.as_ref().map(crate::scan::Ordered::keys)
+    }
+
     pub fn index_buckets(&self) -> usize {
         let Ok(session) = self.core.maintenance_session() else {
             return 0;
@@ -1798,6 +1856,61 @@ impl<'a> Session<'a> {
         Ok(live)
     }
 
+    /// Reads up to `count` records in key order, starting at the first
+    /// key at or after `start`, and hands each one to `each`.
+    ///
+    /// `count` is records handed over and not keys walked. A key whose
+    /// newest record is a tombstone is walked past and not counted,
+    /// because it is not there, and the scan plane keeps a node for it
+    /// anyway. See [`crate::scan`].
+    ///
+    /// The value passed to `each` is only good for the length of the
+    /// call. It points into the log page the record is in, or into this
+    /// session's scratch when the page has left memory, and the next
+    /// record reuses both.
+    ///
+    /// Each record is read the way a point read reads it, through the
+    /// hash index, so a record is as fresh as the moment the scan
+    /// reaches it. Two records in one scan can therefore come from
+    /// different moments. That is what YCSB workload E asks for and it
+    /// is not a snapshot, and a caller that wants one wants a version
+    /// to read at, which is #513 territory and not this.
+    ///
+    /// Errors with [`Error::Checkpoint`] when the database was opened
+    /// without `Options::ordered`, because then there is no key order
+    /// to walk and answering with an empty scan would be a wrong answer
+    /// rather than a missing feature.
+    pub fn scan(
+        &mut self,
+        start: &[u8],
+        count: usize,
+        mut each: impl FnMut(&[u8], &[u8]),
+    ) -> Result<usize> {
+        let mut done = 0;
+        let mut value = Vec::new();
+        // The plane is on the core and the core outlives the session,
+        // so the cursor is not a borrow of `self` and the reads below
+        // are free to take the session mutably while it is open. That
+        // is what keeps the walk to one dereference a record: no batch
+        // is copied out and no descent is repeated.
+        let Some(ordered) = self.core.ordered.as_ref() else {
+            return Err(Error::Checkpoint {
+                why: "this database has no scan plane, open it with Options::ordered",
+            });
+        };
+        let mut cursor = ordered.seek(start);
+        while done < count {
+            let Some(key) = cursor.key() else { break };
+            cursor.step();
+            value.clear();
+            if self.read(key, &mut value)? {
+                each(key, &value);
+                done += 1;
+            }
+        }
+        Ok(done)
+    }
+
     /// Writes `value` under `key`, whether or not it was there.
     pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.write(key, value, false, record::KIND_VALUE)
@@ -2076,7 +2189,7 @@ impl<'a> Session<'a> {
                     }
                 };
                 bucket.slots[i].store(index::entry(tag, fresh, false), Ordering::Release);
-                self.core.index.note_key();
+                self.core.note_key(key)?;
                 return Ok(Some(fresh + size));
             }
 
@@ -2104,7 +2217,7 @@ impl<'a> Session<'a> {
                 .compare_exchange(entry, replacement, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.core.index.note_key();
+                self.core.note_key(key)?;
                 return Ok(Some(fresh + size));
             }
         }

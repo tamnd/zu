@@ -244,6 +244,154 @@ fn the_header_and_the_pair_struct_declare_the_same_fields() {
     );
 }
 
+/// Opens a database with the scan plane on, which is not the default
+/// and cannot be turned on later: the plane is built as keys arrive.
+fn open_ordered(name: &str) -> (tempfile::TempDir, *mut Zu2Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.compact_below = u64::MAX;
+    options.ordered = 1;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    (dir, db)
+}
+
+/// A scan, copied out of the session's buffer the way a host has to
+/// copy it: the array is only good until the next call.
+fn scan(s: *mut Zu2Session, start: &[u8], count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 0usize;
+    let status = unsafe {
+        zu2::zu2_scan(
+            s,
+            start.as_ptr(),
+            start.len(),
+            count,
+            &mut pairs,
+            &mut returned,
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    if returned == 0 {
+        return Vec::new();
+    }
+    assert!(!pairs.is_null(), "records came back with no array");
+    let slice = unsafe { std::slice::from_raw_parts(pairs, returned) };
+    slice
+        .iter()
+        .map(|pair| unsafe {
+            (
+                std::slice::from_raw_parts(pair.key, pair.key_len).to_vec(),
+                std::slice::from_raw_parts(pair.value, pair.value_len).to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// The scan plane across the boundary: the order, the count, the end of
+/// the key set, and what a database without a plane does. See #548.
+#[test]
+fn a_scan_crosses_the_boundary_in_key_order() {
+    let (_dir, db) = open_ordered("scan.zu2");
+    let s = session_on(db);
+    for i in 0..200 {
+        // Scattered, so the order comes from the plane.
+        let at = (i * 91) % 200;
+        upsert(
+            s,
+            format!("user{at:06}").as_bytes(),
+            format!("v{at}").as_bytes(),
+        );
+    }
+    let got = scan(s, b"user000100", 5);
+    let want: Vec<(Vec<u8>, Vec<u8>)> = (100..105)
+        .map(|i| {
+            (
+                format!("user{i:06}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
+    // Past the count the answer is what is there and not an error.
+    assert_eq!(scan(s, b"user000198", 50).len(), 2);
+    assert!(scan(s, b"z", 50).is_empty());
+    // NULL and zero is the first key.
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 0usize;
+    assert_eq!(
+        unsafe { zu2::zu2_scan(s, ptr::null(), 0, 3, &mut pairs, &mut returned) },
+        Zu2Status::Ok
+    );
+    assert_eq!(returned, 3);
+    close(db, &[s]);
+}
+
+/// A database opened without the plane says so rather than answering an
+/// empty scan, which would read as a key set that is not there.
+#[test]
+fn a_scan_without_a_plane_fails_and_writes_its_out_parameters() {
+    let (_dir, db) = open("unordered.zu2");
+    let s = session_on(db);
+    upsert(s, b"a", b"1");
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 7usize;
+    let status = unsafe { zu2::zu2_scan(s, b"".as_ptr(), 0, 10, &mut pairs, &mut returned) };
+    assert_eq!(status, Zu2Status::Error);
+    assert!(pairs.is_null());
+    assert_eq!(returned, 0);
+    let mut len = 0usize;
+    let text = message(unsafe { zu2::zu2_session_error(s, &mut len) });
+    assert!(text.contains("scan plane"), "unhelpful message: {text}");
+    close(db, &[s]);
+}
+
+/// The array a scan is answered out of is the session's, so the call
+/// after it owns those bytes. A host that did not copy them out finds
+/// its own records under its pointers, which is the contract the header
+/// states and is worth a test because it is easy to break by keeping a
+/// buffer per call.
+#[test]
+fn a_scan_buffer_lasts_exactly_until_the_next_call() {
+    let (_dir, db) = open_ordered("scan-buffer.zu2");
+    let s = session_on(db);
+    upsert(s, b"a", b"first");
+    upsert(s, b"b", b"second");
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 0usize;
+    assert_eq!(
+        unsafe { zu2::zu2_scan(s, b"a".as_ptr(), 1, 2, &mut pairs, &mut returned) },
+        Zu2Status::Ok
+    );
+    assert_eq!(returned, 2);
+    let copied: Vec<Vec<u8>> = unsafe { std::slice::from_raw_parts(pairs, returned) }
+        .iter()
+        .map(|pair| unsafe { std::slice::from_raw_parts(pair.value, pair.value_len).to_vec() })
+        .collect();
+    assert_eq!(copied, vec![b"first".to_vec(), b"second".to_vec()]);
+    // The next scan reuses the buffer, and the count it reports is its
+    // own rather than the one before it.
+    assert_eq!(scan(s, b"b", 5).len(), 1);
+    close(db, &[s]);
+}
+
 /// A bad pointer anywhere in a batch is caught before the first record
 /// is written, so the load a host has to unpick is the one it sent and
 /// not a prefix of it.
@@ -793,6 +941,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
         ("uint64_t", "sessions"),
         ("uint32_t", "fixed_index"),
         ("uint32_t", "salvage"),
+        ("uint32_t", "ordered"),
     ];
     let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/zu2.h"))
         .expect("the header ships with the crate");
@@ -867,6 +1016,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "sessions" => std::mem::offset_of!(Zu2Options, sessions),
             "fixed_index" => std::mem::offset_of!(Zu2Options, fixed_index),
             "salvage" => std::mem::offset_of!(Zu2Options, salvage),
+            "ordered" => std::mem::offset_of!(Zu2Options, ordered),
             other => panic!("{other} is in the header and this test does not know it"),
         };
         assert_eq!(

@@ -97,6 +97,14 @@ pub enum Error {
     #[error("cannot take a checkpoint: {why}")]
     Checkpoint { why: &'static str },
 
+    /// The scan plane's arena has as many chunks as it can name. A
+    /// node is never freed, so this is the key set the database has
+    /// ever held rather than the one it holds, and at a megabyte a
+    /// chunk it is sixty four gigabytes of keys. Nothing raises it
+    /// short of a rebuild, which a reopen does.
+    #[error("the scan plane's arena reached its ceiling of {max} chunks")]
+    ArenaFull { max: usize },
+
     /// A transaction committed on the log and then could not finish
     /// putting its records into the index, so what is in memory is part
     /// of a transaction and what is on the log is all of it. Nothing

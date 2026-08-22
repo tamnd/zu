@@ -170,6 +170,13 @@ typedef struct zu2_options {
    * that is worse than one that fails. zu2_discarded() is how much a
    * salvaged open threw away. */
   uint32_t salvage;
+  /* Nonzero keeps the scan plane, which is what zu2_scan runs on. Off
+   * by default: the plane is a node per key held in memory for as long
+   * as the db is open, and a host that only does point operations
+   * should not pay for an order it never asks for. It has to be on for
+   * the whole life of the data and not just the run that scans,
+   * because the plane is built as the keys arrive. */
+  uint32_t ordered;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -255,6 +262,24 @@ zu2_status zu2_upsert_many(zu2_session *s, const zu2_pair *pairs,
  * The buffer is the session's and is valid until the next call on it. */
 zu2_status zu2_read(zu2_session *s, const uint8_t *key, size_t key_len,
                     const uint8_t **value, size_t *value_len, int *found);
+
+/* Reads up to count records in key order from the first key at or
+ * after start, and points *pairs at the session's own array of them.
+ * The array and the bytes it points into are good until the next call
+ * on this session.
+ *
+ * *returned is how many were filled, which is fewer than count at the
+ * end of the key set and is the whole answer: a key whose newest
+ * record is a tombstone is walked past and not counted, because it is
+ * not there.
+ *
+ * start may be NULL with a zero length, which is the first key.
+ *
+ * Fails when the db was opened without zu2_options.ordered, because
+ * then there is no key order to walk and answering with an empty scan
+ * would be a wrong answer rather than a missing feature. */
+zu2_status zu2_scan(zu2_session *s, const uint8_t *start, size_t start_len,
+                    size_t count, const zu2_pair **pairs, size_t *returned);
 
 /* Removes key. *existed says whether it was there. */
 zu2_status zu2_delete(zu2_session *s, const uint8_t *key, size_t key_len,

@@ -160,7 +160,7 @@ fn release(
         // record there, and the page it is in has just been made
         // resident.
         let header = unsafe { RecordRef::new(base) };
-        install(core, header, address, rewritten, repairs, scratch);
+        install(core, header, address, rewritten, repairs, scratch)?;
     }
     Ok(())
 }
@@ -226,7 +226,7 @@ fn replay_one(
                 &mut building.rewritten,
                 &mut building.repairs,
                 &mut building.scratch,
-            );
+            )?;
         }
     }
     Ok(())
@@ -362,6 +362,17 @@ fn from_checkpoint(core: &Core, salvage: bool) -> Result<bool> {
     if journal::present(core) {
         return Ok(false);
     }
+    if core.ordered().is_some() {
+        // A checkpoint holds the index and the graph and not the key
+        // order, so taking the shortcut with a scan plane on would open
+        // a database whose keys are all there and whose key order is
+        // empty, and every scan would come back with nothing. The full
+        // scan is what rebuilds the order, so a scanning database pays
+        // for the whole log until the checkpoint carries the key set.
+        // That is the next box on #548 and it is a format change, which
+        // is why it is not this one.
+        return Ok(false);
+    }
     let len = core.log.file_len()?;
     if len <= FIRST {
         return Ok(false);
@@ -475,7 +486,7 @@ fn cold_scan(
     let stopped = tier.walk(from, end, |header, address| {
         records += 1;
         version = version.max(header.version());
-        if !install_cold(core, header, address, scratch) {
+        if !install_cold(core, header, address, scratch)? {
             // SAFETY: the walk hands over a whole record in its page
             // buffer, and it is copied out before the walk moves on.
             unsafe {
@@ -509,7 +520,7 @@ fn cold_scan(
         // SAFETY: the address came back from the append that wrote the
         // record, and the page it went in is resident.
         let header = unsafe { RecordRef::new(base) };
-        install(core, header, at, rewritten, repairs, scratch);
+        install(core, header, at, rewritten, repairs, scratch)?;
         core.recovered
             .rehomed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -543,7 +554,7 @@ fn install_cold(
     header: RecordRef<'_>,
     address: Address,
     scratch: &mut Vec<u64>,
-) -> bool {
+) -> Result<bool> {
     let key = header.key();
     let hash = index::hash(key);
     let tag = Index::tag(hash);
@@ -567,21 +578,21 @@ fn install_cold(
             // The hot log holds something newer for this key, which is
             // the ordinary case for a key that was written again after
             // it settled. The cold record is garbage waiting for a pass.
-            return true;
+            return Ok(true);
         }
         if index::is_foreign(entry) {
             // Putting a record with no chain pointer at the head of a
             // chain would cut off every key behind it.
-            return false;
+            return Ok(false);
         }
         bucket.slots[i].store(
             index::entry(tag, address, false),
             std::sync::atomic::Ordering::Relaxed,
         );
-        return true;
+        return Ok(true);
     }
-    core.index.note_key();
-    match empty {
+    core.note_key(key)?;
+    Ok(match empty {
         Some(i) => {
             bucket.slots[i].store(
                 index::entry(tag, address, false),
@@ -592,7 +603,7 @@ fn install_cold(
         // A full bucket means taking an entry over, which means carrying
         // what it held, which is the one thing a cold record cannot do.
         None => false,
-    }
+    })
 }
 
 /// Whether every record in a page of the log parses and holds its
@@ -823,7 +834,7 @@ fn install(
     rewritten: &mut Rewritten,
     repairs: &mut Repairs,
     scratch: &mut Vec<u64>,
-) {
+) -> Result<()> {
     let key = header.key();
     let hash = index::hash(key);
     let tag = Index::tag(hash);
@@ -861,13 +872,15 @@ fn install(
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-            return;
+            return Ok(());
         }
     }
     // Past the loop is a key the table has not seen, whichever way it
     // goes in, and the count is what the table sizes itself against once
-    // the flusher starts.
-    core.index.note_key();
+    // the flusher starts. It is also the key set the scan plane is,
+    // when there is one, and this is the only place a replay learns a
+    // key it has not already got.
+    core.note_key(key)?;
     if let Some(i) = empty {
         // Nothing was reachable through an empty slot, so the record
         // starts a chain rather than extending one.
@@ -876,7 +889,7 @@ fn install(
             index::entry(tag, address, false),
             std::sync::atomic::Ordering::Relaxed,
         );
-        return;
+        return Ok(());
     }
     // A full bucket, so the record takes an entry over and carries what
     // it held. The slot is the one the write path would have picked, not
@@ -889,6 +902,7 @@ fn install(
         index::entry(tag, address, true),
         std::sync::atomic::Ordering::Relaxed,
     );
+    Ok(())
 }
 
 /// Points a record at what the entry it is taking over holds, unless it

@@ -102,6 +102,13 @@ pub struct Zu2Options {
     /// about that is worse than one that fails. `zu2_discarded` is how
     /// much a salvaged open threw away.
     pub salvage: u32,
+    /// Nonzero keeps the scan plane, which is what `zu2_scan` runs on.
+    /// Off by default: the plane is a node per key held in memory for
+    /// as long as the database is open, and a host that only does point
+    /// operations should not pay for an order it never asks for. It has
+    /// to be on for the whole life of the data and not just the run
+    /// that scans, because the plane is built as keys arrive.
+    pub ordered: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -169,6 +176,17 @@ struct State {
     /// clearing the bits it set rather than the whole thing, so a probe
     /// on a big graph costs its own frontier and not the node count.
     seen: Vec<u64>,
+    /// The keys and values a scan copied out, back to back. One buffer
+    /// rather than one allocation per record, and the pairs point into
+    /// it once it has stopped growing.
+    scan_bytes: Vec<u8>,
+    /// Where each record starts and how long its two halves are, kept
+    /// as offsets while the buffer is still growing and turned into
+    /// pointers at the end. A pointer taken before the buffer stopped
+    /// growing would be into an allocation the next push freed.
+    scan_spans: Vec<(usize, usize, usize)>,
+    /// The array a scan is answered out of.
+    scan_pairs: Vec<Zu2Pair>,
 }
 
 /// Held for the length of a call on a session. Dropping it lets the
@@ -354,6 +372,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.fixed_index != 0 {
         options.grow_index = false;
+    }
+    if given.ordered != 0 {
+        options.ordered = true;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,
@@ -565,6 +586,9 @@ pub unsafe extern "C" fn zu2_session_open(db: *mut Zu2Db, out: *mut *mut Zu2Sess
             frontier: Vec::new(),
             next: Vec::new(),
             seen: Vec::new(),
+            scan_bytes: Vec::new(),
+            scan_spans: Vec::new(),
+            scan_pairs: Vec::new(),
         }),
         _owner: owner,
     });
@@ -786,6 +810,89 @@ pub unsafe extern "C" fn zu2_read(
     if !found.is_null() {
         unsafe { found.write(c_int::from(hit)) };
     }
+    Zu2Status::Ok
+}
+
+/// Reads up to `count` records in key order from the first key at or
+/// after `start`.
+///
+/// `*pairs` is the session's own array and is good until the next call
+/// on this session. `*returned` is how many of them were filled, which
+/// is fewer than `count` at the end of the key set and is the whole
+/// answer: a key whose newest record is a tombstone is walked past and
+/// not counted, because it is not there.
+///
+/// A NULL `start` with a zero length is the first key, which is what a
+/// caller who wants the whole order from the beginning passes.
+///
+/// Fails when the database was opened without `zu2_options.ordered`,
+/// because then there is no key order to walk and answering with an
+/// empty scan would be a wrong answer rather than a missing feature.
+///
+/// # Safety
+/// `s` is live, `start` covers `start_len` or is NULL with a zero
+/// length, and `pairs` and `returned` point at writable slots.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_scan(
+    s: *mut Zu2Session,
+    start: *const u8,
+    start_len: usize,
+    count: usize,
+    pairs: *mut *const Zu2Pair,
+    returned: *mut usize,
+) -> Zu2Status {
+    if !pairs.is_null() {
+        unsafe { pairs.write(std::ptr::null()) };
+    }
+    if !returned.is_null() {
+        unsafe { returned.write(0) };
+    }
+    let Some(s) = (unsafe { session(s) }) else {
+        return Zu2Status::Misuse;
+    };
+    let Some(start) = (unsafe { bytes(start, start_len) }) else {
+        return Zu2Status::Misuse;
+    };
+    if pairs.is_null() || returned.is_null() {
+        return Zu2Status::Misuse;
+    }
+    let Some(call) = s.enter() else {
+        return Zu2Status::MisuseConcurrent;
+    };
+    let state = &mut *call.state;
+    // Taken out and put back, because the scan borrows the session
+    // mutably and the buffers live beside it in the same struct.
+    let mut buffer = std::mem::take(&mut state.scan_bytes);
+    let mut spans = std::mem::take(&mut state.scan_spans);
+    buffer.clear();
+    spans.clear();
+    let outcome = state.session.scan(start, count, |key, value| {
+        spans.push((buffer.len(), key.len(), value.len()));
+        buffer.extend_from_slice(key);
+        buffer.extend_from_slice(value);
+    });
+    state.scan_bytes = buffer;
+    state.scan_spans = spans;
+    if let Err(status) = note(&mut state.error, outcome) {
+        return status;
+    }
+    // After the buffer has stopped growing and not before. A pointer
+    // taken while it was still being pushed to would be into whatever
+    // allocation the next push replaced.
+    state.scan_pairs.clear();
+    for &(at, key_len, value_len) in &state.scan_spans {
+        let base = state.scan_bytes.as_ptr();
+        state.scan_pairs.push(Zu2Pair {
+            // SAFETY: the offsets came from the buffer as it was built
+            // and the buffer has not been touched since.
+            key: unsafe { base.add(at) },
+            key_len,
+            value: unsafe { base.add(at + key_len) },
+            value_len,
+        });
+    }
+    unsafe { pairs.write(state.scan_pairs.as_ptr()) };
+    unsafe { returned.write(state.scan_pairs.len()) };
     Zu2Status::Ok
 }
 

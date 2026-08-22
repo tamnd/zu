@@ -7248,14 +7248,14 @@
       "id": "zu::zu1::cache::DecodedPool",
       "kind": "struct",
       "name": "DecodedPool",
-      "doc": "A budgeted pool of decoded objects keyed by the first block pointer\nof the segment they decode, the decode-on-touch tier of perf/04\nsection 2. A dropped table's keys stop being touched and age out;\nthe one real hazard is the free list recycling a pointer into a new\nsegment, which `Zu1File::write_block` covers by calling\n[`Self::remove`] on every block it rewrites. Values are `Arc`-handed:\neviction drops the map's reference and any reader still holding the\n`Arc` keeps its snapshot alive, which is safe because decoded\nobjects are immutable under MVCC.\n\nEviction is plain LRU by touch tick, scanned on demand. Pools hold\ntens of entries, whole decoded groups and directories, so the scan\ncosts less than the bookkeeping a linked LRU would add."
+      "doc": "A budgeted pool of decoded objects keyed by where in the file the\nsegment they decode starts, the decode-on-touch tier of perf/04\nsection 2. The key is a byte offset rather than a block pointer\nbecause a block holds more than one packed segment, and two\nsegments sharing a block are not the same segment.\n\nA dropped table's keys stop being touched and age out;\nthe one real hazard is the free list recycling a pointer into a new\nsegment, which `Zu1File::write_block` covers by calling\n[`Self::remove_block`] on every block it rewrites. Values are `Arc`-handed:\neviction drops the map's reference and any reader still holding the\n`Arc` keeps its snapshot alive, which is safe because decoded\nobjects are immutable under MVCC.\n\nEviction is plain LRU by touch tick, scanned on demand. Pools hold\ntens of entries, whole decoded groups and directories, so the scan\ncosts less than the bookkeeping a linked LRU would add."
     },
     {
       "id": "zu::zu1::cache::DecodedPool::get",
       "kind": "method",
       "name": "get",
       "of": "zu::zu1::cache::DecodedPool",
-      "signature": "fn get(&self, key: BlockPtr) -> Option<Arc<T>>",
+      "signature": "fn get(&self, key: u64) -> Option<Arc<T>>",
       "doc": "The pooled object for `key`, or `None` on a miss."
     },
     {
@@ -7263,7 +7263,7 @@
       "kind": "method",
       "name": "insert",
       "of": "zu::zu1::cache::DecodedPool",
-      "signature": "fn insert(&self, key: BlockPtr, value: Arc<T>)",
+      "signature": "fn insert(&self, key: u64, value: Arc<T>)",
       "doc": "Pools `value` under `key`, evicting least-recently-touched\nentries until the budget holds it. Racing inserts keep the\nfirst entry; both racers already hold a usable `Arc`."
     },
     {
@@ -7275,12 +7275,12 @@
       "doc": "A pool holding at most `budget` bytes of decoded objects. A\nsingle object above the budget is still admitted alone, so a\npool cannot starve its own hot path."
     },
     {
-      "id": "zu::zu1::cache::DecodedPool::remove",
+      "id": "zu::zu1::cache::DecodedPool::remove_block",
       "kind": "method",
-      "name": "remove",
+      "name": "remove_block",
       "of": "zu::zu1::cache::DecodedPool",
-      "signature": "fn remove(&self, key: BlockPtr)",
-      "doc": "Drops the entry under `key`, the write-invalidation hook: the\nfree list recycles block pointers, so a rewrite of a segment's\nfirst block can give a new segment an old key. Readers still\nholding the old `Arc` keep their snapshot, same as eviction."
+      "signature": "fn remove_block(&self, ptr: BlockPtr)",
+      "doc": "Drops every entry whose segment starts in the block at `ptr`,\nthe write-invalidation hook: the free list recycles block\npointers, so a rewrite of a segment's first block can give a new\nsegment an old key, and one block can be the first of several\npacked segments. Readers still holding the old `Arc` keep their\nsnapshot, same as eviction."
     },
     {
       "id": "zu::zu1::cache::DecodedPool::stats",
@@ -8556,6 +8556,12 @@
       "doc": "The null block pointer."
     },
     {
+      "id": "zu::zu1::file::PackScope",
+      "kind": "struct",
+      "name": "PackScope",
+      "doc": "A packing scope suspended by [`Zu1File::pack_open`], to be handed\nback to [`Zu1File::pack_close`]. Opaque because the only thing a\ncaller may do with one is put it back."
+    },
+    {
       "id": "zu::zu1::file::Shared",
       "kind": "struct",
       "name": "Shared",
@@ -8766,6 +8772,38 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn open_read_only_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self>",
       "doc": "[`Self::open_read_only`] somewhere other than the filesystem."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::pack_bytes",
+      "kind": "method",
+      "name": "pack_bytes",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn pack_bytes(&mut self, payload: &[u8]) -> Result<(Vec<BlockPtr>, u32)>",
+      "doc": "Writes `payload` and returns the blocks it landed in and the\nbyte offset it starts at in the first of them.\n\nUnder a tag this is a bump allocator: the payload starts where\nthe last one ended and spills into fresh blocks as it needs\nthem, so a store of thirty small segments costs the bytes they\nweigh rather than thirty blocks. The block under the cursor is\nrewritten whole on every call, which is what lets the caller\nstop at any point without a flush: what is on disk is always\neverything handed out so far."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::pack_close",
+      "kind": "method",
+      "name": "pack_close",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn pack_close(&mut self, held: PackScope)",
+      "doc": "Ends the scope [`Self::pack_open`] began and resumes the one it\nsuspended."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::pack_open",
+      "kind": "method",
+      "name": "pack_open",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn pack_open(&mut self) -> PackScope",
+      "doc": "Opens a packing scope: every [`Self::pack_bytes`] until the\nmatching [`Self::pack_close`] shares blocks with the others, and\nwith nothing outside.\n\nA scope is whatever the caller frees as a unit, one property\ndirectory or one rel table's adjacency, because a block holding\ntwo payloads has to be freed when the last of them goes and\nnothing in the file counts what is left in one. Scoping by the\nthing that frees makes the question moot: everything in the\nblock dies on the same call, and that call deduplicates the\npointers it hands back. A scope always starts on a fresh block,\nso two folds of the same table never share one either.\n\nThe returned value is the scope this one suspended and belongs\nback in [`Self::pack_close`]. Scopes nest: an inner one takes\nits own blocks and the outer resumes where it was."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::pack_reset",
+      "kind": "method",
+      "name": "pack_reset",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn pack_reset(&mut self)",
+      "doc": "Drops any scope still open, which is what a caller that is\nstarting a fold does: a fold that failed partway may have left\none, and a block half filled by work that was thrown away is not\na block the next fold may write into."
     },
     {
       "id": "zu::zu1::file::Zu1File::path",
@@ -9049,7 +9087,7 @@
       "kind": "function",
       "name": "write_blob_segment",
       "signature": "fn write_blob_segment(db: &mut zu_zu1::file::Zu1File, values: &[&[u8]]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
-      "doc": "Encodes `values` chunk by chunk and writes the FullZip payload across\nfreshly allocated blocks."
+      "doc": "Encodes `values` chunk by chunk and writes the FullZip payload out\nthrough the file's placer."
     },
     {
       "id": "zu::zu1::graph",
@@ -10646,6 +10684,14 @@
       "doc": "Location and integrity data for one stored segment."
     },
     {
+      "id": "zu::zu1::segment::SegmentMeta::at",
+      "kind": "method",
+      "name": "at",
+      "of": "zu::zu1::segment::SegmentMeta",
+      "signature": "fn at(&self) -> u64",
+      "doc": "Where the payload starts in the file, which is what names a\nsegment when a block pointer no longer does: the pools above the\nblock cache key on this."
+    },
+    {
       "id": "zu::zu1::segment::SegmentMeta::blocks",
       "kind": "field",
       "name": "blocks",
@@ -10666,6 +10712,14 @@
       "of": "zu::zu1::segment::SegmentMeta",
       "signature": "fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)>",
       "doc": "Reads a meta from `bytes` starting at `pos`, returning the meta and\nthe position after it."
+    },
+    {
+      "id": "zu::zu1::segment::SegmentMeta::decode_unpacked",
+      "kind": "method",
+      "name": "decode_unpacked",
+      "of": "zu::zu1::segment::SegmentMeta",
+      "signature": "fn decode_unpacked(bytes: &[u8], pos: usize) -> Result<(Self, usize)>",
+      "doc": "The same, for a directory written before payloads could be\npacked: its metas carry no start word and every one of them\nbegins at the head of its first block."
     },
     {
       "id": "zu::zu1::segment::SegmentMeta::encode",
@@ -10713,6 +10767,14 @@
       "of": "zu::zu1::segment::SegmentMeta",
       "signature": "bool",
       "doc": "The writer saw the values in ascending order, which upgrades the\nfence array to a per-chunk zone map: chunk `i` holds values in\n`fences[i-1]..=fences[i]` (`min..=fences[0]` for the first), so\na range scan can skip chunks without reading them. Unsorted\nsegments keep only the segment-level min and max."
+    },
+    {
+      "id": "zu::zu1::segment::SegmentMeta::start",
+      "kind": "field",
+      "name": "start",
+      "of": "zu::zu1::segment::SegmentMeta",
+      "signature": "u32",
+      "doc": "Byte offset the payload starts at inside `blocks[0]`. A block\nholds as many small payloads as fit (`Zu1File::pack_bytes`), so\nwhere a segment starts is part of naming it."
     },
     {
       "id": "zu::zu1::segment::SegmentMeta::structural",
@@ -10844,7 +10906,7 @@
       "kind": "function",
       "name": "read_segment_pooled",
       "signature": "fn read_segment_pooled(db: &mut zu_zu1::file::Zu1File, pool: &zu_zu1::cache::DecodedPool<Vec<u64>>, meta: &SegmentMeta) -> zu_common::Result<std::sync::Arc<Vec<u64>>>",
-      "doc": "Reads a whole segment through `pool`, decoding it at most once per\npooled lifetime. The key is the segment's first block pointer, which\nevery segment has since even an empty one carries its chunk count,\nand which is unique per committed segment version."
+      "doc": "Reads a whole segment through `pool`, decoding it at most once per\npooled lifetime. The key is where the payload starts in the file,\nwhich every segment has since even an empty one carries its chunk\ncount, and which is unique per committed segment version."
     },
     {
       "id": "zu::zu1::segment::rewrite_segment",
@@ -10858,7 +10920,7 @@
       "kind": "function",
       "name": "write_segment",
       "signature": "fn write_segment(db: &mut zu_zu1::file::Zu1File, values: &[u64]) -> zu_common::Result<SegmentMeta>",
-      "doc": "Encodes `values` chunk by chunk with the cascade selector and writes\nthe MiniBlock payload across freshly allocated blocks."
+      "doc": "Encodes `values` chunk by chunk with the cascade selector and writes\nthe MiniBlock payload out through the file's placer."
     },
     {
       "id": "zu::zu1::stats",

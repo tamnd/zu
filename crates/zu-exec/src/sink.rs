@@ -531,6 +531,13 @@ impl TopN {
         &self.keys
     }
 
+    /// How many rows the buffer can still use. Nothing a chunk holds
+    /// past its own best `need` can reach the answer, which is what
+    /// lets a caller cut a chunk down before it stages anything.
+    pub(crate) fn need(&self) -> usize {
+        self.need
+    }
+
     /// Whether a row with this key, arriving after everything the
     /// buffer holds, can still reach the answer. Equal to the worst
     /// kept key is not good enough: the tie breaks on scan position

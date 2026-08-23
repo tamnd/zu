@@ -7356,18 +7356,46 @@ impl Binder<'_> {
                 }
                 Ok(Type::Bool)
             }
-            // ISO 20.23. Strings on both sides and a string out. It is
-            // written apart from the plus for the reason the standard
-            // writes it apart: a plus over two numbers adds them and a
-            // plus over two strings joins them, so a query whose
-            // operands the lattice does not know yet says which of the
-            // two it meant by which operator it wrote.
-            BinaryOp::Concat => {
-                if !lhs.is_str() || !rhs.is_str() {
-                    return Err(bad_type(format!("|| joins strings, got {lhs} and {rhs}")));
+            // ISO 20.23. The operator is written apart from the plus
+            // for the reason the standard writes it apart: a plus over
+            // two numbers adds them and a plus over two strings joins
+            // them, so a query whose operands the lattice does not know
+            // yet says which of the two it meant by which operator it
+            // wrote.
+            //
+            // Four kinds of thing can be joined and the grammar gives
+            // each its own rule: <character string concatenation>,
+            // <byte string concatenation>, <list concatenation> and
+            // <path value concatenation>. They all spell the operator
+            // the same way, so the operand types are what tell them
+            // apart, and the two sides have to be the same kind. A
+            // string and a byte string is not a longer one of either,
+            // and a number is refused rather than written out as its
+            // digits, since a query that meant the digits says so with
+            // a CAST.
+            BinaryOp::Concat => match (lhs, rhs) {
+                (Type::Any, Type::Any) => Ok(Type::Any),
+                (Type::Str, t) | (t, Type::Str) if t.is_str() => Ok(Type::Str),
+                (Type::Bytes, Type::Bytes | Type::Any) | (Type::Any, Type::Bytes) => {
+                    Ok(Type::Bytes)
                 }
-                Ok(Type::Str)
-            }
+                (Type::Path, Type::Path | Type::Any) | (Type::Any, Type::Path) => Ok(Type::Path),
+                // The element type of a join is the element type both
+                // sides agree on, and `Any` where they do not, which is
+                // the rule a list literal written over mixed items uses.
+                (Type::List(a), Type::List(b)) => Ok(Type::List(Box::new(if a == b {
+                    *a.clone()
+                } else {
+                    Type::Any
+                }))),
+                (Type::List(a), Type::Any) | (Type::Any, Type::List(a)) => {
+                    Ok(Type::List(a.clone()))
+                }
+                _ => Err(bad_type(format!(
+                    "|| joins two strings, two byte strings, two lists or two paths, \
+                     got {lhs} and {rhs}"
+                ))),
+            },
         }
     }
 }

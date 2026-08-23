@@ -5794,11 +5794,20 @@ impl Parser<'_> {
         Ok(Expr::Normalize { expr, form })
     }
 
-    /// `TRIM(s)`, `TRIM(c FROM s)` or `TRIM(LEADING c FROM s)`, the
-    /// parenthesis unconsumed and TRIM already read.
+    /// `TRIM(s)`, `TRIM(c FROM s)`, `TRIM(LEADING c FROM s)` or
+    /// `TRIM(list, n)`, the parenthesis unconsumed and TRIM already
+    /// read.
     ///
-    /// Three spellings and one function. The trim specification and the
-    /// trim character are both optional, so what stands after the
+    /// Four spellings and, in the grammar, three rules:
+    /// `<single-character trim function>` over a string,
+    /// `<byte string trim function>` over octets, and
+    /// `<trim list function>` over a list and a count. The first two
+    /// share a shape and this reads them as one; the third is the comma
+    /// form and is told apart by the comma alone, because a FROM never
+    /// follows one and a count is written where nothing else may be.
+    ///
+    /// Inside the first two, the trim specification and the trim
+    /// character are both optional, so what stands after the
     /// parenthesis may be an end of the string, the character to take
     /// off it, or the string itself, and only what follows says which.
     fn parse_trim(&mut self) -> Result<Expr> {
@@ -5817,9 +5826,18 @@ impl Parser<'_> {
             (chars, self.parse_expr()?)
         } else {
             let first = self.parse_expr()?;
-            match self.eat_kw("FROM") {
-                true => (Some(Box::new(first)), self.parse_expr()?),
-                false => (None, first),
+            if self.eat(&TokenKind::Comma) {
+                // The list form. The count goes where the character to
+                // take off goes, because both are the one thing the
+                // trim is given besides what it is trimming, and the
+                // kernel reads the first argument to know which it has.
+                let count = self.parse_expr()?;
+                (Some(Box::new(count)), first)
+            } else {
+                match self.eat_kw("FROM") {
+                    true => (Some(Box::new(first)), self.parse_expr()?),
+                    false => (None, first),
+                }
             }
         };
         self.expect(&TokenKind::RParen)?;

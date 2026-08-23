@@ -65,9 +65,21 @@ pub enum Kind {
     Path,
     /// A node or an edge.
     Element,
-    /// A string first and a count of characters after it, which is what
-    /// the substring function takes and the one kind here whose
-    /// positions are not alike.
+    /// What the bare TRIM takes, which is three rules of the grammar
+    /// under one name: `<single-character trim function>` over a
+    /// character string, `<byte string trim function>` over a byte
+    /// string, and `<trim list function>` over a list and a count. So
+    /// the first argument may be any of the three and the second is
+    /// whatever the first one's rule says goes with it, which the
+    /// kernel checks because a kind reads one argument at a time.
+    Trimmable,
+    /// A string first and a count of units after it, which is what the
+    /// substring functions take and the one kind here whose positions
+    /// are not alike. The string may be a byte string, because ISO
+    /// writes the substring twice, once as
+    /// `<character string substring function>` and once as
+    /// `<byte string substring function>`, both spelled LEFT and RIGHT,
+    /// and the unit counted is whatever the first argument is made of.
     Counted,
 }
 
@@ -95,18 +107,30 @@ impl Kind {
             }
             Kind::Path => matches!(ty, Type::Any | Type::Path),
             Kind::Element => matches!(ty, Type::Any | Type::Node | Type::Rel),
-            Kind::Counted => Kind::Str.accepts(ty) || Kind::Number.accepts(ty),
+            Kind::Counted => Kind::Octets.accepts(ty) || Kind::Number.accepts(ty),
+            Kind::Trimmable => {
+                Kind::Octets.accepts(ty) || Kind::List.accepts(ty) || Kind::Number.accepts(ty)
+            }
         }
     }
 
     /// Whether an argument of this type is one this kind accepts in the
-    /// position it was written in. Only [`Kind::Counted`] reads the
-    /// position: every other kind takes the same thing everywhere, so
-    /// for those this is [`Kind::accepts`] and nothing more.
+    /// position it was written in. Only the two kinds whose arguments
+    /// are not alike read the position: every other kind takes the same
+    /// thing everywhere, so for those this is [`Kind::accepts`] and
+    /// nothing more.
     pub fn accepts_at(self, at: usize, ty: &Type) -> bool {
         match (self, at) {
-            (Kind::Counted, 0) => Kind::Str.accepts(ty),
+            (Kind::Counted, 0) => Kind::Octets.accepts(ty),
             (Kind::Counted, _) => Kind::Number.accepts(ty),
+            // A trim's first argument says which of the three rules was
+            // written, and only after that is it known whether the
+            // second is a count or the characters to take off. So the
+            // second position accepts either here and the kernel pairs
+            // them, which it has to do anyway to refuse a byte string
+            // trimmed by a character.
+            (Kind::Trimmable, 0) => Kind::Octets.accepts(ty) || Kind::List.accepts(ty),
+            (Kind::Trimmable, _) => Kind::Octets.accepts(ty) || Kind::Number.accepts(ty),
             _ => self.accepts(ty),
         }
     }
@@ -162,13 +186,14 @@ pub enum Ret {
     /// one and a float where any of them is, which is the rule the
     /// arithmetic operators follow and so is the rule `MOD` follows.
     Wider,
-    /// A character string, or a byte string where the first argument is
-    /// one. This is what the trim family answers: it hands back the
-    /// type it was given, and the two types it takes are these. Reading
-    /// the first argument rather than saying `Same` keeps a trim of a
-    /// property, whose type nobody declared, binding as a string, which
-    /// is what it was before byte strings existed and what it is in
-    /// every query that is not about octets.
+    /// A character string, or a byte string or a list where the first
+    /// argument is one. This is what the trim family and the substring
+    /// family answer: they hand back the type they were given, and
+    /// these are the types they take. Reading the first argument rather
+    /// than saying `Same` keeps a trim of a property, whose type nobody
+    /// declared, binding as a string, which is what it was before byte
+    /// strings existed and what it is in every query that is not about
+    /// octets.
     Trimmed,
 }
 
@@ -189,6 +214,7 @@ impl Ret {
             Ret::ListOf => Type::List(Box::new(first())),
             Ret::Trimmed => match first() {
                 Type::Bytes => Type::Bytes,
+                ty @ Type::List(_) => ty,
                 _ => Type::Str,
             },
             Ret::Wider => {
@@ -527,7 +553,13 @@ pub static REGISTRY: &[Signature] = &[
     },
     Signature {
         name: "octet_length",
-        aliases: &[],
+        // ISO 20.22 writes one rule, <byte length expression>, and lets
+        // it be spelled either way, so the two words are one function
+        // and not two. It is the byte string's length that both of them
+        // ask for; a character string answers with the octets of its
+        // encoding, which is the same count under a different question
+        // and is what this engine has always answered.
+        aliases: &["byte_length"],
         func: Func::OctetLength,
         arity: Arity::Exactly(1),
         arg: Kind::Octets,
@@ -572,8 +604,8 @@ pub static REGISTRY: &[Signature] = &[
         aliases: &[],
         func: Func::Trim(Trim::Both),
         arity: Arity::Between(1, 2),
-        arg: Kind::Octets,
-        needs: "needs a string or a byte string",
+        arg: Kind::Trimmable,
+        needs: "needs a string, a byte string, or a list and a count",
         ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
@@ -660,14 +692,19 @@ pub static REGISTRY: &[Signature] = &[
     // else: SUBSTRING is a word the standard has reserved and given no
     // meaning yet, so a query that wants the middle of a string writes
     // one of these inside the other.
+    //
+    // ISO writes them twice, at <character string substring function>
+    // and <byte string substring function>, with the same two keywords
+    // both times. So one signature covers both and the first argument
+    // is what says which was meant, the way it does for TRIM above.
     Signature {
         name: "left",
         aliases: &[],
         func: Func::Cut(Cut::Left),
         arity: Arity::Exactly(2),
         arg: Kind::Counted,
-        needs: "needs a string and a count of characters",
-        ret: Ret::Str,
+        needs: "needs a string or a byte string and a count of its units",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -680,8 +717,8 @@ pub static REGISTRY: &[Signature] = &[
         func: Func::Cut(Cut::Right),
         arity: Arity::Exactly(2),
         arg: Kind::Counted,
-        needs: "needs a string and a count of characters",
-        ret: Ret::Str,
+        needs: "needs a string or a byte string and a count of its units",
+        ret: Ret::Trimmed,
         deterministic: true,
         aggregate: false,
         star: false,
@@ -1519,6 +1556,9 @@ fn trim_kernel(func: Func, args: &[Value]) -> Result<Value> {
     if let Value::Bytes(bytes) = source {
         return trim_bytes(func, trim, &bytes, args.get(1));
     }
+    if let Value::List(items) = source {
+        return trim_list(func, trim, items, args.get(1));
+    }
     let text = match source {
         Value::Str(text) => text,
         Value::Null => return Ok(Value::Null),
@@ -1613,6 +1653,69 @@ fn trim_bytes(func: Func, trim: Trim, bytes: &[u8], octets: Option<&Value>) -> R
     Ok(Value::Bytes(out.to_vec()))
 }
 
+/// ISO 20.16, `<trim list function>`: TRIM over a list and a count.
+///
+/// This is the third thing TRIM names and the odd one of the three. The
+/// other two take the characters or the octets to take off the ends;
+/// this one takes a number, and the number is a length rather than a
+/// thing to remove, so the result is the first `n` elements. A list
+/// shorter than `n` comes back whole, which is the rule LEFT follows
+/// over a string that is shorter than its count.
+///
+/// That reading is this engine's and not a quotation. The artifacts
+/// vendored here are ISO's grammar and its lists of features,
+/// conditions and subclauses, and the Syntax Rules of 20.16 are prose
+/// this project does not hold, so which end the count applies to is the
+/// one thing about the list trim that rests on a reading. It is written
+/// down here rather than left in the code so that a reader who has the
+/// text can say it is wrong.
+///
+/// Only the bare TRIM reaches this. BTRIM, LTRIM and RTRIM name ends of
+/// a string, and a list has no rule of the grammar that gives them one.
+fn trim_list(func: Func, trim: Trim, items: Vec<Value>, count: Option<&Value>) -> Result<Value> {
+    if !matches!(trim, Trim::Both) {
+        return Err(bad_type(func, "a string or a byte string", &Value::List(items)));
+    }
+    let Some(count) = count else {
+        return Err(gql(
+            codes::C22G03,
+            format!(
+                "{}() over a list needs the count of elements to keep, which is the second \
+                 argument the one argument form has not got",
+                name_of(func)
+            ),
+        ));
+    };
+    let count = match settle(count.clone()) {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(n) => n,
+        Value::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e18 => f as i64,
+        Value::Float(f) => {
+            return Err(gql(
+                codes::C22011,
+                format!(
+                    "{}() keeps whole elements and was asked for {f} of them",
+                    name_of(func)
+                ),
+            ));
+        }
+        other => return Err(bad_type(func, "a number", &other)),
+    };
+    if count < 0 {
+        return Err(gql(
+            codes::C22011,
+            format!(
+                "{}() was asked to keep {count} elements, and a list has no negative number \
+                 of them",
+                name_of(func)
+            ),
+        ));
+    }
+    let mut items = items;
+    items.truncate(count as usize);
+    Ok(Value::List(items))
+}
+
 /// ISO 20.24, the substring function: the first characters of a string
 /// or the last of them.
 ///
@@ -1635,8 +1738,12 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
             )));
         }
     };
-    let Some(text) = str_arg(func, args.first())? else {
-        return Ok(Value::Null);
+    let source = args
+        .first()
+        .ok_or_else(|| invalid(format!("{}() was given no string", name_of(func))))?;
+    let source = match settle(source.clone()) {
+        Value::Null => return Ok(Value::Null),
+        other => other,
     };
     let given = args
         .get(1)
@@ -1649,8 +1756,9 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
             return Err(gql(
                 codes::C22011,
                 format!(
-                    "{}() counts whole characters and was asked for {f} of them",
-                    name_of(func)
+                    "{}() counts whole {} and was asked for {f} of them",
+                    name_of(func),
+                    unit_of(&source)
                 ),
             ));
         }
@@ -1660,18 +1768,47 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
         return Err(gql(
             codes::C22011,
             format!(
-                "{}() was asked for {count} characters, and a string has no negative number of them",
-                name_of(func)
+                "{}() was asked for {count} {}, and a string has no negative number of them",
+                name_of(func),
+                unit_of(&source)
             ),
         ));
     }
     let count = count as usize;
-    let held = text.chars().count();
-    let taken: String = match cut {
-        Cut::Left => text.chars().take(count).collect(),
-        Cut::Right => text.chars().skip(held.saturating_sub(count)).collect(),
-    };
-    Ok(Value::Str(taken))
+    // The unit is what the value is made of. A character string is cut
+    // by characters, because that is what a reader counts, and a byte
+    // string is cut by octets, because a byte string has no characters
+    // to count. Cutting either one by the other's unit would answer a
+    // question nobody asked and, for the byte string, could hand back
+    // half of something.
+    match source {
+        Value::Str(text) => {
+            let held = text.chars().count();
+            Ok(Value::Str(match cut {
+                Cut::Left => text.chars().take(count).collect(),
+                Cut::Right => text.chars().skip(held.saturating_sub(count)).collect(),
+            }))
+        }
+        Value::Bytes(octets) => {
+            let held = octets.len();
+            Ok(Value::Bytes(match cut {
+                Cut::Left => octets[..count.min(held)].to_vec(),
+                Cut::Right => octets[held.saturating_sub(count)..].to_vec(),
+            }))
+        }
+        other => Err(bad_type(func, "a string or a byte string", &other)),
+    }
+}
+
+/// What a substring or a length counts in a value: characters where it
+/// is a character string, octets where it is a byte string. It is only
+/// ever used to write a message, so anything else answers with the word
+/// that fits the question that was asked.
+fn unit_of(value: &Value) -> &'static str {
+    match value {
+        Value::Bytes(_) => "octets",
+        _ => "characters",
+    }
 }
 
 /// The temporal value functions of ISO 20.27 and the `DURATION` of ISO

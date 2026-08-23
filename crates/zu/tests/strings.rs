@@ -115,6 +115,40 @@ fn the_characters_of_a_string_and_the_bytes_of_it() {
     assert_eq!(int_of(&db, bytes), 6);
 }
 
+/// GV35. A byte string is a sequence of octets, and the operators and
+/// functions ISO 20.22 gives it are the string ones over a different
+/// unit: the join is a join, the length is counted in octets, and the
+/// two ends are cut by octets rather than by characters.
+#[test]
+fn two_byte_strings_are_joined_and_measured_and_cut_by_their_octets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    assert_eq!(
+        one(&db, "RETURN X'0102' || X'0304' AS v"),
+        Value::Bytes(vec![1, 2, 3, 4])
+    );
+    assert_eq!(one(&db, "RETURN X'0102' || NULL AS v"), Value::Null);
+    // BYTE_LENGTH is the spelling ISO gives the question over octets and
+    // OCTET_LENGTH is the one it gives over characters, and over a byte
+    // string there is nothing between them to tell apart.
+    assert_eq!(int_of(&db, "RETURN BYTE_LENGTH(X'00AB00') AS n"), 3);
+    assert_eq!(int_of(&db, "RETURN OCTET_LENGTH(X'00AB00') AS n"), 3);
+    assert_eq!(
+        one(&db, "RETURN LEFT(X'01020304', 2) AS v"),
+        Value::Bytes(vec![1, 2])
+    );
+    assert_eq!(
+        one(&db, "RETURN RIGHT(X'01020304', 2) AS v"),
+        Value::Bytes(vec![3, 4])
+    );
+    // A trim over octets takes off the octet it was given, the way a
+    // trim over characters takes off the character.
+    assert_eq!(
+        one(&db, "RETURN TRIM(X'000100', X'00') AS v"),
+        Value::Bytes(vec![1])
+    );
+}
+
 #[test]
 fn a_string_folds_up_and_down_and_loses_the_spaces_at_its_ends() {
     let dir = tempfile::tempdir().unwrap();
@@ -156,15 +190,19 @@ fn a_number_written_where_a_string_belongs_is_refused_by_name() {
     // meant the digits of the number says so with a CAST and one that
     // meant a sum wrote a plus. Both are told which it was.
     let err = refused(&db, "RETURN 'ab' || 1 AS v");
-    assert!(err.contains("joins strings"), "{err}");
-    for source in [
-        "RETURN CHAR_LENGTH(1) AS v",
-        "RETURN UPPER(1) AS v",
-        "RETURN TRIM(1) AS v",
-    ] {
+    assert!(err.contains("|| joins two strings"), "{err}");
+    // The operator joins four kinds of thing and both sides have to be
+    // the same one. A string and a byte string is not a longer one of
+    // either, which is the mistake the type names in the message are
+    // there to point at.
+    let err = refused(&db, "RETURN 'ab' || X'0102' AS v");
+    assert!(err.contains("STR") && err.contains("BYTES"), "{err}");
+    for source in ["RETURN CHAR_LENGTH(1) AS v", "RETURN UPPER(1) AS v"] {
         let err = refused(&db, source);
         assert!(err.contains("needs a string"), "{source}: {err}");
     }
+    let err = refused(&db, "RETURN TRIM(1) AS v");
+    assert!(err.contains("needs a string"), "{err}");
 }
 
 /// The four normal forms of ISO 20.24, over literals and over a stored

@@ -1128,11 +1128,13 @@ exec_semi_mprobes_s_core = 1.8
 # every send after it, so what is left is a lookup and the refusal.
 # Before that they read 1.54, 2.12 and 2.54 against a 5.50 us answer.
 # The GitHub runner the gate job uses is about twice as slow on both
-# sides and lands on the same ratios: answer 12.81, syntax 3.27
-# (0.25x), undefined reference 4.57 (0.36x), missing parameter 5.58
-# (0.44x), taken before #655 and due a re-take. That the two machines
-# agree to within a couple of hundredths on the ratio while disagreeing
-# by 2.3x on the latencies is the reason the gate is written this way.
+# sides and lands on the same ratios: answer 6.22, syntax 0.97 (0.16x),
+# undefined reference 0.98 (0.16x), missing parameter 1.09 (0.18x).
+# Before #655 the same runner read answer 12.81, syntax 3.27 (0.25x),
+# undefined reference 4.57 (0.36x) and missing parameter 5.58 (0.44x),
+# so it took the whole 2x there too. That the two machines agree to
+# within a few hundredths on the ratio while disagreeing by 1.7x on the
+# latencies is the reason the gate is written this way.
 # The milestone only asks for a ratio under 1.0; the ceiling sits at
 # 0.6 because 0.33 is what the engine actually does and a refusal that
 # drifted up to two thirds of an answer would be worth looking at.

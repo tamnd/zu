@@ -6043,6 +6043,32 @@ impl Parser<'_> {
         if self.at_list_name() {
             return self.parse_list_type(None);
         }
+        // ISO 18.7 lets a verbose integer name carry SIGNED or UNSIGNED
+        // in front of it, and that word is the whole of what tells the
+        // two towers apart: `UNSIGNED INTEGER32` is `UINT32`. It is
+        // read here rather than listed as a name of its own, since
+        // otherwise every width would need three rows.
+        let sign = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Ident(word),
+                ..
+            }) if word.eq_ignore_ascii_case("SIGNED") || word.eq_ignore_ascii_case("UNSIGNED") => {
+                let signed = word.eq_ignore_ascii_case("SIGNED");
+                match self.tokens.get(self.pos + 1) {
+                    Some(Token {
+                        kind: TokenKind::Ident(_),
+                        ..
+                    }) => {
+                        self.pos += 1;
+                        Some(signed)
+                    }
+                    // A bare SIGNED is not a type, so the word is left
+                    // where it is and the message names it.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let mut name = match self.peek() {
             Some(Token {
                 kind: TokenKind::Ident(s),
@@ -6068,6 +6094,16 @@ impl Parser<'_> {
         if !value_type::is_type_name(&name) {
             return Err(unknown_type(&name));
         }
+        // GV42, ISO 18.7. A duration type says which fields it spans
+        // and the parenthesis holds a qualifier rather than a length,
+        // there being no third kind of duration for a number to pick.
+        if let Some(kind) = self.parse_duration_qualifier(&name)? {
+            let ty = LogicalType::Duration(kind);
+            if self.at_list_name() {
+                return self.parse_list_type(Some(ty));
+            }
+            return Ok(ty);
+        }
         let mut args = Vec::new();
         if self.eat(&TokenKind::LParen) {
             loop {
@@ -6088,6 +6124,20 @@ impl Parser<'_> {
                 ),
             )
         })?;
+        let ty = match (sign, ty) {
+            (
+                Some(signed),
+                LogicalType::Int {
+                    bits, precision, ..
+                },
+            ) => LogicalType::Int {
+                signed,
+                bits,
+                precision,
+            },
+            (Some(_), _) => return Err(unknown_type(&name)),
+            (None, ty) => ty,
+        };
         // GV50 again, written after its element type. `INT LIST` and
         // `LIST<INT>` are one type asked for two ways, so the postfix
         // spelling is read here rather than given a branch of its own.
@@ -6095,6 +6145,49 @@ impl Parser<'_> {
             return self.parse_list_type(Some(ty));
         }
         Ok(ty)
+    }
+
+    /// The duration kind a qualifier behind a duration type name says,
+    /// and `None` when this is not a duration type or carries no
+    /// parenthesis.
+    ///
+    /// ISO 18.7 writes the qualifier as one of exactly two phrases,
+    /// `YEAR TO MONTH` and `DAY TO SECOND`, because those are the two
+    /// kinds and no arithmetic crosses between them. It sits where a
+    /// length would on a string type, so the two are told apart by the
+    /// word after the bracket: a number is a length and either of those
+    /// words is a qualifier.
+    fn parse_duration_qualifier(&mut self, name: &str) -> Result<Option<DurationKind>> {
+        if !(name.eq_ignore_ascii_case("DURATION") || name.eq_ignore_ascii_case("INTERVAL")) {
+            return Ok(None);
+        }
+        if !self.at(&TokenKind::LParen) {
+            return Ok(None);
+        }
+        let opens = matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token { kind: TokenKind::Ident(word), .. })
+                if word.eq_ignore_ascii_case("YEAR") || word.eq_ignore_ascii_case("DAY")
+        );
+        if !opens {
+            return Ok(None);
+        }
+        self.expect(&TokenKind::LParen)?;
+        let kind = match self.eat_kw("YEAR") {
+            true => {
+                self.expect_kw("TO")?;
+                self.expect_kw("MONTH")?;
+                DurationKind::YearMonth
+            }
+            false => {
+                self.expect_kw("DAY")?;
+                self.expect_kw("TO")?;
+                self.expect_kw("SECOND")?;
+                DurationKind::DayTime
+            }
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(Some(kind))
     }
 
     /// Whether a list type name starts here.

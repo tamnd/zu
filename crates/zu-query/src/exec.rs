@@ -6857,6 +6857,18 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                         })?))
                     }
                     Value::Float(f) => Ok(Value::Float(-f)),
+                    // A duration factor is a sign and then a duration
+                    // (ISO 20.28, GV41), which is the one place the
+                    // language negates a duration without arithmetic.
+                    // The count is months or nanoseconds and the kind
+                    // rides along untouched, minus two months being two
+                    // months the other way and not some other unit.
+                    Value::Temporal(Temporal::Duration(kind, count)) => {
+                        let count = count
+                            .checked_neg()
+                            .ok_or_else(|| gql(codes::C22003, "duration overflow".into()))?;
+                        Ok(Value::Temporal(Temporal::Duration(kind, count)))
+                    }
                     Value::Null => Ok(Value::Null),
                     other => Err(invalid(format!("cannot negate {other:?}"))),
                 },

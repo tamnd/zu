@@ -155,6 +155,44 @@ fn a_duration_shifts_an_instant_and_two_instants_leave_a_duration() {
     );
 }
 
+/// GV41. The two spellings of a negative duration, which ISO writes in
+/// two different places: a sign in front of the duration is a
+/// `<duration factor>` (20.28) and a sign inside the string belongs to
+/// the field it is written on, `<iso8601 sint>` (21.2). Neither is
+/// arithmetic, and both have to agree with the arithmetic that reaches
+/// the same value the long way.
+#[test]
+fn a_duration_may_be_negative_by_a_sign_in_front_or_a_sign_in_the_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let minus_a_day = Value::Temporal(Temporal::Duration(
+        DurationKind::DayTime,
+        -86_400_000_000_000,
+    ));
+    assert_eq!(one(&mut db, "RETURN -DURATION 'P1D' AS v"), minus_a_day);
+    assert_eq!(one(&mut db, "RETURN DURATION 'P-1D' AS v"), minus_a_day);
+    assert_eq!(one(&mut db, "RETURN DURATION 'P1D' * -1 AS v"), minus_a_day);
+    // The kind rides along untouched, minus two months being two
+    // months the other way and not some number of days.
+    assert_eq!(
+        one(&mut db, "RETURN -DURATION 'P2M' AS v"),
+        Value::Temporal(Temporal::Duration(DurationKind::YearMonth, -2))
+    );
+    // A sign on one field and not the others is a sum, so this is nine
+    // hours short of a day.
+    assert_eq!(
+        one(&mut db, "RETURN DURATION 'P1DT-3H' AS v"),
+        Value::Temporal(Temporal::Duration(
+            DurationKind::DayTime,
+            86_400_000_000_000 - 3 * 3_600_000_000_000
+        ))
+    );
+    assert_eq!(
+        one(&mut db, "RETURN DATE '2024-01-15' + -DURATION 'P1D' AS v"),
+        Value::Temporal(Temporal::Date(19736))
+    );
+}
+
 /// The three conditions the corpus asks for by name. Each is a
 /// different reason an answer does not exist, and an engine that
 /// answered anyway would be answering a question nobody asked.

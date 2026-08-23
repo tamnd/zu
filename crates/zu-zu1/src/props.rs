@@ -228,16 +228,56 @@ fn code_type(code: u8) -> Option<LogicalType> {
         .map(|(_, t)| t.clone())
 }
 
+/// The code an extended declared type is written under, followed by
+/// the kind byte and whatever that kind carries.
+///
+/// These are types a graph type may name and no column stores. Naming
+/// a type and holding a value of one are different promises, and the
+/// catalog only makes the first: `STRING(1,5)` is a declaration a
+/// reader can hand back word for word, where a column of it would be a
+/// layout this file has no lane for.
+const EXTENDED_CODE: u8 = 19;
+
+const EXT_ZONED_TIME: u8 = 0;
+const EXT_ZONED_DATETIME: u8 = 1;
+const EXT_STR: u8 = 2;
+const EXT_BYTES: u8 = 3;
+
+/// The count that stands for a bound nobody wrote, since a length is a
+/// `u32` and every one of them is a length somebody could write.
+const NO_BOUND: u32 = u32::MAX;
+
 /// The bytes a declared type is written as, for a container that names
 /// a type without storing values of it. `None` is a type nothing can be
 /// declared with, which the caller refuses before writing anything.
 pub(crate) fn declared_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
-    type_bytes(ty)
+    if let Some(bytes) = type_bytes(ty) {
+        return Some(bytes);
+    }
+    extended_bytes(ty)
+}
+
+/// The extended form, for the declarable types no column code covers.
+fn extended_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
+    let bounded = |kind: u8, min: &Option<u32>, max: &Option<u32>, fixed: bool| {
+        let mut out = vec![EXTENDED_CODE, kind, u8::from(fixed)];
+        out.extend(min.unwrap_or(NO_BOUND).to_le_bytes());
+        out.extend(max.unwrap_or(NO_BOUND).to_le_bytes());
+        out
+    };
+    Some(match ty {
+        LogicalType::ZonedTime => vec![EXTENDED_CODE, EXT_ZONED_TIME],
+        LogicalType::ZonedDatetime => vec![EXTENDED_CODE, EXT_ZONED_DATETIME],
+        LogicalType::Str { min, max, fixed } => bounded(EXT_STR, min, max, *fixed),
+        LogicalType::Bytes { min, max, fixed } => bounded(EXT_BYTES, min, max, *fixed),
+        _ => return None,
+    })
 }
 
 /// Reads a type written by [`declared_type_bytes`], leaving `pos` after
 /// it. The codes are the column codes, so a type the catalog names and
-/// a type a column stores are the same byte.
+/// a type a column stores are the same byte, and the extended form is
+/// the one that carries what a code alone cannot.
 pub(crate) fn decode_declared_type(bytes: &[u8], pos: &mut usize) -> Result<LogicalType> {
     let ty = match bytes.get(*pos) {
         Some(&LIST_CODE) => {
@@ -249,11 +289,52 @@ pub(crate) fn decode_declared_type(bytes: &[u8], pos: &mut usize) -> Result<Logi
                 code_type(*elem).ok_or_else(|| corrupt(format!("unknown element type {elem}")))?;
             list_of(elem)
         }
+        Some(&EXTENDED_CODE) => {
+            *pos += 1;
+            return decode_extended_type(bytes, pos);
+        }
         Some(&code) => code_type(code).ok_or_else(|| corrupt(format!("unknown type {code}")))?,
         None => return Err(corrupt("truncated type".into())),
     };
     *pos += 1;
     Ok(ty)
+}
+
+/// The extended form, read back. `pos` is at the kind byte.
+fn decode_extended_type(bytes: &[u8], pos: &mut usize) -> Result<LogicalType> {
+    let kind = *bytes
+        .get(*pos)
+        .ok_or_else(|| corrupt("truncated extended type".into()))?;
+    *pos += 1;
+    if kind == EXT_ZONED_TIME {
+        return Ok(LogicalType::ZonedTime);
+    }
+    if kind == EXT_ZONED_DATETIME {
+        return Ok(LogicalType::ZonedDatetime);
+    }
+    fn count(bytes: &[u8], pos: &mut usize) -> Result<Option<u32>> {
+        let end = *pos + 4;
+        let word: [u8; 4] = bytes
+            .get(*pos..end)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| corrupt("truncated length bound".into()))?;
+        *pos = end;
+        Ok(match u32::from_le_bytes(word) {
+            NO_BOUND => None,
+            bound => Some(bound),
+        })
+    }
+    let fixed = match bytes.get(*pos) {
+        Some(&flag) => flag != 0,
+        None => return Err(corrupt("truncated extended type".into())),
+    };
+    *pos += 1;
+    let (min, max) = (count(bytes, pos)?, count(bytes, pos)?);
+    match kind {
+        EXT_STR => Ok(LogicalType::Str { min, max, fixed }),
+        EXT_BYTES => Ok(LogicalType::Bytes { min, max, fixed }),
+        other => Err(corrupt(format!("unknown extended type {other}"))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

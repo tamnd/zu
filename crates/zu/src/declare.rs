@@ -141,6 +141,12 @@ fn wanted_rels(
             left = right;
             continue;
         };
+        // A step naming the types it does not walk names no table to
+        // make, and it is turned away by name as well.
+        if rel.negated {
+            left = right;
+            continue;
+        }
         if catalog.rel_in(graph, name).is_some() {
             left = right;
             continue;

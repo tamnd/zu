@@ -536,3 +536,50 @@ fn a_checkpoint_does_not_outlive_the_database_it_was_taken_of() {
         "the reopen read the second database through the first one's index"
     );
 }
+
+/// Every page of the log a reopen warms, including the one the file
+/// header lives in.
+///
+/// `db::warm` reads the log back after an open, and it will only publish
+/// a page it can walk end to end as records. Page zero does not start
+/// with a record, it starts with the eight bytes the address space keeps
+/// out of use, so a check handed the whole page read the header as a
+/// record header, turned the page down, and left it on the device for
+/// the life of the process. Nothing failed, and every read of a record
+/// down there cost a read of the file rather than a load out of memory,
+/// which is a page in every database and all of a small one. #665.
+#[test]
+fn a_reopen_warms_the_page_the_file_header_is_in() {
+    const PAGE: u64 = 4 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("warm.zu2");
+    // Wide values, so this is several pages of log rather than part of
+    // one and the page the header is in is not the only page there is.
+    let wide = vec![b'v'; 1200];
+    {
+        let db = Db::create(&path, options()).expect("create");
+        let mut session = db.session();
+        for i in 0..N {
+            session.upsert(&key(i), &wide).expect("upsert");
+        }
+        drop(session);
+        db.sync().expect("sync");
+    }
+
+    let db = Db::open(&path, options()).expect("reopen");
+    let want = db.log_bytes().div_ceil(PAGE) as usize;
+    assert!(want > 1, "this wants a log of more than one page");
+    // The warm runs while the database serves, so give it a moment to
+    // finish rather than reading the count out from under it.
+    for _ in 0..100 {
+        if db.resident_pages() >= want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        db.resident_pages(),
+        want,
+        "the reopen left a page of the log on the device"
+    );
+}

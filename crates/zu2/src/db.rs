@@ -1395,11 +1395,23 @@ fn warm(core: &Core, options: Options) {
                         return;
                     }
                     let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
-                    if core
-                        .log
-                        .warm_page(page, bytes, recover::page_intact)
-                        .is_err()
-                    {
+                    // The first page of the walk does not start with a
+                    // record. Page zero starts with the eight bytes
+                    // [`crate::addr::FIRST`] keeps out of the address
+                    // space, and after a compaction the lowest live page
+                    // starts wherever the floor left off. `page_intact`
+                    // reads a record header at the first byte it is
+                    // given, so it is given the page from the floor
+                    // rather than from the top: handed the whole page it
+                    // reads the file header as a record, turns the page
+                    // down, and leaves it on the device for the life of
+                    // the process. Every read of a record down there
+                    // then costs a read of the file. #665.
+                    let floor = core.log.begin().saturating_sub(page_start(page)) as usize;
+                    let check = |page: &[u8]| {
+                        floor <= page.len() && recover::page_intact(&page[floor..])
+                    };
+                    if core.log.warm_page(page, bytes, check).is_err() {
                         // A page that cannot be read is a page the read
                         // path will fail on too, and it will say so with
                         // the address in hand.

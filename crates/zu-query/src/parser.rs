@@ -1460,20 +1460,106 @@ impl Parser<'_> {
         Ok(GraphTypeSource::Elements(elements))
     }
 
-    /// One element type, written the way ISO writes it: as the pattern
-    /// an element of it matches.
+    /// One element type. ISO 18.4 gives it two spellings, the pattern
+    /// an element of it matches and a phrase that says the same thing
+    /// in words, and the two share their opening: a direction word, a
+    /// synonym and a name, none of which tells them apart. What comes
+    /// after does. A parenthesis opens a pattern and anything else is
+    /// a phrase.
     ///
     /// `NODE TYPE PersonType (:Person)` is the same type as `(:Person)`
-    /// with a name on it (GG20), and an edge type is two node type
-    /// patterns with an arc between them.
+    /// with a name on it (GG20), `NODE TYPE PersonType LABEL Person` is
+    /// the same type again with the colon spelled out, and an edge type
+    /// is either two node type patterns with an arc between them or a
+    /// phrase that names its endpoints after `CONNECTING`.
     fn parse_element_type(&mut self) -> Result<ElementTypeDef> {
-        let mut name = None;
-        if self.eat_kw("NODE") || self.eat_kw("EDGE") || self.eat_kw("RELATIONSHIP") {
-            self.expect_kw("TYPE")?;
-            name = Some(self.expect_name("an element type name")?);
+        let kind = self.parse_edge_kind();
+        let synonym = self.parse_element_synonym(kind.is_some())?;
+        let name = match synonym {
+            Some(_) if self.at_element_type_name() => {
+                Some(self.expect_name("an element type name")?)
+            }
+            _ => None,
+        };
+        match synonym {
+            Some(node) if !self.at(&TokenKind::LParen) => {
+                self.parse_element_type_phrase(kind, node, name)
+            }
+            // ISO writes the name into the pattern's opening rather
+            // than beside it: a pattern that says the word NODE says
+            // which node type it is declaring. Only the phrase may
+            // leave the name out, the filler being enough to read.
+            Some(_) if name.is_none() => Err(self.error("an element type name")),
+            _ => self.parse_element_type_pattern(kind, name),
         }
+    }
+
+    /// `DIRECTED` or `UNDIRECTED`, the word an edge type may say its
+    /// direction with rather than draw it. Answers whether the word
+    /// written said the edges of the type have no direction.
+    fn parse_edge_kind(&mut self) -> Option<bool> {
+        if self.eat_kw("DIRECTED") {
+            return Some(false);
+        }
+        if self.eat_kw("UNDIRECTED") {
+            return Some(true);
+        }
+        None
+    }
+
+    /// `NODE`, `VERTEX`, `EDGE` or `RELATIONSHIP` and the `TYPE` ISO
+    /// makes optional after any of them. Answers whether the word was
+    /// one of the two that name a node, and `None` when none was
+    /// written, which a pattern allows and a phrase does not.
+    ///
+    /// A direction word in front commits the type to being an edge, so
+    /// the synonym is no longer the caller's to leave out.
+    fn parse_element_synonym(&mut self, directed: bool) -> Result<Option<bool>> {
+        let node = if self.eat_kw("NODE") || self.eat_kw("VERTEX") {
+            true
+        } else if self.eat_kw("EDGE") || self.eat_kw("RELATIONSHIP") {
+            false
+        } else if directed {
+            return Err(self.error("EDGE or RELATIONSHIP after a direction word"));
+        } else {
+            return Ok(None);
+        };
+        if node && directed {
+            return Err(self.error("an edge type after a direction word"));
+        }
+        self.eat_kw("TYPE");
+        Ok(Some(node))
+    }
+
+    /// Whether a name stands here. Every word that could open what
+    /// follows a name instead is reserved, so a plain word is a name
+    /// and a reserved one is the rest of the type.
+    fn at_element_type_name(&self) -> bool {
+        match self.peek() {
+            Some(Token {
+                kind: TokenKind::Ident(word),
+                ..
+            }) => !keywords::is_reserved(word),
+            Some(token) => matches!(
+                token.kind,
+                TokenKind::QuotedIdent(_) | TokenKind::Str(_) if self.double_quoted(token)
+            ),
+            None => false,
+        }
+    }
+
+    /// The pattern spelling: a node type pattern, and then an arc and a
+    /// second pattern when the element type is an edge.
+    fn parse_element_type_pattern(
+        &mut self,
+        kind: Option<bool>,
+        name: Option<String>,
+    ) -> Result<ElementTypeDef> {
         let mut def = self.parse_node_type_pattern()?;
         if !self.at(&TokenKind::Minus) && !self.at(&TokenKind::Lt) && !self.at(&TokenKind::Tilde) {
+            if kind.is_some() {
+                return Err(self.error("an arc, since a direction word says this is an edge type"));
+            }
             if def.name.is_none() {
                 def.name = name;
             }
@@ -1490,12 +1576,85 @@ impl Parser<'_> {
         if edge.name.is_none() {
             edge.name = name;
         }
+        self.agree(kind, undirected)?;
         edge.kind = ElementDefKind::Edge {
             from,
             to,
             undirected,
         };
         Ok(edge)
+    }
+
+    /// The phrase spelling (ISO 18.4): the same filler a pattern holds
+    /// with no parentheses round it, and for an edge the endpoints it
+    /// connects written after `CONNECTING`.
+    fn parse_element_type_phrase(
+        &mut self,
+        kind: Option<bool>,
+        node: bool,
+        name: Option<String>,
+    ) -> Result<ElementTypeDef> {
+        let mut def = self.parse_type_filler(node, name)?;
+        if node {
+            return Ok(def);
+        }
+        // ISO writes the direction word into the edge phrase rather
+        // than making it optional there, and this is why: `TO` is the
+        // connector of both a right pointing pair and an undirected
+        // one, so with no word in front there would be nothing to read
+        // the pair by.
+        let Some(kind) = kind else {
+            return Err(self.error("DIRECTED or UNDIRECTED in front of an edge type phrase"));
+        };
+        self.expect_kw("CONNECTING")?;
+        let (from, to, said) = self.parse_endpoint_pair()?;
+        self.agree(Some(kind), said.unwrap_or(kind))?;
+        def.kind = ElementDefKind::Edge {
+            from,
+            to,
+            undirected: kind,
+        };
+        Ok(def)
+    }
+
+    /// `(a TO b)` and the three other ways ISO 18.3 writes one pair of
+    /// endpoints. Answers them in source and destination order, and
+    /// whether the connector said the edge has no direction, which
+    /// `TO` does not say either way.
+    fn parse_endpoint_pair(&mut self) -> Result<(Endpoint, Endpoint, Option<bool>)> {
+        self.expect(&TokenKind::LParen)?;
+        let first = self.expect_name("a node type the edge connects")?;
+        let (reversed, said) = if self.eat_kw("TO") {
+            (false, None)
+        } else if self.eat(&TokenKind::Tilde) {
+            (false, Some(true))
+        } else if self.eat(&TokenKind::Minus) {
+            self.expect(&TokenKind::Gt)?;
+            (false, Some(false))
+        } else if self.eat(&TokenKind::Lt) {
+            self.expect(&TokenKind::Minus)?;
+            (true, Some(false))
+        } else {
+            return Err(self.error("TO, an arrow or a tilde between two node types"));
+        };
+        let second = self.expect_name("a node type the edge connects")?;
+        self.expect(&TokenKind::RParen)?;
+        let (from, to) = if reversed {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        Ok((Endpoint::Named(from), Endpoint::Named(to), said))
+    }
+
+    /// Refuses a type whose direction is written twice and differently.
+    fn agree(&self, kind: Option<bool>, undirected: bool) -> Result<()> {
+        match kind {
+            Some(kind) if kind != undirected => {
+                Err(self.error("an edge type that runs the way the word in front of it says"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// `(:Person => :Employee {name :: STRING})`: an alias, the labels
@@ -1527,16 +1686,22 @@ impl Parser<'_> {
             TokenKind::LBrace,
         ]
         .iter()
-        .any(|kind| self.at(kind));
+        .any(|kind| self.at(kind))
+            || !self.at_element_type_name();
         let name = if anonymous {
             None
         } else {
             Some(self.expect_name("an element type name")?)
         };
-        let mut first = Vec::new();
-        if self.eat(&TokenKind::Colon) {
-            first = self.parse_label_set()?;
-        }
+        self.parse_type_filler(node, name)
+    }
+
+    /// What a type says about itself: the labels an element of it
+    /// carries, which of them identify it, and what it declares. The
+    /// name is read by the caller, since a phrase and a pattern write
+    /// it in different places and the rest the same way.
+    fn parse_type_filler(&mut self, node: bool, name: Option<String>) -> Result<ElementTypeDef> {
+        let first = self.parse_label_phrase()?.unwrap_or_default();
         let mut key_labels = Vec::new();
         let mut labels = first;
         // `=>` is two tokens, the way `->` is: the lexer has no arrow.
@@ -1549,12 +1714,14 @@ impl Parser<'_> {
             self.pos += 2;
             key_labels = std::mem::take(&mut labels);
             self.check_key_labels(&key_labels, node)?;
-            self.expect(&TokenKind::Colon)?;
+            let Some(rest) = self.parse_label_phrase()? else {
+                return Err(self.error("the rest of the labels after the key label set"));
+            };
             // The key labels are labels an element carries too, and the
             // catalog keeps one set with the key marked inside it. They
             // go first because that is the order they were written in.
             labels = key_labels.clone();
-            for label in self.parse_label_set()? {
+            for label in rest {
                 if !labels.contains(&label) {
                     labels.push(label);
                 }
@@ -1596,6 +1763,21 @@ impl Parser<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// The labels of an element type, however they were opened (ISO
+    /// 18.4). A colon and `IS` are the punctuation and the word for one
+    /// thing, `LABELS` takes a set of them, and `LABEL` takes the one
+    /// label a type most often carries. `None` is nothing written,
+    /// which every part of an element type allows.
+    fn parse_label_phrase(&mut self) -> Result<Option<Vec<String>>> {
+        if self.eat(&TokenKind::Colon) || self.eat_kw("IS") || self.eat_kw("LABELS") {
+            return Ok(Some(self.parse_label_set()?));
+        }
+        if self.eat_kw("LABEL") {
+            return Ok(Some(vec![self.expect_name("a label")?]));
+        }
+        Ok(None)
     }
 
     /// `A&B&C` in an element type, which is a label set and not the
@@ -6900,6 +7082,85 @@ mod tests {
         );
     }
 
+    /// GG20. ISO 18.4 writes an element type twice over, once as the
+    /// pattern an element matches and once as a phrase, and the two
+    /// have to arrive at the same type.
+    #[test]
+    fn an_element_type_written_as_a_phrase_is_the_type_the_pattern_writes() {
+        let stmt = catalog_stmt(
+            "CREATE GRAPH TYPE social {
+               NODE TYPE PersonType LABEL Person {name :: STRING},
+               VERTEX OrgType LABELS Org & Employer,
+               NODE TYPE KeyedType LABEL Person => LABELS Person & Employee,
+               DIRECTED EDGE TYPE WorksAt LABEL WORKS CONNECTING (PersonType TO OrgType),
+               DIRECTED RELATIONSHIP TYPE Employs LABEL EMPLOYS
+                 CONNECTING (PersonType <- OrgType),
+               UNDIRECTED EDGE TYPE NearTo LABEL NEAR CONNECTING (PersonType ~ OrgType)
+             }",
+        );
+        let CatalogStmt::CreateGraphType {
+            source: GraphTypeSource::Elements(elements),
+            ..
+        } = stmt
+        else {
+            panic!("not a graph type written out");
+        };
+        assert_eq!(elements.len(), 6);
+        assert_eq!(elements[0].name.as_deref(), Some("PersonType"));
+        assert_eq!(elements[0].labels, ["Person"]);
+        assert_eq!(elements[0].properties.len(), 1);
+        // VERTEX is the other node synonym and TYPE is a word ISO lets
+        // the writer leave out.
+        assert_eq!(elements[1].name.as_deref(), Some("OrgType"));
+        assert_eq!(elements[1].labels, ["Org", "Employer"]);
+        // A key label set is written the same way in either spelling,
+        // so the arrow reads with words on both sides of it.
+        assert_eq!(elements[2].key_labels, ["Person"]);
+        assert_eq!(elements[2].labels, ["Person", "Employee"]);
+        // The endpoints of a phrase are always references, since a
+        // CONNECTING clause holds aliases and not patterns.
+        let ends = |def: &ElementTypeDef| match &def.kind {
+            ElementDefKind::Edge {
+                from,
+                to,
+                undirected,
+            } => (format!("{from:?} {to:?}"), *undirected),
+            other => panic!("not an edge: {other:?}"),
+        };
+        let (both, undirected) = ends(&elements[3]);
+        assert_eq!(both, r#"Named("PersonType") Named("OrgType")"#);
+        assert!(!undirected);
+        assert_eq!(elements[3].labels, ["WORKS"]);
+        // A left arrow names the destination first, so the endpoints
+        // come out in the order the type means rather than the order
+        // the page has them.
+        let (both, _) = ends(&elements[4]);
+        assert_eq!(both, r#"Named("OrgType") Named("PersonType")"#);
+        let (_, undirected) = ends(&elements[5]);
+        assert!(undirected, "a tilde connector is undirected");
+        // The direction word is what tells a right pointing pair from
+        // an undirected one when the connector is TO, so a phrase with
+        // no word in front has nothing to read the pair by, and a word
+        // that disagrees with the connector is two answers.
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { EDGE TYPE E LABEL R CONNECTING (a TO b) }")
+                .contains("DIRECTED or UNDIRECTED"),
+            "an edge type phrase says its direction in a word"
+        );
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { DIRECTED EDGE TYPE E LABEL R CONNECTING (a ~ b) }")
+                .contains("runs the way the word in front of it says")
+        );
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { UNDIRECTED EDGE TYPE E (a)-[:R]->(b) }")
+                .contains("runs the way the word in front of it says")
+        );
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { DIRECTED NODE TYPE N LABEL A }")
+                .contains("an edge type after a direction word")
+        );
+    }
+
     #[test]
     fn a_graph_type_may_be_taken_from_a_graph_or_dropped() {
         assert_eq!(
@@ -7113,7 +7374,11 @@ mod tests {
             "a schema is named by a path and not by a word"
         );
         assert!(catalog_err("CREATE GRAPH TYPE t { (: ) }").contains("expected a label"));
-        assert!(catalog_err("CREATE GRAPH TYPE t { NODE (:A) }").contains("expected TYPE"));
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { NODE (:A) }")
+                .contains("expected an element type name"),
+            "a pattern that says NODE says which node type it declares"
+        );
         assert!(
             catalog_err("CREATE GRAPH TYPE t { (:A)<-[:R]->(:B) }")
                 .contains("an arc with one arrowhead")

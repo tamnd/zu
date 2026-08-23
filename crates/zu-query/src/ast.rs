@@ -93,6 +93,10 @@ pub enum SessionStmt {
     /// session.
     SetTimeZone(i16),
     Reset(SessionReset),
+    /// `SESSION CLOSE`, ISO 7.3. Two words with nothing under them:
+    /// the session ends, and a statement sent after it is sent to a
+    /// session that is not there.
+    Close,
 }
 
 /// What a `SESSION RESET` puts back (ISO 7.2, GS04 through GS08 and
@@ -582,6 +586,43 @@ pub enum SchemaRef {
     /// A schema by its path, `AT /app`, which is absolute, and the
     /// root schema is written `/`.
     Path(String),
+    /// A relative catalog schema reference, ISO 4.3.2 and 17.1:
+    /// `../sibling` is one directory up and one down, and `.` is the
+    /// schema the session is in already. `up` is how many double
+    /// periods were written and `down` is the names behind them, so
+    /// the pair says where to start and where to walk rather than
+    /// naming a directory the catalog would have to hold.
+    Relative { up: usize, down: Vec<String> },
+}
+
+impl SchemaRef {
+    /// The catalog path this reference names, ISO 4.3.2.
+    ///
+    /// `session` is the schema the statement was sent in and `home` is
+    /// the one the session opened in. A relative reference is walked
+    /// from the session's own schema, which is what makes it relative,
+    /// and the answer is [`None`] where the walk climbs out of the
+    /// root: a directory above the root is a directory the catalog
+    /// cannot hold, so there is nothing to name.
+    pub fn resolve(&self, session: &str, home: &str) -> Option<String> {
+        let (up, down) = match self {
+            SchemaRef::Current => return Some(session.to_string()),
+            SchemaRef::Home => return Some(home.to_string()),
+            SchemaRef::Path(path) => return Some(path.clone()),
+            SchemaRef::Relative { up, down } => (*up, down),
+        };
+        let mut walked: Vec<&str> = session.split('/').filter(|s| !s.is_empty()).collect();
+        for _ in 0..up {
+            walked.pop()?;
+        }
+        for name in down {
+            walked.push(name);
+        }
+        Some(match walked.is_empty() {
+            true => "/".to_string(),
+            false => format!("/{}", walked.join("/")),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -872,22 +872,26 @@ impl Parser<'_> {
         Ok(stmt)
     }
 
-    /// `SESSION SET ...` and `SESSION RESET ...` (ISO 7.1 and 7.2, GS01
-    /// through GS16).
+    /// `SESSION SET ...`, `SESSION RESET ...` and `SESSION CLOSE` (ISO
+    /// 7.1 through 7.3, GS01 through GS16).
     ///
-    /// The whole family is one word followed by one of two verbs, so
+    /// The whole family is one word followed by one of three verbs, so
     /// there is nothing else `SESSION` can open and no lookahead is
     /// needed to know one is here. What comes after the verb is a small
     /// matrix rather than fifteen statements: three parameter kinds
     /// over two value sources, and the schema, the graph and the zone
-    /// beside them.
+    /// beside them. The close command is the one with nothing under it
+    /// at all.
     fn parse_session_stmt(&mut self) -> Result<SessionStmt> {
         self.expect_kw("SESSION")?;
         let stmt = if self.eat_kw("RESET") {
             SessionStmt::Reset(self.parse_session_reset()?)
-        } else {
-            self.expect_kw("SET")?;
+        } else if self.eat_kw("CLOSE") {
+            SessionStmt::Close
+        } else if self.eat_kw("SET") {
             self.parse_session_set()?
+        } else {
+            return Err(self.error("SET, RESET or CLOSE after SESSION"));
         };
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
@@ -928,6 +932,15 @@ impl Parser<'_> {
             }
             if self.eat_kw("HOME_SCHEMA") {
                 return Ok(SessionStmt::SetSchema(SchemaRef::Home));
+            }
+            // The third predefined reference is a period on its own,
+            // which names the schema the session is in already and so
+            // says what `CURRENT_SCHEMA` says in one character.
+            if self.eat(&TokenKind::Dot) {
+                return Ok(SessionStmt::SetSchema(SchemaRef::Current));
+            }
+            if self.at(&TokenKind::DotDot) {
+                return Ok(SessionStmt::SetSchema(self.parse_relative_schema(false)?));
             }
             return Ok(SessionStmt::SetSchema(SchemaRef::Path(
                 self.parse_schema_path()?,
@@ -1334,6 +1347,46 @@ impl Parser<'_> {
                 return Ok(path);
             }
         }
+    }
+
+    /// A relative catalog schema reference, ISO 4.3.2: a double period
+    /// for each directory to climb and the names to walk down into
+    /// after them, `../sibling` being the pair a schema writes to name
+    /// the one beside it without knowing where either of them sits.
+    ///
+    /// `heading` says whether the reference is being read at the head
+    /// of a query, where a segment that opens a clause was never a
+    /// segment and the path has to end in front of it. A session
+    /// statement has nothing behind the path, so it reads every name
+    /// it finds.
+    fn parse_relative_schema(&mut self, heading: bool) -> Result<SchemaRef> {
+        let mut up = 0;
+        let mut down: Vec<String> = Vec::new();
+        loop {
+            if !self.eat(&TokenKind::DotDot) {
+                return Err(self.error("a double period"));
+            }
+            up += 1;
+            if !self.eat(&TokenKind::Slash) {
+                return Ok(SchemaRef::Relative { up, down });
+            }
+            if !self.at(&TokenKind::DotDot) {
+                break;
+            }
+        }
+        // The double periods are all in front, the grammar giving a
+        // relative directory path no way to climb again once it has
+        // walked down, so what is left is the plain names.
+        while match heading {
+            true => self.at_path_segment(0),
+            false => self.at_name(),
+        } {
+            down.push(self.expect_name("a name in a path")?);
+            if !self.eat(&TokenKind::Slash) {
+                break;
+            }
+        }
+        Ok(SchemaRef::Relative { up, down })
     }
 
     /// Whether a name stands where the parser is, which is what tells
@@ -3173,6 +3226,15 @@ impl Parser<'_> {
         // `SCHEMA` before the path is the long spelling and says
         // nothing the path does not.
         self.eat_kw("SCHEMA");
+        // The other two spellings of a relative reference, ISO 4.3.2:
+        // a period is the schema the session is in and a double period
+        // climbs out of it.
+        if self.eat(&TokenKind::Dot) {
+            return Ok(Some(SchemaRef::Current));
+        }
+        if self.at(&TokenKind::DotDot) {
+            return Ok(Some(self.parse_relative_schema(true)?));
+        }
         Ok(Some(SchemaRef::Path(self.parse_head_schema_path()?)))
     }
 

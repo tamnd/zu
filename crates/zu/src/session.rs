@@ -1835,7 +1835,7 @@ impl Session {
         self.check_open()?;
         self.sync()?;
         self.check_refs(params)?;
-        if query::not_a_query(source)?.is_some() {
+        if self.categorised(source)?.is_some() {
             let result = self.run_in(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
         }
@@ -1948,7 +1948,13 @@ impl Session {
         self.check_open()?;
         self.sync()?;
         self.check_refs(params)?;
-        match query::not_a_query(source)? {
+        // Only when the cache has no plan for this text. Which of the
+        // five kinds a statement is, is a property of its text: the
+        // parse that decides it reads no catalog, no session and no
+        // parameters. So a text with a plan behind it parsed as a query
+        // once and parses as one every time, and asking again costs a
+        // full parse of the source on the warmest path there is. #655.
+        match self.categorised(source)? {
             Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
             // GS01 through GS16. It changes this session and answers no
             // rows, and it is not held in the plan cache: there is
@@ -2671,6 +2677,52 @@ impl Session {
     /// because that is the only text whose graph is not in it. Every
     /// other text is one lookup and nothing else, which is what the P0
     /// plan-hit gate times.
+    /// What this text is when it is not a query, skipping the parse
+    /// that decides it when the cache already holds a plan for it.
+    ///
+    /// A plan is only ever kept for a text that compiled, and only a
+    /// query compiles, so a hit is the answer: this text is a query and
+    /// [`query::not_a_query`] would say `None`. It is worth the lookup
+    /// because that call is a whole parse of the source and it sits in
+    /// front of the cache, so a client sending the same point read a
+    /// million times parses it a million times and throws every tree
+    /// away. It cost 2 us of a 5.5 us warm read. #655.
+    ///
+    /// A remembered refusal counts too, and raises the same condition
+    /// it raised the first time: the cache only ever sees a text this
+    /// call already let through, so a refusal in it is one the compiler
+    /// made on a text that parsed, and [`Session::plan_for`] hands the
+    /// same record straight back.
+    ///
+    /// A text that will not parse is remembered here for the same
+    /// reason a text that will not compile is remembered below: it will
+    /// not parse next time either, and a client repeating a malformed
+    /// statement was paying a parse a send to be told so again.
+    ///
+    /// A text keyed on the graph a `USE` parameter named is not looked
+    /// up here: it is keyed on more than the text, and this is the text
+    /// on its own.
+    fn categorised(&mut self, source: &str) -> Result<Option<NotAQuery>> {
+        if self.plans.contains_key(source) {
+            return Ok(None);
+        }
+        match query::not_a_query(source) {
+            // Nothing here for `declaring` to make: a text with no
+            // parse has no clauses, so it has no `INSERT` in it.
+            Err(ZuError::Gql(record)) => {
+                self.remember(
+                    source.to_string(),
+                    Compiled::Refused {
+                        record: record.clone(),
+                        declarable: false,
+                    },
+                );
+                Err(ZuError::Gql(record))
+            }
+            other => other,
+        }
+    }
+
     fn plan_for(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Arc<CachedPlan>> {
         if let Some(compiled) = self.plans.get(source) {
             return compiled.result();
@@ -3624,6 +3676,58 @@ mod tests {
         session.graph.file_mut().db_header_mut().epoch += 1;
         session.refresh().expect("refresh");
         assert!(session.plans.is_empty(), "the refusal went with the epoch");
+    }
+
+    #[test]
+    fn a_text_that_will_not_parse_is_held_and_refused_the_same_way() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("unparsed.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let bad = "MATCH (a:person)-[:follows]->( RETURN count(a) AS n";
+        let first = session.run(bad, &[]).expect_err("syntax");
+        assert_eq!(first.gqlstatus(), Some(codes::C42001));
+        assert_eq!(session.plans.len(), 1, "the refusal is held");
+        // It is the parse that decides this one, and the second send
+        // does not make it again. #655.
+        let second = session.run(bad, &[]).expect_err("still refused");
+        assert_eq!(second.to_string(), first.to_string());
+        assert_eq!(second.gqlstatus(), first.gqlstatus());
+
+        session.graph.file_mut().db_header_mut().epoch += 1;
+        session.refresh().expect("refresh");
+        assert!(session.plans.is_empty(), "the refusal went with the epoch");
+        let again = session.run(bad, &[]).expect_err("refused after the epoch");
+        assert_eq!(again.to_string(), first.to_string());
+    }
+
+    /// The point of #655: a text with a plan behind it is not parsed
+    /// again to find out that it is a query, and a statement that is
+    /// not a query still reaches the arm that runs it.
+    #[test]
+    fn a_planned_text_skips_the_parse_that_categorises_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("categorised.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let query = "MATCH (a:person) RETURN count(a) AS n";
+        session.run(query, &[]).expect("warm");
+        assert!(session.categorised(query).expect("a query").is_none());
+        assert!(session.plans.contains_key(query), "the plan is held");
+
+        // A session statement is not held, so it is categorised on
+        // every send and still lands on the arm that runs it.
+        let stmt = "SESSION SET SCHEMA /";
+        assert!(
+            matches!(
+                session.categorised(stmt).expect("not a query"),
+                Some(NotAQuery::Session(_))
+            ),
+            "a session statement is one every time"
+        );
+        assert!(!session.plans.contains_key(stmt), "and nothing is held");
     }
 
     #[test]

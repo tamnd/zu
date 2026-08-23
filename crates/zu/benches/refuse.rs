@@ -76,14 +76,18 @@ fn xorshift(rng: &mut u64) -> u64 {
 /// What the answer path costs on the machine the absolute ceiling was
 /// written for, in microseconds. A laptop M4 with its cores to itself.
 ///
-/// Three runs on an idle one read 5.54, 5.50 and 5.75, so the spread is
-/// four percent and [`ENFORCE_WITHIN`] covers it several times over.
-/// Take it on an idle machine or not at all: the same three runs during
-/// a background `cargo test` read 7.46.
+/// Three runs on an idle one read 3.71, 3.62 and 3.67, so the spread is
+/// two percent and [`ENFORCE_WITHIN`] covers it several times over.
+/// Take it on an idle machine or not at all: the same reading during a
+/// background `cargo test` was 7.46.
+///
+/// It was 5.50 until #655 took a parse off every send, which is worth
+/// saying here because the number moving is the engine getting faster
+/// and not the host changing.
 ///
 /// This is not a number to tune. It is a property of one host, and the
 /// only reason to change it is that the host has been replaced.
-const REFERENCE_ANSWER_US: f64 = 5.5;
+const REFERENCE_ANSWER_US: f64 = 3.67;
 
 /// How far past the reference a host may read and still be held to the
 /// written microsecond ceiling.

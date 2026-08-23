@@ -9,13 +9,39 @@
 //! much of a scan is the engine and how much is the harness, because
 //! they take different work to fix.
 //!
+//! Both engines are here rather than zu2 alone, because a number with
+//! nothing beside it settles nothing. #647 asks that a milestone claim
+//! quote the in process example and not the harness, and a claim of the
+//! form "10x sqlite" needs sqlite measured in the same process, on the
+//! same rows, from the same start keys, with the same work done to each
+//! row that comes back. That is what this does.
+//!
 //! The workload is YCSB E as `core/workload_e.go` runs it: a start key
 //! drawn uniformly over the key space and a length drawn uniformly from
-//! 1 to 100, over ten fields of a hundred bytes.
+//! 1 to 100, over ten fields of a hundred bytes. Every engine gets the
+//! same list of draws, generated once before any of them runs, so the
+//! comparison is not also a comparison of two random sequences.
+//!
+//! Neither side copies a row. zu2 hands the callback a borrow of the
+//! record and sqlite hands out a borrow of the column, and this counts
+//! the length of each without taking a copy of it. Asking rusqlite for a
+//! `Vec<u8>` instead would put an allocation and a memcpy a row on the
+//! sqlite side that zu2 does not pay, and it would be measuring a
+//! binding rather than an engine.
+//!
+//!     cargo run --release --example scanbench
+//!     RECORDS=1000000 SCANS=100000 cargo run --release --example scanbench
 
-use std::time::Instant;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use zu2::{Db, Durability, Options};
+
+/// The draw sequence. Fixed, so two runs of this example on the same
+/// host are comparable and so every engine within one run sees the same
+/// scans in the same order.
+const SEED: u64 = 0x2545_f491_4f6c_dd1d;
 
 fn key(i: u64) -> Vec<u8> {
     format!("user{i:012}").into_bytes()
@@ -44,19 +70,29 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn main() {
-    let records: u64 = std::env::var("RECORDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100_000);
-    let scans: u64 = std::env::var("SCANS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
+/// Every scan the run will do, as a start key index and a length.
+fn draws(scans: u64, records: u64) -> Vec<(u64, usize)> {
+    let mut state = SEED;
+    (0..scans)
+        .map(|_| {
+            let start = next(&mut state) % records;
+            let count = (next(&mut state) % 100 + 1) as usize;
+            (start, count)
+        })
+        .collect()
+}
 
-    let dir = tempfile::tempdir().expect("tempdir");
+/// What one engine did, in the two phases worth timing.
+struct Took {
+    load: Duration,
+    scan: Duration,
+    rows: u64,
+    bytes: u64,
+}
+
+fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)]) -> Took {
     let db = Db::create(
-        &dir.path().join("e.zu2"),
+        &dir.join("e.zu2"),
         Options {
             durability: Durability::Async,
             ordered: true,
@@ -72,43 +108,177 @@ fn main() {
     }
     let load = started.elapsed();
 
-    let mut state = 0x2545_f491_4f6c_dd1d;
     let mut rows = 0u64;
     let mut bytes = 0u64;
     let started = Instant::now();
-    for _ in 0..scans {
-        let start = key(next(&mut state) % records);
-        let count = (next(&mut state) % 100 + 1) as usize;
+    for &(start, count) in plan {
         rows += s
-            .scan(&start, count, |_, value| bytes += value.len() as u64)
+            .scan(&key(start), count, |_, value| bytes += value.len() as u64)
             .expect("scan") as u64;
     }
-    let took = started.elapsed();
+    let scan = started.elapsed();
 
-    println!();
+    Took {
+        load,
+        scan,
+        rows,
+        bytes,
+    }
+}
+
+/// sqlite at its fastest: write ahead log, nothing waiting for the
+/// device, a big page cache and the file mapped. The same settings the
+/// point bench loads at, which is the setting this comparison would be
+/// accused of leaving off if it ran anything slower.
+fn connect(path: &Path) -> Connection {
+    let conn = Connection::open(path).expect("open sqlite");
+    conn.execute_batch(
+        "PRAGMA busy_timeout=60000;
+         PRAGMA synchronous=OFF;
+         PRAGMA cache_size=-262144;
+         PRAGMA mmap_size=268435456;
+         PRAGMA temp_store=MEMORY;",
+    )
+    .expect("pragmas");
+    conn
+}
+
+/// One sqlite database of one table shape, loaded and then scanned.
+///
+/// The shape matters more here than it does on a point read. A rowid
+/// table keeps the key in an index and the row in a B tree of its own,
+/// so a range scan walks the index in key order and then goes to the
+/// table once a row. A `WITHOUT ROWID` table is the index, so the walk
+/// is the rows. Both are run and the faster one is the one zu2 is
+/// compared against.
+fn run_sqlite(dir: &Path, records: u64, plan: &[(u64, usize)], rowid: bool) -> Took {
+    let shape = if rowid { "rowid" } else { "norowid" };
+    let path = dir.join(format!("e-{shape}.db"));
+    let conn = connect(&path);
+    let suffix = if rowid { "" } else { " WITHOUT ROWID" };
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE usertable (ykey TEXT PRIMARY KEY, yvalue BLOB NOT NULL){suffix};"
+    ))
+    .expect("create table");
+
+    let started = Instant::now();
+    {
+        let mut stmt = conn
+            .prepare("INSERT OR REPLACE INTO usertable (ykey, yvalue) VALUES (?1, ?2)")
+            .expect("prepare insert");
+        for i in 0..records {
+            stmt.execute(rusqlite::params![key(i), value(i)])
+                .expect("insert");
+        }
+    }
+    let load = started.elapsed();
+
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    let started = Instant::now();
+    {
+        let mut stmt = conn
+            .prepare("SELECT yvalue FROM usertable WHERE ykey >= ?1 ORDER BY ykey LIMIT ?2")
+            .expect("prepare scan");
+        for &(start, count) in plan {
+            let mut got = stmt
+                .query(rusqlite::params![key(start), count as i64])
+                .expect("scan");
+            while let Some(row) = got.next().expect("row") {
+                let blob = row.get_ref(0).expect("column").as_blob().expect("blob");
+                bytes += blob.len() as u64;
+                rows += 1;
+            }
+        }
+    }
+    let scan = started.elapsed();
+
+    Took {
+        load,
+        scan,
+        rows,
+        bytes,
+    }
+}
+
+fn report(name: &str, records: u64, scans: u64, took: &Took) {
+    println!("{name}");
     println!(
-        "{records} records of {} bytes, ordered, async",
-        value(0).len()
+        "  load  {:.0} records a second",
+        records as f64 / took.load.as_secs_f64()
     );
     println!(
-        "load    {:.0} records a second",
-        records as f64 / load.as_secs_f64()
-    );
-    println!(
-        "scan    {:.0} scans a second, {:.0} rows a second, {:.1} rows a scan",
-        scans as f64 / took.as_secs_f64(),
-        rows as f64 / took.as_secs_f64(),
-        rows as f64 / scans as f64
+        "  scan  {:.0} scans a second, {:.0} rows a second, {:.1} rows a scan",
+        scans as f64 / took.scan.as_secs_f64(),
+        took.rows as f64 / took.scan.as_secs_f64(),
+        took.rows as f64 / scans as f64
     );
     println!(
         "        {:.0} ns a row, {:.0} MiB a second out of the engine",
-        took.as_nanos() as f64 / rows as f64,
-        bytes as f64 / took.as_secs_f64() / (1024.0 * 1024.0)
+        took.scan.as_nanos() as f64 / took.rows as f64,
+        took.bytes as f64 / took.scan.as_secs_f64() / (1024.0 * 1024.0)
     );
+}
+
+fn main() {
+    let records: u64 = std::env::var("RECORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let scans: u64 = std::env::var("SCANS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    let plan = draws(scans, records);
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let zu2 = run_zu2(dir.path(), records, &plan);
+    let rowid = run_sqlite(dir.path(), records, &plan, true);
+    let norowid = run_sqlite(dir.path(), records, &plan, false);
+
+    // A scan that hands back fewer rows than another engine handed back
+    // from the same draws is a faster scan for the wrong reason, and it
+    // has happened here before: an engine that returns nothing returns
+    // it very quickly (tamnd/zu#560). The rows are the same draws, so
+    // the counts have to agree.
+    assert_eq!(
+        zu2.rows, rowid.rows,
+        "zu2 and rowid sqlite disagree on rows"
+    );
+    assert_eq!(
+        rowid.rows, norowid.rows,
+        "the two sqlite shapes disagree on rows"
+    );
+
     println!();
     println!(
-        "A row here is a plane step, a hash, a chain walk and one copy \
-         into the callback's\nbuffer. Whatever the harness reports below \
-         this is the Go side and the C boundary."
+        "{records} records of {} bytes, {scans} scans, one thread, in process",
+        value(0).len()
+    );
+    println!();
+    report("zu2 async, ordered", records, scans, &zu2);
+    report("sqlite wal/off, rowid", records, scans, &rowid);
+    report("sqlite wal/off, without rowid", records, scans, &norowid);
+
+    let best = if norowid.scan < rowid.scan {
+        ("without rowid", &norowid)
+    } else {
+        ("rowid", &rowid)
+    };
+    println!();
+    println!(
+        "zu2 is {:.1}x the faster sqlite shape ({}) on scan throughput, \
+         {:.0} ns a row against {:.0}.",
+        best.1.scan.as_secs_f64() / zu2.scan.as_secs_f64(),
+        best.0,
+        zu2.scan.as_nanos() as f64 / zu2.rows as f64,
+        best.1.scan.as_nanos() as f64 / best.1.rows as f64,
+    );
+    println!(
+        "A row on the zu2 side is a plane step, a hash, a chain walk and a \
+         borrow of the\nrecord. Whatever go-ycsb reports for either engine \
+         below this is the Go side\nand, for zu2, the C boundary."
     );
 }

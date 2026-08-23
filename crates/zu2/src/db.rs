@@ -69,7 +69,35 @@ const SCAN_EPOCH_RUN: usize = 1024;
 /// can have outstanding, which is ten to twelve on the cores this runs
 /// on. Deeper also means more keys walked past the end of a short scan,
 /// which is work for nobody.
+///
+/// Measured at a million records scattered, which is past the point the
+/// working set leaves the last level cache and so is where the misses
+/// this hides are real: one is 589 and 539 ns a row over two rounds,
+/// four is 514, eight is 519, sixteen is 535 and thirty two is 563.
+/// Four and eight are a percent apart over eight interleaved rounds,
+/// which is not a difference, and either is 12 percent better than not
+/// running ahead at all. #665.
 const SCAN_LOOKAHEAD: usize = 8;
+
+/// Keys a [`Session::scan`] resolves an index entry for ahead of the
+/// record it is reading.
+///
+/// The third miss of a row is the record itself, and unlike the node and
+/// the bucket it cannot be taken at walk time, because the address is in
+/// the bucket and the bucket has not arrived yet. So the walk runs in
+/// two stages: [`SCAN_LOOKAHEAD`] rows out it hashes the key and starts
+/// the bucket, and this many rows out the bucket is in cache, so it
+/// probes it for the tag and starts the record.
+///
+/// Half the lookahead, which puts the bucket's own miss at four rows of
+/// work and leaves four more for the record's. The probe is a hint and
+/// takes the first entry whose tag matches rather than the entry whose
+/// key matches, because proving the key means reading the record, which
+/// is the miss being hidden. A fourteen bit tag makes that the right
+/// record all but one time in sixteen thousand, and the other times it
+/// warms a line the read does not want and the read takes its miss as
+/// before.
+const SCAN_HINT_AHEAD: usize = SCAN_LOOKAHEAD / 2;
 
 /// The record a split has settled on for one key.
 #[derive(Clone, Copy)]
@@ -2227,6 +2255,35 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Starts the load of the record a key hashing to `hash` most likely
+    /// lives in, and does not wait for it. See [`SCAN_HINT_AHEAD`].
+    ///
+    /// Everything here is a hint, so everything here gives up rather
+    /// than works: the live table without draining a migration, the
+    /// first tag match rather than the key, and nothing at all for a
+    /// record in the cold tier or one the page table has evicted, since
+    /// those are a read of the device and not a line.
+    fn hint_record(&self, hash: u64) {
+        let tag = Index::tag(hash);
+        for slot in &self.core.index.live().bucket(hash).slots {
+            let entry = slot.load(Ordering::Relaxed);
+            if entry == index::EMPTY || index::is_tentative(entry) || index::tag_of(entry) != tag {
+                continue;
+            }
+            let address = index::address_of(entry);
+            if cold::is_cold(address) {
+                return;
+            }
+            let at = self.core.log.resident(address);
+            if !at.is_null() {
+                // SAFETY: a resident log page, held down by the epoch
+                // protection this scan is inside.
+                unsafe { index::prefetch_line(at) };
+            }
+            return;
+        }
+    }
+
     /// Reads the newest value for `key` into `out`.
     pub fn read(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool> {
         let hash = index::hash(key);
@@ -2357,6 +2414,9 @@ impl<'a> Session<'a> {
             let mut ahead: [(&[u8], u64); SCAN_LOOKAHEAD] = [(&[][..], 0); SCAN_LOOKAHEAD];
             let mut held = 0usize;
             let mut out = 0usize;
+            // How many of those have had their record started as well.
+            // See [`SCAN_HINT_AHEAD`].
+            let mut hinted = 0usize;
             while done < count {
                 // Run the walk forward until the lookahead is full,
                 // hashing each key and starting the load of the bucket
@@ -2376,9 +2436,18 @@ impl<'a> Session<'a> {
                 if held == 0 {
                     break;
                 }
+                // The buckets of the rows nearest the front have been on
+                // their way for several rows now, so probe them for the
+                // address and start the record too.
+                while hinted < SCAN_HINT_AHEAD.min(held) {
+                    let (_, hash) = ahead[(out + hinted) % SCAN_LOOKAHEAD];
+                    self.hint_record(hash);
+                    hinted += 1;
+                }
                 let (key, hash) = ahead[out];
                 out = (out + 1) % SCAN_LOOKAHEAD;
                 held -= 1;
+                hinted = hinted.saturating_sub(1);
                 walked += 1;
                 if walked.is_multiple_of(SCAN_EPOCH_RUN) {
                     self.slot.unprotect();

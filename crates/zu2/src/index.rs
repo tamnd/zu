@@ -136,6 +136,42 @@ pub const fn tentative(tag: u64) -> u64 {
     TENTATIVE | (tag & TAG_MASK) << TAG_SHIFT
 }
 
+/// Starts the load of the cacheline `at` lies on, and does not wait for
+/// it.
+///
+/// This is a hint and nothing else. Nothing reads what it warms, so
+/// there is nothing here to be stale and nothing to get wrong: the worst
+/// a caller can do is warm a line it turns out not to want, which costs
+/// the bandwidth of one line. `at` has to point at memory this process
+/// owns, which on the read paths means a live bucket or a resident log
+/// page and never an address the page table answered null for.
+///
+/// # Safety
+///
+/// On x86_64 the instruction faults on nothing and this is safe for any
+/// pointer at all. Everywhere else the line is warmed by reading a byte
+/// of it, so `at` has to be a byte this process may read.
+#[inline]
+pub unsafe fn prefetch_line(at: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `_mm_prefetch` reads nothing and faults on nothing.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(at.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: the caller owns the line, so this is a read of initialised
+    // memory that other threads are allowed to be writing. It is
+    // volatile so it is not optimised away and nothing depends on what
+    // it loads, which is what makes it a prefetch: the miss starts here
+    // and the stall, if there is one, lands wherever the processor
+    // decides rather than here. A byte, because a record base is not
+    // promised to be aligned for anything wider and the line is the
+    // same line either way.
+    unsafe {
+        std::ptr::read_volatile(at);
+    }
+}
+
 /// One cacheline of entries.
 #[repr(align(64))]
 pub struct Bucket {
@@ -454,23 +490,8 @@ impl Index {
     /// Nothing reads the value, so there is nothing here to be stale.
     #[inline]
     pub fn prefetch(&self, hash: u64) {
-        let at = std::ptr::from_ref(self.live().bucket(hash));
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `_mm_prefetch` reads nothing and faults on nothing,
-        // and the pointer is a live bucket in any case.
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(at.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        // SAFETY: the pointer is a live bucket, so the read is a read of
-        // an initialised `AtomicU64` that other threads are allowed to
-        // be writing. It is volatile so it is not optimised away and
-        // nothing depends on what it loads, which is what makes it a
-        // prefetch: the miss starts here and the stall, if there is one,
-        // lands wherever the processor decides rather than here.
-        unsafe {
-            std::ptr::read_volatile(at.cast::<u64>());
-        }
+        // SAFETY: a live bucket, which this process owns and may read.
+        unsafe { prefetch_line(std::ptr::from_ref(self.live().bucket(hash)).cast()) };
     }
 
     /// The doubling in progress, if there is one. Read after

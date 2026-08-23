@@ -151,165 +151,120 @@ const SAMPLE: u64 = 25;
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
-/// How large a region [`calibrate`] writes into, in bytes.
+/// How many rows the store [`calibrate`] reads holds.
 ///
-/// Past every level of cache but the last, so the round pays for the
-/// memory system and not only for the core, without going so far past it
-/// that all it measures is the DIMM. See the note on [`calibrate`] for
-/// the readings that picked this.
-const CALIBRATION_TABLE: usize = 4 << 20;
+/// The same [`SMALL`] the write runs use, so the proxy walks a store the
+/// size of the one the gated window walks.
+const CALIBRATION_ROWS: u64 = SMALL;
 
-/// How many distinct keys [`calibrate`] keeps in its map.
-///
-/// A million, so the map is tens of megabytes and a lookup misses cache
-/// and mispredicts, which is what an index in a store does. Sixty four
-/// of them sit in L1 and every probe is a hit, which is not.
-const CALIBRATION_KEYS: usize = 1 << 20;
+/// How many reads one round of [`calibrate`] makes.
+const CALIBRATION_ROUNDS: u64 = 2000;
 
 /// What one round of [`calibrate`] costs on the machine the target was
-/// written for, in nanoseconds. A laptop M4 with its cores to itself.
+/// written for, in microseconds. A laptop M4 with its cores to itself.
 ///
-/// Three consecutive runs on that host read 598, 710 and 705, so the
-/// middle one is the figure and the spread is about ten percent, which
-/// the floor of the clamp absorbs: a host at or under the reference
-/// reads the target exactly and never anything tighter.
+/// Three consecutive runs on an idle one read 13.7, 13.9 and 14.0, so
+/// the middle one is the figure and the spread is two percent, which the
+/// floor of the clamp absorbs: a host at or under the reference reads
+/// the target exactly and never anything tighter. The same three runs
+/// read 22.4, 22.2 and 22.3 on the gated number, so both ends of the
+/// ratio are steady on a quiet box.
+///
+/// Take it on an idle machine or not at all. A stray `cargo test` in the
+/// background moved the read to 21.2 us and the write to 36.2, and one
+/// run under ten concurrent rustc read 4122 us a statement.
 ///
 /// This is not a number to tune. It is a property of one host, and the
 /// only reason to change it is that the host it was taken on has been
 /// replaced.
-const CALIBRATION_REFERENCE_NS: f64 = 705.0;
+const CALIBRATION_REFERENCE_US: f64 = 13.9;
 
 /// The most the host calibration is allowed to relax the write ceiling.
 ///
-/// A hosted runner reads about two and a half times the reference and a
-/// bad minute on one reads more, so three leaves room for the bad
-/// minute. Past that the box is not slow, it is broken or it is
-/// swapping, and a gate that keeps stretching for it stops being a gate.
-const CALIBRATION_CAP: f64 = 3.0;
+/// A hosted runner reads about three times the reference and a bad
+/// minute on one reads more, so four leaves room for the bad minute.
+/// Past that the box is not slow, it is broken or it is swapping, and a
+/// gate that keeps stretching for it stops being a gate.
+const CALIBRATION_CAP: f64 = 4.0;
 
-fn xorshift(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
-/// How fast this host is on a loop shaped like the work the write gate
-/// measures, in nanoseconds a round.
+/// How fast this host is on the read path, in microseconds a statement.
 ///
 /// The write ceiling below is a product target and not a number fitted
 /// to a box, so it cannot simply be raised until the runners pass. The
 /// alternative used to be a second ceiling written for the shared runner
 /// class, which drifted out of date without anyone noticing and had to
-/// be refitted twice, and that is what #648 asked to remove.
+/// be refitted twice, and that is what #648 asked to remove. So instead:
+/// measure the host on something, divide by what that something costs on
+/// the box the target was written for, and scale the ceiling by the
+/// ratio. A box twice as slow gets twice the ceiling and there is no per
+/// box class key to keep current.
 ///
-/// This is what `refuse.rs` does instead: measure the host on a proxy,
-/// divide by what the proxy costs on the box the target was written
-/// for, and scale the ceiling by the ratio. A box twice as slow gets
-/// twice the ceiling and nothing else changes, so there is no per box
-/// class key to keep current.
+/// The whole difficulty is what to measure. Five synthetic loops were
+/// tried first, and here is what each read against the write path on the
+/// same run, laptop against hosted runner:
 ///
-/// The proxy has to be shaped like the write path or the ratio means
-/// nothing, and a write statement is four things: it formats a key and a
-/// value, it copies both into a table at an address it did not choose,
-/// it puts an entry in a map, and it appends the result to a file. So
-/// that is the round. No sync, because the metric this scales is the
-/// unsynced one and the sync cost is reported separately.
-///
-/// The size of the table is the whole question, and it took four drafts
-/// to settle, so here is what each one read against the write path on
-/// the same run, laptop against hosted runner:
-///
-/// | draft | proxy | write path |
+/// | loop | proxy | write path |
 /// |---|---|---|
 /// | a few hundred bytes of buffer | 1.17x | 2.19x |
-/// | 64 MiB table | 1.14x | 3.24x |
-/// | 4 MiB table | 2.02x | 3.24x |
+/// | 4 MiB table, 64 keys | 1.78x | 3.05x |
+/// | 64 MiB table, 64 keys | 0.89x | 3.05x |
+/// | 64 KiB table, a million keys | 1.15x | 3.05x |
+/// | 4 MiB table, a million keys | 1.23x | 3.05x |
 /// | 4 MiB table and an unsynced append, on processor time | 0.33x | 2.10x |
 ///
-/// A proxy that only measures how fast the core retires instructions
-/// cannot stand in for a path that walks a store, so the first is out. A
-/// table sized past the last level cache overshoots the other way: the
-/// laptop has a very fast core and ordinary memory, so at 64 MiB its own
-/// advantage washes out and the ratio collapses. A few megabytes reads
-/// the difference between the two boxes rather than the difference
-/// between a cache and a DIMM.
+/// None of them reaches two. A loop small enough to sit in cache only
+/// measures how fast the core retires instructions; one sized past the
+/// last level cache measures the DIMM, and the laptop's advantage is in
+/// the core rather than in its memory, so that ratio collapses or
+/// inverts. The append was worse still, because on processor time a
+/// Linux kernel absorbs an unsynced write far more cheaply than a Darwin
+/// one and the proxy read the difference between two kernels.
 ///
-/// The append was the obvious thing to try next, since the ceiling this
-/// scales is the cost of a write that is not synced, and it was wrong:
-/// on processor time a Linux runner absorbed the appends at 2711 ns a
-/// round against the laptop's 8260, so the proxy read the difference
-/// between two kernels instead of the difference between two boxes. The
-/// file is out and the ratio is taken on wall clock, which is what the
-/// four other calibrated numbers in this file are taken on.
-fn calibrate(table: usize, keys: usize) -> f64 {
-    const ROUNDS: usize = 20_000;
-    const VALUE: usize = 256;
-    const STRIDE: usize = 4096;
-    let mut rng = 0x2064u64;
-    let mut sink = 0usize;
-    let mut region: Vec<u8> = vec![0; table];
-    // Touch every page before anything is timed. A fresh mapping faults
-    // in on first write, and at this size the random walk would still be
-    // meeting untouched pages well into the timed loop, which is how the
-    // first draft of this read 1284, 746 and 687 ns on three consecutive
-    // runs of the same host. What is wanted is the steady state cost of
-    // a write that misses cache, not the one time cost of the mapping.
-    for page in region.chunks_mut(STRIDE) {
-        page[0] = 1;
+/// What is actually three times slower on the runner is zu's own code,
+/// which is branchy, allocates, and has an instruction footprint no
+/// twenty line loop has. So the proxy is zu's own code: the same
+/// `MATCH ... WHERE` the gated statement makes, without the `SET` on the
+/// end of it. It runs the same planner, the same scan and the same
+/// storage, and it is not the path the ceiling gates, so a write that
+/// got slower cannot relax its own ceiling by making this slower too.
+///
+/// A read that got slower would relax it, which is the one thing this
+/// gives up. That is a trade worth making: the read path has ceilings of
+/// its own in `read.rs`, so a regression there is caught there, and it
+/// is caught before this ever runs.
+fn calibrate() -> f64 {
+    let db = Database::memory_with(Config::new().threads(1)).expect("memory");
+    let mut conn = db.connect().expect("connect");
+    seed(
+        conn.session_mut().file_mut().expect("the store"),
+        CALIBRATION_ROWS,
+        &ring(CALIBRATION_ROWS),
+    );
+    let read = |conn: &mut zu::Connection, age: u64| {
+        one(
+            conn,
+            &format!("MATCH (p:person) WHERE p.age = {age} RETURN count(p) AS n"),
+        )
+    };
+    let mut age = 0;
+    for _ in 0..CALIBRATION_ROUNDS / 10 {
+        read(&mut conn, age % CALIBRATION_ROWS);
+        age += 1;
     }
-    let slots = (table / STRIDE).max(1) as u64;
-    // How many distinct keys are live in the map. A handful of them fit
-    // in L1 and every lookup is a hit and a predicted branch, which is
-    // not what a store's index does. A million of them is a hash table
-    // several tens of megabytes wide where the probe misses and the
-    // branch is a coin toss, which is.
-    let keys = keys as u64;
-    let mut seen: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::with_capacity(keys as usize);
-    let mut round =
-        |rng: &mut u64, sink: &mut usize, seen: &mut std::collections::HashMap<u64, usize>| {
-            for _ in 0..4 {
-                let k = xorshift(rng) % keys;
-                let key = format!("person:{k:012}");
-                // A page the round did not choose, which is the part a
-                // small buffer cannot imitate: the store decides where the
-                // row goes and the writer follows it there.
-                let at = (xorshift(rng) % slots) as usize * STRIDE;
-                let n = key.len();
-                region[at..at + n].copy_from_slice(key.as_bytes());
-                region[at + n..at + n + VALUE].fill(b'v');
-                *sink += region[at] as usize;
-                let m = seen.len();
-                seen.insert(k, m);
-            }
-            // A fold reads back what it just wrote, so the round does too.
-            for _ in 0..4 {
-                let k = xorshift(rng) % keys;
-                *sink += seen.get(&k).copied().unwrap_or(0);
-            }
-            if seen.len() as u64 > keys {
-                seen.clear();
-            }
-        };
-    for _ in 0..ROUNDS / 10 {
-        round(&mut rng, &mut sink, &mut seen);
-    }
-    // Best of a few, the same way the write measurements below take the
-    // best of PASSES: on a shared box a single pass reads whatever else
-    // was on the core at the time, and the cheapest pass is the one that
-    // got the fewest of those.
-    let mut ns = f64::MAX;
+    // Best of a few, the same way every measurement below is taken: on a
+    // shared box a single pass reads whatever else was on the core at
+    // the time, and the cheapest pass is the one that got the fewest of
+    // those.
+    let mut us = f64::MAX;
     for _ in 0..PASSES {
         let start = Instant::now();
-        for _ in 0..ROUNDS {
-            round(&mut rng, &mut sink, &mut seen);
+        for _ in 0..CALIBRATION_ROUNDS {
+            read(&mut conn, age % CALIBRATION_ROWS);
+            age += 1;
         }
-        ns = ns.min(start.elapsed().as_nanos() as f64 / ROUNDS as f64);
+        us = us.min(start.elapsed().as_nanos() as f64 / 1e3 / CALIBRATION_ROUNDS as f64);
     }
-    std::hint::black_box(sink);
-    std::hint::black_box(&region);
-    ns
+    us
 }
 
 fn budget(key: &str) -> Option<f64> {
@@ -1602,29 +1557,12 @@ fn main() {
     // read at what the target says on the reference host and at the
     // ratio above it on a slower one. See #648 for what this replaced.
     let root = tempfile::tempdir().expect("tempdir");
-    let cal_ns = calibrate(CALIBRATION_TABLE, CALIBRATION_KEYS);
-    // The other shapes, printed and not used, so a run on a host where
-    // the scaled ceiling looks wrong says in its own log which of them
-    // tracked the write path and which did not. Remove them once enough
-    // hosts have reported for the choice to be settled.
-    for (table, keys) in [
-        (4 << 20, 64),
-        (64 << 20, 64),
-        (64 << 10, 1 << 20),
-        (64 << 20, 1 << 20),
-    ] {
-        println!(
-            "host calibration probe: {} KiB table, {} keys, {:.0} ns per round",
-            table / 1024,
-            keys,
-            calibrate(table, keys)
-        );
-    }
-    let raw = cal_ns / CALIBRATION_REFERENCE_NS;
+    let cal_us = calibrate();
+    let raw = cal_us / CALIBRATION_REFERENCE_US;
     let scale = raw.clamp(1.0, CALIBRATION_CAP);
     println!(
-        "host calibration: {cal_ns:.0} ns per round, {raw:.2}x the reference \
-         {CALIBRATION_REFERENCE_NS:.0} ns"
+        "host calibration: {cal_us:.1} us a read, {raw:.2}x the reference \
+         {CALIBRATION_REFERENCE_US:.1} us"
     );
     if raw > scale {
         println!(

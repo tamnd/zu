@@ -448,6 +448,7 @@ mod tests {
     use super::*;
     use crate::zu1::catalog::KeyLabels;
     use crate::zu1::graph;
+    use zu_common::types::{DurationKind, IntBits, LogicalType};
     use zu_query::ast::Statement;
     use zu_query::parser::parse_statement;
 
@@ -487,6 +488,77 @@ mod tests {
         // set is the whole label set rather than absent.
         let person = catalog.label_id("Person").expect("Person");
         assert_eq!(ty.elements[0].key_labels, KeyLabels::Inferred(vec![person]));
+    }
+
+    /// GG23. A declared property type is written to the file and read
+    /// back, so the ones a column cannot hold have to survive the trip
+    /// as well: naming a type is not the same promise as storing a
+    /// value of one. The spellings here are the ones ISO 18.7 writes
+    /// and a column code has no room for, a length bound and an instant
+    /// that carries a zone, beside the verbose integer names and the
+    /// duration qualifier, which are the same types under other words.
+    #[test]
+    fn a_declared_property_type_survives_the_file_whatever_it_names() {
+        let catalog = applied(&["CREATE PROPERTY GRAPH TYPE gg23 {
+               (:Bounded {a :: STRING(1,5), b :: CHAR(3), c :: VARCHAR(10)}),
+               (:Instants {a :: ZONED DATETIME, b :: ZONED TIME}),
+               (:Verbose {a :: INTEGER8, b :: SMALL INTEGER, c :: BIG INTEGER,
+                          d :: UNSIGNED INTEGER32}),
+               (:Spans {a :: DURATION(YEAR TO MONTH), b :: DURATION(DAY TO SECOND)})
+             }"]);
+        let ty = catalog.graph_type("gg23").expect("gg23");
+        let declared = |element: &str, prop: &str| {
+            ty.element(element)
+                .expect(element)
+                .properties
+                .iter()
+                .find(|p| p.name == prop)
+                .map(|p| p.ty.clone())
+                .expect(prop)
+        };
+        assert_eq!(
+            declared("Bounded", "a"),
+            LogicalType::Str {
+                min: Some(1),
+                max: Some(5),
+                fixed: false
+            }
+        );
+        assert_eq!(
+            declared("Bounded", "b"),
+            LogicalType::Str {
+                min: Some(3),
+                max: Some(3),
+                fixed: true
+            }
+        );
+        assert_eq!(
+            declared("Bounded", "c"),
+            LogicalType::Str {
+                min: None,
+                max: Some(10),
+                fixed: false
+            }
+        );
+        assert_eq!(declared("Instants", "a"), LogicalType::ZonedDatetime);
+        assert_eq!(declared("Instants", "b"), LogicalType::ZonedTime);
+        let int = |signed, bits| LogicalType::Int {
+            signed,
+            bits,
+            precision: None,
+        };
+        assert_eq!(declared("Verbose", "a"), int(true, IntBits::B8));
+        assert_eq!(declared("Verbose", "b"), int(true, IntBits::B16));
+        assert_eq!(declared("Verbose", "c"), int(true, IntBits::B64));
+        assert_eq!(declared("Verbose", "d"), int(false, IntBits::B32));
+        assert_eq!(
+            declared("Spans", "a"),
+            LogicalType::Duration(DurationKind::YearMonth)
+        );
+        assert_eq!(
+            declared("Spans", "b"),
+            LogicalType::Duration(DurationKind::DayTime)
+        );
     }
 
     #[test]

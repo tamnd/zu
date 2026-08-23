@@ -73,6 +73,20 @@ static NAMES: &[(&str, Family)] = &[
     ("UINT", int(false, IntBits::B32)),
     ("BIGINT", int(true, IntBits::B64)),
     ("UBIGINT", int(false, IntBits::B64)),
+    // The verbose spellings of the same tower, ISO 18.7. `INTEGER32`
+    // and `INT32` are one type under two names, and `SMALL INTEGER`
+    // and `BIG INTEGER` are the two the standard writes as a pair of
+    // words. `SIGNED` and `UNSIGNED` in front of any of them is read
+    // by the parser rather than listed here, there being no third
+    // tower for the pair to make.
+    ("INTEGER8", int(true, IntBits::B8)),
+    ("INTEGER16", int(true, IntBits::B16)),
+    ("INTEGER32", int(true, IntBits::B32)),
+    ("INTEGER64", int(true, IntBits::B64)),
+    ("INTEGER128", int(true, IntBits::B128)),
+    ("INTEGER256", int(true, IntBits::B256)),
+    ("SMALL INTEGER", int(true, IntBits::B16)),
+    ("BIG INTEGER", int(true, IntBits::B64)),
     ("DECIMAL", Family::Decimal),
     ("DEC", Family::Decimal),
     ("NUMERIC", Family::Decimal),
@@ -268,6 +282,20 @@ mod tests {
         assert_eq!(t("double"), t("FLOAT64"));
         assert_eq!(t("double precision"), t("FLOAT64"));
         assert_eq!(t("nosuchtype"), None);
+    }
+
+    /// ISO 18.7 writes each width a second time in full, and the long
+    /// name and the short one are the same type.
+    #[test]
+    fn the_verbose_spellings_are_the_widths_they_spell_out() {
+        assert_eq!(t("INTEGER8"), t("INT8"));
+        assert_eq!(t("integer16"), t("INT16"));
+        assert_eq!(t("INTEGER32"), t("INT32"));
+        assert_eq!(t("INTEGER64"), t("INT64"));
+        assert_eq!(t("INTEGER128"), t("INT128"));
+        assert_eq!(t("INTEGER256"), t("INT256"));
+        assert_eq!(t("small integer"), t("SMALLINT"));
+        assert_eq!(t("BIG INTEGER"), t("BIGINT"));
     }
 
     /// The declared digit count is not the width. Nine digits fit in 32

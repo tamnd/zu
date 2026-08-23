@@ -802,6 +802,14 @@ fn fields(text: &str) -> Option<Vec<(&str, char)>> {
         if ch.is_ascii_digit() || ch == '.' || ch == ',' {
             continue;
         }
+        // ISO 21.2 writes every field of a duration string as an
+        // `<iso8601 sint>`, a sign and then digits, so a sign at the
+        // head of a field opens it rather than ending the one before:
+        // `P-1D` is minus a day and there is no form with the sign in
+        // front of the `P`.
+        if (ch == '-' || ch == '+') && ix == start {
+            continue;
+        }
         if ix == start {
             return None;
         }
@@ -824,7 +832,14 @@ fn whole(text: &str) -> Option<i64> {
 /// `PT0.5S` is half a second and half a second is nanoseconds.
 fn scaled(text: &str, unit: i64) -> Option<i64> {
     let text = text.replace(',', ".");
-    match text.split_once('.') {
+    // The sign comes off in front, because the fraction carries it as
+    // well: minus half a second is half a second the other way and not
+    // minus one plus a positive half.
+    let (sign, text) = match text.strip_prefix('-') {
+        Some(rest) => (-1, rest.to_string()),
+        None => (1, text.strip_prefix('+').unwrap_or(&text).to_string()),
+    };
+    let size = match text.split_once('.') {
         None => text.parse::<i64>().ok()?.checked_mul(unit),
         Some((whole, frac)) => {
             if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
@@ -840,7 +855,8 @@ fn scaled(text: &str, unit: i64) -> Option<i64> {
             let part = unit.checked_mul(numerator)? / 10i64.pow(digits);
             whole.checked_mul(unit)?.checked_add(part)
         }
-    }
+    };
+    size?.checked_mul(sign)
 }
 
 /// Days in `month` of `year`, which is where the leap rule lives.
@@ -1213,6 +1229,35 @@ mod tests {
         // exist to prevent.
         assert!(Temporal::parse(&LogicalType::Duration(DurationKind::DayTime), "P1M1D").is_none());
         assert!(Temporal::parse(&LogicalType::Duration(DurationKind::DayTime), "P").is_none());
+    }
+
+    /// ISO 21.2 writes each field of a duration string as an
+    /// `<iso8601 sint>`, so the minus belongs to the field and there is
+    /// no form with one in front of the `P`.
+    #[test]
+    fn a_field_of_a_duration_carries_its_own_sign() {
+        assert_eq!(
+            duration("P-1D"),
+            Temporal::Duration(DurationKind::DayTime, -NANOS_PER_DAY)
+        );
+        assert_eq!(
+            duration("P-1Y-2M"),
+            Temporal::Duration(DurationKind::YearMonth, -14)
+        );
+        assert_eq!(
+            duration("PT-0.5S"),
+            Temporal::Duration(DurationKind::DayTime, -NANOS_PER_SEC / 2)
+        );
+        // Two signs of opposite kinds is a sum like any other: nine
+        // hours less than a day.
+        assert_eq!(
+            duration("P1DT-3H"),
+            Temporal::Duration(DurationKind::DayTime, NANOS_PER_DAY - 3 * NANOS_PER_HOUR)
+        );
+        // A sign with nothing behind it is not a field, and the sign
+        // in front of the P was never a spelling of anything.
+        assert!(Temporal::parse(&LogicalType::Duration(DurationKind::DayTime), "P-D").is_none());
+        assert!(Temporal::parse(&LogicalType::Duration(DurationKind::DayTime), "P1-D").is_none());
     }
 
     #[test]

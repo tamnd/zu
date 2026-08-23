@@ -82,6 +82,46 @@ cases:
           - type: STRING
             value: unmatched
 
+  - name: a-branch-may-list-several-operands
+    doc: ISO 20.7 writes a when clause of the simple form as a when operand list, so a branch may name several values and holds when the subject equals any of them. An engine that reads one operand per branch refuses this outright, and one that reads the list as a value refuses it in the binder instead.
+    query: RETURN CASE 2 WHEN 1, 2, 3 THEN 'in' ELSE 'out' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: in
+
+  - name: an-operand-may-be-a-comparison-with-the-subject
+    doc: The second part of a when operand is a comparison written without its left side, the subject standing in for what was left out, so a branch may ask an ordering rather than an equality. This is the one place the simple form tests rather than compares, and it is the standard that says so.
+    query: RETURN CASE 3 WHEN > 2 THEN 'above' ELSE 'below' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: above
+
+  - name: an-operand-may-be-a-null-predicate
+    doc: The same abbreviation over the null predicate rather than over a comparison, which is the case a simple form cannot otherwise write at all: an equality against null is unknown, so a subject that is null is only reachable by a branch that tests it.
+    query: RETURN CASE null WHEN IS NULL THEN 'none' ELSE 'some' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: none
+
+  - name: a-list-and-a-comparison-are-still-asked-in-order
+    doc: A branch that abbreviates and a branch that lists stand in one expression, and the first that holds is the answer, so nothing about the abbreviations changes the order the branches are asked in.
+    query: RETURN CASE 3 WHEN 1, 2 THEN 'a' WHEN > 2 THEN 'b' ELSE 'c' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: b
+
   - name: only-the-branch-that-holds-is-evaluated
     doc: The division in the branch nobody reached is never done, which is the property that lets a case guard an expression the other rows cannot answer. A client evaluating every branch and choosing afterwards raises here instead of answering.
     query: RETURN CASE WHEN false THEN 1 / 0 ELSE 7 END AS n

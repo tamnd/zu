@@ -1245,7 +1245,7 @@ cases:
 
   - name: a-stored-string-is-asked-which-form-it-is-in
     doc: The predicate of ISO 19.7 over a column. Three of the four tags hold nothing that composes, so they are in the decomposed form as they stand; the fourth holds the composed accent and is not. The rows are named rather than counted so a client that answers the predicate backwards cannot pass on the count.
-    query: MATCH (n:person) WHERE n.tag IS NORMALIZED NFD RETURN n.name AS m ORDER BY m
+    query: MATCH (n:person) WHERE n.tag IS NFD NORMALIZED RETURN n.name AS m ORDER BY m
     columns:
       - m
     rows:
@@ -1261,7 +1261,7 @@ cases:
 
   - name: the-negated-predicate-names-the-other-row
     doc: The same question spelled with NOT in it, which has to answer the row the plain spelling left out and no other. A null would be in neither answer, there being no third bit in a predicate, and there is no null here so the two answers cover the table between them.
-    query: MATCH (n:person) WHERE n.tag IS NOT NORMALIZED NFD RETURN n.name AS m
+    query: MATCH (n:person) WHERE n.tag IS NOT NFD NORMALIZED RETURN n.name AS m
     columns:
       - m
     rows:

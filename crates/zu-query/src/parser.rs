@@ -4888,17 +4888,24 @@ impl Parser<'_> {
                 negated,
             });
         }
-        // ISO 19.7. The form is optional and defaults to NFC, and the
-        // word after NORMALIZED is only read as one when it is one of
-        // the four, so `s IS NORMALIZED AND t IS NULL` still reads.
-        if self.eat_kw("NORMALIZED") {
-            let form = match self.at_normal_form() {
-                true => self.parse_normal_form()?,
-                false => NormalForm::Nfc,
-            };
+        // ISO 19.7. The form stands in front of NORMALIZED and is
+        // optional, NFC being what leaving it out means. A word that
+        // names a form and has no NORMALIZED behind it belongs to
+        // whatever comes next rather than to this predicate, so nothing
+        // is taken on the strength of the form alone.
+        if self.at_normal_form() && self.kw_at(1, "NORMALIZED") {
+            let form = self.parse_normal_form()?;
+            self.expect_kw("NORMALIZED")?;
             return Ok(Expr::IsNormalized {
                 expr: Box::new(lhs),
                 form,
+                negated,
+            });
+        }
+        if self.eat_kw("NORMALIZED") {
+            return Ok(Expr::IsNormalized {
+                expr: Box::new(lhs),
+                form: NormalForm::Nfc,
                 negated,
             });
         }
@@ -5225,6 +5232,20 @@ impl Parser<'_> {
         // bracket after a name, so the two readings never overlap.
         if name.eq_ignore_ascii_case("path") && self.at(&TokenKind::LBracket) {
             return Ok(Expr::Path(self.parse_bracketed_items()?));
+        }
+        // ISO 20.3, the other half of <general value specification>.
+        // The word names the principal the session was opened for, and
+        // it is a reserved word, so no query can have meant a variable
+        // by it. This engine authenticates nobody, so what it names is
+        // the null value: ID061 says the declared type is the character
+        // string and says the value is always absent, which is a thing
+        // a program can read and act on where a refusal is not.
+        // A bracket behind it is left to the call path, so the word
+        // written as a call is an unknown function rather than a
+        // puzzle about the bracket, which is how the bare temporal
+        // words are refused too.
+        if name.eq_ignore_ascii_case("SESSION_USER") && !self.at(&TokenKind::LParen) {
+            return Ok(Expr::SessionUser);
         }
         // GE01, a graph named where a value goes. Each of these four
         // words is a whole graph reference on its own, so there is
@@ -5756,17 +5777,47 @@ impl Parser<'_> {
     /// Both forms are read here, and which one this is is settled by
     /// what follows `CASE`: a `WHEN` means the searched form, and
     /// anything else is the value the simple form compares each branch
-    /// with. Nothing is rewritten on the way in, so the simple form
-    /// keeps its one subject rather than becoming an equality repeated
-    /// once per branch.
+    /// with.
+    ///
+    /// A branch of the simple form holds a `<when operand list>`, so it
+    /// may name several operands and any one of them matching selects
+    /// the result, and an operand may be the second half of a predicate
+    /// rather than a value, `WHEN > 1` and `WHEN IS NULL` being two of
+    /// the eight ISO lists. Both of those are the searched form written
+    /// short: a list is the disjunction of the comparisons it stands
+    /// for, and a predicate half is the predicate with the case operand
+    /// as its left side. So a branch written either way is folded into
+    /// the condition it abbreviates, and the whole expression becomes
+    /// the searched form, since a subject compared with nothing is not
+    /// a subject.
+    ///
+    /// The plain simple form is left as it stands, which is the point
+    /// of folding only where something was abbreviated: `CASE a.kind
+    /// WHEN 'x' THEN 1 WHEN 'y' THEN 2 END` keeps its one subject and
+    /// reads `a.kind` once, where the fold would write it out per
+    /// branch.
     fn parse_case(&mut self) -> Result<Expr> {
         let subject = match self.at_kw("WHEN") {
             true => None,
             false => Some(Box::new(self.parse_expr()?)),
         };
         let mut branches = Vec::new();
+        let mut abbreviated = false;
         while self.eat_kw("WHEN") {
-            let when = self.parse_expr()?;
+            let when = match &subject {
+                None => vec![Operand::Condition(self.parse_expr()?)],
+                Some(subject) => {
+                    let mut operands = vec![self.parse_when_operand(subject)?];
+                    while self.eat(&TokenKind::Comma) {
+                        operands.push(self.parse_when_operand(subject)?);
+                    }
+                    abbreviated |= operands.len() > 1
+                        || operands
+                            .iter()
+                            .any(|operand| matches!(operand, Operand::Condition(_)));
+                    operands
+                }
+            };
             self.expect_kw("THEN")?;
             branches.push((when, self.parse_expr()?));
         }
@@ -5778,11 +5829,58 @@ impl Parser<'_> {
             false => None,
         };
         self.expect_kw("END")?;
+        // The subject is written into the branches only where something
+        // was abbreviated, and then it is written into all of them,
+        // since a case is one form or the other and not a branch of
+        // each.
+        let written = match abbreviated {
+            true => subject.as_deref(),
+            false => None,
+        };
+        let branches = branches
+            .into_iter()
+            .map(|(when, then)| (fold_when(when, written), then))
+            .collect();
         Ok(Expr::Case {
-            subject,
+            subject: match abbreviated {
+                true => None,
+                false => subject,
+            },
             branches,
             otherwise,
         })
+    }
+
+    /// One `<when operand>` of the simple form, `subject` being the
+    /// case operand it is read against.
+    ///
+    /// A comparison operator or an `IS` standing where a value belongs
+    /// is the second half of a predicate, which the standard allows
+    /// exactly here: the case operand is its left side, so the operand
+    /// is that predicate with the subject written into it. `IS` covers
+    /// six of ISO's eight alternatives on its own, the null test, the
+    /// value type test, the normalized test and the three pattern
+    /// predicates all being written behind it, so the two branches here
+    /// are the whole list.
+    fn parse_when_operand(&mut self, subject: &Expr) -> Result<Operand> {
+        let op = match self.peek().map(|t| &t.kind) {
+            Some(TokenKind::Eq) => BinaryOp::Eq,
+            Some(TokenKind::Ne) => BinaryOp::Ne,
+            Some(TokenKind::Lt) => BinaryOp::Lt,
+            Some(TokenKind::Le) => BinaryOp::Le,
+            Some(TokenKind::Gt) => BinaryOp::Gt,
+            Some(TokenKind::Ge) => BinaryOp::Ge,
+            _ => {
+                if self.eat_kw("IS") {
+                    let predicate = self.parse_is_tail(subject.clone())?;
+                    return Ok(Operand::Condition(predicate));
+                }
+                return Ok(Operand::Value(self.parse_expr()?));
+            }
+        };
+        self.pos += 1;
+        let right = self.parse_concat()?;
+        Ok(Operand::Condition(binary(op, subject.clone(), right)))
     }
 
     /// `CAST(expr AS type)`, the opening parenthesis unconsumed.
@@ -6403,6 +6501,42 @@ fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }
+}
+
+/// One `<when operand>` of a case expression (ISO 20.7), as read.
+///
+/// A value is one the case operand is compared with, and a condition is
+/// one that already holds the case operand, being a predicate written
+/// without its left side. The searched form writes conditions and
+/// nothing else, and the simple form may write either.
+enum Operand {
+    Value(Expr),
+    Condition(Expr),
+}
+
+/// The one condition a branch comes to.
+///
+/// `subject` is the case operand where it has to be written into the
+/// branch, and `None` where the branch is a condition already, which is
+/// the searched form and the simple form that abbreviated nothing. Any
+/// operand matching selects the result, so the operands of one branch
+/// meet under `OR`, and null behaves the way it does in every other
+/// disjunction: a branch that is neither true nor false is one the walk
+/// passes over.
+fn fold_when(operands: Vec<Operand>, subject: Option<&Expr>) -> Expr {
+    let mut folded: Option<Expr> = None;
+    for operand in operands {
+        let condition = match (operand, subject) {
+            (Operand::Value(value), None) => value,
+            (Operand::Value(value), Some(subject)) => binary(BinaryOp::Eq, subject.clone(), value),
+            (Operand::Condition(condition), _) => condition,
+        };
+        folded = Some(match folded {
+            None => condition,
+            Some(left) => binary(BinaryOp::Or, left, condition),
+        });
+    }
+    folded.expect("a WHEN holds at least one operand")
 }
 
 #[cfg(test)]
@@ -8837,7 +8971,7 @@ mod tests {
             r#"MATCH (u:"Unit") RETURN 1 AS v"#,
             "RETURN 1 AS `MATCH`",
             r#"RETURN 1 AS "MATCH""#,
-            "MATCH (u:Unit) RETURN u.`odd name` AS v",
+            "MATCH (u:Widget) RETURN u.`odd name` AS v",
         ] {
             parsed(source);
         }
@@ -8845,16 +8979,17 @@ mod tests {
         // so it does not stand where a name belongs.
         assert!(parse_err("RETURN 1 AS 'v'").contains("expected an alias"));
         for source in [
-            "MATCH (`odd name`:Unit) RETURN 1 AS v",
-            r#"MATCH ("odd name":Unit) RETURN 1 AS v"#,
+            "MATCH (`odd name`:Widget) RETURN 1 AS v",
+            r#"MATCH ("odd name":Widget) RETURN 1 AS v"#,
         ] {
             let e = parse_err(source);
             assert!(e.contains("a variable is a plain name"), "{source}: {e}");
         }
         assert!(parse_err("RETURN 1 AS MATCH").contains("reserved word"));
-        // A pre-reserved word is a name here, which is the deviation
-        // `zu_common::keywords` writes down.
-        parsed("MATCH (u:Unit) RETURN 1 AS data");
+        // A pre-reserved word is a reserved word, 21.3 writing the one
+        // list as an alternative of the other, so it is no name either.
+        assert!(parse_err("RETURN 1 AS data").contains("reserved word"));
+        assert!(parse_err("MATCH (u:Unit) RETURN 1 AS v").contains("reserved word"));
     }
 
     /// GQ18. A value query expression carries a whole query: it may

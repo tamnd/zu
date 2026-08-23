@@ -51,6 +51,16 @@ cases:
           - type: INT64
             value: "1"
 
+  - name: a-pre-reserved-word-where-a-name-belongs
+    doc: The production reads reserved word ::= pre-reserved word | ..., so the forty words ISO has taken for a later edition and given no meaning to are inside the list a regular identifier may not be drawn from. An engine that lets one through hands out a name somebody's schema comes to depend on and the edition that wants the word cannot have it back.
+    query: RETURN 1 AS data
+    raises: "42001"
+
+  - name: a-pre-reserved-word-as-a-label
+    doc: The same rule in the other place a name is written plainly, since a label is an identifier too and an engine that guards only the alias position guards half of it.
+    query: MATCH (n:Unit) RETURN count(*) AS c
+    raises: "42001"
+
   - name: a-write-clause-that-is-reserved
     doc: CREATE opens statements that are not in the v0 core, and the parser names it rather than saying it expected MATCH, which is the difference between a useful refusal and a puzzle.
     query: CREATE (n:person)

@@ -246,7 +246,7 @@ The 64 bit signed integer. A count that reached the top of it would raise `22003
 
 The declared type of SESSION_USER.
 
-zu has no SESSION_USER, having no principal for it to name.
+The character string, and the value is always the null value: this engine authenticates nobody, so the word names a principal that is not there rather than failing to be a word. A client reading it learns that the session has no user, which is a thing it can act on.
 
 ### ID062
 

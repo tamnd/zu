@@ -11,28 +11,38 @@
 //!
 //! `<reserved word>` has `<pre-reserved word>` as its first
 //! alternative, forty words ISO has taken for a later edition and given
-//! no meaning to. Read strictly, `ABSTRACT`, `DATA`, `NUMBER`, `QUERY`,
-//! `UNIT`, `VALUES` and thirty-four others are therefore not names.
+//! no meaning to. `ABSTRACT`, `DATA`, `NUMBER`, `QUERY`, `UNIT`,
+//! `VALUES` and thirty-four others are therefore not names, and
+//! [`is_reserved`] says so: the forty are inside the answer rather than
+//! beside it, which is where the grammar puts them.
 //!
-//! zu admits them, and [`is_reserved`] answers `false` for them on
-//! purpose. Refusing a word buys a query nothing until the word means
-//! something, and it costs everybody who has a label called `Unit` or a
-//! property called `data` a rewrite for a meaning that has not arrived.
-//! This is a deviation and `docs/07-query-engine.md` records it as one.
-//! [`is_pre_reserved`] is here so that a tool that wants to warn can.
+//! Refusing a word nobody wants today is the whole point of holding it
+//! back. Every one an engine lets through is a name somebody's schema
+//! can come to depend on, and the edition that gives the word a meaning
+//! cannot have it back. The accent quoted form puts any of them within
+//! reach of a query that really wants one, which is what that form is
+//! for. [`is_pre_reserved`] stays, for a tool that wants to say which
+//! of the two lists a word came from.
 
 mod generated;
 
 /// Whether a word may not be spelled as a regular identifier.
 ///
+/// Both lists are asked, the pre-reserved forty being an alternative of
+/// `<reserved word>` and not a list beside it. The words ISO spells out
+/// are asked first, since they are five times as many and are the ones
+/// a query is likely to have written.
+///
 /// The comparison is ASCII case-insensitive, which is how the standard
 /// compares a keyword: `match` and `MATCH` are the same word.
 pub fn is_reserved(word: &str) -> bool {
-    lookup(generated::RESERVED, &RESERVED_SHAPES, word)
+    lookup(generated::RESERVED, &RESERVED_SHAPES, word) || is_pre_reserved(word)
 }
 
-/// Whether a word is one of the forty ISO has taken for a later edition.
-/// zu admits these as names; see the module note.
+/// Whether a word is one of the forty ISO has taken for a later
+/// edition. These are reserved words too, so [`is_reserved`] answers
+/// `true` for them; this says which of the two lists a word is in,
+/// which is what a message that wants to explain the refusal needs.
 pub fn is_pre_reserved(word: &str) -> bool {
     lookup(generated::PRE_RESERVED, &PRE_RESERVED_SHAPES, word)
 }
@@ -124,11 +134,13 @@ mod tests {
         assert!(!is_reserved(""));
     }
 
-    /// The three lists are three answers and a word gets one of them.
+    /// The pre-reserved forty are reserved words, and the non-reserved
+    /// are names however much they look like keywords.
     #[test]
-    fn the_pre_reserved_and_the_non_reserved_are_names_here() {
+    fn the_pre_reserved_are_reserved_and_the_non_reserved_are_names() {
         assert!(is_pre_reserved("UNIT"));
-        assert!(!is_reserved("UNIT"));
+        assert!(is_reserved("UNIT"));
+        assert!(is_reserved("unit"));
         assert!(is_non_reserved("ACYCLIC"));
         assert!(!is_reserved("ACYCLIC"));
         assert!(!is_pre_reserved("ACYCLIC"));

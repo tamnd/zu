@@ -208,7 +208,7 @@ fn a_stored_date_and_a_stored_duration_compare_against_their_literals() {
     assert_eq!(one(&mut db, source), Value::Str("launch".into()));
     let source = "MATCH (e:Event) WHERE e.on > DATE '2024-01-01' RETURN e.name AS name";
     assert_eq!(one(&mut db, source), Value::Str("launch".into()));
-    let source = "MATCH (e:Event) RETURN e.on AS on";
+    let source = "MATCH (e:Event) RETURN e.on AS stamp";
     assert_eq!(one(&mut db, source), Value::Temporal(Temporal::Date(19737)));
 }
 

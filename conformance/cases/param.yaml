@@ -1391,3 +1391,13 @@ cases:
       - values:
           - type: INT64
             value: "9"
+
+  - name: the-session-user
+    doc: ISO 20.3 writes a general value specification as a parameter or the word SESSION_USER, so the word belongs with the parameters rather than with the functions and takes no brackets. What it answers is implementation defined, an engine that authenticates nobody having no principal to name, so the case asks only that the word is read and answers a value: an engine that has never heard of it refuses the statement and fails here, and every engine that reads it passes whatever it answers.
+    query: RETURN (SESSION_USER IS NULL OR SESSION_USER IS NOT NULL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true

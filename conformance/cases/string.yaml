@@ -772,8 +772,8 @@ cases:
             value: fi
 
   - name: is-normalized-asks-the-same-question
-    doc: The predicate of ISO 19.7 over a string that is in one form and not the other, and over a null, which answers null the way every other predicate over a null does.
-    query: RETURN 'é' IS NORMALIZED NFC AS a, 'é' IS NORMALIZED NFD AS b, NULL IS NORMALIZED AS c
+    doc: The predicate of ISO 19.7 over a string that is in one form and not the other, and over a null, which answers null the way every other predicate over a null does. The form is written in front of the word and not behind it, the production putting the optional NOT and the optional form between IS and NORMALIZED, so an engine that took the form as a suffix reads none of these.
+    query: RETURN 'é' IS NFC NORMALIZED AS a, 'é' IS NFD NORMALIZED AS b, NULL IS NORMALIZED AS c
     columns:
       - a
       - b
@@ -785,6 +785,19 @@ cases:
           - type: BOOL
             value: false
           - type: NULL
+
+  - name: is-not-normalized-is-the-same-predicate-negated
+    doc: The NOT sits inside the predicate rather than in front of it, and the form still stands behind the NOT, so this is the one spelling that tells an engine reading the form as a suffix apart from an engine reading the production.
+    query: RETURN 'é' IS NOT NFD NORMALIZED AS a, 'ab' IS NOT NORMALIZED AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+          - type: BOOL
+            value: false
 
   - name: trim-takes-one-character-off-each-end
     doc: The explicit form of ISO 20.24 with an end named and a character to take off it. BOTH is what the form means when no end is written, and it is written out here so the two cases below read as the halves of this one.

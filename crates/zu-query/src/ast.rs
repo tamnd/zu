@@ -1554,6 +1554,13 @@ pub enum Expr {
     Literal(Literal),
     Param(String),
     Variable(String),
+    /// `SESSION_USER`, ISO 20.3: the principal the session was opened
+    /// for, which is one of the two things a general value
+    /// specification may be. It is a value and not a function, so it
+    /// takes no brackets and reads the same in every statement of a
+    /// session. This engine authenticates nobody, so it answers the
+    /// null value, which is the answer ID061 records.
+    SessionUser,
     Property {
         base: Box<Expr>,
         key: String,
@@ -1635,7 +1642,7 @@ pub enum Expr {
         /// written, which reads as DAY TO SECOND.
         kind: Option<DurationKind>,
     },
-    /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
+    /// `expr IS [NOT] [NFC] NORMALIZED`, ISO 19.7. The same question the
     /// function answers, asked as a predicate, and the form defaults the
     /// same way.
     IsNormalized {

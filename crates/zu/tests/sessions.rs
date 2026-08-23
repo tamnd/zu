@@ -226,6 +226,65 @@ fn setting_the_schema_moves_where_an_unqualified_name_is_looked_up() {
     assert!(refused.contains("no schema"), "{refused}");
 }
 
+/// ISO 4.3.2 and 17.1. A relative catalog schema reference is walked
+/// from wherever the session is, so the same text names a different
+/// directory in two sessions, which is the whole difference between it
+/// and the absolute form.
+#[test]
+fn a_relative_schema_reference_is_walked_from_where_the_session_is() {
+    let (_dir, mut session) = opened("relative.zu1");
+    for schema in ["/app", "/app/one", "/app/two"] {
+        run(&mut session, &format!("CREATE SCHEMA {schema}"));
+    }
+    run(&mut session, "SESSION SET SCHEMA /app/one");
+    // One up and one down, which is the sibling.
+    run(&mut session, "SESSION SET SCHEMA ../two");
+    assert_eq!(session.session_schema(), "/app/two");
+    // A period on its own is the third predefined reference and names
+    // where the session is already, so it moves nothing.
+    run(&mut session, "SESSION SET SCHEMA .");
+    assert_eq!(session.session_schema(), "/app/two");
+    // Two double periods climb twice, and the root is where they stop
+    // being able to.
+    run(&mut session, "SESSION SET SCHEMA ../..");
+    assert_eq!(session.session_schema(), "/");
+    let refused = failure(&mut session, "SESSION SET SCHEMA ../elsewhere");
+    assert!(refused.contains("above the root"), "{refused}");
+    // The same reference in an AT clause, which is the other place a
+    // schema is named (GP16).
+    run(&mut session, "SESSION SET SCHEMA /app/one");
+    run(&mut session, "CREATE PROPERTY GRAPH /app/two/orders");
+    assert!(
+        session
+            .run("USE orders MATCH (n) RETURN count(*) AS n", &[])
+            .is_err()
+    );
+    run(
+        &mut session,
+        "AT ../two USE orders MATCH (n) RETURN count(*) AS n",
+    );
+}
+
+/// ISO 7.3 and 4.5.1. A session runs from a session start to a session
+/// close, and the close is two words with nothing under them. What the
+/// statement ends is the environment, so the session takes no more
+/// statements afterwards and says so as a connection condition rather
+/// than as a fault in the text it was handed.
+#[test]
+fn a_closed_session_takes_no_more_statements() {
+    let (_dir, mut session) = opened("close.zu1");
+    assert!(!session.is_closed());
+    run(&mut session, "SESSION CLOSE");
+    assert!(session.is_closed());
+    let refused = failure(&mut session, "RETURN 1 AS n");
+    assert!(refused.contains("08000"), "{refused}");
+    assert!(refused.contains("closed"), "{refused}");
+    // A second close is a statement like any other, so it is refused
+    // rather than quietly accepted: there is no session left to end.
+    let again = failure(&mut session, "SESSION CLOSE");
+    assert!(again.contains("closed"), "{again}");
+}
+
 /// GS15 and GS07. The displacement the datetime value functions answer
 /// in, which moves the zone and not the instant.
 #[test]

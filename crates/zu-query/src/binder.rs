@@ -2321,11 +2321,19 @@ enum Projected {
 /// opened in: the two words name the same directory until something
 /// moves the current one, which is the whole reason there are two of
 /// them.
-fn at_path<'a>(at: &'a Option<ast::SchemaRef>, session: &'a str) -> Option<&'a str> {
-    match at.as_ref()? {
-        ast::SchemaRef::Current => Some(session),
-        ast::SchemaRef::Home => Some(procedures::ROOT),
-        ast::SchemaRef::Path(path) => Some(path),
+/// A relative reference is walked from the session's schema, so this
+/// is where `../sibling` becomes a path, and a walk that climbs out of
+/// the root names no directory at all, which is `42002`.
+fn at_path(at: &Option<ast::SchemaRef>, session: &str) -> Result<Option<String>> {
+    let Some(reference) = at.as_ref() else {
+        return Ok(None);
+    };
+    match reference.resolve(session, procedures::ROOT) {
+        Some(path) => Ok(Some(path)),
+        None => Err(ZuError::gql(
+            codes::C42002,
+            format!("a schema above the root of the catalog, climbed out of '{session}'"),
+        )),
     }
 }
 
@@ -2347,7 +2355,8 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
 pub fn bind_in(query: &ast::Query, schema: &Schema, session: &str) -> Result<BoundQuery> {
-    let at = at_path(&query.at_schema, session).or(Some(session));
+    let named = at_path(&query.at_schema, session)?;
+    let at = named.as_deref().or(Some(session));
     let mut params = Vec::new();
     // The binding variable definition block at the head of the
     // statement (GP17), bound before anything that could read one of
@@ -2513,7 +2522,8 @@ fn bind_bindings(
         // A definition holding a query of its own may say which schema
         // that query resolves in, and one that does not resolves where
         // the statement around it does.
-        let at = at_path(&query.at_schema, at.unwrap_or(procedures::ROOT)).or(at);
+        let named = at_path(&query.at_schema, at.unwrap_or(procedures::ROOT))?;
+        let at = named.as_deref().or(at);
         let mut inner = visible.clone();
         bind_bindings(&query.bindings, schema, at, params, out, &mut inner)?;
         let mut bound = bind_body(&query.body, schema, at, params, &[], &inner)?;
@@ -6964,8 +6974,7 @@ impl Binder<'_> {
         let at = at_path(
             &query.at_schema,
             self.at.as_deref().unwrap_or(procedures::ROOT),
-        )
-        .map(str::to_string)
+        )?
         .or_else(|| self.at.clone());
         let mut bound = bind_body(
             &query.body,

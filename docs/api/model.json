@@ -5735,6 +5735,14 @@
       "doc": "The handle a statement on this session can be stopped through.\n\nOne handle for the life of the session, so a caller can take it\nonce and keep it. It is raised from another thread while a\nstatement runs, which is the only time it means anything: the\nstatement stops at the next boundary the executor checks and\nanswers [`ZuError::Interrupted`], and this session is exactly as\nit was, plans and readers included. Clear it before a statement\nrather than after, so a stop that arrived while nothing was\nrunning cannot end the next one."
     },
     {
+      "id": "zu::session::Session::is_closed",
+      "kind": "method",
+      "name": "is_closed",
+      "of": "zu::session::Session",
+      "signature": "fn is_closed(&self) -> bool",
+      "doc": "Whether a `SESSION CLOSE` has ended this session (ISO 7.3), so\nthat a caller holding one can tell without sending a statement\nto find out."
+    },
+    {
       "id": "zu::session::Session::memory",
       "kind": "method",
       "name": "memory",

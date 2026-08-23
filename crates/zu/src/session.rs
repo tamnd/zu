@@ -440,6 +440,10 @@ pub struct Session {
     /// here because the wait happens after the write side has gone
     /// back and the log with it.
     owed: Option<(Arc<Commits>, u64)>,
+    /// Whether a `SESSION CLOSE` has ended this session (ISO 7.3). A
+    /// session ends once, so this only ever goes one way, and what it
+    /// costs a session nobody closed is one boolean read per statement.
+    closed: bool,
 }
 
 impl Session {
@@ -514,6 +518,7 @@ impl Session {
             frames: Arc::new(FrameSet::new()),
             pending: None,
             owed: None,
+            closed: false,
         })
     }
 
@@ -904,6 +909,27 @@ impl Session {
         self.txn.is_some()
     }
 
+    /// Whether a `SESSION CLOSE` has ended this session (ISO 7.3), so
+    /// that a caller holding one can tell without sending a statement
+    /// to find out.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// A statement sent to a session that has ended, which is `08000`:
+    /// the environment the statement would have run in is not there,
+    /// and that is a fact about the connection rather than about the
+    /// text, so it is raised before the text is read.
+    fn check_open(&self) -> Result<()> {
+        match self.closed {
+            false => Ok(()),
+            true => Err(ZuError::gql(
+                codes::C08000,
+                "this session was closed and takes no more statements".to_string(),
+            )),
+        }
+    }
+
     /// Runs one of the three statements that say where a transaction
     /// begins and ends (GT01).
     ///
@@ -984,6 +1010,23 @@ impl Session {
             SessionStmt::SetGraph(reference) => self.set_graph(&reference, params)?,
             SessionStmt::SetTimeZone(minutes) => self.options.zone = minutes,
             SessionStmt::Reset(what) => self.reset(&what)?,
+            // ISO 7.3 and 4.5.1. A session runs from a session start
+            // to a session close, and this is the close: what it ends
+            // is the environment, so an explicit transaction still
+            // open is rolled back rather than left for nobody, and the
+            // statement after it is sent to a session that is gone.
+            SessionStmt::Close => {
+                if self.txn.take().is_some()
+                    && self
+                        .side
+                        .as_ref()
+                        .is_some_and(|side| side.file().in_savepoint())
+                {
+                    self.undo()?;
+                    self.leave(true);
+                }
+                self.closed = true;
+            }
         }
         Ok(QueryResult::new(Vec::new(), Vec::new()))
     }
@@ -1122,10 +1165,18 @@ impl Session {
     /// somewhere else or nowhere now, so keeping them would run a
     /// statement against a lookup nobody would make today.
     fn set_schema(&mut self, reference: &SchemaRef) -> Result<()> {
-        let path = match reference {
-            SchemaRef::Current => return Ok(()),
-            SchemaRef::Home => zu_query::procedures::ROOT.to_string(),
-            SchemaRef::Path(path) => path.clone(),
+        // A relative reference is walked from where the session is
+        // now, which is what makes `SESSION SET SCHEMA ../sibling`
+        // mean a different directory in two sessions, and a walk that
+        // climbs out of the root names nothing the catalog can hold.
+        let Some(path) = reference.resolve(&self.schema, zu_query::procedures::ROOT) else {
+            return Err(ZuError::gql(
+                codes::C42002,
+                format!(
+                    "a schema above the root of the catalog, climbed out of '{}'",
+                    self.schema
+                ),
+            ));
         };
         if !self.graph.catalog().has_schema(&path) {
             return Err(ZuError::gql(
@@ -1781,6 +1832,7 @@ impl Session {
         batch_rows: usize,
         sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
     ) -> Result<Streamed> {
+        self.check_open()?;
         self.sync()?;
         self.check_refs(params)?;
         if query::not_a_query(source)?.is_some() {
@@ -1893,6 +1945,7 @@ impl Session {
     }
 
     fn run_within(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
+        self.check_open()?;
         self.sync()?;
         self.check_refs(params)?;
         match query::not_a_query(source)? {

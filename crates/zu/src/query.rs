@@ -3,6 +3,7 @@
 //! frontend. The binder itself is engine-agnostic; this is where zu1
 //! table definitions become labels and relationship types.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -1254,7 +1255,28 @@ pub(crate) fn graph_of(
     let Some(named) = &query.use_graph else {
         return working_graph(catalog, working);
     };
-    graph_of_ref(catalog, schema, working, named, &query.bindings, params)
+    let at = at_schema(schema, query)?;
+    graph_of_ref(catalog, &at, working, named, &query.bindings, params)
+}
+
+/// The catalog schema a statement's names are looked up in, which is
+/// the session's until an `AT` clause at the head of it says otherwise
+/// (ISO 4.3.2, GP16).
+///
+/// A relative reference is walked from the session's schema, so this is
+/// where `../sibling` becomes a path, and a walk that climbs out of the
+/// root names no directory at all, which is `42002`.
+fn at_schema<'a>(schema: &'a str, query: &zu_query::ast::Query) -> Result<Cow<'a, str>> {
+    let Some(reference) = &query.at_schema else {
+        return Ok(Cow::Borrowed(schema));
+    };
+    match reference.resolve(schema, zu_query::procedures::ROOT) {
+        Some(path) => Ok(Cow::Owned(path)),
+        None => Err(ZuError::gql(
+            codes::C42002,
+            format!("a schema above the root of the catalog, climbed out of '{schema}'"),
+        )),
+    }
 }
 
 /// The graph the session is working in, or `42002` when it has been

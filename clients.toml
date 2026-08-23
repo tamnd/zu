@@ -166,7 +166,7 @@ package = "zu"
 registry = "vcpkg and Conan"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "leaks", "install"]
+holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "leaks", "install", "stability"]
 doc = "The developer kit for the ABI itself: examples, the header-only C++ wrapper, the packaging and the sanitizer suites. It owes no api-map, because the C names are zu.h and zu.h is generated in the engine."
 
 [[client]]

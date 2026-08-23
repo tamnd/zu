@@ -246,6 +246,48 @@ fn a_graph_reference_written_in_a_statement_is_typed_a_graph() {
     );
 }
 
+/// GV60, GV56 and GV57 in their closed spelling, which is an element
+/// type or a whole graph type written where a value type is expected.
+///
+/// What it answers is the kind of the value, because whether an
+/// element is of a declared type is a question about the catalog and
+/// not about the value in hand. So a graph is of every closed graph
+/// type and a number is of none of them, and the same for a node and
+/// an edge. That is the same answer the open spelling gives, and the
+/// point of reading the closed one is that a query which writes the
+/// type out is no longer refused.
+#[test]
+fn a_closed_reference_type_answers_by_the_kind_of_the_value() {
+    let (_dir, mut session) = opened("closed-reference-types.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+    let graph = [("g", home)];
+
+    yes(
+        &mut session,
+        "$g IS TYPED PROPERTY GRAPH { (:person) }",
+        &graph,
+    );
+    yes(&mut session, "$g IS TYPED GRAPH { (:absent) }", &graph);
+    no(&mut session, "1 IS TYPED PROPERTY GRAPH { (:person) }", &[]);
+    no(
+        &mut session,
+        "1 IS TYPED (:person)-[:knows]->(:person)",
+        &[],
+    );
+    no(&mut session, "1 IS TYPED (:person)", &[]);
+    yes(&mut session, "1 IS NOT TYPED (:person)", &[]);
+
+    let out = session
+        .run(
+            "MATCH (p:person)-[k:knows]->(q:person)
+             RETURN p IS TYPED (:person) AND k IS TYPED (:person)-[:knows]->(:person)
+                AND k IS NOT TYPED (:person) AS v",
+            &[],
+        )
+        .expect("an element is of the kind of type it is");
+    assert_eq!(out.rows[0], vec![Value::Bool(true)]);
+}
+
 /// The path is the whole of how a graph is named in an expression,
 /// and this is why: a bare name is a variable, and a word with a path
 /// behind it is a division as often as it is a graph. Both readings

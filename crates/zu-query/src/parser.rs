@@ -407,6 +407,23 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
     }
 }
 
+/// The reference value type an element type stands for.
+///
+/// Only the kind of the element survives, which is as much as the
+/// predicate asks: whether a node is of a declared node type is a
+/// question about the catalog rather than about the value, so `IS
+/// TYPED` on a closed reference type answers the way it does on an
+/// open one. The name kept beside the kind is the first label the
+/// type names, or its own name where it names no labels, and it is
+/// there so a message can say which type was written.
+fn reference_type(def: ElementTypeDef) -> LogicalType {
+    let name = def.labels.first().cloned().or(def.name);
+    match def.kind {
+        ElementDefKind::Node => LogicalType::Node(name),
+        ElementDefKind::Edge { .. } => LogicalType::Edge(name),
+    }
+}
+
 /// Clause keywords the surface reserves but the v0 core does not parse
 /// yet; naming them beats "expected MATCH" when someone writes CREATE.
 ///
@@ -1448,16 +1465,26 @@ impl Parser<'_> {
             let graph = self.expect_name("the graph a type is taken from")?;
             return Ok(GraphTypeSource::Like(graph));
         }
+        Ok(GraphTypeSource::Elements(
+            self.parse_nested_graph_type(true)?,
+        ))
+    }
+
+    /// The element types in the braces ISO 18.1 calls a nested graph
+    /// type specification. A graph type is declared as one of these,
+    /// and a closed graph reference value type (GV60) names one, which
+    /// is the same list read for a different reason.
+    fn parse_nested_graph_type(&mut self, declaring: bool) -> Result<Vec<ElementTypeDef>> {
         self.expect(&TokenKind::LBrace)?;
         let mut elements = Vec::new();
         if !self.at(&TokenKind::RBrace) {
-            elements.push(self.parse_element_type()?);
+            elements.push(self.parse_element_type_spec(declaring)?);
             while self.eat(&TokenKind::Comma) {
-                elements.push(self.parse_element_type()?);
+                elements.push(self.parse_element_type_spec(declaring)?);
             }
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(GraphTypeSource::Elements(elements))
+        Ok(elements)
     }
 
     /// One element type. ISO 18.4 gives it two spellings, the pattern
@@ -1472,7 +1499,13 @@ impl Parser<'_> {
     /// the same type again with the colon spelled out, and an edge type
     /// is either two node type patterns with an arc between them or a
     /// phrase that names its endpoints after `CONNECTING`.
-    fn parse_element_type(&mut self) -> Result<ElementTypeDef> {
+    ///
+    /// `declaring` is whether the type is being declared, which is
+    /// where ISO requires the name a synonym in a pattern introduces.
+    /// A closed reference value type is the same grammar read as a
+    /// use rather than a declaration, and it has nothing to do with a
+    /// name, so it reads the pattern without one.
+    fn parse_element_type_spec(&mut self, declaring: bool) -> Result<ElementTypeDef> {
         let kind = self.parse_edge_kind();
         let synonym = self.parse_element_synonym(kind.is_some())?;
         let name = match synonym {
@@ -1489,7 +1522,7 @@ impl Parser<'_> {
             // than beside it: a pattern that says the word NODE says
             // which node type it is declaring. Only the phrase may
             // leave the name out, the filler being enough to read.
-            Some(_) if name.is_none() => Err(self.error("an element type name")),
+            Some(_) if declaring && name.is_none() => Err(self.error("an element type name")),
             _ => self.parse_element_type_pattern(kind, name),
         }
     }
@@ -6436,43 +6469,85 @@ impl Parser<'_> {
         })
     }
 
-    /// A node or edge reference value type, GV56 and GV57, or `None`
-    /// where the next word is neither synonym.
+    /// A node, edge or graph reference value type, GV56, GV57 and the
+    /// closed half of GV60, or `None` where nothing of the sort stands
+    /// here.
     ///
-    /// Open and closed are one production here because they differ
-    /// only in what follows the synonym: `NODE` on its own admits any
-    /// node, and `NODE :Person` admits the ones wearing that label.
-    /// The two are the same word read one token further, so a caller
-    /// that had to choose between them before reading would have to
-    /// look ahead anyway.
+    /// The open spellings are a synonym on its own: `NODE` admits every
+    /// node whatever it wears. The closed ones are a whole element type
+    /// (ISO 18.4) or, for a graph, the braced list of element types a
+    /// graph type is made of, so `(:Person)-[:KNOWS]->(:Person)` is a
+    /// type and reading it is the element type parser's work rather
+    /// than a second reading of the same grammar here.
     ///
-    /// The label set is one name rather than a label expression. A
-    /// reference type in zu carries a name, and widening it to an
-    /// expression is worth doing when a cast to a disjunction is a
-    /// thing somebody writes; refusing the rest here says so plainly
-    /// rather than accepting a conjunction and checking one half of it.
+    /// `NODE :Person` is neither of ISO's two spellings and is the
+    /// shortest way to write the closed type, so it is read too. It is
+    /// one label rather than a label expression: widening it is worth
+    /// doing when a cast to a disjunction is a thing somebody writes,
+    /// and refusing the rest says so plainly rather than accepting a
+    /// conjunction and checking one half of it.
     fn parse_reference_type(&mut self) -> Result<Option<LogicalType>> {
+        if self.at_closed_graph_type() {
+            self.eat_kw("PROPERTY");
+            self.pos += 1;
+            // The element types are read for their syntax and then
+            // let go. A graph value carries the graph it names and
+            // not a type, so which elements the type lists is a
+            // question for the catalog rather than for the value, the
+            // same way `GRAPH graphtype` is.
+            self.parse_nested_graph_type(false)?;
+            return Ok(Some(LogicalType::Graph(None)));
+        }
+        // A pattern or a direction word opens an element type with no
+        // synonym in front of it, and there is nothing else either
+        // could be where a value type is expected.
+        if self.at(&TokenKind::LParen) || self.at_kw("DIRECTED") || self.at_kw("UNDIRECTED") {
+            let def = self.parse_element_type_spec(false)?;
+            return Ok(Some(reference_type(def)));
+        }
         let node = self.at_kw("NODE") || self.at_kw("VERTEX");
         if !node && !(self.at_kw("EDGE") || self.at_kw("RELATIONSHIP")) {
             return Ok(None);
         }
+        let at = self.pos;
         self.pos += 1;
         self.eat_kw("TYPE");
-        let mut label = None;
-        // `NODE (:Person)` is the pattern spelling of the same thing,
-        // and the parenthesis is what tells it from the phrase.
-        let parenthesised = self.eat(&TokenKind::LParen);
         if self.eat(&TokenKind::Colon) {
-            label = Some(self.expect_name("a label in a reference type")?);
+            let label = Some(self.expect_name("a label in a reference type")?);
+            return Ok(Some(if node {
+                LogicalType::Node(label)
+            } else {
+                LogicalType::Edge(label)
+            }));
         }
-        if parenthesised {
-            self.expect(&TokenKind::RParen)?;
+        // A name or a pattern after the synonym is the closed type
+        // written the long way, and the synonym belongs to it, so the
+        // whole thing is read again from where it started.
+        if self.at(&TokenKind::LParen) || self.at_element_type_name() {
+            self.pos = at;
+            let def = self.parse_element_type_spec(false)?;
+            return Ok(Some(reference_type(def)));
         }
         Ok(Some(if node {
-            LogicalType::Node(label)
+            LogicalType::Node(None)
         } else {
-            LogicalType::Edge(label)
+            LogicalType::Edge(None)
         }))
+    }
+
+    /// Whether a closed graph reference value type stands here, which
+    /// the brace is what says: `GRAPH` on its own is the open type and
+    /// `GRAPH { ... }` is the closed one.
+    fn at_closed_graph_type(&self) -> bool {
+        let property = usize::from(self.at_kw("PROPERTY"));
+        self.kw_at(property, "GRAPH")
+            && matches!(
+                self.tokens.get(self.pos + property + 1),
+                Some(Token {
+                    kind: TokenKind::LBrace,
+                    ..
+                })
+            )
     }
 
     /// The fields of a record type, GV46, or no fields at all.
@@ -8956,6 +9031,80 @@ mod tests {
             ty("LIST<INT>(2)"),
             "the two spellings of a maximum are one type"
         );
+    }
+
+    /// GV56, GV57 and GV60 closed, which is an element type written
+    /// where a value type is expected and, for a graph, the braces a
+    /// graph type is declared in.
+    #[test]
+    fn a_closed_reference_value_type_is_the_element_type_it_writes() {
+        let ty = |text: &str| {
+            let q = parsed(&format!("RETURN CAST(x AS {text}) AS v"));
+            match &q.result().expect("RETURN").items[0].expr {
+                Expr::Cast { ty, .. } => ty.base().clone(),
+                other => panic!("{text}: {other:?}"),
+            }
+        };
+        assert_eq!(ty("(:Person)"), LogicalType::Node(Some("Person".into())));
+        assert_eq!(ty("()"), LogicalType::Node(None));
+        assert_eq!(
+            ty("(:Person {name :: STRING})"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(
+            ty("NODE TYPE PersonType (:Person)"),
+            LogicalType::Node(Some("Person".into()))
+        );
+        assert_eq!(
+            ty("NODE TYPE PersonType LABEL Person"),
+            LogicalType::Node(Some("Person".into())),
+            "the phrase spelling names the same type the pattern does"
+        );
+        assert_eq!(
+            ty("NODE TYPE PersonType"),
+            LogicalType::Node(Some("PersonType".into())),
+            "a type that names no labels is known by its own name"
+        );
+        assert_eq!(
+            ty("(:Person)-[:KNOWS]->(:Person)"),
+            LogicalType::Edge(Some("KNOWS".into()))
+        );
+        assert_eq!(
+            ty("(:Person)<-[:KNOWS]-(:Person)"),
+            LogicalType::Edge(Some("KNOWS".into()))
+        );
+        assert_eq!(
+            ty("(:Person)~[:KNOWS]~(:Person)"),
+            LogicalType::Edge(Some("KNOWS".into()))
+        );
+        assert_eq!(
+            ty("DIRECTED EDGE TYPE Knows LABEL KNOWS CONNECTING (a TO b)"),
+            LogicalType::Edge(Some("KNOWS".into()))
+        );
+        assert_eq!(ty("()-[]->()"), LogicalType::Edge(None));
+        assert_eq!(ty("GRAPH { (:Person) }"), LogicalType::Graph(None));
+        assert_eq!(
+            ty("PROPERTY GRAPH { (:Person), (:Person)-[:KNOWS]->(:Person) }"),
+            LogicalType::Graph(None)
+        );
+        assert_eq!(
+            ty("PROPERTY GRAPH { }"),
+            LogicalType::Graph(None),
+            "a graph type may list no element types and so may a type that names one"
+        );
+        assert_eq!(
+            ty("GRAPH"),
+            LogicalType::Graph(None),
+            "the brace is the whole of what tells the closed type from the open one"
+        );
+        for text in [
+            "PROPERTY GRAPH { (:Person)",
+            "GRAPH { :Person }",
+            "(:Person)-[:KNOWS]->",
+        ] {
+            let e = parse_err(&format!("RETURN CAST(x AS {text}) AS v"));
+            assert!(e.contains("expected"), "{text}: {e}");
+        }
     }
 
     #[test]

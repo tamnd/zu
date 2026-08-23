@@ -90,22 +90,36 @@ struct Took {
     bytes: u64,
 }
 
+/// The order the keys go in.
+///
+/// go-ycsb's default `insertorder` is `hashed`, so a real load hands
+/// the keys over in an order that has nothing to do with the key order,
+/// and both of these engines end up with their rows on the device in
+/// that order too. Loading ascending instead puts a zu2 log in key
+/// order, which makes a scan a walk along the log rather than a walk
+/// around it, and a number taken that way is a number about the
+/// benchmark and not about the engine.
+///
+/// Both engines get the same order, whichever it is. 7919 is prime, so
+/// stepping by it covers every key exactly once for any record count
+/// that is not a multiple of it.
+fn order(records: u64, scattered: bool) -> impl Iterator<Item = u64> {
+    (0..records).map(move |i| if scattered { (i * 7919) % records } else { i })
+}
+
 /// `reopen` closes the database after the load and opens it again
 /// before the scan. It is not a durability test, it is the state every
 /// benchmark run phase is actually in: go-ycsb loads in one process and
 /// runs in another, so every published run phase number is a number
 /// taken on a database that has just been opened.
 ///
-/// It went in to ask a different question, which it answered no to. A
-/// node is allocated when its key is first written, so after a load in
-/// random key order the walk order and the arena order have nothing to
-/// do with each other, and an open from a checkpoint builds the plane
-/// through `Ordered::builder` in key order instead. If the level zero
-/// pointer chase were the cost, the reopened plane would be the faster
-/// one. It is the slower one, by three times cold and by half warm, so
-/// the chase is not what a scan is spending its time on. What the gap
-/// is instead is #665.
-fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)], reopen: bool) -> Took {
+/// It went in to ask about the plane's arena order, and it cannot
+/// answer that on its own: a node is allocated when its key is first
+/// written, so it takes `ZU2_SCATTER` for the written plane's nodes to
+/// be in an order the walk does not follow. What it does show without
+/// any help is that a reopened database scans three times slower on the
+/// first pass and half again slower after that, which is #665.
+fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)], reopen: bool, scattered: bool) -> Took {
     let path = dir.join("e.zu2");
     let options = Options {
         durability: Durability::Async,
@@ -118,7 +132,7 @@ fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)], reopen: bool) -> Too
     let started = Instant::now();
     {
         let mut s = db.session();
-        for i in 0..records {
+        for i in order(records, scattered) {
             s.upsert(&key(i), &value(i)).expect("upsert");
         }
     }
@@ -188,7 +202,13 @@ fn connect(path: &Path) -> Connection {
 /// table once a row. A `WITHOUT ROWID` table is the index, so the walk
 /// is the rows. Both are run and the faster one is the one zu2 is
 /// compared against.
-fn run_sqlite(dir: &Path, records: u64, plan: &[(u64, usize)], rowid: bool) -> Took {
+fn run_sqlite(
+    dir: &Path,
+    records: u64,
+    plan: &[(u64, usize)],
+    rowid: bool,
+    scattered: bool,
+) -> Took {
     let shape = if rowid { "rowid" } else { "norowid" };
     let path = dir.join(format!("e-{shape}.db"));
     let conn = connect(&path);
@@ -204,7 +224,7 @@ fn run_sqlite(dir: &Path, records: u64, plan: &[(u64, usize)], rowid: bool) -> T
         let mut stmt = conn
             .prepare("INSERT OR REPLACE INTO usertable (ykey, yvalue) VALUES (?1, ?2)")
             .expect("prepare insert");
-        for i in 0..records {
+        for i in order(records, scattered) {
             stmt.execute(rusqlite::params![key(i), value(i)])
                 .expect("insert");
         }
@@ -283,7 +303,12 @@ fn main() {
     // order the keys were written. See [`run_zu2`].
     let reopen = std::env::var("ZU2_REOPEN").is_ok();
 
-    let zu2 = run_zu2(dir.path(), records, &plan, reopen);
+    // ZU2_SCATTER hands the keys over in an order that has nothing to
+    // do with the key order, which is what go-ycsb's default does. See
+    // [`order`].
+    let scattered = std::env::var("ZU2_SCATTER").is_ok();
+
+    let zu2 = run_zu2(dir.path(), records, &plan, reopen, scattered);
 
     println!();
     println!(
@@ -291,18 +316,19 @@ fn main() {
         value(0).len()
     );
     println!();
-    let name = if reopen {
-        "zu2 async, ordered, reopened"
-    } else {
-        "zu2 async, ordered"
+    let name = match (reopen, scattered) {
+        (true, true) => "zu2 async, ordered, reopened, scattered load",
+        (true, false) => "zu2 async, ordered, reopened",
+        (false, true) => "zu2 async, ordered, scattered load",
+        (false, false) => "zu2 async, ordered",
     };
     report(name, records, scans, &zu2);
     if only {
         return;
     }
 
-    let rowid = run_sqlite(dir.path(), records, &plan, true);
-    let norowid = run_sqlite(dir.path(), records, &plan, false);
+    let rowid = run_sqlite(dir.path(), records, &plan, true, scattered);
+    let norowid = run_sqlite(dir.path(), records, &plan, false, scattered);
 
     // A scan that hands back fewer rows than another engine handed back
     // from the same draws is a faster scan for the wrong reason, and it

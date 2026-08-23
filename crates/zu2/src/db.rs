@@ -53,6 +53,24 @@ const SPLIT_WALK_LIMIT: usize = 1024;
 /// one pair of atomics for the lot.
 const SCAN_EPOCH_RUN: usize = 1024;
 
+/// Keys a [`Session::scan`] walks ahead of the record it is reading.
+///
+/// A row costs three misses that nothing in the row before it can hide:
+/// the plane node, the index bucket and the record. The node and the
+/// bucket do not depend on anything the read produces, so the walk runs
+/// ahead and takes them early, and by the time the read wants them the
+/// lines are on their way or already in. This is the group prefetching
+/// that Chen, Ailamaki, Gibbons and Mowry describe for hash joins
+/// (TODS 32(3), 2007), which is the same shape of problem: a stream of
+/// independent probes whose latency is the whole cost.
+///
+/// Eight, because it wants to be at least as deep as the miss is long
+/// in units of the per row work and no deeper than the line fill buffers
+/// can have outstanding, which is ten to twelve on the cores this runs
+/// on. Deeper also means more keys walked past the end of a short scan,
+/// which is work for nobody.
+const SCAN_LOOKAHEAD: usize = 8;
+
 /// The record a split has settled on for one key.
 #[derive(Clone, Copy)]
 struct Placed {
@@ -2292,15 +2310,38 @@ impl<'a> Session<'a> {
         self.slot.protect();
         let outcome = (|| -> Result<usize> {
             let mut walked = 0usize;
+            // The keys the walk has reached and the scan has not read
+            // yet, oldest at `out`. See [`SCAN_LOOKAHEAD`].
+            let mut ahead: [(&[u8], u64); SCAN_LOOKAHEAD] = [(&[][..], 0); SCAN_LOOKAHEAD];
+            let mut held = 0usize;
+            let mut out = 0usize;
             while done < count {
-                let Some(key) = cursor.key() else { break };
-                cursor.step();
+                // Run the walk forward until the lookahead is full,
+                // hashing each key and starting the load of the bucket
+                // it will probe. The step is a dereference of a node
+                // this thread has not touched, and the prefetch is a
+                // line it has not touched either, so both misses are
+                // taken here, several records before the read that
+                // needs them.
+                while held < SCAN_LOOKAHEAD {
+                    let Some(key) = cursor.key() else { break };
+                    cursor.step();
+                    let hash = index::hash(key);
+                    self.core.index.prefetch(hash);
+                    ahead[(out + held) % SCAN_LOOKAHEAD] = (key, hash);
+                    held += 1;
+                }
+                if held == 0 {
+                    break;
+                }
+                let (key, hash) = ahead[out];
+                out = (out + 1) % SCAN_LOOKAHEAD;
+                held -= 1;
                 walked += 1;
                 if walked.is_multiple_of(SCAN_EPOCH_RUN) {
                     self.slot.unprotect();
                     self.slot.protect();
                 }
-                let hash = index::hash(key);
                 let tag = Index::tag(hash);
                 let bucket = self.bucket_of(hash)?;
                 let Some((address, base)) = self.newest_record(bucket, tag, key)? else {

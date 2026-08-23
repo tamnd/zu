@@ -438,6 +438,41 @@ impl Index {
         unsafe { &*self.live.load(Ordering::Acquire) }
     }
 
+    /// Starts the load of the bucket `hash` will probe, and does not
+    /// wait for it.
+    ///
+    /// A bucket is eight entries and sixty four bytes, so it is one
+    /// cacheline and one miss. A scan knows the keys it is about to
+    /// read several records before it reads them, so it can pay that
+    /// miss early and have the line in cache by the time the probe
+    /// wants it. See [`Session::scan`](crate::Session::scan).
+    ///
+    /// This is a hint and nothing else. The line it warms is the one
+    /// the live table holds now, and by the time the probe runs the
+    /// table may have doubled and the bucket may be somewhere else,
+    /// which costs the miss this was trying to avoid and nothing more.
+    /// Nothing reads the value, so there is nothing here to be stale.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let at = std::ptr::from_ref(self.live().bucket(hash));
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `_mm_prefetch` reads nothing and faults on nothing,
+        // and the pointer is a live bucket in any case.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(at.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        // SAFETY: the pointer is a live bucket, so the read is a read of
+        // an initialised `AtomicU64` that other threads are allowed to
+        // be writing. It is volatile so it is not optimised away and
+        // nothing depends on what it loads, which is what makes it a
+        // prefetch: the miss starts here and the stall, if there is one,
+        // lands wherever the processor decides rather than here.
+        unsafe {
+            std::ptr::read_volatile(at.cast::<u64>());
+        }
+    }
+
     /// The doubling in progress, if there is one. Read after
     /// [`Index::live`] and not before: the migration is published
     /// first, so a caller that saw the new table also sees this.

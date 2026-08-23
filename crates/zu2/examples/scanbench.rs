@@ -90,23 +90,60 @@ struct Took {
     bytes: u64,
 }
 
-fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)]) -> Took {
-    let db = Db::create(
-        &dir.join("e.zu2"),
-        Options {
-            durability: Durability::Async,
-            ordered: true,
-            ..Options::default()
-        },
-    )
-    .expect("create");
+/// `reopen` closes the database after the load and opens it again
+/// before the scan. It is not a durability test, it is the state every
+/// benchmark run phase is actually in: go-ycsb loads in one process and
+/// runs in another, so every published run phase number is a number
+/// taken on a database that has just been opened.
+///
+/// It went in to ask a different question, which it answered no to. A
+/// node is allocated when its key is first written, so after a load in
+/// random key order the walk order and the arena order have nothing to
+/// do with each other, and an open from a checkpoint builds the plane
+/// through `Ordered::builder` in key order instead. If the level zero
+/// pointer chase were the cost, the reopened plane would be the faster
+/// one. It is the slower one, by three times cold and by half warm, so
+/// the chase is not what a scan is spending its time on. What the gap
+/// is instead is #665.
+fn run_zu2(dir: &Path, records: u64, plan: &[(u64, usize)], reopen: bool) -> Took {
+    let path = dir.join("e.zu2");
+    let options = Options {
+        durability: Durability::Async,
+        ordered: true,
+        checkpoint_on_close: reopen,
+        ..Options::default()
+    };
+    let db = Db::create(&path, options).expect("create");
 
-    let mut s = db.session();
     let started = Instant::now();
-    for i in 0..records {
-        s.upsert(&key(i), &value(i)).expect("upsert");
+    {
+        let mut s = db.session();
+        for i in 0..records {
+            s.upsert(&key(i), &value(i)).expect("upsert");
+        }
     }
     let load = started.elapsed();
+
+    let db = if reopen {
+        db.sync().expect("sync");
+        drop(db);
+        Db::open(&path, options).expect("reopen")
+    } else {
+        db
+    };
+    let mut s = db.session();
+
+    // ZU2_WARM runs the plan once before the clock starts. A reopened
+    // database holds none of its log in memory and reads a page in when
+    // something asks for a record in it, so the first pass over a range
+    // pays for the pages under it and the second does not. Off by
+    // default: a published number is the one a caller gets on the pass
+    // it asks for.
+    if std::env::var("ZU2_WARM").is_ok() {
+        for &(start, count) in plan {
+            s.scan(&key(start), count, |_, _| {}).expect("warm");
+        }
+    }
 
     let mut rows = 0u64;
     let mut bytes = 0u64;
@@ -241,7 +278,12 @@ fn main() {
     let plan = draws(scans, records);
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let zu2 = run_zu2(dir.path(), records, &plan);
+    // ZU2_REOPEN loads, closes and opens again before the scan, so the
+    // plane's nodes are in the arena in key order rather than in the
+    // order the keys were written. See [`run_zu2`].
+    let reopen = std::env::var("ZU2_REOPEN").is_ok();
+
+    let zu2 = run_zu2(dir.path(), records, &plan, reopen);
 
     println!();
     println!(
@@ -249,7 +291,12 @@ fn main() {
         value(0).len()
     );
     println!();
-    report("zu2 async, ordered", records, scans, &zu2);
+    let name = if reopen {
+        "zu2 async, ordered, reopened"
+    } else {
+        "zu2 async, ordered"
+    };
+    report(name, records, scans, &zu2);
     if only {
         return;
     }

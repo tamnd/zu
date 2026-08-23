@@ -140,6 +140,33 @@ fn grouping_without_an_aggregate_answers_one_row_per_group() {
     assert_eq!(keys, [0, 1, 2]);
 }
 
+/// The empty grouping set says the whole binding table is one group,
+/// which is what leaving the clause out says, so a count over it is the
+/// count over everything and it is one row and not none.
+#[test]
+fn an_empty_grouping_set_makes_the_whole_table_one_group() {
+    let mut fx = Fixture::open("group-empty.zu1");
+    let rows = fx
+        .conn
+        .query("MATCH (p:person) RETURN count(*) AS n GROUP BY ()")
+        .expect("query");
+    let counts: Vec<i64> = rows
+        .iter()
+        .map(|row| row.get_by_name::<i64>("n").expect("n"))
+        .collect();
+    assert_eq!(counts, [i64::from(NODES)]);
+    // ISO 16.15 writes the empty set in place of the list rather than
+    // as one element of it, so nothing stands beside it.
+    let err = fx
+        .conn
+        .query("MATCH (p:person) LET k = p.id % 3 RETURN k AS k, count(*) AS n GROUP BY (), k")
+        .expect_err("the empty set is the whole list");
+    assert!(
+        err.to_string().contains("nothing may follow RETURN"),
+        "{err}"
+    );
+}
+
 /// An item that is neither a key nor an aggregate has no one value in a
 /// group, so it is refused by name rather than answered with whichever
 /// row of the group came first.

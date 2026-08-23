@@ -3256,14 +3256,8 @@ impl Parser<'_> {
                 // clause GQL gives that job elsewhere too.
                 clauses.push(Clause::Filter { expr });
             }
-            if self.eat_kw("GROUP") {
-                self.expect_kw("BY")?;
-                loop {
-                    group_by.push(self.parse_expr()?);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
+            if self.at_kw("GROUP") {
+                group_by = self.parse_group_by()?;
             }
             if self.eat_kw("HAVING") {
                 having = Some(self.parse_expr()?);
@@ -3675,16 +3669,11 @@ impl Parser<'_> {
         // GROUP BY stands after the items and in front of the order,
         // which is where ISO 16.15 puts it: the items say what a row
         // of the group is and this says what a group is.
-        let mut group_by = Vec::new();
-        if self.eat_kw("GROUP") {
-            self.expect_kw("BY")?;
-            loop {
-                group_by.push(self.parse_expr()?);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
+        let group_by = if self.at_kw("GROUP") {
+            self.parse_group_by()?
+        } else {
+            Vec::new()
+        };
         let (order_by, skip, limit) = self.parse_order_and_page()?;
         Ok(Projection {
             distinct,
@@ -3695,6 +3684,33 @@ impl Parser<'_> {
             skip,
             limit,
         })
+    }
+
+    /// The grouping elements of ISO 16.15, which say what one group is.
+    ///
+    /// GQ15 is the empty grouping set, a pair of parentheses holding
+    /// nothing, and ISO writes it as an alternative to the whole list
+    /// rather than as one element of it, so nothing may be written
+    /// beside it. It says the whole binding table is one group, which
+    /// is what leaving the clause out says too, so it reads as the
+    /// empty list of elements and the two agree from there on.
+    fn parse_group_by(&mut self) -> Result<Vec<Expr>> {
+        self.expect_kw("GROUP")?;
+        self.expect_kw("BY")?;
+        if self.at(&TokenKind::LParen)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::RParen)
+            )
+        {
+            self.pos += 2;
+            return Ok(Vec::new());
+        }
+        let mut group_by = vec![self.parse_expr()?];
+        while self.eat(&TokenKind::Comma) {
+            group_by.push(self.parse_expr()?);
+        }
+        Ok(group_by)
     }
 
     /// The order by and page of ISO 14.9: the sort keys, the offset and
@@ -5371,6 +5387,20 @@ impl Parser<'_> {
                     if self.at_kw("IS") {
                         self.pos += 1;
                         lhs = self.parse_is_tail(lhs)?;
+                        continue;
+                    }
+                    // G111. ISO 19.9 writes the labeled predicate two
+                    // ways, `IS LABELED` and a colon, so `x:Person` is
+                    // the predicate the words above read. Two colons
+                    // written together are a separator of their own and
+                    // are left alone.
+                    if self.at(&TokenKind::Colon) && !self.at_double_colon() {
+                        self.pos += 1;
+                        lhs = Expr::IsLabeled {
+                            expr: Box::new(lhs),
+                            label: self.parse_label_expr()?,
+                            negated: false,
+                        };
                         continue;
                     }
                     break;

@@ -498,3 +498,30 @@ fn a_held_table_of_scalars_is_only_mentioned_once_it_is_old() {
         Value::Int(4)
     );
 }
+
+/// `SESSION_USER` is a `<general value specification>` (ISO 20.3) and
+/// not a function, so it is written as a bare word and takes no
+/// brackets. What it answers is implementation defined, and the answer
+/// here is the null value: this engine authenticates nobody, so the
+/// word names a principal that is not there. That is ID061 in the
+/// implementation defined declaration, and it is a value a client can
+/// act on rather than a refusal it has to special case.
+#[test]
+fn the_session_user_is_a_word_and_answers_the_principal_there_is_none_of() {
+    let (_dir, mut session) = opened("session_user.zu1");
+    assert_eq!(one(&mut session, "RETURN SESSION_USER AS n"), Value::Null);
+    // It is a value expression like any other, so it stands under a
+    // predicate and inside a call.
+    assert_eq!(
+        one(&mut session, "RETURN SESSION_USER IS NULL AS n"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut session, "RETURN COALESCE(SESSION_USER, 'nobody') AS n"),
+        Value::Str("nobody".into())
+    );
+    // A word and not a call, so the bracketed spelling is a call to a
+    // function nobody defined.
+    let err = failure(&mut session, "RETURN SESSION_USER() AS n");
+    assert!(err.contains("SESSION_USER"), "{err}");
+}

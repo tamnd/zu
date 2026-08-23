@@ -257,24 +257,35 @@ fn the_predicate_asks_whether_the_string_is_already_in_the_form() {
         Value::Bool(true)
     );
     assert_eq!(
-        one(&db, "RETURN '\u{e9}' IS NORMALIZED NFC AS v"),
+        one(&db, "RETURN '\u{e9}' IS NFC NORMALIZED AS v"),
         Value::Bool(true)
     );
     assert_eq!(
-        one(&db, "RETURN '\u{e9}' IS NORMALIZED NFD AS v"),
+        one(&db, "RETURN '\u{e9}' IS NFD NORMALIZED AS v"),
         Value::Bool(false)
     );
     assert_eq!(
-        one(&db, "RETURN '\u{e9}' IS NOT NORMALIZED NFD AS v"),
+        one(&db, "RETURN '\u{e9}' IS NOT NFD NORMALIZED AS v"),
         Value::Bool(true)
     );
-    // A word that is not a form is read as the word after the
-    // predicate, so the predicate ends at NORMALIZED and the AND is an
-    // AND.
+    // The form stands in front of the word, which is ISO's order, so
+    // the predicate ends at NORMALIZED and a word behind it is the
+    // word it is: the AND here is an AND.
     assert_eq!(
         one(&db, "RETURN 'ab' IS NORMALIZED AND 1 = 1 AS v"),
         Value::Bool(true)
     );
+    // The negation with no form named asks about the default, which is
+    // the shape a client writes when it only wants to know whether a
+    // string needs normalizing at all.
+    assert_eq!(
+        one(&db, "RETURN 'ab' IS NOT NORMALIZED AS v"),
+        Value::Bool(false)
+    );
+    // A form written behind the word is not the predicate: the name is
+    // read as whatever follows it, and here nothing may.
+    let err = refused(&db, "RETURN 'ab' IS NORMALIZED NFC AS v");
+    assert!(err.contains("NFC"), "{err}");
 }
 
 #[test]

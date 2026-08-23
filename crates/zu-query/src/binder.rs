@@ -6347,6 +6347,11 @@ impl Binder<'_> {
                 };
                 Ok((BoundExpr::Literal(lit.clone()), ty))
             }
+            // ISO 20.3. The session has no principal to name, so the
+            // word is a null of the character string type, which is
+            // the answer ID061 declares and is what makes it a value a
+            // query can carry rather than a statement that fails.
+            Expr::SessionUser => Ok((BoundExpr::Literal(Literal::Null), Type::Str)),
             Expr::Param(name) => {
                 let index = match self.params.iter().position(|p| p == name) {
                     Some(ix) => ix,
@@ -7423,6 +7428,7 @@ pub fn text(expr: &Expr) -> String {
         Expr::Literal(Literal::Str(s)) => format!("'{s}'"),
         Expr::Literal(Literal::Bytes(b)) => zu_common::bytes::literal(b),
         Expr::Literal(Literal::Temporal(t)) => t.to_string(),
+        Expr::SessionUser => "SESSION_USER".into(),
         Expr::Param(p) => format!("${p}"),
         Expr::Variable(v) => v.clone(),
         Expr::Property { base, key } => format!("{}.{key}", text(base)),
@@ -7511,7 +7517,7 @@ pub fn text(expr: &Expr) -> String {
             negated,
         } => {
             let not = if *negated { "NOT " } else { "" };
-            format!("{} IS {not}NORMALIZED {}", text(expr), form.name())
+            format!("{} IS {not}{} NORMALIZED", text(expr), form.name())
         }
         Expr::IsTyped { expr, ty, negated } => {
             let not = if *negated { "NOT " } else { "" };

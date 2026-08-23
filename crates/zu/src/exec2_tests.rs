@@ -583,13 +583,13 @@ fn covered_queries() -> &'static [&'static str] {
         // is a truth value. Both spellings of the negation, a form
         // written and a form left out, the column that is plain and so
         // is in every form, and the predicate behind an AND and an OR.
-        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFC RETURN count(*) AS n",
-        "MATCH (p:person) WHERE p.tag IS NORMALIZED NFD RETURN count(*) AS n",
-        "MATCH (p:person) WHERE p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NFC NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NFD NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.tag IS NOT NFC NORMALIZED RETURN count(*) AS n",
         "MATCH (p:person) WHERE p.tag IS NORMALIZED RETURN count(*) AS n",
-        "MATCH (p:person) WHERE p.name IS NORMALIZED NFKD RETURN count(*) AS n",
-        "MATCH (p:person) WHERE p.age > 50 AND p.tag IS NORMALIZED NFC RETURN count(*) AS n",
-        "MATCH (p:person) WHERE p.age > 50 OR p.tag IS NOT NORMALIZED NFC RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.name IS NFKD NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 AND p.tag IS NFC NORMALIZED RETURN count(*) AS n",
+        "MATCH (p:person) WHERE p.age > 50 OR p.tag IS NOT NFC NORMALIZED RETURN count(*) AS n",
         // The substring function, which in GQL is these two. A count
         // the statement wrote cannot be negative, so these are the
         // string calls that stand in a projection, and one written
@@ -1416,7 +1416,7 @@ fn fallback_queries() -> &'static [&'static str] {
         // predicate has a register of its own and a projection wants a
         // vector. In a filter the same expression is claimed, which is
         // where a query writes it.
-        "MATCH (p:person) RETURN p.tag IS NORMALIZED NFC AS b, p.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person) RETURN p.tag IS NFC NORMALIZED AS b, p.id AS id ORDER BY id LIMIT 20",
         // A count that is a column, in a projection. A string has no
         // negative number of characters, and a computed column is
         // filled before the filter that would have dropped the row

@@ -130,6 +130,61 @@ fn the_simple_form_compares_each_branch_with_one_value() {
     assert_eq!(unmatched, [0, 0, 0, 1]);
 }
 
+/// A branch of the simple form is a `<when operand list>`, so it holds
+/// several operands and holds when the subject equals any of them.
+#[test]
+fn a_branch_may_list_the_values_it_holds_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    let mut said = numbers(
+        &db,
+        "MATCH (p:person) RETURN CASE p.name WHEN 'ana', 'bo' THEN 1 ELSE 0 END AS n",
+    );
+    said.sort();
+    assert_eq!(said, [0, 0, 1, 1]);
+    // The list is the disjunction of the comparisons and nothing else,
+    // so a null subject equals none of them and lands in the ELSE.
+    let mut unmatched = numbers(
+        &db,
+        "MATCH (p:person) OPTIONAL MATCH (p)-[:has]->(t:pet) \
+         RETURN CASE t.weight WHEN 4, 20 THEN 1 ELSE 0 END AS n",
+    );
+    unmatched.sort();
+    assert_eq!(unmatched, [0, 0, 1, 1]);
+}
+
+/// The second part of a `<when operand>` is a predicate with its left
+/// side left out, the case operand standing where it would have been, so
+/// a branch may ask an ordering or a null test rather than an equality.
+#[test]
+fn a_branch_may_ask_a_predicate_of_the_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    let mut said = numbers(
+        &db,
+        "MATCH (p:person) RETURN CASE p.age WHEN < 18 THEN 1 WHEN >= 65 THEN 3 ELSE 2 END AS n",
+    );
+    said.sort();
+    assert_eq!(said, [1, 2, 3, 3]);
+    // The null predicate is the one branch an equality cannot write,
+    // since a subject that is null equals nothing at all, not even null.
+    let mut pets = numbers(
+        &db,
+        "MATCH (p:person) OPTIONAL MATCH (p)-[:has]->(t:pet) \
+         RETURN CASE t.weight WHEN IS NULL THEN 0 WHEN <= 4 THEN 1 ELSE 2 END AS n",
+    );
+    pets.sort();
+    assert_eq!(pets, [0, 0, 1, 2]);
+    // An abbreviated branch and a listed one stand in one expression and
+    // are still asked in the order they were written.
+    let mut mixed = numbers(
+        &db,
+        "MATCH (p:person) RETURN CASE p.age WHEN 15, 30 THEN 1 WHEN > 20 THEN 2 ELSE 3 END AS n",
+    );
+    mixed.sort();
+    assert_eq!(mixed, [1, 1, 2, 2]);
+}
+
 /// Only the branch that holds is evaluated, which is what lets a case
 /// stand in front of an expression the other rows cannot answer: the
 /// division by zero is in a branch the walk never reaches.

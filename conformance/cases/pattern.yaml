@@ -963,6 +963,16 @@ cases:
           - type: INT64
             value: "4"
 
+  - name: a-labeled-predicate-may-be-written-with-a-colon
+    doc: ISO 19.9 spells the labeled predicate two ways, the words and a colon, so `n:person` is the case above written shorter. The colon is the harder half to read, a colon after a variable being a colon where the pattern syntax also writes one, and it stands in the predicate part of the statement rather than in the pattern part.
+    query: MATCH (n) WHERE n:person RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
   - name: a-labeled-predicate-answers-no-for-a-label-nothing-carries
     doc: A name the graph has never held is a question with the answer no rather than a mistake, which is the reading a pattern naming one gets.
     query: MATCH (n) WHERE n IS NOT LABELED absent RETURN count(*) AS a

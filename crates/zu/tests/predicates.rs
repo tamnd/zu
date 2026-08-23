@@ -189,6 +189,29 @@ fn is_labeled_tests_a_label_expression_against_a_bound_element() {
     assert_eq!(of("k IS LABELED %"), 1);
 }
 
+/// G111 again, written the short way. ISO 19.9 gives the predicate two
+/// spellings, `IS LABELED` and a colon, so the colon answers what the
+/// words answer and the whole label expression stands behind it.
+#[test]
+fn a_colon_is_the_other_spelling_of_the_labeled_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded(dir.path());
+    let of = |predicate: &str| {
+        seeded_count(
+            &db,
+            &format!("MATCH (x) WHERE {predicate} RETURN COUNT(*) AS n"),
+        )
+    };
+    assert_eq!(of("x:person"), of("x IS LABELED person"));
+    assert_eq!(of("x:person|company"), 3);
+    assert_eq!(of("x:!person"), 1);
+    assert_eq!(of("x:robot"), 0);
+    // It is a predicate like the others, so it reads inside a longer
+    // one and the word NOT in front of it says what it always says.
+    assert_eq!(of("NOT x:person"), 1);
+    assert_eq!(of("x:person AND x.name IS NOT NULL"), 2);
+}
+
 /// G112. An edge value already holds the rows of both of its ends, so
 /// the predicate is a comparison and never a second read of storage.
 #[test]

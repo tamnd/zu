@@ -33,6 +33,10 @@ name = "session"
 harness = false
 
 [[bench]]
+name = "compile"
+harness = false
+
+[[bench]]
 name = "append"
 harness = false
 

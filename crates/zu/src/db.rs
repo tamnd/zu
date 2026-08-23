@@ -630,6 +630,15 @@ impl Connection {
         if !self.read_only {
             return Ok(());
         }
+        // A plan is only kept for a text that compiled, and only a
+        // query compiles, so a text the session already holds is one
+        // this call let through before and would let through again.
+        // Saying so from the cache is what keeps a read-only connection
+        // from parsing every statement twice, once here and once in the
+        // session below (#658).
+        if self.session.holds_plan(source) {
+            return Ok(());
+        }
         if matches!(
             crate::query::not_a_query(source),
             Ok(Some(crate::query::NotAQuery::Catalog(_)))
@@ -887,6 +896,32 @@ mod tests {
             .query("INSERT (p:person {name: 'zoe'})")
             .expect_err("refused");
         assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    /// The refusal above sits in front of the plan cache, so a
+    /// read-only connection was parsing every statement one more time
+    /// than a read-write one. A text with a plan behind it is one the
+    /// refusal already let through, and the second send skips it. #658.
+    #[test]
+    fn a_read_only_connection_refuses_from_the_cache_the_second_time() {
+        let (_dir, path) = scratch("refuse-twice.zu1");
+        let db = Database::open_with(&path, Config::new().read_only(true)).expect("open");
+        let mut conn = db.connect().expect("connect");
+        let query = "MATCH (p:person) RETURN count(p) AS n";
+        conn.query(query).expect("a read");
+        assert!(
+            conn.session.holds_plan(query),
+            "the plan is held, so the refusal has its answer"
+        );
+        conn.query(query).expect("the same read again");
+
+        // A write is not held, so it is refused on every send.
+        for _ in 0..2 {
+            let err = conn
+                .query("CREATE PROPERTY GRAPH later ANY")
+                .expect_err("refused");
+            assert!(err.to_string().contains("read-only"), "{err}");
+        }
     }
 
     /// The API refusal above is a courtesy; this is the guarantee. The

@@ -1120,14 +1120,15 @@ exec_semi_mprobes_s_core = 1.8
 # one machine and does not move with the host. Three refusals are timed,
 # one per stage a statement can die at: syntax in the parser, an
 # undefined reference after the parse, and a missing parameter at bind
-# time on a plan that is already cached and correct. Measured on the
-# local M series against a 3.62 us answer: syntax 0.54 (0.15x),
-# undefined reference 1.21 (0.33x), missing parameter 0.04 (0.01x).
-# The GitHub runner the gate job uses is slower on both sides and lands
-# on the same ratio: answer 6.13, syntax 0.86 (0.14x), undefined
-# reference 2.04 (0.33x), missing parameter 0.11 (0.02x). That the two
-# machines agree to two decimal places on the ratio while disagreeing
-# by 1.7x on the latencies is the reason the gate is written this way.
+# time on a plan that is already cached and correct. Measured on an
+# idle local M series against a 5.50 us answer: syntax 1.54 (0.28x),
+# undefined reference 2.12 (0.39x), missing parameter 2.54 (0.46x).
+# The GitHub runner the gate job uses is about twice as slow on both
+# sides and lands on the same ratios: answer 12.81, syntax 3.27
+# (0.25x), undefined reference 4.57 (0.36x), missing parameter 5.58
+# (0.44x). That the two machines agree to within a couple of hundredths
+# on the ratio while disagreeing by 2.3x on the latencies is the reason
+# the gate is written this way.
 # The milestone only asks for a ratio under 1.0; the ceiling sits at
 # 0.6 because 0.33 is what the engine actually does and a refusal that
 # drifted up to two thirds of an answer would be worth looking at.
@@ -1144,21 +1145,34 @@ exec_semi_mprobes_s_core = 1.8
 # runner slower than the reference machine reads the undefined
 # reference refusal at 3.40, 3.94, 4.01 and 4.04 us on four consecutive
 # runs of the same code, which is a coin flip against a ceiling of 4
-# and cost main a red run on 2026-08-14 with nothing wrong with it. So
-# the bench measures the host with a loop that touches nothing in zu
-# and reads the backstop at what that says, clamped to between one and
-# four times the written number. The loop is the work a refusal is,
-# which is a short string walked into a few small allocations and a
-# lookup, because a pointer chase was tried first and read 0.99x on the
-# runner: its memory is as fast as the reference machine's and its core
-# is not. refuse_calibration_ns is the reference reading, 498 ns per
-# round on the local M series over three runs that read 496, 498 and
-# 504. A host that reads the same is held to exactly 4 us. Only the backstop
-# scales; refuse_over_answer is a ratio between two paths timed in one
-# run and needs no help from any of this.
+# and cost main a red run on 2026-08-14 with nothing wrong with it.
+#
+# The bench used to answer that by measuring the host with a loop that
+# touched nothing in zu and reading the backstop at what the loop said.
+# That does not work and #648 is why. Four proxies were tried here and
+# in benches/write.rs and none of them tracks: a pointer chase reads
+# 0.99x on a runner because its memory is as fast as the reference
+# machine's and its core is not, the string and map loop that replaced
+# the chase read 1.15x on one runner and 1.61x on the next while both
+# ran zu at about 2x, and timing the store build reads under one
+# because it is a filesystem measurement and Linux takes an unsynced
+# write more cheaply than Darwin does.
+#
+# The one thing that tracks a query engine is the query engine, and
+# here that is the answer path this bench already times. It cannot
+# scale the backstop, though: the ratio gate above divides by the same
+# number, so a backstop scaled by it is refuse_over_answer with a
+# looser constant and catches nothing the ratio does not. So the
+# backstop is held on a host that reads within a quarter of the
+# reference and reported and not held anywhere else, which is honest
+# about what a shared vCPU can say about a 4 us target. The reference
+# is 5.5 us, three idle runs of the local M series reading 5.54, 5.50
+# and 5.75; it lives in the bench and not here because it is a property
+# of one machine rather than a budget. refuse_over_answer is a ratio
+# between two paths timed in one run, holds on every host, and needs no
+# help from any of this.
 refuse_over_answer = 0.6
 refuse_p50_us = 4.0
-refuse_calibration_ns = 498
 
 # Tail latency of a served read (perf/05, zu#76), benches/tail.rs: the
 # p99 of a point seeded one hop over the p50 of the same stream, on a

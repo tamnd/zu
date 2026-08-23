@@ -7,8 +7,10 @@
 //! form answers: `-/ knows knows /->` and `-[:knows]->()-[:knows]->` are
 //! one question, and so are the seven arrows around the slashes and the
 //! seven an ordinary step writes. The rest is what the slashes may hold,
-//! since a label expression there says more than an edge kept under one
-//! type can answer, and what has no answer is refused by name.
+//! which is read against the one fact that an edge here is kept under
+//! exactly one type: the bar, the ampersand and the exclamation mark are
+//! a set of types and the complement of one, and what those two cannot
+//! hold is refused by name.
 
 use zu::Database;
 use zu::zu1::file::Zu1File;
@@ -26,6 +28,14 @@ fn seeded(path: &std::path::Path) {
     bulk_load_as(&mut db, "person", "knows", NODES.into(), &edges).expect("load");
 }
 
+/// [`seeded`] with a second edge type over the same nodes, so that a
+/// step which excludes one type has another one left to walk.
+fn seeded_with_a_second_type(path: &std::path::Path) {
+    seeded(path);
+    let mut db = Zu1File::open(path).expect("open");
+    bulk_load_as(&mut db, "person", "likes", NODES.into(), &[(0, 4)]).expect("load");
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     conn: zu::Connection,
@@ -33,9 +43,13 @@ struct Fixture {
 
 impl Fixture {
     fn open(name: &str) -> Fixture {
+        Fixture::seeded_by(name, seeded)
+    }
+
+    fn seeded_by(name: &str, seed: fn(&std::path::Path)) -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(name);
-        seeded(&path);
+        seed(&path);
         let db = Database::open(&path).expect("open");
         let conn = db.connect().expect("connect");
         Fixture { _dir: dir, conn }
@@ -149,16 +163,81 @@ fn a_bar_inside_the_slashes_is_either_label_on_one_step() {
     assert_eq!(fx.walks("-/ knows|knows /->"), fx.walks("-[:knows]->"));
 }
 
+/// An ampersand asks the one label of the step to be several things at
+/// once. An edge is kept under exactly one type here, so the only
+/// conjunction with an answer is the one that names the same type
+/// twice, and that answer is the type.
+#[test]
+fn an_ampersand_inside_the_slashes_asks_the_one_label_twice() {
+    let mut fx = Fixture::open("simplified-conjunction.zu1");
+    assert_eq!(fx.walks("-/ knows & knows /->"), fx.walks("-[:knows]->"));
+    assert_eq!(fx.walks("-/ (knows|knows) & knows /->"), 5);
+}
+
+/// An exclamation mark says the step is not of some type, and an edge
+/// kept under one type is of every other type instead, so the step
+/// walks all the types the mark did not name.
+#[test]
+fn an_exclamation_mark_walks_every_other_type() {
+    let mut fx = Fixture::seeded_by("simplified-negation.zu1", seeded_with_a_second_type);
+    assert_eq!(fx.walks("-/ !knows /->"), fx.walks("-[:likes]->"));
+    assert_eq!(fx.walks("-/ !likes /->"), fx.walks("-[:knows]->"));
+    // One edge of the second type, from 0 to 4, so a step that keeps
+    // out the first one reaches the far end of the line in a hop.
+    assert_eq!(fx.reached("-/ !knows /->"), [4]);
+    // The mark and the bar read together: neither type is nothing.
+    assert_eq!(fx.walks("-/ !knows & !likes /->"), 0);
+}
+
+/// A dash in front of a step is the seventh override: it says the step
+/// may go either way, whatever the arrow around the slashes said.
+#[test]
+fn a_dash_in_front_of_a_step_says_it_goes_either_way() {
+    let mut fx = Fixture::open("simplified-any-direction.zu1");
+    assert_eq!(fx.walks("-/ -knows /->"), fx.walks("-[:knows]-"));
+    assert_eq!(fx.walks("-/ -knows /->"), 10);
+    // The other steps of the stretch keep what the arrow gave them, so
+    // only the step the dash stands in front of goes either way.
+    assert_eq!(
+        fx.walks("-/ -knows knows /->"),
+        fx.walks("-[:knows]-()-[:knows]->")
+    );
+}
+
 /// An edge is kept under exactly one type here, so the parts of the
 /// standard's label expression that ask about more than that are
 /// refused by name and pointed at what to write instead.
 #[test]
 fn what_a_simplified_stretch_refuses() {
     let mut fx = Fixture::open("simplified-refusals.zu1");
-    for stretch in ["-/ !knows /->", "-/ % /->", "-/ knows&knows /->"] {
+    for stretch in [
+        "-/ % /->",
+        "-/ knows&likes /->",
+        "-/ knows & !knows /->",
+        "-/ !(knows|!knows) /->",
+    ] {
         let err = fx.refused(stretch);
         assert!(err.contains("stored under one type"), "{stretch}: {err}");
     }
+    // Two types on the one step name themselves in the message; a type
+    // asked for and excluded at once is the other way to ask for
+    // nothing, and it says so in its own words.
+    assert!(
+        fx.refused("-/ knows&likes /->")
+            .contains("this step names 2")
+    );
+    let err = fx.refused("-/ knows & !knows /->");
+    assert!(err.contains("excludes in the same breath"), "{err}");
+    // An ampersand joins the labels of one step, so a walk on either
+    // side of it is not something it can join.
+    let err = fx.refused("-/ (knows knows) & knows /->");
+    assert!(err.contains("a label and not a walk"), "{err}");
+    // The dash and the arrowhead answer the same question twice.
+    let err = fx.refused("-/ -knows> /->");
+    assert!(
+        err.contains("a second answer to the same question"),
+        "{err}"
+    );
     // A bar between walks of different shapes is an alternation of
     // paths, which the bar between two whole patterns already says.
     let err = fx.refused("-/ knows knows | knows /->");

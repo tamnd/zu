@@ -67,6 +67,9 @@ struct Simplified {
     /// The types the step may walk, which is what the labels the
     /// expression wrote for this step come to.
     types: Vec<String>,
+    /// Whether the list is the types the step does not walk, which is
+    /// what an exclamation mark in front of a label says.
+    negated: bool,
     /// The direction this step overrode the pattern's with, if it wrote
     /// one (features G081 and G082).
     direction: Option<RelDirection>,
@@ -345,6 +348,114 @@ fn a_direction(inbound: bool, tilde: bool, outbound: bool) -> Option<RelDirectio
         (true, true, false) => Some(RelDirection::InOrUndirected),
         (false, true, true) => Some(RelDirection::OutOrUndirected),
         (false, false, false) => Some(RelDirection::Any),
+    }
+}
+
+/// The edge types a step may walk: the names it walks, or the names it
+/// does not.
+///
+/// An edge is stored under one type in this engine, so the label set of
+/// an edge it holds has exactly one label in it, and that is what makes
+/// a list and a side of it enough for every operator ISO 16.12 writes
+/// over labels. A set of one label meets another set of one label in
+/// the four ways below and never needs to be more than this.
+///
+/// Empty means what it says on each side: no type at all when the list
+/// is what the step walks, and every type when the list is what it does
+/// not, since a step that excludes nothing excludes nothing.
+struct Labels {
+    names: Vec<String>,
+    negated: bool,
+}
+
+impl Labels {
+    /// No type at all, which is what a union starts from.
+    fn nothing() -> Self {
+        Self {
+            names: Vec::new(),
+            negated: false,
+        }
+    }
+
+    fn walking(names: Vec<String>) -> Self {
+        Self {
+            names,
+            negated: false,
+        }
+    }
+
+    /// What a step read so far says about the label.
+    fn of(step: &Simplified) -> Self {
+        Self {
+            names: step.types.clone(),
+            negated: step.negated,
+        }
+    }
+
+    /// Whether nothing can walk the step, which is a set the AST has no
+    /// way to write and every caller refuses.
+    fn empty(&self) -> bool {
+        !self.negated && self.names.is_empty()
+    }
+
+    /// The names in `self` that are also in `other`, or that are not,
+    /// in the order they were written.
+    fn kept(&self, other: &[String], wanted: bool) -> Vec<String> {
+        self.names
+            .iter()
+            .filter(|name| other.contains(name) == wanted)
+            .cloned()
+            .collect()
+    }
+
+    fn joined(&self, other: &[String]) -> Vec<String> {
+        let mut names = self.names.clone();
+        for name in other {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    /// Either side, which is what a bar between two steps asks for.
+    fn or(&self, other: &Labels) -> Labels {
+        match (self.negated, other.negated) {
+            (false, false) => Labels::walking(self.joined(&other.names)),
+            (false, true) => Labels {
+                names: other.kept(&self.names, false),
+                negated: true,
+            },
+            (true, false) => Labels {
+                names: self.kept(&other.names, false),
+                negated: true,
+            },
+            (true, true) => Labels {
+                names: self.kept(&other.names, true),
+                negated: true,
+            },
+        }
+    }
+
+    /// Both sides, which is what an ampersand asks for.
+    fn and(&self, other: &Labels) -> Labels {
+        match (self.negated, other.negated) {
+            (false, false) => Labels::walking(self.kept(&other.names, true)),
+            (false, true) => Labels::walking(self.kept(&other.names, false)),
+            (true, false) => Labels::walking(other.kept(&self.names, false)),
+            (true, true) => Labels {
+                names: self.joined(&other.names),
+                negated: true,
+            },
+        }
+    }
+
+    /// Every type but these, which is what an exclamation mark says.
+    fn not(self) -> Labels {
+        Labels {
+            names: self.names,
+            negated: !self.negated,
+        }
     }
 }
 
@@ -4608,6 +4719,7 @@ impl Parser<'_> {
         Ok(RelPattern {
             var,
             types,
+            negated: false,
             direction,
             range,
             props,
@@ -4691,6 +4803,7 @@ impl Parser<'_> {
             .map(|step| RelPattern {
                 var: None,
                 types: step.types,
+                negated: step.negated,
                 direction: step.direction.unwrap_or(default),
                 range: step.range,
                 props: Vec::new(),
@@ -4729,7 +4842,7 @@ impl Parser<'_> {
         // on it, which is what a step written `[:A|B]` is. Ways of more
         // than one step are walks of different shapes, and a walk is
         // not something a label expression can hold.
-        let mut types = Vec::new();
+        let mut union = Labels::nothing();
         for way in &ways {
             match way.as_slice() {
                 [one] if one.range.is_none() && one.direction == ways[0][0].direction => {
@@ -4737,11 +4850,7 @@ impl Parser<'_> {
                     // label: what the bar answers is a set of paths,
                     // and a step that walked the same edge under the
                     // same type walked the same path.
-                    for name in &one.types {
-                        if !types.contains(name) {
-                            types.push(name.clone());
-                        }
-                    }
+                    union = union.or(&Labels::of(one));
                 }
                 _ => {
                     return Err(ZuError::gql_in(
@@ -4757,7 +4866,8 @@ impl Parser<'_> {
             }
         }
         Ok(vec![Simplified {
-            types,
+            types: union.names,
+            negated: union.negated,
             direction: ways[0][0].direction,
             range: None,
         }])
@@ -4766,11 +4876,99 @@ impl Parser<'_> {
     /// One term: the factors written one after another, which are the
     /// steps of the walk in the order it takes them.
     fn parse_simple_term(&mut self) -> Result<Vec<Simplified>> {
-        let mut out = self.parse_simple_factor()?;
+        let mut out = self.parse_simple_conjunction()?;
         while self.at_simple_factor() {
-            out.extend(self.parse_simple_factor()?);
+            out.extend(self.parse_simple_conjunction()?);
         }
         Ok(out)
+    }
+
+    /// The factors an ampersand joins (ISO 16.12).
+    ///
+    /// An edge is stored under one type in this engine, so a step's
+    /// label set holds one label and a conjunction is a question about
+    /// that one label: `LINK & LINK` is the label written twice and is
+    /// the step that walks it, and `A & B` asks the one label to be two
+    /// things at once, which is 42007 the way it always was.
+    fn parse_simple_conjunction(&mut self) -> Result<Vec<Simplified>> {
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        let steps = self.parse_simple_factor()?;
+        if !self.at(&TokenKind::Amp) {
+            return Ok(steps);
+        }
+        let mut walked = 0;
+        let mut both = match steps.as_slice() {
+            [one] if one.range.is_none() => Labels::of(one),
+            _ => return Err(self.conjoins_a_walk(at)),
+        };
+        walked += usize::from(!both.negated && !both.names.is_empty());
+        let mut direction = steps[0].direction;
+        let mut names = both.names.clone();
+        while self.eat(&TokenKind::Amp) {
+            let next = self.parse_simple_factor()?;
+            let [one] = next.as_slice() else {
+                return Err(self.conjoins_a_walk(at));
+            };
+            if one.range.is_some() {
+                return Err(self.conjoins_a_walk(at));
+            }
+            if one.direction.is_some() && direction.is_some() && one.direction != direction {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "a step goes one way, and the two sides of this ampersand say two",
+                ));
+            }
+            direction = direction.or(one.direction);
+            walked += usize::from(!one.negated && !one.types.is_empty());
+            for name in &one.types {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            both = both.and(&Labels::of(one));
+        }
+        if both.empty() {
+            // Two labels the step is asked to wear at once is the count
+            // the message names, and a label the same step is asked to
+            // wear and not to wear is the other way to ask for nothing.
+            let detail = if walked > 1 {
+                format!(
+                    "its label set holds one label and this step names {}; write the one \
+                     type the step walks",
+                    names.len()
+                )
+            } else {
+                "and this step asks for a type it excludes in the same breath, so nothing \
+                 could walk it"
+                    .to_string()
+            };
+            return Err(ZuError::gql_in(
+                codes::C42007,
+                self.source,
+                at,
+                format_args!("an edge is stored under one type in this engine, so {detail}"),
+            ));
+        }
+        Ok(vec![Simplified {
+            types: both.names,
+            negated: both.negated,
+            direction,
+            range: None,
+        }])
+    }
+
+    /// An ampersand between two things that are not one step each,
+    /// which is a conjunction of walks rather than of labels.
+    fn conjoins_a_walk(&self, at: usize) -> ZuError {
+        ZuError::gql_in(
+            codes::C42001,
+            self.source,
+            at,
+            "an ampersand inside a simplified path pattern joins the labels of one step, \
+             so what stands on each side of it is a label and not a walk",
+        )
     }
 
     /// Whether another factor is written here, which is what ends a
@@ -4783,6 +4981,7 @@ impl Parser<'_> {
                     | TokenKind::QuotedIdent(_)
                     | TokenKind::LParen
                     | TokenKind::Lt
+                    | TokenKind::Minus
                     | TokenKind::Tilde
                     | TokenKind::Bang
                     | TokenKind::Percent
@@ -4796,9 +4995,23 @@ impl Parser<'_> {
         let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
         let inbound = self.eat(&TokenKind::Lt);
         let tilde = self.eat(&TokenKind::Tilde);
+        // G081's seventh override, and the only one written with the
+        // mark that is otherwise a bar: a dash in front of a step says
+        // the step may go either way, whatever the arrow around the
+        // slashes says.
+        let any = !inbound && !tilde && self.eat(&TokenKind::Minus);
         let mut steps = self.parse_simple_primary()?;
         let outbound = self.eat(&TokenKind::Gt);
-        if inbound || tilde || outbound {
+        if any && outbound {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "a dash in front of a step says the step goes either way, so an arrowhead \
+                 behind it is a second answer to the same question",
+            ));
+        }
+        if inbound || tilde || outbound || any {
             let Some(over) = a_direction(inbound, tilde, outbound) else {
                 return Err(ZuError::gql_in(
                     codes::C42001,
@@ -4835,6 +5048,7 @@ impl Parser<'_> {
         {
             return Ok(vec![Simplified {
                 types: one.types.clone(),
+                negated: one.negated,
                 direction: one.direction,
                 range: Some(times),
             }]);
@@ -4879,18 +5093,53 @@ impl Parser<'_> {
         ))
     }
 
-    /// One label, or a bracketed expression over labels.
+    /// One label, a negation of one, or a bracketed expression over
+    /// labels.
+    ///
+    /// An edge is stored under one type here, so `!KNOWS` is a step
+    /// that walks an edge of any other type, and that is the whole of
+    /// what the exclamation mark has to mean: the label set of an edge
+    /// this engine holds has one label in it, so not wearing a label
+    /// and wearing another are the same thing.
     fn parse_simple_primary(&mut self) -> Result<Vec<Simplified>> {
         let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
-        if self.at(&TokenKind::Bang) || self.at(&TokenKind::Percent) {
+        if self.at(&TokenKind::Percent) {
             return Err(ZuError::gql_in(
                 codes::C42001,
                 self.source,
                 at,
-                "an edge is stored under one type in this engine, so a label expression \
-                 on a step is the types it may have and nothing else; write the types \
-                 the step walks with bars between them",
+                "a percent sign is every label at once, and an edge is stored under one \
+                 type in this engine, so a step that walks every type writes no type at \
+                 all",
             ));
+        }
+        if self.eat(&TokenKind::Bang) {
+            let inner = self.parse_simple_primary()?;
+            let [one] = inner.as_slice() else {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "an exclamation mark says a step is not of some type, so what follows \
+                     it is a type and not a walk",
+                ));
+            };
+            let labels = Labels::of(one).not();
+            if labels.empty() {
+                return Err(ZuError::gql_in(
+                    codes::C42007,
+                    self.source,
+                    at,
+                    "an edge is stored under one type in this engine, and this step \
+                     excludes every type there is, so nothing could walk it",
+                ));
+            }
+            return Ok(vec![Simplified {
+                types: labels.names,
+                negated: labels.negated,
+                direction: one.direction,
+                range: one.range,
+            }]);
         }
         if self.eat(&TokenKind::LParen) {
             let inner = self.parse_simple_contents()?;
@@ -4898,9 +5147,9 @@ impl Parser<'_> {
             return Ok(inner);
         }
         let name = self.expect_name("an edge type")?;
-        self.refuse_edge_conjunction()?;
         Ok(vec![Simplified {
             types: vec![name],
+            negated: false,
             direction: None,
             range: None,
         }])

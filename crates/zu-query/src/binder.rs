@@ -281,6 +281,13 @@ fn disjoint_types(lhs: &ast::RelPattern, rhs: &ast::RelPattern) -> bool {
     if lhs.types.is_empty() || rhs.types.is_empty() {
         return false;
     }
+    // A step that names the types it does not walk reaches every type
+    // the graph may grow, so what it has in common with another step is
+    // a question about the catalog rather than about the two patterns,
+    // and the answer here is the one that keeps them.
+    if lhs.negated || rhs.negated {
+        return false;
+    }
     !lhs.types.iter().any(|name| rhs.types.contains(name))
 }
 
@@ -5665,6 +5672,12 @@ impl Binder<'_> {
                 "a hop range asks for a walk of some length, and {verb} writes one edge"
             )));
         }
+        if pat.negated {
+            return Err(invalid(format!(
+                "{verb} needs the type of the edge it writes, and a step saying which \
+                 types it is not names none"
+            )));
+        }
         let [name] = pat.types.as_slice() else {
             return Err(match pat.types.is_empty() {
                 // 22G0Q. An edge lives in a rel table and the table's
@@ -6065,6 +6078,17 @@ impl Binder<'_> {
         let mut candidates = Vec::new();
         if pat.types.is_empty() {
             candidates.extend(self.schema.rels.iter().map(|r| r.id));
+        } else if pat.negated {
+            // `!KNOWS` is every table but that one, and a name the
+            // graph has no table for takes nothing away, which is the
+            // same reading the positive step gets from the other side.
+            candidates.extend(
+                self.schema
+                    .rels
+                    .iter()
+                    .filter(|rel| !pat.types.contains(&rel.name))
+                    .map(|rel| rel.id),
+            );
         } else {
             // A type the graph has no table for holds no edges, so a
             // step asking for it walks nothing. That is the same

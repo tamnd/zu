@@ -1314,10 +1314,20 @@ cases:
           - type: INT64
             value: "3"
 
-  - name: a-label-expression-a-single-typed-edge-cannot-answer-is-refused
-    doc: An edge is stored under exactly one type in this engine, so a negated label on a step describes something no edge of it can be asked about. It is refused by name where it is written rather than answered as though the negation had been dropped.
+  - name: a-negated-label-in-a-simplified-stretch-walks-every-other-type
+    doc: An edge is stored under exactly one type in this engine, so a step that is not of a type is a step of every other type, which is ISO 16.12 feature G080. The fixture holds one edge type, so the step that keeps it out has nothing left to walk and answers no rows rather than walking the type it excluded.
     query: MATCH (a:person)-/ !knows /->(b:person) RETURN count(*) AS a
-    raises: "42001"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-label-expression-a-single-typed-edge-cannot-answer-is-refused
+    doc: The label set of an edge stored under one type holds one label, so a step asked to wear two labels at once describes something no edge of it can be, which is the too many labels condition of ISO 24.5.2 seen while the statement is being read. It is refused by name where it is written rather than answered as though one of the two had been dropped.
+    query: MATCH (a:person)-/ knows & likes /->(b:person) RETURN count(*) AS a
+    raises: "42007"
 
   - name: path-length-counts-the-edges-of-a-walk
     doc: Feature GF04, ISO 20.22. The length of a path is its edges and not its elements, and the two are different numbers that are both integers, so an engine answering with the element count would be believed. The walk asked about here is ann to bo to cy.

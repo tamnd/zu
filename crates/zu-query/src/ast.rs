@@ -1308,6 +1308,11 @@ pub struct RelPattern {
     pub var: Option<String>,
     /// `:KNOWS|LIKES` alternatives.
     pub types: Vec<String>,
+    /// Whether the list is what the step does not walk rather than
+    /// what it walks, which is what `!KNOWS` says. An empty list is
+    /// every type either way, since a step that excludes nothing
+    /// excludes nothing.
+    pub negated: bool,
     pub direction: RelDirection,
     /// `*`, `*2`, `*1..3`, `*..3`, `*2..` hop ranges; `None` is a
     /// single hop, `Some((None, None))` is a bare `*`.

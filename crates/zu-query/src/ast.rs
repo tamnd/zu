@@ -1596,7 +1596,10 @@ pub enum Expr {
     /// calls and do not come through here.
     Trim {
         side: TrimSide,
-        /// The character to trim, or none, which means a space.
+        /// The character to trim, or none, which means a space. Over a
+        /// list this is the count of elements to keep instead, since
+        /// ISO 20.16 writes the list trim with the same name and gives
+        /// it a number where the others take a character.
         chars: Option<Box<Expr>>,
         source: Box<Expr>,
     },

@@ -245,7 +245,7 @@ fn the_substring_function_answers_over_a_column() {
     // binding, and a count no string has is the standard's condition.
     let says = refused(&db, "RETURN LEFT('abc', 'two') AS v");
     assert!(
-        says.contains("left() needs a string and a count of characters"),
+        says.contains("left() needs a string or a byte string and a count of its units"),
         "{says}"
     );
     let says = refused(&db, "MATCH (p:person) RETURN RIGHT(p.name, -1) AS v");

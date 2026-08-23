@@ -204,6 +204,47 @@ fn a_path_whose_edges_do_not_join_its_nodes_is_refused() {
     assert_eq!(code(&mut db, source), "22G03");
 }
 
+/// G004. Two paths join with the same operator two strings join with,
+/// and the join is a walk rather than a sequence: the first path has to
+/// end where the second one starts, and the shared node is in the answer
+/// once. A join that does not meet is the same fault as a path built
+/// from elements that do not join, and carries the same condition.
+#[test]
+fn two_paths_that_meet_at_a_node_join_into_one_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let source = "MATCH p = (a:person)-[:knows]->(b:person), q = (b2:person)-[:knows]->(c:person) \
+                  WHERE a.id = 0 AND b.id = b2.id RETURN PATH_LENGTH(p || q) AS v";
+    assert_eq!(one(&mut db, source), Value::Int(2));
+
+    // The joined path is the path the same walk matches, elements and
+    // all, which is what says the shared node was not counted twice.
+    let source = "MATCH p = (a:person)-[:knows]->(b:person), q = (b2:person)-[:knows]->(c:person), \
+                  w = (a2:person)-[:knows]->(:person)-[:knows]->(:person) \
+                  WHERE a.id = 0 AND b.id = b2.id AND a2.id = 0 RETURN (p || q) = w AS v";
+    assert!(yes(&mut db, source));
+
+    // Two paths that do not meet describe no walk, so there is nothing
+    // to answer with.
+    let source = "MATCH p = (a:person)-[:knows]->(b:person), q = (c:person)-[:knows]->(d:person) \
+                  WHERE a.id = 0 AND c.id = 2 RETURN p || q AS v";
+    assert_eq!(code(&mut db, source), "22G0Z");
+
+    // A path joined to the one node path at its end is itself, which is
+    // the join having an identity rather than a special case for it.
+    let source = "MATCH p = (a:person)-[:knows]->(b:person) WHERE a.id = 0 \
+                  RETURN (p || PATH [b]) = p AS v";
+    assert!(yes(&mut db, source));
+
+    // A path is not a list, and joining one to a list is the mistake the
+    // operator's own message is about rather than a walk that does not
+    // meet.
+    let source = "MATCH p = (a:person)-[:knows]->(b:person) WHERE a.id = 0 RETURN p || [b] AS v";
+    assert_eq!(code(&mut db, source), "22G03");
+    let source = "MATCH p = (a:person)-[:knows]->(b:person) WHERE a.id = 0 RETURN p || NULL AS v";
+    assert_eq!(one(&mut db, source), Value::Null);
+}
+
 /// GF04. Length is edges. The distinction matters because the element
 /// count is a different number and both are integers, so an engine that
 /// answered with the element count would be believed.

@@ -148,6 +148,52 @@ fn cardinality_counts_a_list_and_refuses_what_is_not_one() {
     assert_eq!(one(&mut db, "RETURN SIZE('abc') AS v"), Value::Int(3));
 }
 
+/// The two list value expressions of ISO 20.16: the join, which is the
+/// same operator two strings are joined with, and the trim, which takes
+/// a count rather than a character because a list has no character to
+/// take off.
+#[test]
+fn two_lists_are_joined_and_one_is_trimmed_to_a_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    assert_eq!(
+        one(&mut db, "RETURN [1, 2] || [3] AS v"),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+    assert_eq!(
+        one(&mut db, "RETURN [] || [1] AS v"),
+        Value::List(vec![Value::Int(1)])
+    );
+    assert_eq!(one(&mut db, "RETURN [1] || NULL AS v"), Value::Null);
+    // The element type of the join is the one both sides agree on, and
+    // a list of strings joined to a list of numbers is still a list, so
+    // this is a question about the values and not about the binder.
+    assert_eq!(
+        one(&mut db, "RETURN ['a'] || [1] AS v"),
+        Value::List(vec![Value::Str("a".to_owned()), Value::Int(1)])
+    );
+    assert_eq!(
+        one(&mut db, "RETURN TRIM([1, 2, 3], 2) AS v"),
+        Value::List(vec![Value::Int(1), Value::Int(2)])
+    );
+    // A count past the end takes the whole list rather than failing,
+    // which is what a trim does to a string that is already short.
+    assert_eq!(
+        one(&mut db, "RETURN TRIM([1], 5) AS v"),
+        Value::List(vec![Value::Int(1)])
+    );
+    assert_eq!(
+        one(&mut db, "RETURN TRIM([1, 2], 0) AS v"),
+        Value::List(vec![])
+    );
+    assert_eq!(one(&mut db, "RETURN TRIM(NULL, 2) AS v"), Value::Null);
+    // A list has to be told how many to keep, and the count has to be a
+    // whole number that is not negative.
+    assert_eq!(code(&mut db, "RETURN TRIM([1, 2]) AS v"), "22G03");
+    assert_eq!(code(&mut db, "RETURN TRIM([1, 2], -1) AS v"), "22011");
+    assert_eq!(code(&mut db, "RETURN [1] || 'a' AS v"), "22G03");
+}
+
 /// A list in a property column is the same value a list literal is,
 /// which is the point of storing one: the count, the membership test
 /// and the elements all answer the way they answer for a literal.

@@ -99,6 +99,35 @@ fn gql(status: zu_common::GqlStatus, detail: String) -> ZuError {
     ZuError::gql(status, detail)
 }
 
+/// ISO 20.13, `<path value concatenation>`. Two walks become one walk
+/// when the first ends where the second starts, and the shared node is
+/// written once, so a path of two hops joined to a path of one is a
+/// path of three and not of four.
+///
+/// The ends have to be the same node and that is checked here rather
+/// than left to [`Value::path`]. The shape check there looks at each
+/// hop's edge and the two nodes around it, and at the seam the edge is
+/// the second path's first edge, which joins the second path's first
+/// node and may join the first path's last node too if the two happen
+/// to be neighbours. That would be a walk nobody took spliced out of
+/// two that somebody did, which is exactly what 22G0Z is for.
+fn join_paths(left: Vec<Value>, right: Vec<Value>) -> Result<Value> {
+    let (Some(end), Some(start)) = (left.last(), right.first()) else {
+        unreachable!("a path value is never empty")
+    };
+    if end != start {
+        return Err(gql(
+            codes::C22G0Z,
+            "|| joins two paths at a shared node, and the first path does not end where the \
+             second one starts"
+                .to_owned(),
+        ));
+    }
+    let mut joined = left;
+    joined.extend(right.into_iter().skip(1));
+    Ok(Value::Path(joined))
+}
+
 /// One runtime value. Nodes and rels carry their table so multi-table
 /// slots stay unambiguous.
 #[derive(Debug, Clone, PartialEq)]
@@ -6878,17 +6907,41 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     let r = settle(eval(ctx, rhs)?);
                     arith(*op, l, r)
                 }
-                // ISO 20.23. Strings and nothing else: a number here is
-                // refused rather than written out as its digits, since
-                // a query that meant the digits says so with a CAST and
-                // one that meant an addition wrote a plus.
+                // ISO 20.23. Four kinds of thing are joined by this
+                // operator and the standard gives each its own rule,
+                // all spelling the operator the same way, so what the
+                // operands are is what says which join was meant. A
+                // number is refused rather than written out as its
+                // digits, since a query that meant the digits says so
+                // with a CAST and one that meant an addition wrote a
+                // plus.
                 Concat => {
                     let l = settle(eval(ctx, lhs)?);
                     let r = settle(eval(ctx, rhs)?);
                     match (l, r) {
                         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                         (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
-                        (a, b) => Err(invalid(format!("|| joins strings, got {a:?} and {b:?}"))),
+                        (Value::Bytes(mut a), Value::Bytes(b)) => {
+                            a.extend_from_slice(&b);
+                            Ok(Value::Bytes(a))
+                        }
+                        (Value::List(mut a), Value::List(b)) => {
+                            a.extend(b);
+                            Ok(Value::List(a))
+                        }
+                        (Value::Path(a), Value::Path(b)) => join_paths(a, b),
+                        // Reached when the binder could not tell: an
+                        // operand whose type was still `Any` when the
+                        // query was bound, which is a parameter or a
+                        // property read. The condition is the same one
+                        // the binder raises for the same mistake.
+                        (a, b) => Err(gql(
+                            codes::C22G03,
+                            format!(
+                                "|| joins two strings, two byte strings, two lists or two \
+                                 paths, got {a:?} and {b:?}"
+                            ),
+                        )),
                     }
                 }
                 In => {

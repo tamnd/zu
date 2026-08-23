@@ -224,7 +224,7 @@ const CALIBRATION_CAP: f64 = 4.0;
 /// which is branchy, allocates, and has an instruction footprint no
 /// twenty line loop has. So the proxy is zu's own code: the same
 /// `MATCH ... WHERE` the gated statement makes, without the `SET` on the
-/// end of it. It runs the same planner, the same scan and the same
+/// end of it. It runs the same optimizer, the same scan and the same
 /// storage, and it is not the path the ceiling gates, so a write that
 /// got slower cannot relax its own ceiling by making this slower too.
 ///

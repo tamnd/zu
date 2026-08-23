@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -1332,27 +1332,69 @@ impl Db {
 /// residency every open had before checkpoints existed, and a caller who
 /// wants the log to stay on the device says so with the option that has
 /// always meant that.
+/// It is more than one thread because the reads it is racing are not
+/// one thread either. A page is four megabytes and every one of them is
+/// a read, a checksum over what came back and an allocation, and while
+/// that is happening the workers are reading records out of pages this
+/// has not reached and paying for them a page at a time themselves. One
+/// warmer on a box with thirty two cores hands the device a queue depth
+/// of one and leaves the run to do the rest. See #665.
 fn warm(core: &Core, options: Options) {
     let upto = core.warm_upto.load(Ordering::Acquire);
     let Ok(len) = core.log.file_len() else {
         return;
     };
     let last = page_of(upto.min(len).saturating_sub(1));
-    for page in page_of(core.log.begin())..=last {
-        if core.log.stopping() || core.log.resident_pages() >= options.memory_pages {
-            return;
-        }
-        let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
-        if core
-            .log
-            .warm_page(page, bytes, recover::page_intact)
-            .is_err()
-        {
-            // A page that cannot be read is a page the read path will
-            // fail on too, and it will say so with the address in hand.
-            return;
-        }
+    let first = page_of(core.log.begin());
+    if last < first {
+        return;
     }
+    // Still bottom up: the counter hands the pages out in order and the
+    // workers take them as they finish, so the residency fills from the
+    // beginning whatever the thread count is.
+    let next = AtomicUsize::new(first);
+    let workers = warm_threads().min(last - first + 1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    if core.log.stopping() || core.log.resident_pages() >= options.memory_pages {
+                        return;
+                    }
+                    let page = next.fetch_add(1, Ordering::Relaxed);
+                    if page > last {
+                        return;
+                    }
+                    let bytes = (len - page_start(page)).min(PAGE_SIZE as u64) as usize;
+                    if core
+                        .log
+                        .warm_page(page, bytes, recover::page_intact)
+                        .is_err()
+                    {
+                        // A page that cannot be read is a page the read
+                        // path will fail on too, and it will say so with
+                        // the address in hand.
+                        return;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Threads [`warm`] reads with.
+///
+/// Half the cores, because the other half of the machine is the run
+/// this is trying to get out of the way of, and capped because past a
+/// handful of outstanding four megabyte reads the device is the limit
+/// and the extra threads are only more memory in flight. One when the
+/// machine will not say how many cores it has.
+fn warm_threads() -> usize {
+    const CAP: usize = 8;
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).clamp(1, CAP))
+        .unwrap_or(1)
 }
 
 /// The background thread: flush, then compact if the log has outgrown

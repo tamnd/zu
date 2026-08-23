@@ -231,10 +231,29 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
 
+    // ZU2_ONLY skips the sqlite side. It is for the case where two
+    // builds of zu2 are being compared against each other rather than
+    // against another engine, where the sqlite runs are two thirds of
+    // the wall clock and none of the answer. A published number is a
+    // full run.
+    let only = std::env::var("ZU2_ONLY").is_ok();
+
     let plan = draws(scans, records);
     let dir = tempfile::tempdir().expect("tempdir");
 
     let zu2 = run_zu2(dir.path(), records, &plan);
+
+    println!();
+    println!(
+        "{records} records of {} bytes, {scans} scans, one thread, in process",
+        value(0).len()
+    );
+    println!();
+    report("zu2 async, ordered", records, scans, &zu2);
+    if only {
+        return;
+    }
+
     let rowid = run_sqlite(dir.path(), records, &plan, true);
     let norowid = run_sqlite(dir.path(), records, &plan, false);
 
@@ -252,13 +271,6 @@ fn main() {
         "the two sqlite shapes disagree on rows"
     );
 
-    println!();
-    println!(
-        "{records} records of {} bytes, {scans} scans, one thread, in process",
-        value(0).len()
-    );
-    println!();
-    report("zu2 async, ordered", records, scans, &zu2);
     report("sqlite wal/off, rowid", records, scans, &rowid);
     report("sqlite wal/off, without rowid", records, scans, &norowid);
 

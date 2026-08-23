@@ -1121,14 +1121,18 @@ exec_semi_mprobes_s_core = 1.8
 # one per stage a statement can die at: syntax in the parser, an
 # undefined reference after the parse, and a missing parameter at bind
 # time on a plan that is already cached and correct. Measured on an
-# idle local M series against a 5.50 us answer: syntax 1.54 (0.28x),
-# undefined reference 2.12 (0.39x), missing parameter 2.54 (0.46x).
+# idle local M series against a 3.67 us answer: syntax 0.75 (0.21x),
+# undefined reference 0.75 (0.21x), missing parameter 0.75 (0.21x).
+# All three sit together because after #655 none of them parses: the
+# first send of a text decides what it is and the cache answers for
+# every send after it, so what is left is a lookup and the refusal.
+# Before that they read 1.54, 2.12 and 2.54 against a 5.50 us answer.
 # The GitHub runner the gate job uses is about twice as slow on both
 # sides and lands on the same ratios: answer 12.81, syntax 3.27
 # (0.25x), undefined reference 4.57 (0.36x), missing parameter 5.58
-# (0.44x). That the two machines agree to within a couple of hundredths
-# on the ratio while disagreeing by 2.3x on the latencies is the reason
-# the gate is written this way.
+# (0.44x), taken before #655 and due a re-take. That the two machines
+# agree to within a couple of hundredths on the ratio while disagreeing
+# by 2.3x on the latencies is the reason the gate is written this way.
 # The milestone only asks for a ratio under 1.0; the ceiling sits at
 # 0.6 because 0.33 is what the engine actually does and a refusal that
 # drifted up to two thirds of an answer would be worth looking at.
@@ -1166,8 +1170,8 @@ exec_semi_mprobes_s_core = 1.8
 # backstop is held on a host that reads within a quarter of the
 # reference and reported and not held anywhere else, which is honest
 # about what a shared vCPU can say about a 4 us target. The reference
-# is 5.5 us, three idle runs of the local M series reading 5.54, 5.50
-# and 5.75; it lives in the bench and not here because it is a property
+# is 3.67 us, three idle runs of the local M series reading 3.71, 3.62
+# and 3.67; it lives in the bench and not here because it is a property
 # of one machine rather than a budget. refuse_over_answer is a ratio
 # between two paths timed in one run, holds on every host, and needs no
 # help from any of this.

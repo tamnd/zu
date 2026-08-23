@@ -418,6 +418,16 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &["CREATE"];
 
+/// The column a select statement's having clause is carried in.
+///
+/// A having clause tests a value only the projection can work out, and
+/// it runs between that projection and the order clause behind it, so
+/// the value travels from the one to the other as a column. The name
+/// begins with a hash because no identifier does, which is the same
+/// thing the binder's own anonymous slots rely on, so no query can
+/// name this column and none can shadow it.
+const HAVING_COLUMN: &str = "#having";
+
 /// Every word that can stand where a query begins once the schema
 /// clause is read: the graph clause, the three that open a binding
 /// variable definition, and the clauses themselves.
@@ -431,7 +441,7 @@ const UNIMPLEMENTED: &[&str] = &["CREATE"];
 const OPENS_A_CLAUSE: &[&str] = &[
     "USE", "VALUE", "TABLE", "BINDING", "GRAPH", "PROPERTY", "MATCH", "OPTIONAL", "CALL", "INSERT",
     "MERGE", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "UNWIND", "FOR", "FILTER", "LET",
-    "WITH", "ORDER", "OFFSET", "SKIP", "LIMIT", "FINISH", "RETURN", "NEXT",
+    "WITH", "ORDER", "OFFSET", "SKIP", "LIMIT", "FINISH", "RETURN", "SELECT", "NEXT",
 ];
 
 fn opens_a_clause(word: &str) -> bool {
@@ -500,6 +510,8 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         hoisted_at: None,
         hoisted_use: None,
         hoisted_bindings: Vec::new(),
+        select_body: false,
+        select_graph: None,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -592,6 +604,21 @@ struct Parser<'a> {
     /// The definitions that body was written with, which come out with
     /// the graph clause because the clause may read one of them.
     hoisted_bindings: Vec<BindingDef>,
+    /// Whether a select statement body is being read, which is the one
+    /// place a comma may end a match statement rather than joining
+    /// another pattern to its list. See
+    /// [`Parser::comma_ends_a_select_graph_match`].
+    select_body: bool,
+    /// The graph a select statement body named, waiting for the query
+    /// it belongs to.
+    ///
+    /// ISO 14.12 writes the graph expression inside the body, once per
+    /// match, where every other statement here writes it as a `USE`
+    /// clause in front. zu runs one graph per query, so what the body
+    /// named is the query's, and it is carried out here rather than
+    /// turned into a clause because a clause is a thing the reader
+    /// wrote and this is a thing the reader wrote somewhere else.
+    select_graph: Option<GraphRef>,
 }
 
 /// A catalog statement lifted out of a call body (GP18).
@@ -2220,9 +2247,17 @@ impl Parser<'_> {
             self.hoisted_at.take(),
             self.hoisted_use.take(),
             std::mem::take(&mut self.hoisted_bindings),
+            std::mem::take(&mut self.select_body),
+            self.select_graph.take(),
         );
         let read = self.parse_query_body_inner();
-        (self.hoisted_at, self.hoisted_use, self.hoisted_bindings) = waiting;
+        (
+            self.hoisted_at,
+            self.hoisted_use,
+            self.hoisted_bindings,
+            self.select_body,
+            self.select_graph,
+        ) = waiting;
         read
     }
 
@@ -2251,6 +2286,21 @@ impl Parser<'_> {
             }
         };
         let (linear, ending) = self.parse_linear()?;
+        // The graph a select statement body named, which is where that
+        // form writes what a `USE` clause writes in front. A statement
+        // that wrote both says one graph twice or two graphs once, and
+        // the second of those is the one this engine declines.
+        let use_graph = match (use_graph, self.select_graph.take()) {
+            (front, None) => front,
+            (None, from) => from,
+            (Some(front), Some(from)) if front == from => Some(front),
+            (Some(_), Some(_)) => {
+                return Err(ZuError::gql(
+                    codes::C25G04,
+                    "a statement runs against the one graph it names, and the USE clause and the select statement body name two different ones".to_string(),
+                ));
+            }
+        };
         // The schema clause of a body taken out of a call the statement
         // begins with, which is this query's now.
         let at_schema = at_schema.or_else(|| self.hoisted_at.take());
@@ -2444,6 +2494,54 @@ impl Parser<'_> {
         Ok(Some(Conjunction::Set { op, all }))
     }
 
+    /// One match statement, and the yield clause that belongs to it.
+    ///
+    /// Two readers: the clause of a simple query statement, and the
+    /// match a select statement body lists after a graph expression.
+    /// ISO 14.12 says the body holds `<match statement>`, which is this
+    /// same rule, so the two forms take the same patterns, the same
+    /// modes and the same optional word rather than the select form
+    /// taking a narrower match that happens to look like one.
+    fn parse_match_clause(&mut self, clauses: &mut Vec<Clause>) -> Result<()> {
+        let optional = self.eat_kw("OPTIONAL");
+        // GQ21. An OPTIONAL takes either one match statement or a
+        // braced block of them. The block is one operand, so it either
+        // matches whole or every name it writes is null, which is why
+        // the whole block becomes one bracketed group rather than a
+        // group per statement.
+        let (patterns, alts, distinct, filter) = if optional && self.at(&TokenKind::LBrace) {
+            let (patterns, filter) = self.parse_match_block(&TokenKind::RBrace)?;
+            (patterns, Vec::new(), false, filter)
+        } else {
+            self.expect_kw("MATCH")?;
+            let (patterns, alts, bar) = self.parse_graph_pattern_alts()?;
+            // A bar that was never written leaves nothing to say about
+            // duplicates: the ways a quantifier spelled out are
+            // lengths, and two lengths cannot be the same path.
+            (patterns, alts, bar == Some(false), self.parse_where()?)
+        };
+        clauses.push(Clause::Match {
+            optional,
+            patterns,
+            alts,
+            distinct,
+            filter,
+        });
+        // GQ19. A yield belongs to the match it stands after, and what
+        // it does is narrow what the match wrote, so it is a clause of
+        // its own here and a statement of the match in the standard.
+        // Nothing may stand between the two, which is what makes the
+        // two readings the same.
+        if self.eat_kw("YIELD") {
+            let mut items = vec![self.parse_yield_item()?];
+            while self.eat(&TokenKind::Comma) {
+                items.push(self.parse_yield_item()?);
+            }
+            clauses.push(Clause::Yield { items });
+        }
+        Ok(())
+    }
+
     /// One simple query statement: the primitive statements it is
     /// written out of, and the result statement it ends with.
     fn parse_simple(&mut self) -> Result<(Simple, Ending)> {
@@ -2452,45 +2550,10 @@ impl Parser<'_> {
             // An OPTIONAL takes a match or a call, so the word alone
             // does not say which clause this is: the token behind it
             // does, and a call is read where a call is read.
-            if self.at_kw("MATCH") || (self.at_kw("OPTIONAL") && !self.kw_at(1, "CALL")) {
-                let optional = self.eat_kw("OPTIONAL");
-                // GQ21. An OPTIONAL takes either one match statement or
-                // a braced block of them. The block is one operand, so
-                // it either matches whole or every name it writes is
-                // null, which is why the whole block becomes one
-                // bracketed group rather than a group per statement.
-                let (patterns, alts, distinct, filter) = if optional && self.at(&TokenKind::LBrace)
-                {
-                    let (patterns, filter) = self.parse_match_block(&TokenKind::RBrace)?;
-                    (patterns, Vec::new(), false, filter)
-                } else {
-                    self.expect_kw("MATCH")?;
-                    let (patterns, alts, bar) = self.parse_graph_pattern_alts()?;
-                    // A bar that was never written leaves nothing to
-                    // say about duplicates: the ways a quantifier
-                    // spelled out are lengths, and two lengths cannot
-                    // be the same path.
-                    (patterns, alts, bar == Some(false), self.parse_where()?)
-                };
-                clauses.push(Clause::Match {
-                    optional,
-                    patterns,
-                    alts,
-                    distinct,
-                    filter,
-                });
-                // GQ19. A yield belongs to the match it stands after,
-                // and what it does is narrow what the match wrote, so
-                // it is a clause of its own here and a statement of the
-                // match in the standard. Nothing may stand between the
-                // two, which is what makes the two readings the same.
-                if self.eat_kw("YIELD") {
-                    let mut items = vec![self.parse_yield_item()?];
-                    while self.eat(&TokenKind::Comma) {
-                        items.push(self.parse_yield_item()?);
-                    }
-                    clauses.push(Clause::Yield { items });
-                }
+            if clauses.is_empty() && self.at_kw("SELECT") {
+                return self.parse_select();
+            } else if self.at_kw("MATCH") || (self.at_kw("OPTIONAL") && !self.kw_at(1, "CALL")) {
+                self.parse_match_clause(&mut clauses)?;
             } else if self.eat_kw("INSERT") {
                 let mut patterns = vec![self.parse_path()?];
                 while self.eat(&TokenKind::Comma) {
@@ -2735,9 +2798,267 @@ impl Parser<'_> {
                 ));
             } else if clauses.is_empty() && self.peek().is_none() {
                 return Err(ZuError::gql(codes::C42001, "empty query"));
+            } else if clauses.is_empty() {
+                // A select statement is a whole statement rather than a
+                // clause, so the word is one of the answers here and is
+                // not one anywhere else in the loop.
+                return Err(
+                    self.error("MATCH, OPTIONAL MATCH, SELECT, CALL, UNWIND, WITH, or RETURN")
+                );
             } else {
                 return Err(self.error("MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN"));
             }
+        }
+    }
+
+    /// The select statement of ISO 14.12.
+    ///
+    /// It is the second way GQL spells a query and it is not an
+    /// optional feature: no code in `features.xml` gates it, and it
+    /// hangs off `<focused linear query statement>` beside the match
+    /// and return form every other query here is written in. What it
+    /// says is what the other form says in a different order, the items
+    /// first and the rows they come from second, so it is read into the
+    /// same clauses rather than into a shape of its own. That is not a
+    /// shortcut: a select statement and the linear statement below have
+    /// the same answer by 14.12's own General Rules, and one shape
+    /// means one binder, one optimizer and one set of conditions.
+    ///
+    /// ```text
+    /// SELECT DISTINCT a, COUNT(*) AS n FROM g MATCH (x) WHERE p GROUP BY a HAVING n > 1 ORDER BY a
+    /// USE g MATCH (x) FILTER p WITH DISTINCT a, COUNT(*) AS n, (n > 1) AS #having GROUP BY a
+    ///                          FILTER #having RETURN a, n ORDER BY a
+    /// ```
+    ///
+    /// The having clause is what makes the second line longer than the
+    /// first. It tests a group rather than a row, so it has to run
+    /// after the projection that made the groups and before the order
+    /// and the page, and the value it tests is one the projection is
+    /// the only place that can work out. So the projection carries it
+    /// as a column of its own under a name no query can write, a filter
+    /// behind the projection reads that column, and the result
+    /// statement projects the columns the reader asked for. Where no
+    /// having clause is written none of that is there and the select
+    /// statement is one projection.
+    fn parse_select(&mut self) -> Result<(Simple, Ending)> {
+        let at = self.here();
+        self.expect_kw("SELECT")?;
+        // ISO 10.9. `ALL` is the default written down, so both words
+        // are read and only one of them leaves a mark.
+        let distinct = if self.eat_kw("DISTINCT") {
+            true
+        } else {
+            self.eat_kw("ALL");
+            false
+        };
+        let mut star = false;
+        let mut items = Vec::new();
+        if self.eat(&TokenKind::Star) {
+            star = true;
+        } else {
+            items.push(self.parse_projection_item()?);
+            while self.eat(&TokenKind::Comma) {
+                items.push(self.parse_projection_item()?);
+            }
+        }
+        let mut clauses = Vec::new();
+        let (mut group_by, mut having) = (Vec::new(), None);
+        let (mut order_by, mut skip, mut limit) = (Vec::new(), None, None);
+        // The body and everything after it is one optional group in
+        // 14.12, so `SELECT 1 AS n` is a whole statement: the items are
+        // read over the one row a statement starts from, and there is
+        // nothing to narrow or group.
+        if self.eat_kw("FROM") {
+            self.parse_select_body(&mut clauses)?;
+            if let Some(expr) = self.parse_where()? {
+                // The where clause sits after the body rather than
+                // inside a match of it, so it narrows what the whole
+                // body bound. That is a filter statement, which is the
+                // clause GQL gives that job elsewhere too.
+                clauses.push(Clause::Filter { expr });
+            }
+            if self.eat_kw("GROUP") {
+                self.expect_kw("BY")?;
+                loop {
+                    group_by.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            if self.eat_kw("HAVING") {
+                having = Some(self.parse_expr()?);
+            }
+            (order_by, skip, limit) = self.parse_order_and_page()?;
+        }
+        let Some(having) = having else {
+            return Ok((
+                Simple {
+                    clauses,
+                    result: Some(Projection {
+                        distinct,
+                        star,
+                        items,
+                        group_by,
+                        order_by,
+                        skip,
+                        limit,
+                    }),
+                },
+                Ending::Result,
+            ));
+        };
+        // The names the result statement projects, read off the items
+        // before the having column joins them. An item that wrote no
+        // alias is named the way the binder names an unaliased return
+        // item, and by the binder's own rendering rather than a second
+        // one here, so the column a select statement answers is the
+        // column the equivalent return answers and stays that way.
+        let names: Vec<String> = items
+            .iter()
+            .map(|item| match (&item.alias, &item.expr) {
+                (Some(alias), _) => alias.clone(),
+                (None, Expr::Variable(name)) => name.clone(),
+                (None, other) => crate::binder::text(other),
+            })
+            .collect();
+        if star {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                format_args!(
+                    "a having clause tests a group, and an asterisk says the columns are whatever the body bound, so there is nothing here that says what a group is: write the items out"
+                ),
+            ));
+        }
+        // The projection hands its columns on rather than answering
+        // them, so each of them is named there: a name a reader wrote
+        // where they wrote one, and the name the answer would have
+        // carried anyway where they did not.
+        for (item, name) in items.iter_mut().zip(&names) {
+            item.alias = Some(name.clone());
+        }
+        items.push(ProjectionItem {
+            expr: having,
+            alias: Some(HAVING_COLUMN.to_owned()),
+        });
+        clauses.push(Clause::With {
+            projection: Projection {
+                distinct,
+                star: false,
+                items,
+                group_by,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            },
+            filter: None,
+        });
+        clauses.push(Clause::Filter {
+            expr: Expr::Variable(HAVING_COLUMN.to_owned()),
+        });
+        Ok((
+            Simple {
+                clauses,
+                result: Some(Projection {
+                    distinct: false,
+                    star: false,
+                    items: names
+                        .into_iter()
+                        .map(|name| ProjectionItem {
+                            expr: Expr::Variable(name.clone()),
+                            alias: Some(name),
+                        })
+                        .collect(),
+                    group_by: Vec::new(),
+                    order_by,
+                    skip,
+                    limit,
+                }),
+            },
+            Ending::Result,
+        ))
+    }
+
+    /// The select statement body of ISO 14.12: what the items are read
+    /// over.
+    ///
+    /// Two forms. A graph match list is a graph expression and a match
+    /// statement, as many times as the reader writes them, and two
+    /// matches that share no variable bind every pairing of what each
+    /// found, which is what two match statements written one after the
+    /// other already do here. A query specification is a whole query in
+    /// braces, which is the inline call this engine already has: the
+    /// block answers a table and the statement goes on over its rows.
+    ///
+    /// The graph expression is not optional in ISO's rule, so every
+    /// match names one. This engine runs a statement against the one
+    /// graph the statement names, so a list naming two different graphs
+    /// is 25G04 rather than a syntax error: the grammar is fine and the
+    /// engine is declining it. What the list names is carried out to
+    /// the query, where it meets any `USE` clause written in front of
+    /// the statement.
+    fn parse_select_body(&mut self, clauses: &mut Vec<Clause>) -> Result<()> {
+        if self.at(&TokenKind::LBrace) {
+            let body = self.parse_nested_query_named("FROM")?;
+            clauses.push(Clause::CallInline {
+                optional: false,
+                scope: None,
+                body: Box::new(body),
+            });
+            return Ok(());
+        }
+        loop {
+            let at = self.here();
+            let graph = self.parse_graph_ref()?;
+            // A query specification may name a graph in front of the
+            // braces, which is the second of its two spellings.
+            if self.at(&TokenKind::LBrace) {
+                self.name_the_select_graph(graph, at)?;
+                let body = self.parse_nested_query_named("FROM")?;
+                clauses.push(Clause::CallInline {
+                    optional: false,
+                    scope: None,
+                    body: Box::new(body),
+                });
+                return Ok(());
+            }
+            self.name_the_select_graph(graph, at)?;
+            self.select_body = true;
+            let read = self.parse_match_clause(clauses);
+            self.select_body = false;
+            read?;
+            if !self.eat(&TokenKind::Comma) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Records the graph one select graph match named.
+    ///
+    /// `CURRENT_PROPERTY_GRAPH` is the graph the statement is already
+    /// running against, so it names nothing new and every case can
+    /// write it. Anything else is the statement's graph, and a second
+    /// one that is not the same graph is refused.
+    fn name_the_select_graph(&mut self, graph: GraphRef, at: usize) -> Result<()> {
+        if graph == GraphRef::Current {
+            return Ok(());
+        }
+        match &self.select_graph {
+            Some(named) if *named == graph => Ok(()),
+            None => {
+                self.select_graph = Some(graph);
+                Ok(())
+            }
+            Some(_) => Err(ZuError::gql_in(
+                codes::C25G04,
+                self.source,
+                at,
+                format_args!(
+                    "a statement runs against the one graph it names, and this select statement body names a second one; write the two as two statements"
+                ),
+            )),
         }
     }
 
@@ -3569,6 +3890,31 @@ impl Parser<'_> {
     /// however many alternatives matched it and `|+|` answers it once
     /// per alternative, so a list written with both is asking for two
     /// different answers at once.
+    /// Whether the comma in hand ends a match statement of a select
+    /// statement body rather than joining another pattern to the list
+    /// this match is reading.
+    ///
+    /// ISO's own grammar reaches for the same comma twice: a select
+    /// graph match list writes commas between graph matches and a path
+    /// pattern list writes them between patterns, so `MATCH (a), g
+    /// MATCH (b)` is two readings until the second MATCH arrives. What
+    /// settles it is what stands after the comma, so this reads a graph
+    /// expression and a match ahead of it and puts the tokens back. A
+    /// path pattern never begins with a name that a MATCH follows,
+    /// which is what makes the lookahead an answer rather than a guess,
+    /// and outside a select body the question is not asked at all.
+    fn comma_ends_a_select_graph_match(&mut self) -> bool {
+        if !self.select_body {
+            return false;
+        }
+        let at = self.pos;
+        self.pos += 1;
+        let ends = self.parse_graph_ref().is_ok()
+            && (self.at_kw("MATCH") || (self.at_kw("OPTIONAL") && self.kw_at(1, "MATCH")));
+        self.pos = at;
+        ends
+    }
+
     fn parse_graph_pattern_alts(&mut self) -> Result<Ways> {
         let list = PatternList {
             mode: self.parse_match_mode(),
@@ -3577,7 +3923,8 @@ impl Parser<'_> {
         self.lists += 1;
         let mut bar: Option<bool> = None;
         let mut written = vec![self.parse_path_alts(&mut bar)?];
-        while self.eat(&TokenKind::Comma) {
+        while self.at(&TokenKind::Comma) && !self.comma_ends_a_select_graph_match() {
+            self.pos += 1;
             written.push(self.parse_path_alts(&mut bar)?);
         }
         let mut ways = self.spread(written)?;

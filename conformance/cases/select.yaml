@@ -1,0 +1,171 @@
+schema: 4
+suite: select
+doc: The select statement of ISO 14.12, which is the second of the two ways GQL spells a query and the one an engine written from the match and return form alone will not have. It is not an optional feature and no code in features.xml gates it, so a client that sends a select statement to a conforming engine is entitled to an answer. The standard's General Rules define it in terms of the clauses it is written out of, so most of the cases here are a select statement beside the linear statement made of the same parts, and the rest are the two places where the two forms differ: the graph expression that sits inside the body rather than in front of the statement, and the having clause, which the other form has no word for at all.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+    - name: city
+      type: STRING
+      values:
+        - paris
+        - paris
+        - lyon
+        - nice
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+
+cases:
+  - name: the-items-come-first-and-the-rows-second
+    doc: The plainest select statement there is, which is the one an engine that has never heard the word refuses outright. The items are written in front of the body they are read over, which is the whole of what makes this a second spelling rather than a second language.
+    query: SELECT p.name AS name FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) WHERE p.age = 50
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: an-item-with-no-alias-is-named-the-way-a-return-names-it
+    doc: There is one rule for naming a column and not one per statement form, so an item written without AS comes back under the text that produced it, exactly as the same item does in a return statement. A client that reads columns by name gets the same name from either spelling.
+    query: SELECT p.name FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) WHERE p.age = 50
+    columns:
+      - p.name
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: the-set-quantifier-drops-the-repeated-rows
+    doc: DISTINCT is written between SELECT and the items rather than inside the projection, and it does what the same word does in a return statement. Three people live in two cities here, so a statement that keeps the repeats answers one row more than this.
+    query: SELECT DISTINCT p.city AS city FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) ORDER BY city
+    columns:
+      - city
+    rows:
+      - values:
+          - type: STRING
+            value: lyon
+      - values:
+          - type: STRING
+            value: nice
+      - values:
+          - type: STRING
+            value: paris
+
+  - name: a-body-lists-a-graph-match-per-comma
+    doc: A select statement body is a list of graph matches, each one a graph expression and a match statement, and the list is separated by the same comma that separates the patterns inside one match. What tells the two apart is what stands after the comma, so an engine that reads the comma one way only will either lose this statement or lose the one below it.
+    query: SELECT a.name AS a, b.name AS b FROM CURRENT_PROPERTY_GRAPH MATCH (a:person), CURRENT_PROPERTY_GRAPH MATCH (b:person) WHERE a.age = 30 AND b.age = 50
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: one-match-may-still-list-its-patterns
+    doc: The other reading of the same comma, which has to keep working: inside a match statement the comma joins another pattern to the list, and the rows are the pairs. This case and the one above it are the same answer written two ways, which is what makes the lookahead a reading rather than a guess.
+    query: SELECT a.name AS a, b.name AS b FROM CURRENT_PROPERTY_GRAPH MATCH (a:person), (b:person) WHERE a.age = 30 AND b.age = 50
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: a-body-may-be-a-query-in-braces
+    doc: The second form ISO gives the body: a nested query specification rather than a graph match, whose columns are the ones the nested query returned. The clauses behind the body read those columns the same way they read what a match bound.
+    query: SELECT n AS name FROM { MATCH (p:person) RETURN p.name AS n, p.age AS a } WHERE a > 40
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: the-body-is-optional
+    doc: The body and every clause behind it are one optional group in ISO's rule, so a select statement with no FROM at all is a whole statement and its items are read over the one row every statement starts from. This is the shape a client sends to test a connection.
+    query: SELECT 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: an-asterisk-keeps-what-the-body-bound
+    doc: An asterisk says the columns are the body's own, so a nested query's names come through unchanged and a projection cannot rename them by accident.
+    query: SELECT * FROM { MATCH (p:person) WHERE p.age = 50 RETURN p.name AS who }
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-having-clause-tests-the-group
+    doc: The one clause the other spelling has no word for. A where clause tests a row and a having clause tests a group, so what it reads is a value only the projection can work out, and an engine that runs it as a where clause cannot answer this at all.
+    query: SELECT p.city AS city, COUNT(*) AS n FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) GROUP BY p.city HAVING COUNT(*) > 1
+    columns:
+      - city
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: paris
+          - type: INT64
+            value: "2"
+
+  - name: a-having-clause-runs-before-the-page
+    doc: The order of the clauses is the standard's: the projection groups, the having clause drops groups, and only then does the sort and the page apply. An engine that pages first answers two rows here and an engine that reads them in order answers these two, so the limit is the measurement.
+    query: SELECT p.city AS city, COUNT(*) AS n FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) GROUP BY p.city HAVING COUNT(*) = 1 ORDER BY city LIMIT 5
+    columns:
+      - city
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: lyon
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: nice
+          - type: INT64
+            value: "1"
+
+  - name: a-having-clause-with-no-grouping-tests-the-whole-table
+    doc: With no group by clause the binding table is one group, so the having clause has a single row to keep or to drop and the answer is either the whole aggregate or nothing.
+    query: SELECT COUNT(*) AS n FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) HAVING COUNT(*) > 30
+    columns:
+      - n
+    rows:
+
+  - name: an-asterisk-with-a-having-clause-is-refused
+    doc: An asterisk says the columns are whatever the body bound and a having clause has to be evaluated over a projection the engine can name, so the two together say nothing an engine can act on and the statement is refused rather than guessed at.
+    query: SELECT * FROM CURRENT_PROPERTY_GRAPH MATCH (p:person) HAVING COUNT(*) > 1
+    raises: "42001"

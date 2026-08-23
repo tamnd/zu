@@ -32,8 +32,8 @@ cases:
     raises: "42001"
 
   - name: a-word-that-opens-no-clause
-    doc: SQL's first word, sent to a GQL engine, which is the single most likely mistake anyone makes here.
-    query: SELECT 1
+    doc: SQL sent to a GQL engine, which is the single most likely mistake anyone makes here. The word is UPDATE rather than SELECT because ISO 14.12 gives GQL a select statement of its own, so the word an engine has to refuse is one the two languages do not share.
+    query: UPDATE person SET age = 1
     raises: "42001"
 
   - name: a-reserved-word-where-a-name-belongs

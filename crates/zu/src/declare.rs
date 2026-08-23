@@ -880,4 +880,44 @@ mod tests {
             .run("INSERT (c:city {name: 'york'})", &[])
             .expect("the home graph promises nothing");
     }
+
+    /// A refusal is asked once whether this module can do anything for
+    /// it, and the answer is held with it, so the second send of the
+    /// same bad statement does not parse it again to find out. What
+    /// that must not change is the refusal itself: the same text raises
+    /// the same condition however often it is sent.
+    #[test]
+    fn a_refusal_that_makes_no_table_stays_the_same_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "again.zu1");
+
+        let query = "MATCH (a:person)-[:knows]->(b) RETURN c.name AS name";
+        let first = session.run(query, &[]).expect_err("c is bound by nothing");
+        let second = session.run(query, &[]).expect_err("and still is");
+        assert_eq!(first.gqlstatus().map(|s| s.code()), Some("42002"));
+        assert_eq!(
+            first.gqlstatus().map(|s| s.code()),
+            second.gqlstatus().map(|s| s.code())
+        );
+        assert_eq!(first.to_string(), second.to_string());
+    }
+
+    /// The other half of the same rule. A statement that does make a
+    /// table is refused on the way in, and the refusal must not be the
+    /// one the session holds: it made the table, so the second send
+    /// inserts into what the first send made.
+    #[test]
+    fn a_statement_that_makes_a_table_still_makes_it_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "twice.zu1");
+
+        let query = "INSERT (c:city {name: 'york', founded: 71})";
+        session.run(query, &[]).expect("the first makes the table");
+        session.run(query, &[]).expect("the second uses it");
+
+        let after = session
+            .run("MATCH (c:city) RETURN c.name AS name", &[])
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["york", "york"]);
+    }
 }

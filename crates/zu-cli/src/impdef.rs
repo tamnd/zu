@@ -650,6 +650,11 @@ fn answer(code: &str) -> Option<&'static str> {
 /// finding it cannot tell a dull answer from an unanswered question.
 pub fn render() -> String {
     let mut out = String::new();
+    // The item texts are the standard's, verbatim out of the artifact,
+    // and ID090 asks which of NODE or VERTEX zu prefers. The question
+    // cannot be asked without the word in it, so the page names the
+    // exemption instead of rewording an item, which is the one thing
+    // this file is built not to do.
     out.push_str(
         "# What zu leaves to itself\n\
          \n\
@@ -666,7 +671,9 @@ pub fn render() -> String {
          The second is implementation-dependent: an answer the standard asks \
          neither to be stable nor to be published. zu publishes those too, as behaviour observed today and \
          not as a promise, because a reader who knows what an engine does can \
-         write a query that does not depend on it.\n",
+         write a query that does not depend on it.\n\
+         \n\
+         <!-- terms: allow vertex -->\n",
     );
     let mut kind = None;
     for item in ITEMS {

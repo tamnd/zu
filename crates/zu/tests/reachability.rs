@@ -85,7 +85,10 @@ fn a_page_of_a_partly_ordered_set_enumerates() {
     let source = "MATCH (a:person)-[:knows*1..3]->(b:person) WHERE a.id = 0 \
                   RETURN DISTINCT b.id AS id, b.id % 4 AS bucket \
                   ORDER BY bucket ASC LIMIT 5";
-    assert!(!walks(&mut db, source), "the tie was decided by the rewrite");
+    assert!(
+        !walks(&mut db, source),
+        "the tie was decided by the rewrite"
+    );
 }
 
 /// A `DISTINCT` with no page at all keeps the walk it always had, page

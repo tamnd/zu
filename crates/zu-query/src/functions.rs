@@ -1674,7 +1674,11 @@ fn trim_bytes(func: Func, trim: Trim, bytes: &[u8], octets: Option<&Value>) -> R
 /// a string, and a list has no rule of the grammar that gives them one.
 fn trim_list(func: Func, trim: Trim, items: Vec<Value>, count: Option<&Value>) -> Result<Value> {
     if !matches!(trim, Trim::Both) {
-        return Err(bad_type(func, "a string or a byte string", &Value::List(items)));
+        return Err(bad_type(
+            func,
+            "a string or a byte string",
+            &Value::List(items),
+        ));
     }
     let Some(count) = count else {
         return Err(gql(

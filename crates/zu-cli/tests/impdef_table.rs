@@ -43,6 +43,8 @@ fn artifact(name: &str) -> PathBuf {
 
 /// Pulls the `<code>` and `<description>` pairs out of one artifact.
 ///
+/// <!-- terms: allow attribute -->
+///
 /// Both documents carry a DTD in front of the data that declares
 /// elements by those names, so the scan starts after the DTD closes.
 /// Neither document uses an XML entity or an attribute anywhere in its

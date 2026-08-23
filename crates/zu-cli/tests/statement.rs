@@ -43,6 +43,8 @@ fn read(path: &Path) -> String {
 
 /// Pulls the `<code>` and `<description>` pairs out of the artifact.
 ///
+/// <!-- terms: allow attribute -->
+///
 /// Same reader as the register's, and correct on the same grounds: the
 /// document carries a DTD in front of the data, nothing below the DTD
 /// uses an entity or an attribute, and the only markup there is the

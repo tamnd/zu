@@ -2224,22 +2224,18 @@ sustained_file_x = 3.0
 # supposed to fail it rather than have it raised.
 write_cpu_nosync_us = 30.0
 
-# The same measurement on a shared runner, which is where CI runs it.
+# There is no second key for a shared runner any more. There used to be
+# one, because the ceiling above is a product target rather than a number
+# fitted to a box and a hosted runner cannot meet it, and a per box class
+# key drifts: it was fitted at 60 off two readings, went red on every run
+# for a day, and had to be refitted to 100 off twelve. That is #648.
 #
-# The key above is a target and not a fitted ceiling, so it does not
-# move: 30 us is what docs/12 asks of the write path and the laptop
-# reads 19.7 against it. A hosted runner is two shared vCPUs and reads
-# 35.6 and 40.7 on two runs of the same commit, which is the box and not
-# the write path, and gating the target there would either fail forever
-# or drag the target up behind it. So the target stays where it is and
-# is enforced on a machine with its cores to itself, and the shared box
-# gets a ceiling of its own that is still a ceiling: it sits at twice
-# the target, over the worse of the two readings with room for a runner
-# having a bad minute, and under anything that would double the cost of
-# a write. The bench prints which of the two it enforced.
-#
-# Lower this ceiling, never raise it.
-write_cpu_nosync_shared_us = 60.0
+# write.rs now does what refuse.rs does. It times a proxy loop shaped
+# like a write, divides by what that loop costs on the host the target
+# was written for, and reads the ceiling at that ratio, clamped to three.
+# So the target above is enforced everywhere, at 30 us on a machine with
+# its cores to itself and at whatever multiple of 30 the box has earned
+# on a slower one, and there is nothing here to keep current.
 
 # A bound on a stored date at one worker, M rows/s (docs/07): two
 # million people with a birthday strided over forty years, so

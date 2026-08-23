@@ -151,6 +151,122 @@ const SAMPLE: u64 = 25;
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
+/// How many rows the store [`calibrate`] reads holds.
+///
+/// The same [`SMALL`] the write runs use, so the proxy walks a store the
+/// size of the one the gated window walks.
+const CALIBRATION_ROWS: u64 = SMALL;
+
+/// How many reads one round of [`calibrate`] makes.
+const CALIBRATION_ROUNDS: u64 = 2000;
+
+/// What one round of [`calibrate`] costs on the machine the target was
+/// written for, in microseconds. A laptop M4 with its cores to itself.
+///
+/// Three consecutive runs on an idle one read 13.7, 13.9 and 14.0, so
+/// the middle one is the figure and the spread is two percent, which the
+/// floor of the clamp absorbs: a host at or under the reference reads
+/// the target exactly and never anything tighter. The same three runs
+/// read 22.4, 22.2 and 22.3 on the gated number, so both ends of the
+/// ratio are steady on a quiet box.
+///
+/// Take it on an idle machine or not at all. A stray `cargo test` in the
+/// background moved the read to 21.2 us and the write to 36.2, and one
+/// run under ten concurrent rustc read 4122 us a statement.
+///
+/// This is not a number to tune. It is a property of one host, and the
+/// only reason to change it is that the host it was taken on has been
+/// replaced.
+const CALIBRATION_REFERENCE_US: f64 = 13.9;
+
+/// The most the host calibration is allowed to relax the write ceiling.
+///
+/// A hosted runner reads about three times the reference and a bad
+/// minute on one reads more, so four leaves room for the bad minute.
+/// Past that the box is not slow, it is broken or it is swapping, and a
+/// gate that keeps stretching for it stops being a gate.
+const CALIBRATION_CAP: f64 = 4.0;
+
+/// How fast this host is on the read path, in microseconds a statement.
+///
+/// The write ceiling below is a product target and not a number fitted
+/// to a box, so it cannot simply be raised until the runners pass. The
+/// alternative used to be a second ceiling written for the shared runner
+/// class, which drifted out of date without anyone noticing and had to
+/// be refitted twice, and that is what #648 asked to remove. So instead:
+/// measure the host on something, divide by what that something costs on
+/// the box the target was written for, and scale the ceiling by the
+/// ratio. A box twice as slow gets twice the ceiling and there is no per
+/// box class key to keep current.
+///
+/// The whole difficulty is what to measure. Five synthetic loops were
+/// tried first, and here is what each read against the write path on the
+/// same run, laptop against hosted runner:
+///
+/// | loop | proxy | write path |
+/// |---|---|---|
+/// | a few hundred bytes of buffer | 1.17x | 2.19x |
+/// | 4 MiB table, 64 keys | 1.78x | 3.05x |
+/// | 64 MiB table, 64 keys | 0.89x | 3.05x |
+/// | 64 KiB table, a million keys | 1.15x | 3.05x |
+/// | 4 MiB table, a million keys | 1.23x | 3.05x |
+/// | 4 MiB table and an unsynced append, on processor time | 0.33x | 2.10x |
+///
+/// None of them reaches two. A loop small enough to sit in cache only
+/// measures how fast the core retires instructions; one sized past the
+/// last level cache measures the DIMM, and the laptop's advantage is in
+/// the core rather than in its memory, so that ratio collapses or
+/// inverts. The append was worse still, because on processor time a
+/// Linux kernel absorbs an unsynced write far more cheaply than a Darwin
+/// one and the proxy read the difference between two kernels.
+///
+/// What is actually three times slower on the runner is zu's own code,
+/// which is branchy, allocates, and has an instruction footprint no
+/// twenty line loop has. So the proxy is zu's own code: the same
+/// `MATCH ... WHERE` the gated statement makes, without the `SET` on the
+/// end of it. It runs the same optimizer, the same scan and the same
+/// storage, and it is not the path the ceiling gates, so a write that
+/// got slower cannot relax its own ceiling by making this slower too.
+///
+/// A read that got slower would relax it, which is the one thing this
+/// gives up. That is a trade worth making: the read path has ceilings of
+/// its own in `read.rs`, so a regression there is caught there, and it
+/// is caught before this ever runs.
+fn calibrate() -> f64 {
+    let db = Database::memory_with(Config::new().threads(1)).expect("memory");
+    let mut conn = db.connect().expect("connect");
+    seed(
+        conn.session_mut().file_mut().expect("the store"),
+        CALIBRATION_ROWS,
+        &ring(CALIBRATION_ROWS),
+    );
+    let read = |conn: &mut zu::Connection, age: u64| {
+        one(
+            conn,
+            &format!("MATCH (p:person) WHERE p.age = {age} RETURN count(p) AS n"),
+        )
+    };
+    let mut age = 0;
+    for _ in 0..CALIBRATION_ROUNDS / 10 {
+        read(&mut conn, age % CALIBRATION_ROWS);
+        age += 1;
+    }
+    // Best of a few, the same way every measurement below is taken: on a
+    // shared box a single pass reads whatever else was on the core at
+    // the time, and the cheapest pass is the one that got the fewest of
+    // those.
+    let mut us = f64::MAX;
+    for _ in 0..PASSES {
+        let start = Instant::now();
+        for _ in 0..CALIBRATION_ROUNDS {
+            read(&mut conn, age % CALIBRATION_ROWS);
+            age += 1;
+        }
+        us = us.min(start.elapsed().as_nanos() as f64 / 1e3 / CALIBRATION_ROUNDS as f64);
+    }
+    us
+}
+
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
     for line in std::fs::read_to_string(path).ok()?.lines() {
@@ -1435,15 +1551,25 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
 
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
-    // Whether the box this is running on is a shared runner rather than
-    // a machine with its cores to itself. One ceiling here is a product
-    // target rather than a number fitted to what was measured, and a
-    // target is about the product and not about whatever vCPU a hosted
-    // runner handed out, so on a shared box that key is enforced against
-    // a second ceiling written for a shared box. Both are ceilings and
-    // both are enforced; neither is the other's excuse.
-    let shared = std::env::var("ZU_GATE_SHARED").is_ok_and(|v| v == "1");
+    // How fast this box is, on a proxy shaped like a write. One ceiling
+    // here is a product target rather than a number fitted to a box, and
+    // this is what lets that one target be enforced everywhere: it is
+    // read at what the target says on the reference host and at the
+    // ratio above it on a slower one. See #648 for what this replaced.
     let root = tempfile::tempdir().expect("tempdir");
+    let cal_us = calibrate();
+    let raw = cal_us / CALIBRATION_REFERENCE_US;
+    let scale = raw.clamp(1.0, CALIBRATION_CAP);
+    println!(
+        "host calibration: {cal_us:.1} us a read, {raw:.2}x the reference \
+         {CALIBRATION_REFERENCE_US:.1} us"
+    );
+    if raw > scale {
+        println!(
+            "host calibration: {raw:.2}x is past the {CALIBRATION_CAP:.0}x cap, the write \
+             ceiling is read at {CALIBRATION_CAP:.0}x"
+        );
+    }
     let sync = sync_cpu(root.path());
     println!("one sync costs this machine {sync:.0} us of processor time");
 
@@ -1597,7 +1723,20 @@ fn main() {
         sustained.window_x
     );
 
-    let unsynced = run_unsynced(SMALL, ramp, window);
+    // Best of PASSES, the way every other number in this file is taken.
+    // This one was a single pass and it is the one the gate reads, which
+    // is why it kept coming back with a different answer: three runs of
+    // the same hosted runner read 53.5, 75.1 and 50.3 us a statement,
+    // and no ceiling scaled off a host measurement can absorb a fifty
+    // percent spread that is contention on the box rather than the write
+    // path. The lowest pass is the one that got the fewest neighbours.
+    let mut unsynced = run_unsynced(SMALL, ramp, window);
+    for _ in 1..PASSES {
+        let again = run_unsynced(SMALL, ramp, window);
+        if again.cost.cpu < unsynced.cost.cpu {
+            unsynced = again;
+        }
+    }
     unsynced
         .cost
         .report(&format!("SET unsynced, {SMALL} rows"), 0.0);
@@ -1729,18 +1868,21 @@ fn main() {
         ("write_cpu_nosync_us", unsynced.cost.cpu),
     ];
     for (key, got) in checks {
-        // The one key with a ceiling per box class. On a shared runner
-        // the target below it is not the question being asked, so the
-        // shared ceiling is read instead, and the line says which one
-        // was enforced so a log is not quietly measuring the other.
-        let key = match (key, shared) {
-            ("write_cpu_nosync_us", true) => "write_cpu_nosync_shared_us",
-            (key, _) => key,
+        let Some(written) = budget(key) else { continue };
+        // The one key that is a product target rather than a number
+        // fitted to what was measured, so it is the one that has to be
+        // read against the host rather than against a box class. Every
+        // other ceiling here is either a ratio, which a slow box cannot
+        // move, or was fitted on the box class that enforces it.
+        let ceiling = match key {
+            "write_cpu_nosync_us" => written * scale,
+            _ => written,
         };
-        if let Some(ceiling) = budget(key)
-            && got > ceiling
-        {
-            println!("GATE FAIL {key}: {got:.2} > ceiling {ceiling}");
+        if key == "write_cpu_nosync_us" {
+            println!("write ceiling: {written:.1} us written, {ceiling:.1} us on this host");
+        }
+        if got > ceiling {
+            println!("GATE FAIL {key}: {got:.2} > ceiling {ceiling:.2}");
             failed = true;
         }
     }

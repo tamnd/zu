@@ -242,7 +242,13 @@ fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("refuse.zu1");
+    // How long zu takes to build the store, which is the candidate
+    // calibration below. Printed for now and not used, so one round on a
+    // hosted runner says whether it tracks. See #648.
+    let build_start = Instant::now();
     let degree = build(&path);
+    let build_us = build_start.elapsed().as_nanos() as f64 / 1e3;
+    println!("host calibration candidate: store build {build_us:.0} us");
     let edge_count: i64 = degree.iter().sum();
     println!("refuse bench graph: {NODES} nodes, {edge_count} edges");
 

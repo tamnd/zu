@@ -42,6 +42,17 @@ use crate::{compact, file, recover};
 /// ten thousand.
 const SPLIT_WALK_LIMIT: usize = 1024;
 
+/// Records a [`Session::scan`] walks under one epoch protection before
+/// it drops that one and takes another.
+///
+/// A protection held is a floor under reclamation, and a scan takes one
+/// for a run of records rather than for each, so this is where the two
+/// costs meet: low enough that a very long scan does not stop
+/// compaction freeing anything for its whole length, and high enough
+/// that a YCSB workload E scan, which is fifty records, takes exactly
+/// one pair of atomics for the lot.
+const SCAN_EPOCH_RUN: usize = 1024;
+
 /// The record a split has settled on for one key.
 #[derive(Clone, Copy)]
 struct Placed {
@@ -2264,18 +2275,83 @@ impl<'a> Session<'a> {
         // touches would rewrite the range into the log for nobody. See
         // [`Options::promote_reads`].
         let promoting = std::mem::replace(&mut self.promoting, false);
+        // One epoch protection for a run of records rather than one a
+        // record. [`Session::read`] takes and drops one per call because
+        // a point read is one call, and a scan of fifty records was
+        // paying fifty pairs of atomics for a guarantee it wants held
+        // across the lot anyway.
+        //
+        // It is dropped and retaken every [`SCAN_EPOCH_RUN`] records,
+        // because a held protection is a floor under reclamation and
+        // `count` is the caller's number, not YCSB's. A scan of a
+        // million records holding one epoch for its whole length would
+        // stop compaction from freeing anything for as long as it ran.
+        // The gap between the two calls is the only moment a scan is not
+        // protected, and nothing is borrowed across it: the callback for
+        // the previous record has already returned.
+        self.slot.protect();
         let outcome = (|| -> Result<usize> {
+            let mut walked = 0usize;
             while done < count {
                 let Some(key) = cursor.key() else { break };
                 cursor.step();
-                value.clear();
-                if self.read(key, &mut value)? {
-                    each(key, &value);
+                walked += 1;
+                if walked.is_multiple_of(SCAN_EPOCH_RUN) {
+                    self.slot.unprotect();
+                    self.slot.protect();
+                }
+                let hash = index::hash(key);
+                let tag = Index::tag(hash);
+                let bucket = self.bucket_of(hash)?;
+                let Some((address, base)) = self.newest_record(bucket, tag, key)? else {
+                    continue;
+                };
+                // Below the read-only boundary a record cannot change
+                // under a reader: an update to one of those appends
+                // instead, which is the condition
+                // [`RecordRef::write_value_in_place`] states in its own
+                // safety note. So the value goes to the callback where
+                // it lies and the scan does not copy it. A record still
+                // in the mutable window, or one out in the cold tier
+                // whose address says nothing about that boundary, takes
+                // the copy that [`RecordRef::read_value`] makes under
+                // the seqlock, which is the same copy a point read
+                // takes.
+                //
+                // It is the copy that pays here and not the branch. A
+                // YCSB row is a kilobyte and a scan hands back fifty of
+                // them, and after a load every one of those rows is
+                // below the boundary, so the common scan copied fifty
+                // kilobytes to hand out fifty borrows that were already
+                // good.
+                //
+                // SAFETY: as in read_protected. The slice handed to
+                // `each` points either into a log page this session's
+                // epoch protection is holding down or into this
+                // session's own scratch, and nothing takes `self`
+                // mutably while the call is running, so neither moves
+                // under it.
+                let live = unsafe {
+                    let r = RecordRef::new(base);
+                    if r.tombstone() {
+                        false
+                    } else {
+                        if !cold::is_cold(address) && address < self.core.log.read_only() {
+                            each(key, r.value_unchecked());
+                        } else {
+                            r.read_value(&mut value);
+                            each(key, &value);
+                        }
+                        true
+                    }
+                };
+                if live {
                     done += 1;
                 }
             }
             Ok(done)
         })();
+        self.slot.unprotect();
         self.promoting = promoting;
         outcome
     }

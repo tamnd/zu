@@ -234,6 +234,57 @@ fn a_checkpoint_taken_without_a_plane_is_refused_by_an_open_that_wants_one() {
     assert_eq!(collect(&db, &key(0), 300).len(), 300);
 }
 
+/// A kilobyte, so that a few thousand records make a log longer than one
+/// page and a scan over them has a boundary to cross. `mark` is the
+/// version, and it is in every byte rather than the first few so that a
+/// value handed back half from one write and half from the next would
+/// not read as either.
+fn wide(i: usize, mark: u8) -> Vec<u8> {
+    let mut out = format!("field0={i}:").into_bytes();
+    out.resize(1024, mark);
+    out
+}
+
+/// A scan whose range spans the read-only boundary, which is where the
+/// walk stops copying and starts handing the record over where it lies.
+///
+/// Both sides are in one scan on purpose. A record below the boundary
+/// cannot be updated in place, so the scan borrows it, and a record
+/// above it can be, so the scan takes the copy the seqlock makes. That
+/// branch getting the wrong answer for a record is not a crash, it is a
+/// value from the wrong version, so this writes every key twice and asks
+/// for the second one back.
+#[test]
+fn a_scan_that_crosses_the_read_only_boundary_reads_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = 8000;
+    let db = Db::create(
+        &dir.path().join("boundary.zu2"),
+        Options {
+            // One page of mutable window, so eight megabytes of records
+            // leave most of themselves below it and the tail above.
+            mutable_pages: 1,
+            ..options()
+        },
+    )
+    .unwrap();
+    {
+        let mut s = db.session();
+        for i in 0..records {
+            s.upsert(&key(i), &wide(i, b'a')).unwrap();
+        }
+        for i in 0..records {
+            s.upsert(&key(i), &wide(i, b'b')).unwrap();
+        }
+    }
+    let got = collect(&db, &key(0), records);
+    assert_eq!(got.len(), records, "the scan came back short");
+    for (i, (k, v)) in got.iter().enumerate() {
+        assert_eq!(k, &key(i), "the walk went out of order at {i}");
+        assert_eq!(v, &wide(i, b'b'), "key {i} came back at the wrong version");
+    }
+}
+
 #[test]
 fn the_plane_costs_what_it_says_it_costs() {
     let dir = tempfile::tempdir().unwrap();

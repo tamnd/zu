@@ -95,3 +95,21 @@ strip = true
 # kernel anchors; codegen is otherwise identical to release.
 [profile.bench]
 strip = "none"
+
+# Release with the symbols left on, for profiling the engine through
+# something that is not cargo.
+#
+# The ycsb harness links libzu2 and a stripped library profiles as a run
+# of unnamed addresses, which is the whole difficulty on #743 and what
+# #376 asks for. The shipped release cannot simply keep its symbols
+# because there is a 15 MiB size gate on the CLI above and it was set
+# from a measurement.
+#
+# Line tables only, and codegen is identical to release: debug info is
+# emitted beside the code and does not change it. So a number taken on
+# this profile is a number about the release build, and that is the only
+# reason it is allowed to produce one.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"

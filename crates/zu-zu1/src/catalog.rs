@@ -2114,18 +2114,31 @@ mod tests {
         assert_eq!(edges[1].to.as_deref(), Some("Guest"));
         let raw = c.encode();
         assert_eq!(Catalog::decode(&raw).unwrap(), c);
-        // A declared type is written with the codes a column stores, so
-        // a type no column can hold is refused where it is written and
-        // not where it is encoded.
+        // A list of lists is declarable, since the declared form writes
+        // the element with the same function that wrote the list. No
+        // column holds one yet, which is a different promise and S2's.
+        c.add_graph_type(GraphType::open("deep").with(
+            ElementType::node("Nested", vec![person]).with_property(
+                "tree",
+                list_of(list_of(text())),
+                true,
+            ),
+        ))
+        .expect("a list of lists is declarable");
+        // A type the declared form has no shape for at all is still
+        // refused where it is written and not where it is encoded.
         let err = c
-            .add_graph_type(GraphType::open("deep").with(
-                ElementType::node("Nested", vec![person]).with_property(
-                    "tree",
-                    list_of(list_of(text())),
+            .add_graph_type(GraphType::open("money").with(
+                ElementType::node("Purchase", vec![person]).with_property(
+                    "total",
+                    LogicalType::Decimal {
+                        precision: 12,
+                        scale: 2,
+                    },
                     true,
                 ),
             ))
-            .expect_err("a list of lists is not a column type")
+            .expect_err("a decimal has no declared form")
             .to_string();
         assert!(err.contains("a type this file cannot write"), "{err}");
     }

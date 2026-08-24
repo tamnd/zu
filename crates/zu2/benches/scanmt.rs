@@ -146,6 +146,14 @@ fn phase(threads: usize, body: impl Fn(usize) -> u64 + Sync) -> (u64, f64) {
 fn main() {
     let records: u64 = env("ZU2_RECORDS", 200_000);
     let scan: u64 = env("ZU2_SCAN", 50);
+    // Scans per thread, not scans in total. Splitting a fixed total
+    // across threads is the obvious thing and it is wrong here: at
+    // thirty two threads the first version of this ran the whole walk
+    // in four hundredths of a second, which is close enough to what it
+    // costs to start thirty two threads that the thread starts were a
+    // visible part of the answer. Fixed work per thread keeps the
+    // timed window about the same length at every thread count, and
+    // throughput is rows a second either way.
     let iterations: usize = env("ZU2_ITERS", 20_000);
     // Best of, for the reason the single threaded bench gives: one pass
     // moves by more than the effect on a machine doing anything else,
@@ -161,11 +169,15 @@ fn main() {
 
     println!(
         "# zu2 scan scaling, {records} records, {scan} rows a scan, \
-         {iterations} scans a thread count, best of {repeats}, shuffled log order"
+         {iterations} scans a thread, best of {repeats}, shuffled log order"
     );
     println!("# see tamnd/zu#732 and tamnd/zu#708");
 
-    let keys = starts(records, scan, iterations);
+    // One disjoint block of start keys per worker at the widest thread
+    // count, so no two workers ever run the same start key and none of
+    // them is reading a set another one has just warmed.
+    let widest = threads.iter().copied().max().unwrap_or(1);
+    let keys = starts(records, scan, iterations * widest);
     let path = dir.join("shuffled.db");
     let t = Instant::now();
     let db = load(&path, records);
@@ -187,9 +199,11 @@ fn main() {
             let mut best_rows = 0u64;
             for _ in 0..repeats {
                 let (rows, seconds) = phase(n, |t| {
-                    // Stride rather than block, so no worker gets a
-                    // contiguous and therefore cheaper region.
-                    let mine = keys.iter().skip(t).step_by(n);
+                    // The start keys are uniform over the whole record
+                    // set, so a contiguous block of them is not a
+                    // contiguous region of the store and no worker gets
+                    // an easier slice than any other.
+                    let mine = keys[t * iterations..(t + 1) * iterations].iter();
                     let mut done = 0u64;
                     match variant {
                         "walk" => {

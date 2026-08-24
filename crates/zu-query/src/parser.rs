@@ -640,6 +640,8 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         hoisted_bindings: Vec::new(),
         select_body: false,
         select_graph: None,
+        anon_tables: Vec::new(),
+        anon_tables_made: 0,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -747,6 +749,20 @@ struct Parser<'a> {
     /// turned into a clause because a clause is a thing the reader
     /// wrote and this is a thing the reader wrote somewhere else.
     select_graph: Option<GraphRef>,
+    /// The definitions a `BINDING TABLE { ... }` written where a value
+    /// goes leaves behind, waiting for the query they belong to (GE02,
+    /// ISO 20.1).
+    ///
+    /// A table value is the rows of a query, and the one place this
+    /// engine turns a result into a value is a binding variable, so the
+    /// written form is read as a definition nobody named and a read of
+    /// it. What that buys is the whole of GP10 as it stands: the query
+    /// is worked out once before the first row, it may not write, and
+    /// it may not read a row, each already refused by name.
+    anon_tables: Vec<BindingDef>,
+    /// How many of those this text has made, which is what keeps the
+    /// names they are filed under apart.
+    anon_tables_made: usize,
 }
 
 /// A catalog statement lifted out of a call body (GP18).
@@ -2572,7 +2588,13 @@ impl Parser<'_> {
             } else {
                 return Ok(out);
             };
-            out.push(self.parse_binding_def(kind)?);
+            let def = self.parse_binding_def(kind)?;
+            // A table written out inside this definition is a
+            // definition of its own, and it has to stand in front of
+            // the one that reads it, since a definition may read the
+            // ones written above it and nothing below.
+            out.append(&mut std::mem::take(&mut self.anon_tables));
+            out.push(def);
         }
     }
 
@@ -2670,6 +2692,7 @@ impl Parser<'_> {
             std::mem::take(&mut self.hoisted_bindings),
             std::mem::take(&mut self.select_body),
             self.select_graph.take(),
+            std::mem::take(&mut self.anon_tables),
         );
         let read = self.parse_query_body_inner();
         (
@@ -2678,6 +2701,7 @@ impl Parser<'_> {
             self.hoisted_bindings,
             self.select_body,
             self.select_graph,
+            self.anon_tables,
         ) = waiting;
         read
     }
@@ -2707,6 +2731,11 @@ impl Parser<'_> {
             }
         };
         let (linear, ending) = self.parse_linear(use_graph.as_ref())?;
+        // The tables the clauses of this query wrote out where a value
+        // goes, which are definitions of this query however deeply in
+        // it they were written, the way every other definition is
+        // worked out once before the first row.
+        bindings.append(&mut std::mem::take(&mut self.anon_tables));
         // The graph a select statement body named, which is where that
         // form writes what a `USE` clause writes in front. A statement
         // that wrote both says one graph twice or two graphs once, and
@@ -5828,6 +5857,31 @@ impl Parser<'_> {
         Some(param)
     }
 
+    /// `BINDING TABLE { ... }` where a value goes, the words in front
+    /// of the brace already read (GE02, ISO 20.1).
+    ///
+    /// The rows of a query become a value in one place in this engine,
+    /// which is a binding variable of table kind, so this is read as a
+    /// definition nobody named and a read of it. The name is one no
+    /// query can write, the way the projection's own hidden columns
+    /// are, so nothing the reader wrote can be shadowed by it or shadow
+    /// it. What the shape buys is the whole of GP10 as it stands: the
+    /// query is worked out once before the first row, it may not write,
+    /// and it may not read a row, each of which is already refused by
+    /// name where a named definition is bound.
+    fn parse_written_binding_table(&mut self) -> Result<Expr> {
+        let query = self.parse_nested_query_named("BINDING TABLE")?;
+        let name = format!("#table{}", self.anon_tables_made);
+        self.anon_tables_made += 1;
+        self.anon_tables.push(BindingDef {
+            kind: BindingKind::Table,
+            name: name.clone(),
+            ty: None,
+            init: BindingInit::Query(Box::new(query)),
+        });
+        Ok(Expr::Variable(name))
+    }
+
     /// Whether a definition stands here: a name with an equals sign
     /// behind it, which is what tells `LET` the expression from `let`
     /// the variable.
@@ -5990,6 +6044,44 @@ impl Parser<'_> {
         // makes these readable, so `graph` and `table` stay names.
         if let Some(param) = self.reference_parameter(&name) {
             return Ok(Expr::Param(param));
+        }
+        // GE01, the same reference written out rather than passed in.
+        // The word in front is what turns a name for a graph into a
+        // value of graph type, and what may stand behind it here is
+        // narrower than what may stand behind a `USE`: `graph` is a
+        // name a query may write and `graph / n` is a division as
+        // often as it is a path, so the long spelling takes whatever
+        // the clause takes and the short one takes only the words that
+        // can be nothing else.
+        let long = name.eq_ignore_ascii_case("PROPERTY") && self.at_kw("GRAPH");
+        if long
+            || (name.eq_ignore_ascii_case("GRAPH")
+                && (self.at_kw("CURRENT_GRAPH")
+                    || self.at_kw("CURRENT_PROPERTY_GRAPH")
+                    || self.at_kw("HOME_GRAPH")
+                    || self.at_kw("HOME_PROPERTY_GRAPH")
+                    || self.at_kw("VARIABLE")))
+        {
+            if long {
+                self.pos += 1;
+            }
+            return Ok(Expr::GraphRef(self.parse_graph_ref()?));
+        }
+        // GE02, a table written out where a value goes. A brace cannot
+        // follow a variable in an expression, so both spellings are
+        // safe to read here, and what they are read as is a definition
+        // nobody named plus a read of it: the rows of a query become a
+        // value in one place in this engine and this is that place.
+        let long = name.eq_ignore_ascii_case("BINDING") && self.at_kw("TABLE");
+        let brace = self
+            .tokens
+            .get(self.pos + usize::from(long))
+            .map(|t| &t.kind);
+        if (long || name.eq_ignore_ascii_case("TABLE")) && brace == Some(&TokenKind::LBrace) {
+            if long {
+                self.pos += 1;
+            }
+            return self.parse_written_binding_table();
         }
         // The list value constructor of ISO 20.17, which names the
         // type it is building before it lists what goes in it. LIST

@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "compress"
 harness = false
+
+[[bench]]
+name = "scanmt"
+harness = false

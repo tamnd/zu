@@ -1,0 +1,203 @@
+//! What a graph type may say about a property, end to end from GQL.
+//!
+//! `zu-zu1` pins the frontier at the encoder, where a `LogicalType` is
+//! either written or refused. This pins the same frontier where a user
+//! meets it, which is a `CREATE GRAPH TYPE` and a spelling, and the two
+//! are not the same question: a type the encoder would take is no use
+//! if no spelling reaches it, and a spelling the parser takes is no use
+//! if the catalog then refuses it with a sentence about corruption.
+//!
+//! Both of those are true today and both are pinned below, because S1
+//! and S2 change them and a change nobody is measuring is a change
+//! nobody notices.
+
+use zu::query::run;
+use zu_zu1::file::Zu1File;
+use zu_zu1::graph::bulk_load_as;
+
+fn graph(dir: &std::path::Path) -> Zu1File {
+    let mut zu = Zu1File::create(&dir.join("graph_type.zu1")).unwrap();
+    bulk_load_as(&mut zu, "person", "knows", 2, &[(0, 1)]).unwrap();
+    zu
+}
+
+/// What happened when a graph type named a property of this type.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// The declaration stood.
+    Declared,
+    /// The parser did not reach a type at all.
+    NotSpelled,
+    /// The parser read a type and the catalog would not write it. The
+    /// string is what the user was told.
+    NotStored(String),
+}
+
+/// Declares one property of `ty`, under a name of its own so that a
+/// file can be asked about many types in a row.
+fn declare(db: &mut Zu1File, n: usize, ty: &str) -> Answer {
+    let source = format!("CREATE GRAPH TYPE probe{n} {{ (:Probe {{v :: {ty}}}) }}");
+    match run(&source, db, &[]) {
+        Ok(_) => Answer::Declared,
+        Err(e) => {
+            let message = e.to_string();
+            if e.gqlstatus().is_some() {
+                Answer::NotSpelled
+            } else {
+                Answer::NotStored(message)
+            }
+        }
+    }
+}
+
+/// Every spelling the frontier turns on, and the answer it gets today.
+///
+/// The order is the order of `schema/02` section 2, so this table and
+/// that one can be read side by side.
+fn probe() -> Vec<(&'static str, Answer)> {
+    let stored = |m: &str| Answer::NotStored(m.into());
+    let cannot_write = |n: usize| {
+        stored(&format!(
+            "corrupt catalog: element type 'probe{n}.Probe' declares 'v' with a type this file cannot write"
+        ))
+    };
+    vec![
+        // Storable, and every one of them has a spelling.
+        ("BOOL", Answer::Declared),
+        ("INT8", Answer::Declared),
+        ("INT16", Answer::Declared),
+        ("INT32", Answer::Declared),
+        ("INT64", Answer::Declared),
+        ("UINT8", Answer::Declared),
+        ("UINT16", Answer::Declared),
+        ("UINT32", Answer::Declared),
+        ("UINT64", Answer::Declared),
+        ("FLOAT32", Answer::Declared),
+        ("FLOAT64", Answer::Declared),
+        ("STRING", Answer::Declared),
+        ("BYTES", Answer::Declared),
+        ("DATE", Answer::Declared),
+        ("LOCAL TIME", Answer::Declared),
+        ("LOCAL DATETIME", Answer::Declared),
+        ("DURATION", Answer::Declared),
+        ("ZONED TIME", Answer::Declared),
+        ("ZONED DATETIME", Answer::Declared),
+        ("STRING(1,512)", Answer::Declared),
+        ("CHAR(2)", Answer::Declared),
+        ("BINARY(16)", Answer::Declared),
+        ("LIST<FLOAT32>", Answer::Declared),
+        // Spelled and not stored. This is the list S2 works through, and
+        // the message is the one S1 replaces with a condition.
+        ("LIST<FLOAT32 NOT NULL>(768)", cannot_write(24)),
+        ("LIST<LIST<STRING>>", cannot_write(25)),
+        ("DECIMAL(12,2)", cannot_write(26)),
+        ("INT128", cannot_write(27)),
+        ("INT256", cannot_write(28)),
+        ("UINT128", cannot_write(29)),
+        ("FLOAT16", cannot_write(30)),
+        ("FLOAT128", cannot_write(31)),
+        ("FLOAT256", cannot_write(32)),
+        ("ANY", cannot_write(33)),
+        ("ANY PROPERTY VALUE", cannot_write(34)),
+        ("PATH", cannot_write(35)),
+        ("NODE", cannot_write(36)),
+        ("EDGE", cannot_write(37)),
+        ("GRAPH", cannot_write(38)),
+        ("BINDING TABLE", cannot_write(39)),
+        ("NULL", cannot_write(40)),
+        ("NOTHING", cannot_write(41)),
+        // Not spelled at all. The year month duration is the one type a
+        // column already holds that no declaration can ask for.
+        ("YEAR MONTH DURATION", Answer::NotSpelled),
+    ]
+}
+
+/// The frontier as a user meets it: forty three spellings, and which of
+/// the three answers each one gets.
+#[test]
+fn a_graph_type_declares_the_types_the_frontier_says_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let mut declared = 0;
+    for (n, (ty, want)) in probe().into_iter().enumerate() {
+        let got = declare(&mut db, n + 1, ty);
+        assert_eq!(got, want, "{ty}");
+        if got == Answer::Declared {
+            declared += 1;
+        }
+    }
+    assert_eq!(declared, 23, "the declarable set changed");
+}
+
+/// The frontier has a far side, and one type is on it.
+///
+/// A column code for the year month duration has existed since the
+/// first version of the property format, and `DURATION_BETWEEN(a, b)
+/// YEAR TO MONTH` produces values of it, so the store holds them
+/// happily. No declaration can ask for one. `zu-common`'s type name
+/// table knows the spelling `YEAR MONTH DURATION` and the parser's
+/// table does not, and the grammar's `type_name` is at most two
+/// identifiers, so a three word name could not reach it either.
+///
+/// So the two duration kinds are not symmetric: one is declarable and
+/// the other is only reachable by computing one. S1 owes an answer to
+/// whether ISO gives this type a spelling that fits `type_name`, and if
+/// it does, the parser owes the row.
+#[test]
+fn the_year_month_duration_is_stored_and_cannot_be_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    // The day time duration declares.
+    assert_eq!(declare(&mut db, 100, "DURATION"), Answer::Declared);
+    // Its sibling does not, and the refusal is about the first word.
+    let source = "CREATE GRAPH TYPE ym { (:Span {d :: YEAR MONTH DURATION}) }";
+    let err = run(source, &mut db, &[]).expect_err("there is no such spelling");
+    assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42001".into()));
+    assert!(err.to_string().contains("YEAR"), "{err}");
+    // And the engine computes values of it either way.
+    let counted = run(
+        "RETURN DURATION_BETWEEN(DATE '2024-01-01', DATE '2026-03-01') YEAR TO MONTH AS d",
+        &mut db,
+        &[],
+    )
+    .expect("the year month duration is a value this engine has");
+    assert_eq!(counted.rows.len(), 1);
+}
+
+/// Every refusal above is an error with no GQLSTATUS, which is the
+/// defect S1 fixes.
+///
+/// A user who writes `DECIMAL(12,2)` has written a legal GQL statement
+/// that this engine will not perform. That is a condition the standard
+/// has a code for, and answering it with the word corrupt says the file
+/// is damaged when nothing is. The test is here so that S1 landing is a
+/// visible diff and not a silent improvement.
+#[test]
+fn a_type_the_catalog_will_not_write_is_refused_without_a_condition() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let source = "CREATE GRAPH TYPE money { (:Purchase {total :: DECIMAL(12,2)}) }";
+    let err = run(source, &mut db, &[]).expect_err("a decimal is not storable");
+    assert_eq!(err.gqlstatus(), None, "S1 gives this one a condition");
+    assert!(err.to_string().starts_with("corrupt catalog:"), "{err}");
+}
+
+/// A type the parser refuses is refused as text, with a syntax
+/// condition, which is half of what every refusal above should look
+/// like once S1 is done.
+///
+/// The other half is missing here too. An unknown type name raises
+/// 42001 with no position and therefore no excerpt, so the user is told
+/// the statement has a bad type and not which token it is. In a
+/// declaration of thirty properties that is a search. S1 owes both
+/// halves of the message shape and this pins where it starts.
+#[test]
+fn a_type_with_no_spelling_is_a_syntax_error_that_does_not_say_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let source = "CREATE GRAPH TYPE nope { (:Probe {v :: NOSUCHTYPE}) }";
+    let err = run(source, &mut db, &[]).expect_err("there is no such type");
+    assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42001".into()));
+    assert!(err.to_string().contains("NOSUCHTYPE"), "{err}");
+    assert_eq!(err.position(), None, "S1 gives this one a position");
+}

@@ -2451,10 +2451,10 @@ impl Parser<'_> {
                         break;
                     }
                 }
-                TokenKind::Ident(_) if depth == 1 && self.kw_at(at, "NEXT") => {
-                    if !self.catalog_stmt_at(at + 1) {
-                        return None;
-                    }
+                TokenKind::Ident(_)
+                    if depth == 1 && self.kw_at(at, "NEXT") && !self.catalog_stmt_at(at + 1) =>
+                {
+                    return None;
                 }
                 _ => {}
             }

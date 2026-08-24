@@ -17,9 +17,22 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Arena block size. Matches the storage block so a decoded chunk and its
-/// working vectors have the same granularity.
+/// Largest arena block. Matches the storage block so a decoded chunk and
+/// its working vectors have the same granularity.
 pub const BLOCK_BYTES: usize = 256 * 1024;
+
+/// The first block an arena takes, and the step it grows by after that:
+/// each new block is twice the last until it reaches [`BLOCK_BYTES`].
+///
+/// An arena is born per run, and most runs are small. A point read
+/// wants a few vectors of working memory and used to pay a 256 KiB
+/// block for them, which on a warm read is the largest single thing the
+/// whole query asks the allocator for and is large enough that the
+/// allocator hands back fresh pages the query then faults in one by
+/// one. Starting small and doubling costs a big query one extra block
+/// allocation on the way up, which it does not notice, and saves a small
+/// query the other 248 KiB, which it does.
+const FIRST_BLOCK_BYTES: usize = 8 * 1024;
 
 /// Every allocation is aligned to at least a cache line, which is also
 /// the widest alignment any physical type needs.
@@ -109,13 +122,15 @@ impl MorselArena {
                 borrowed: false,
             });
         }
+        let cap = self.blocks.get(self.cur).map_or(0, |b| b.bytes);
         let off = self.off.next_multiple_of(align);
-        if self.cur >= self.blocks.len() || off + bytes > BLOCK_BYTES {
-            if self.cur < self.blocks.len() && off + bytes > BLOCK_BYTES {
+        if self.cur >= self.blocks.len() || off + bytes > cap {
+            if self.cur < self.blocks.len() && off + bytes > cap {
                 self.cur += 1;
             }
             if self.cur >= self.blocks.len() {
-                self.blocks.push(Block::new(BLOCK_BYTES));
+                let want = self.next_block_bytes().max(bytes);
+                self.blocks.push(Block::new(want));
                 self.cur = self.blocks.len() - 1;
             }
             self.off = 0;
@@ -131,6 +146,15 @@ impl MorselArena {
             #[cfg(debug_assertions)]
             borrowed: false,
         })
+    }
+
+    /// The size of the next block to push: twice the last one, held
+    /// between the first size and the largest. An oversize block can
+    /// make the last one bigger than [`BLOCK_BYTES`], and the clamp
+    /// covers that too.
+    fn next_block_bytes(&self) -> usize {
+        let last = self.blocks.last().map_or(0, |b| b.bytes);
+        (last * 2).clamp(FIRST_BLOCK_BYTES, BLOCK_BYTES)
     }
 
     /// Allocate a typed buffer for `count` values.
@@ -305,6 +329,32 @@ mod tests {
         arena.reset();
         let _c = arena.alloc_of::<u64>(1024);
         assert_eq!(arena.capacity(), held, "reset keeps blocks");
+    }
+
+    #[test]
+    fn a_small_run_pays_a_small_block() {
+        let mut arena = MorselArena::new();
+        let _one_vector = arena.alloc(64, 64);
+        assert_eq!(
+            arena.capacity(),
+            FIRST_BLOCK_BYTES,
+            "a run that wants 64 bytes does not take 256 KiB"
+        );
+        // Spilling the first block takes one twice its size.
+        let _spill = arena.alloc(FIRST_BLOCK_BYTES, 64);
+        assert_eq!(arena.capacity(), FIRST_BLOCK_BYTES * 3);
+        // Doubling stops at the largest block, however far it runs.
+        for _ in 0..8 {
+            arena.alloc(BLOCK_BYTES, 64);
+        }
+        assert!(
+            arena.blocks.iter().all(|b| b.bytes <= BLOCK_BYTES),
+            "no block grows past the cap"
+        );
+        assert!(
+            arena.blocks.iter().any(|b| b.bytes == BLOCK_BYTES),
+            "a run that keeps asking reaches the cap"
+        );
     }
 
     #[test]

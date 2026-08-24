@@ -182,9 +182,10 @@ fn main() {
     let t = Instant::now();
     let db = load(&path, records);
     println!(
-        "# loaded in {:.1}s, {:.1} MiB on device",
+        "# loaded in {:.1}s, {:.1} MiB on device, {:.1} MiB of file",
         t.elapsed().as_secs_f64(),
-        db.disk_bytes().expect("disk bytes") as f64 / (1 << 20) as f64
+        db.disk_bytes().expect("disk bytes") as f64 / (1 << 20) as f64,
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / (1 << 20) as f64
     );
     println!("variant\tthreads\trows\tseconds\tus a row\trows a second");
 
@@ -268,5 +269,14 @@ fn main() {
          the contention is in reading records out of the log"
     );
 
+    // Kept when asked, so what the file costs once this process has let
+    // go of it can be read from outside. st_blocks on an open file on
+    // ext4 counts space the allocator is holding on the file's behalf
+    // and gives back at close, and this is how that gets separated from
+    // space the database is actually using.
+    if env("ZU2_KEEP", 0) != 0 {
+        println!("# kept {}", dir.display());
+        return;
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

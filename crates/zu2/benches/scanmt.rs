@@ -12,8 +12,8 @@
 //! structure the other nineteen want. That leaves readers contending
 //! with each other, and this is the bench that says where.
 //!
-//! Two variants, the same two [`scan`](../scan.rs) uses and for the same
-//! reason:
+//! Four variants, the first two being what [`scan`](../scan.rs) uses and
+//! for the same reason:
 //!
 //! - `walk`, seek and step and touch each key, never looking at a
 //!   record. The scan plane on its own.
@@ -21,6 +21,9 @@
 //!   together.
 //! - `copy`, the same scan with each value copied into a caller buffer,
 //!   which is the smallest honest model of what a host actually needs.
+//! - `memcpy`, no database at all: the same fifty rows of a thousand
+//!   bytes copied out of a plain buffer, laid out back to back so the
+//!   locality is as good as it can be.
 //!
 //! The third one is there for #737. The harness gets 47% of `scan` at
 //! one thread and 40% at thirty two, and the first thing to rule out is
@@ -29,6 +32,15 @@
 //! touches the bytes, so it is a ceiling and not a like for like. If
 //! `copy` lands near the harness then there is no adapter problem to
 //! find.
+//!
+//! The fourth is the gate on #738. A copying scan at thirty two
+//! threads moves 48.6M rows a second, which is 48.6 GB/s out and as
+//! much again in, and the arithmetic says that is near what a machine
+//! can do. Arithmetic is not a measurement. `memcpy` is the ceiling the
+//! copy is being compared against, and it is a generous one because its
+//! rows are contiguous and the store's are scattered. If the copy is
+//! already close to it then no engine work widens the gap to lmdb,
+//! because neither engine is what is slow.
 //!
 //! If `walk` scales and `scan` does not then the plane is fine and the
 //! contention is in reading records out of the log, which is a page
@@ -308,6 +320,66 @@ fn main() {
         }
     }
 
+    // After every database pass and not interleaved with them. This
+    // allocates half a gigabyte and touches all of it, and doing that
+    // between two scan passes would evict the store from the page cache
+    // and the next pass would be measuring a reload.
+    let mut memcpy_rate: Vec<(usize, f64)> = Vec::new();
+    if env("ZU2_MEMCPY", 1) != 0 {
+        // Comfortably past any last level cache on a machine this bench
+        // gets run on, so what it measures is memory and not cache. Not
+        // sized to the store, because a buffer as big as the store plus
+        // the store is two gigabytes of resident pages and the point of
+        // this pass is a bandwidth ceiling, not a memory pressure test.
+        const SOURCE_BYTES: usize = 512 << 20;
+        let source: Vec<u8> = (0..SOURCE_BYTES).map(|i| (i % 251) as u8).collect();
+        let runs = SOURCE_BYTES / (VALUE_BYTES * scan as usize);
+        for &n in &threads {
+            let mut best = f64::MAX;
+            let mut best_rows = 0u64;
+            for _ in 0..repeats {
+                let (rows, seconds) = phase(n, |t| {
+                    let source = &source;
+                    let mut buf: Vec<u8> = Vec::with_capacity(VALUE_BYTES);
+                    let mut done = 0u64;
+                    // Derived from the same start keys so each worker
+                    // touches a different part of the buffer, the same
+                    // way it touches a different part of the store.
+                    let mine = keys[t * iterations..(t + 1) * iterations].iter();
+                    for start in mine {
+                        let run = start.len().wrapping_mul(31).wrapping_add(
+                            start
+                                .as_bytes()
+                                .iter()
+                                .fold(0usize, |a, &b| a.wrapping_mul(131).wrapping_add(b as usize)),
+                        ) % runs;
+                        let mut at = run * VALUE_BYTES * scan as usize;
+                        for _ in 0..scan {
+                            buf.clear();
+                            buf.extend_from_slice(&source[at..at + VALUE_BYTES]);
+                            std::hint::black_box(&buf);
+                            at += VALUE_BYTES;
+                            done += 1;
+                        }
+                    }
+                    done
+                });
+                let per_row = seconds / (rows.max(1) as f64);
+                let best_per_row = best / (best_rows.max(1) as f64);
+                if rows > 0 && per_row < best_per_row {
+                    best = seconds;
+                    best_rows = rows;
+                }
+            }
+            let rate = best_rows as f64 / best;
+            println!(
+                "memcpy\t{n}\t{best_rows}\t{best:.2}\t{:.3}\t{rate:.0}",
+                best * 1e6 / best_rows as f64
+            );
+            memcpy_rate.push((n, rate));
+        }
+    }
+
     // The number #732 asks for, stated rather than left to be worked out.
     println!("#");
     println!("# scaling against one thread");
@@ -334,11 +406,21 @@ fn main() {
     // the whole question is what share of the engine a host can reach.
     println!("#");
     println!("# what a copy costs, which is the floor for any real host");
-    println!("threads\tscan rows a second\tcopy rows a second\tcopy share");
+    println!("threads\tscan rows/s\tcopy rows/s\tcopy share\tmemcpy rows/s\tcopy of memcpy");
     for (i, &(n, s)) in scan_rate.iter().enumerate() {
         let c = copy_rate.get(i).map(|x| x.1).unwrap_or(0.0);
-        println!("{n}\t{s:.0}\t{c:.0}\t{:.0}%", 100.0 * c / s.max(1.0));
+        let m = memcpy_rate.get(i).map(|x| x.1).unwrap_or(0.0);
+        println!(
+            "{n}\t{s:.0}\t{c:.0}\t{:.0}%\t{m:.0}\t{:.0}%",
+            100.0 * c / s.max(1.0),
+            100.0 * c / m.max(1.0)
+        );
     }
+    println!(
+        "# #738 is worth building only if the copy is well short of \
+         memcpy. If it is already near it then the copy is the wall and \
+         no engine work moves it."
+    );
 
     // Kept when asked, so what the file costs once this process has let
     // go of it can be read from outside. st_blocks on an open file on

@@ -234,17 +234,17 @@ fn every_element_type_a_graph_type_may_declare_is_performed() {
 /// A union of two property types is a `value_type` the grammar allows
 /// and the parser reads, and there is no column that holds either an
 /// `INT64` or a `STRING`, so the catalog will not write it. The refusal
-/// is the same shape `graph_type.rs` pins for `DECIMAL(12,2)`: no
-/// condition, and the word corrupt for a file that is not damaged. S1
-/// gives it a condition and S2 decides whether a union gets a column.
+/// is the same shape `graph_type.rs` pins for `DECIMAL(12,2)`: 42000,
+/// and nothing about a file that is not damaged. S2 decides whether a
+/// union gets a column at all.
 #[test]
 fn a_union_of_property_types_is_read_and_not_stored() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
     let source = "CREATE GRAPH TYPE u { (:P {v :: INT64 | STRING}) }";
     let err = run(source, &mut db, &[]).expect_err("no column holds either");
-    assert_eq!(err.gqlstatus(), None, "S1 gives this one a condition");
-    assert!(err.to_string().starts_with("corrupt catalog:"), "{err}");
+    assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42000".into()));
+    assert!(!err.to_string().contains("corrupt"), "{err}");
 }
 
 /// A statement saying both `OR REPLACE` and `IF NOT EXISTS` says

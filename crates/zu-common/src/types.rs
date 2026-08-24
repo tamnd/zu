@@ -688,7 +688,7 @@ impl fmt::Display for LogicalType {
             LogicalType::BindingTable(_) => write!(f, "BINDING TABLE"),
             LogicalType::Path(_) => write!(f, "PATH"),
             LogicalType::List { elem, max } => match max {
-                Some(n) => write!(f, "LIST<{elem}>({n})"),
+                Some(n) => write!(f, "LIST<{elem}>[{n}]"),
                 None => write!(f, "LIST<{elem}>"),
             },
             LogicalType::Record(r) => {
@@ -963,7 +963,7 @@ mod tests {
                 max: Some(4),
             }
             .to_string(),
-            "LIST<DATE>(4)"
+            "LIST<DATE>[4]"
         );
         assert_eq!(
             LogicalType::Union(vec![LogicalType::int(IntBits::B64), LogicalType::string()])

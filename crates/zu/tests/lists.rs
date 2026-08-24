@@ -91,9 +91,9 @@ fn an_element_type_is_a_value_type_and_carries_a_value_type_s_rules() {
 fn a_maximum_length_bounds_the_list_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    assert!(yes(&mut db, "[1, 2] IS TYPED LIST<INT>(2)"));
-    assert!(!yes(&mut db, "[1, 2, 3] IS TYPED LIST<INT>(2)"));
-    assert!(yes(&mut db, "[1, 2] IS TYPED INT LIST(9)"));
+    assert!(yes(&mut db, "[1, 2] IS TYPED LIST<INT>[2]"));
+    assert!(!yes(&mut db, "[1, 2, 3] IS TYPED LIST<INT>[2]"));
+    assert!(yes(&mut db, "[1, 2] IS TYPED INT LIST[9]"));
 }
 
 /// A cast to a list type casts every element, and the two ways it fails
@@ -115,7 +115,7 @@ fn casting_to_a_list_casts_the_elements_and_names_the_element_that_fails() {
         Value::List(Vec::new())
     );
     assert_eq!(
-        code(&mut db, "RETURN CAST([1, 2, 3] AS LIST<INT>(2)) AS v"),
+        code(&mut db, "RETURN CAST([1, 2, 3] AS LIST<INT>[2]) AS v"),
         "22G0B"
     );
     assert_eq!(

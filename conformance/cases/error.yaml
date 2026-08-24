@@ -206,6 +206,11 @@ cases:
     query: "CREATE GRAPH TYPE t { (:P {v :: INT64 | STRING}) }"
     raises: "42000"
 
+  - name: a-list-maximum-written-in-parentheses
+    doc: The maximum length of a list type is written in square brackets and nowhere else. It is the one length in the grammar not written in parentheses, so a parenthesis where the bracket belongs is a statement the standard has no rule for and is refused rather than read as the length somebody probably meant.
+    query: RETURN cast([1, 2] AS LIST<INT8>(2)) AS a
+    raises: "42001"
+
   - name: a-string-added-to-a-number
     doc: Addition is arithmetic here and not concatenation, so a string on either side of it is a value of the wrong type and not a coercion.
     query: RETURN 'a' + 1 AS a
@@ -388,7 +393,7 @@ cases:
 
   - name: a-list-longer-than-its-target
     doc: A list cast to a list of a fixed length, refused on the count before any element is looked at.
-    query: RETURN cast([1, 2, 3] AS LIST<INT8>(2)) AS a
+    query: RETURN cast([1, 2, 3] AS LIST<INT8>[2]) AS a
     raises: "22G0B"
 
   - name: a-list-with-an-element-that-does-not-fit

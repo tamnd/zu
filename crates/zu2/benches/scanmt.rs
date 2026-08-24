@@ -19,6 +19,16 @@
 //!   record. The scan plane on its own.
 //! - `scan`, the real [`zu2::Session::scan`], plane and records
 //!   together.
+//! - `copy`, the same scan with each value copied into a caller buffer,
+//!   which is the smallest honest model of what a host actually needs.
+//!
+//! The third one is there for #737. The harness gets 47% of `scan` at
+//! one thread and 40% at thirty two, and the first thing to rule out is
+//! that the gap is a copy YCSB genuinely asked for rather than anything
+//! the adapter is doing wrong. `scan` black boxes the value and never
+//! touches the bytes, so it is a ceiling and not a like for like. If
+//! `copy` lands near the harness then there is no adapter problem to
+//! find.
 //!
 //! If `walk` scales and `scan` does not then the plane is fine and the
 //! contention is in reading records out of the log, which is a page
@@ -218,9 +228,10 @@ fn main() {
     // left for a reader to divide out.
     let mut walk_rate: Vec<(usize, f64)> = Vec::new();
     let mut scan_rate: Vec<(usize, f64)> = Vec::new();
+    let mut copy_rate: Vec<(usize, f64)> = Vec::new();
 
     for &n in &threads {
-        for variant in ["walk", "scan"] {
+        for variant in ["walk", "scan", "copy"] {
             let mut best = f64::MAX;
             let mut best_rows = 0u64;
             for _ in 0..repeats {
@@ -242,6 +253,24 @@ fn main() {
                                     cursor.step();
                                     done += 1;
                                 }
+                            }
+                        }
+                        "copy" => {
+                            let mut s = db.session();
+                            // One buffer for the whole worker and not
+                            // one a row, because a host that allocates
+                            // a buffer per row is measuring its
+                            // allocator and this is meant to measure
+                            // the copy.
+                            let mut buf: Vec<u8> = Vec::with_capacity(VALUE_BYTES);
+                            for start in mine {
+                                done += s
+                                    .scan(start.as_bytes(), scan as usize, |_k, v| {
+                                        buf.clear();
+                                        buf.extend_from_slice(v);
+                                        std::hint::black_box(&buf);
+                                    })
+                                    .expect("scan") as u64;
                             }
                         }
                         _ => {
@@ -271,10 +300,10 @@ fn main() {
                 "{variant}\t{n}\t{best_rows}\t{best:.2}\t{:.3}\t{rate:.0}",
                 best * 1e6 / best_rows as f64
             );
-            if variant == "walk" {
-                walk_rate.push((n, rate));
-            } else {
-                scan_rate.push((n, rate));
+            match variant {
+                "walk" => walk_rate.push((n, rate)),
+                "scan" => scan_rate.push((n, rate)),
+                _ => copy_rate.push((n, rate)),
             }
         }
     }
@@ -282,17 +311,34 @@ fn main() {
     // The number #732 asks for, stated rather than left to be worked out.
     println!("#");
     println!("# scaling against one thread");
-    println!("threads\twalk\tscan");
+    println!("threads\twalk\tscan\tcopy");
     let walk1 = walk_rate.first().map(|x| x.1).unwrap_or(1.0);
     let scan1 = scan_rate.first().map(|x| x.1).unwrap_or(1.0);
+    let copy1 = copy_rate.first().map(|x| x.1).unwrap_or(1.0);
     for (i, &(n, w)) in walk_rate.iter().enumerate() {
         let s = scan_rate.get(i).map(|x| x.1).unwrap_or(0.0);
-        println!("{n}\t{:.2}x\t{:.2}x", w / walk1, s / scan1);
+        let c = copy_rate.get(i).map(|x| x.1).unwrap_or(0.0);
+        println!(
+            "{n}\t{:.2}x\t{:.2}x\t{:.2}x",
+            w / walk1,
+            s / scan1,
+            c / copy1
+        );
     }
     println!(
         "# if walk keeps climbing and scan does not, the plane is fine and \
          the contention is in reading records out of the log"
     );
+
+    // #737 wants this stated rather than divided out by a reader, since
+    // the whole question is what share of the engine a host can reach.
+    println!("#");
+    println!("# what a copy costs, which is the floor for any real host");
+    println!("threads\tscan rows a second\tcopy rows a second\tcopy share");
+    for (i, &(n, s)) in scan_rate.iter().enumerate() {
+        let c = copy_rate.get(i).map(|x| x.1).unwrap_or(0.0);
+        println!("{n}\t{s:.0}\t{c:.0}\t{:.0}%", 100.0 * c / s.max(1.0));
+    }
 
     // Kept when asked, so what the file costs once this process has let
     // go of it can be read from outside. st_blocks on an open file on

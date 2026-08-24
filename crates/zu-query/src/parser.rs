@@ -768,12 +768,17 @@ struct Parser<'a> {
 /// A catalog statement lifted out of a call body (GP18).
 ///
 /// `from` and `to` are the statement itself, which becomes a part of
-/// the block, and `from` to `cut` is what comes out of the text the
-/// rest of the statement is made of: the statement and the `NEXT`
-/// handing over to what follows it.
+/// the block, and `cut_from` to `cut` is what comes out of the text the
+/// rest of the statement is made of. The two spans are usually the
+/// same one plus the `NEXT` handing over to what follows the
+/// statement. Where the body held nothing but catalog statements the
+/// call goes with them, so the first part's cut opens at the word
+/// `CALL` and the last one's closes past the brace, which is what
+/// leaves nothing of the call behind.
 struct Lift {
     from: usize,
     to: usize,
+    cut_from: usize,
     cut: usize,
 }
 
@@ -2253,6 +2258,11 @@ impl Parser<'_> {
     /// and the text it was cut from is what is left of the span it fell
     /// in. Cuts do not overlap and are gathered in the order they were
     /// read, so one walk over each span is enough.
+    ///
+    /// A span the cuts took the whole of is dropped rather than kept as
+    /// an empty part, which is the call whose body held nothing but
+    /// catalog statements: what it ran is the parts in front and there
+    /// is nothing of the call left to run.
     fn block_parts(&self, spans: &[(usize, usize)]) -> Vec<String> {
         let mut parts: Vec<String> = self
             .lifted
@@ -2263,14 +2273,17 @@ impl Parser<'_> {
             let mut text = String::new();
             let mut at = from;
             for lift in &self.lifted {
-                if lift.from < at || lift.cut > to {
+                if lift.cut_from < at || lift.cut > to {
                     continue;
                 }
-                text.push_str(&self.source[at..lift.from]);
+                text.push_str(&self.source[at..lift.cut_from]);
                 at = lift.cut;
             }
             text.push_str(&self.source[at..to]);
-            parts.push(text.trim().to_string());
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
         }
         parts
     }
@@ -2317,6 +2330,9 @@ impl Parser<'_> {
             let stmt = self.parse_catalog_stmt()?;
             return Ok((Statement::Catalog(stmt), Ending::Write));
         }
+        if let Some(part) = self.parse_catalog_call()? {
+            return Ok(part);
+        }
         // ISO 9.1 and 13.1. A whole statement may be written in braces
         // with nothing around it, a `USE` clause in front of it or
         // both, which the standard calls a nested query specification
@@ -2334,6 +2350,131 @@ impl Parser<'_> {
         self.pos = at;
         let (query, ending) = self.parse_query_body()?;
         Ok((Statement::Query(query), ending))
+    }
+
+    /// A call whose body is nothing but catalog statements, which ISO
+    /// 12.8 calls a call catalog-modifying procedure statement (GP01).
+    ///
+    /// `CALL { CREATE GRAPH g ANY }` is one. It is a catalog statement
+    /// written as a call rather than a call that happens to change the
+    /// catalog: what a call does is add the rows its body answered to
+    /// the row it ran for, a catalog statement answers none, so the
+    /// call is the statements in it and the braces say nothing. That
+    /// is why they come off here instead of a statement being lifted
+    /// out from under them the way [`Self::lift_catalog_out_of_a_call`]
+    /// lifts one. The lift leaves the call standing over what is left
+    /// of the body, and here there is nothing left for it to stand
+    /// over.
+    ///
+    /// Answers `None` for anything else, having read nothing, because
+    /// `CALL {` opens the ordinary inline call too. The shape is
+    /// looked for before a token of it is taken: the word is the first
+    /// one written, every statement between the braces is a catalog
+    /// statement, and the brace closes the text. A call with something
+    /// written behind it is something reading a row the catalog
+    /// statements did not answer, which is the refusal the lift
+    /// already writes.
+    fn parse_catalog_call(&mut self) -> Result<Option<(Statement, Ending)>> {
+        let Some(body) = self.at_catalog_call() else {
+            return Ok(None);
+        };
+        let call_at = self.here();
+        self.pos += body;
+        let mut parts = Vec::new();
+        let last = loop {
+            let from = self.here();
+            let stmt = self.parse_catalog_stmt()?;
+            parts.push((from, self.here()));
+            if !self.eat_kw("NEXT") {
+                break stmt;
+            }
+        };
+        self.expect(&TokenKind::RBrace)?;
+        let end = self.here();
+        let stmt = Statement::Catalog(last);
+        if parts.len() == 1 && !self.at_kw("NEXT") {
+            // One statement with nothing behind it is the statement,
+            // with no block to make of it and no text to cut, since the
+            // whole of what was written is this.
+            return Ok(Some((stmt, Ending::Write)));
+        }
+        // Anything else is a part of a block, and the cuts run end to
+        // end from the word `CALL` to past the brace so that nothing of
+        // the call is left in the span they came out of.
+        for (i, &(from, to)) in parts.iter().enumerate() {
+            self.lifted.push(Lift {
+                from,
+                to,
+                cut_from: if i == 0 { call_at } else { from },
+                cut: parts.get(i + 1).map_or(end, |&(next, _)| next),
+            });
+        }
+        Ok(Some((stmt, Ending::Write)))
+    }
+
+    /// How many tokens stand in front of the body of a call that holds
+    /// nothing but catalog statements, or `None` where this is not one.
+    ///
+    /// The count is what the reader steps over to reach the first
+    /// statement: the word, the empty scope clause where one was
+    /// written, and the brace. An empty scope clause is the one a call
+    /// at the head of a statement may carry, a scope naming variables
+    /// being a question about a row that has none.
+    fn at_catalog_call(&self) -> Option<usize> {
+        if self.pos != 0 || !self.at_kw("CALL") {
+            return None;
+        }
+        let mut body = 1;
+        if matches!(self.kind_at(body), Some(TokenKind::LParen))
+            && matches!(self.kind_at(body + 1), Some(TokenKind::RParen))
+        {
+            body += 2;
+        }
+        if !matches!(self.kind_at(body), Some(TokenKind::LBrace)) {
+            return None;
+        }
+        body += 1;
+        if !self.catalog_stmt_at(body) {
+            return None;
+        }
+        // Every `NEXT` of the body hands over to another catalog
+        // statement, since one that hands over to a data statement is
+        // the ordinary body and the lift reads it.
+        let mut at = body;
+        let mut depth = 1usize;
+        loop {
+            match self.kind_at(at)? {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Ident(_) if depth == 1 && self.kw_at(at, "NEXT") => {
+                    if !self.catalog_stmt_at(at + 1) {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        // The brace closes the text or hands over to another statement
+        // of the block. A clause behind the call would be reading a row
+        // the catalog statements did not answer, which is the refusal
+        // the lift writes.
+        match self.kind_at(at + 1) {
+            None => Some(body),
+            Some(TokenKind::Semicolon) if self.pos + at + 2 == self.tokens.len() => Some(body),
+            Some(TokenKind::Ident(_)) if self.kw_at(at + 1, "NEXT") => Some(body),
+            Some(_) => None,
+        }
+    }
+
+    /// The kind of the token `offset` on from where the parser stands.
+    fn kind_at(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + offset).map(|t| &t.kind)
     }
 
     /// A statement written in braces, with the graph a clause in front
@@ -2475,6 +2616,7 @@ impl Parser<'_> {
         self.lifted.push(Lift {
             from,
             to,
+            cut_from: from,
             cut: self.here(),
         });
         Ok(())
@@ -8577,14 +8719,69 @@ mod tests {
         }
     }
 
-    /// A body answers rows and a catalog statement answers none, so a
-    /// body that is only a catalog statement is refused.
+    /// GP01, ISO 12.8. A call whose body is nothing but catalog
+    /// statements is a catalog statement written as a call: the body
+    /// answers no rows, so what the call adds to the row it ran for is
+    /// nothing and the braces say nothing either. One statement in
+    /// them is that statement and several are the block they make,
+    /// with no call left over in the text.
     #[test]
-    fn a_call_body_that_is_only_a_catalog_statement_is_refused() {
-        assert!(
-            catalog_err("CALL () { CREATE GRAPH g ANY }").contains("hands over to a statement"),
-            "the refusal says what is missing behind it"
+    fn a_call_body_that_is_only_catalog_statements_is_those_statements() {
+        for source in [
+            "CALL { CREATE GRAPH g ANY }",
+            "CALL () { CREATE GRAPH g ANY }",
+            "CALL { CREATE GRAPH g ANY };",
+        ] {
+            assert_eq!(
+                catalog_stmt(source),
+                CatalogStmt::CreateGraph {
+                    name: GraphName {
+                        schema: None,
+                        name: "g".into(),
+                    },
+                    if_not_exists: false,
+                    or_replace: false,
+                    of: GraphTypeRef::Any,
+                    copy_of: None,
+                },
+                "{source}"
+            );
+        }
+        assert_eq!(
+            block_parts("CALL { CREATE GRAPH a ANY NEXT DROP GRAPH b NEXT CREATE SCHEMA /c }"),
+            vec!["CREATE GRAPH a ANY", "DROP GRAPH b", "CREATE SCHEMA /c"],
         );
+        // The statement it is, being a catalog statement, is one a
+        // `NEXT` may hand over from, and what it hands over is the
+        // unit row every statement starts from.
+        assert_eq!(
+            block_parts("CALL { CREATE GRAPH a ANY } NEXT USE a MATCH (p) RETURN p AS p"),
+            vec!["CREATE GRAPH a ANY", "USE a MATCH (p) RETURN p AS p"],
+        );
+        assert_eq!(
+            block_parts("CALL { CREATE GRAPH a ANY NEXT DROP GRAPH b } NEXT RETURN 1 AS n"),
+            vec!["CREATE GRAPH a ANY", "DROP GRAPH b", "RETURN 1 AS n"],
+        );
+    }
+
+    /// A body answers rows and a catalog statement answers none, so a
+    /// clause written behind the call is a clause reading a row nobody
+    /// answered. A `NEXT` there is a statement of the block and reads
+    /// the unit row, which is why the two are told apart rather than
+    /// both refused. A scope clause naming variables is the same
+    /// question asked in front: it is about a row the call has not got.
+    #[test]
+    fn a_call_body_of_catalog_statements_carries_nothing_behind_the_call() {
+        for source in [
+            "CALL { CREATE GRAPH g ANY } RETURN 1 AS n",
+            "CALL { CREATE GRAPH g ANY } FINISH",
+            "CALL (p) { CREATE GRAPH g ANY }",
+        ] {
+            assert!(
+                catalog_err(source).contains("hands over to a statement"),
+                "{source}"
+            );
+        }
     }
 
     /// GP06. ISO writes the separator between a binding variable and

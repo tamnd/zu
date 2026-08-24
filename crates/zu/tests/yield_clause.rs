@@ -6,6 +6,13 @@
 //! carry are the same values under whatever name it gave them, and
 //! that narrowing the columns is not grouping the rows: a yield answers
 //! the rows the match answered.
+//!
+//! Two more shapes are here. `YIELD NO BINDINGS` is the other way ISO
+//! writes the item list, and it takes every name away rather than some
+//! of them, the rows staying where they are. And ISO 9.2 puts a yield
+//! behind a `NEXT` (GQ20), where the names it takes are the columns the
+//! statement in front returned rather than the variables a match wrote,
+//! which is the same clause reading the same scope.
 
 use zu::Database;
 use zu::zu1::file::Zu1File;
@@ -132,6 +139,88 @@ fn yielding_one_name_twice_is_refused() {
     assert!(
         err.to_string().contains("names 'p' twice"),
         "{err}, want the name"
+    );
+}
+
+/// `NO BINDINGS` is the other alternative of the item list, and what it
+/// says is that the match ran and nothing it wrote is in scope behind
+/// it. A binding table is a multiset of records, so a record with no
+/// fields is still a record and the seven matches are still seven rows.
+#[test]
+fn no_bindings_keeps_every_row_and_lets_nothing_out() {
+    let mut fx = Fixture::open("yield-no-bindings.zu1");
+    assert_eq!(
+        fx.one("MATCH (p:person)-[:knows]->(q:person) YIELD NO BINDINGS RETURN count(*) AS n"),
+        7
+    );
+    for source in [
+        "MATCH (p:person)-[:knows]->(q:person) YIELD NO BINDINGS RETURN q.id AS n",
+        "MATCH (p:person)-[:knows]->(q:person) YIELD NO BINDINGS RETURN p.id AS n",
+    ] {
+        let err = fx.conn.query(source).expect_err("nothing left the match");
+        assert!(err.to_string().contains("is not defined"), "{err}");
+    }
+}
+
+/// `no` is a name a query may write, so both words are read before
+/// either is taken and `YIELD no` is the variable it looks like.
+#[test]
+fn a_variable_named_no_is_not_the_first_half_of_no_bindings() {
+    let mut fx = Fixture::open("yield-no-name.zu1");
+    assert_eq!(
+        fx.one("MATCH (no:person) YIELD no RETURN count(no) AS n"),
+        5
+    );
+}
+
+/// ISO 9.2 puts a yield behind a `NEXT`, which is the one place in the
+/// language one may be written without a procedure name in front of it.
+/// The whole binding table is handed on unless it narrows it, so the
+/// column it kept is there under the name it gave and the one it left
+/// behind is gone.
+#[test]
+fn a_yield_behind_a_next_narrows_what_the_statement_past_it_reads() {
+    let mut fx = Fixture::open("yield-next.zu1");
+    assert_eq!(
+        fx.one(
+            "MATCH (p:person) RETURN p.id AS id, p.id + 1 AS bump \
+             NEXT YIELD id AS mine \
+             RETURN count(mine) AS n"
+        ),
+        5
+    );
+    assert_eq!(
+        fx.one(
+            "MATCH (p:person) RETURN p.id AS id, p.id + 1 AS bump \
+             NEXT RETURN sum(bump) AS n"
+        ),
+        15,
+        "the whole table is handed on where no yield narrows it"
+    );
+    let err = fx
+        .conn
+        .query(
+            "MATCH (p:person) RETURN p.id AS id, p.id + 1 AS bump \
+             NEXT YIELD id \
+             RETURN sum(bump) AS n",
+        )
+        .expect_err("bump did not come through the yield");
+    assert!(err.to_string().contains("'bump' is not defined"), "{err}");
+}
+
+/// A yield behind a `NEXT` names columns the statement in front
+/// returned, so a name it never returned is refused the way a name a
+/// match never wrote is.
+#[test]
+fn a_yield_behind_a_next_cannot_name_a_column_nobody_returned() {
+    let mut fx = Fixture::open("yield-next-unknown.zu1");
+    let err = fx
+        .conn
+        .query("MATCH (p:person) RETURN p.id AS id NEXT YIELD other RETURN other AS n")
+        .expect_err("other is nobody");
+    assert!(
+        err.to_string().contains("yield a name the match wrote"),
+        "{err}, want what to do about it"
     );
 }
 

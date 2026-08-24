@@ -61,14 +61,31 @@ crates/zu-common     ids, errors, shared constants
 crates/zu-encoding   lightweight encodings (FastLanes, ALP, FSST, cascades)
 crates/zu-storage    the GraphStore trait every engine implements
 crates/zu-zu1        native single-file engine
+crates/zu2           the record engine, a log with a hash index over it
+crates/zu2-capi      zu2's C ABI, which is what go-ycsb links
 crates/zu-sqlite     SQLite engine
 crates/zu-s3         object-storage engine
 crates/zu-query      parser, planner, factorized executor
+crates/zu-exec       execution operators
+crates/zu-vector     vectors and the column layout the executor works on
+crates/zu-arrow      Arrow interchange
+crates/zu-adbc       the ADBC driver
+crates/zu-json       JSON in and out
+crates/zu-corpus     the datasets the tests and benches run against
 crates/zu            the public embedded API (published as zudb)
+crates/zu-capi       zu's C ABI
 crates/zu-cli        the zu binary
 crates/zu-snippets   the snippets this README prints, compiled and run
+crates/xtask         repository tasks
 docs/                the specification, byte-level where it matters
 ```
+
+zu1 and zu2 are two engines and not two versions of one. zu1 is the
+single file graph engine the specification describes. zu2 is a record
+engine, a log with a hash index over it, written to find out how fast
+the storage layer can be made to go before the graph shapes are put back
+on top of it, and it is the engine every number in the benchmark series
+is measured against. It is tracked by [Z0](https://github.com/tamnd/zu/issues/396).
 
 The crate is published as `zudb` because `zu` is taken on crates.io; the repo, binary, and file extension stay `zu`.
 

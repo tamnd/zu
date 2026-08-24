@@ -1534,3 +1534,43 @@ cases:
             value: di
           - type: BOOL
             value: true
+
+  - name: a-yield-that-carries-no-bindings-keeps-the-rows
+    doc: GQ19, ISO 16.14. NO BINDINGS is the other alternative of the yield item list and the one that says what the clause is for: the match still ran and its rows are still rows, and what changes is that nothing it wrote is in scope behind it. A binding table is a multiset of records, so a record with no fields is still a record and two matches are two rows to count.
+    query: MATCH (p:person)-[:knows]->(q:person) YIELD NO BINDINGS RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-name-a-yield-of-no-bindings-took-away
+    doc: The line the case above draws, from the other side. Nothing the match wrote is in scope behind the clause, so a statement reading one of those names is refused rather than answered from a table that quietly kept it.
+    query: MATCH (p:person)-[:knows]->(q:person) YIELD NO BINDINGS RETURN q.name AS a
+    raises: "42002"
+
+  - name: a-variable-named-no-is-not-the-first-half-of-no-bindings
+    doc: Both words of NO BINDINGS are read before either is taken, because no is a name a query may write and a yield of it is the variable it looks like. An engine that took the first word alone answers a condition here.
+    query: MATCH (no:person) YIELD no RETURN count(no) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-yield-behind-a-next-narrows-the-table-handed-over
+    doc: GQ20, ISO 9.2. A NEXT hands the whole binding table on unless a yield clause narrows it, and this is the one place in the language a yield may be written without a procedure name in front of it. The names it takes are columns the statement in front returned rather than variables a match wrote, which is the same clause reading the same scope.
+    query: MATCH (p:person) RETURN p.name AS name, p.age AS age NEXT YIELD name AS who RETURN count(who) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-column-a-yield-behind-a-next-left-behind
+    doc: What the clause narrowed is narrowed for the whole statement past it, so the column it did not carry is not one the statement behind it can read.
+    query: MATCH (p:person) RETURN p.name AS name, p.age AS age NEXT YIELD name AS who RETURN sum(age) AS a
+    raises: "42002"

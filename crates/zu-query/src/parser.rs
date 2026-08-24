@@ -2823,6 +2823,9 @@ impl Parser<'_> {
     /// and how the last of them ended.
     fn parse_linear(&mut self, focus: Option<&GraphRef>) -> Result<(Linear, Ending)> {
         let mut statements = Vec::new();
+        // The yield clause a `NEXT` behind the last statement carried,
+        // waiting for the statement it belongs to to be read.
+        let mut yielded: Option<Vec<YieldItem>> = None;
         loop {
             let (simple, ending) = self.parse_simple()?;
             // The body of a call the statement began with, which goes
@@ -2830,7 +2833,7 @@ impl Parser<'_> {
             // call. Where the call was the whole statement what is left
             // of it is empty, and the last statement of the body is the
             // one this chain ends with.
-            let (simple, ending) = match self.hoisted.take() {
+            let (mut simple, ending) = match self.hoisted.take() {
                 None => (simple, ending),
                 Some((mut body, theirs)) => {
                     let mine = simple.clauses.is_empty() && simple.result.is_none();
@@ -2843,6 +2846,15 @@ impl Parser<'_> {
                     (last, if mine { theirs } else { ending })
                 }
             };
+            // The yield the `NEXT` in front of this statement carried is
+            // the first thing this statement does, so it goes at the
+            // head of its clauses. A hoisted body cannot be here to
+            // argue about the place: a call is hoisted only where it is
+            // the first token of the text, and a `NEXT` in front of it
+            // means it is not.
+            if let Some(items) = yielded.take() {
+                simple.clauses.insert(0, Clause::Yield { items });
+            }
             statements.push(simple);
             // ISO 16.2 builds a focused linear query statement out of
             // parts, each one a `USE` clause and the statements under
@@ -2883,6 +2895,21 @@ impl Parser<'_> {
                 return Ok((Linear { statements }, ending));
             }
             self.refuse_a_second_graph()?;
+            // GQ20, ISO 9.2. A `NEXT` hands the whole binding table on
+            // unless a yield clause narrows it, and this is the one
+            // place in the language a yield may be written without a
+            // procedure name in front of it. The names it takes are
+            // columns of the table the statement in front returned,
+            // which are the variables in scope where the statement
+            // behind it starts, so it is the clause a yield behind a
+            // match already is.
+            if self.eat_kw("YIELD") {
+                let mut items = vec![self.parse_yield_item()?];
+                while self.eat(&TokenKind::Comma) {
+                    items.push(self.parse_yield_item()?);
+                }
+                yielded = Some(items);
+            }
         }
     }
 
@@ -2976,13 +3003,33 @@ impl Parser<'_> {
         // Nothing may stand between the two, which is what makes the
         // two readings the same.
         if self.eat_kw("YIELD") {
-            let mut items = vec![self.parse_yield_item()?];
-            while self.eat(&TokenKind::Comma) {
-                items.push(self.parse_yield_item()?);
-            }
-            clauses.push(Clause::Yield { items });
+            clauses.push(Clause::Yield {
+                items: self.parse_pattern_yield_items()?,
+            });
         }
         Ok(())
+    }
+
+    /// The item list a yield clause behind a match carries, ISO 16.14.
+    ///
+    /// The rule is written two ways and `NO BINDINGS` is the one that
+    /// says what the clause is for: the match still ran and its rows
+    /// are still rows, and what changes is that nothing it wrote is in
+    /// scope behind it. That is the empty list here, since a clause
+    /// letting nothing out and a clause letting out nothing are the
+    /// same clause. Both words are tested before either is taken,
+    /// because `no` is a name a query may write and `YIELD no` is a
+    /// variable rather than the first half of this.
+    fn parse_pattern_yield_items(&mut self) -> Result<Vec<YieldItem>> {
+        if self.at_kw("NO") && self.kw_at(1, "BINDINGS") {
+            self.pos += 2;
+            return Ok(Vec::new());
+        }
+        let mut items = vec![self.parse_yield_item()?];
+        while self.eat(&TokenKind::Comma) {
+            items.push(self.parse_yield_item()?);
+        }
+        Ok(items)
     }
 
     /// One simple query statement: the primitive statements it is

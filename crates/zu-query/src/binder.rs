@@ -4974,6 +4974,23 @@ impl Binder<'_> {
     /// are refused for the reason a `WITH` refuses them, which is that
     /// the clause after this one would have two things to read for it.
     fn bind_yield(&mut self, items: &[ast::YieldItem]) -> Result<BoundClause> {
+        // `YIELD NO BINDINGS`, which is the empty list by the time it
+        // gets here. A binding table is a multiset of records and a
+        // record with no fields is still a record, so the rows the
+        // match answered are still the rows and the only thing the
+        // clause does is empty the scope. That is no operator at all,
+        // and the shape for saying so is the one a FILTER with nothing
+        // left to filter already binds to.
+        if items.is_empty() {
+            self.scope.clear();
+            self.groups.clear();
+            self.forked.clear();
+            return Ok(BoundClause::Match {
+                kind: MatchKind::Required,
+                patterns: Vec::new(),
+                filter: None,
+            });
+        }
         let mut bound = Vec::with_capacity(items.len());
         let mut scope = HashMap::new();
         for item in items {

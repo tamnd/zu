@@ -38,6 +38,7 @@
 //! Table index layout: `version: u16`, `entry_count: u32`, then per
 //! entry `table_id: u32`, `directory_root: u64`.
 
+use zu_common::gqlstatus::{GqlStatus, codes};
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
@@ -371,12 +372,16 @@ impl GraphType {
     /// Checks the type against the graph's label dictionary and its own
     /// rules. A closed type has to be self-contained, which is what
     /// makes it worth anything to the optimizer.
-    fn validate(&self, labels: usize) -> Result<()> {
+    ///
+    /// Every check below is the same question whichever way the type
+    /// arrived, and the answer means two different things, so the
+    /// caller says which with an [`Origin`].
+    fn validate(&self, labels: usize, origin: Origin) -> Result<()> {
         let mut names: Vec<&str> = self.elements.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
-            return Err(corrupt(
-                "catalog",
+            return Err(origin.refuse(
+                codes::C42000,
                 format!("graph type '{}' declares an element type twice", self.name),
             ));
         }
@@ -384,16 +389,16 @@ impl GraphType {
             let where_ = || format!("element type '{}.{}'", self.name, element.name);
             for &label in element.labels.iter().chain(element.key_labels.ids()) {
                 if usize::from(label) >= labels {
-                    return Err(corrupt(
-                        "catalog",
+                    return Err(origin.refuse(
+                        codes::C42002,
                         format!("{} names label {label} of {labels}", where_()),
                     ));
                 }
             }
             for &key in element.key_labels.ids() {
                 if !element.labels.contains(&key) {
-                    return Err(corrupt(
-                        "catalog",
+                    return Err(origin.refuse(
+                        codes::C42000,
                         format!("{} keys on label {key}, which it does not carry", where_()),
                     ));
                 }
@@ -401,8 +406,8 @@ impl GraphType {
             let mut props: Vec<&str> = element.properties.iter().map(|p| p.name.as_str()).collect();
             props.sort_unstable();
             if props.windows(2).any(|w| w[0] == w[1]) {
-                return Err(corrupt(
-                    "catalog",
+                return Err(origin.refuse(
+                    codes::C42000,
                     format!("{} declares a property twice", where_()),
                 ));
             }
@@ -412,8 +417,8 @@ impl GraphType {
             // encoder past this point may assume it.
             for prop in &element.properties {
                 if props::declared_type_bytes(&prop.ty).is_none() {
-                    return Err(corrupt(
-                        "catalog",
+                    return Err(origin.refuse(
+                        codes::C42000,
                         format!(
                             "{} declares '{}' with a type this file cannot write",
                             where_(),
@@ -425,8 +430,8 @@ impl GraphType {
             match element.kind {
                 ElementKind::Node => {
                     if element.from.is_some() || element.to.is_some() {
-                        return Err(corrupt(
-                            "catalog",
+                        return Err(origin.refuse(
+                            codes::C42000,
                             format!("{} is a node type with endpoints", where_()),
                         ));
                     }
@@ -434,16 +439,16 @@ impl GraphType {
                 ElementKind::Edge => {
                     for end in [&element.from, &element.to] {
                         let end = end.as_deref().ok_or_else(|| {
-                            corrupt(
-                                "catalog",
+                            origin.refuse(
+                                codes::C42000,
                                 format!("{} is an edge type with no endpoint", where_()),
                             )
                         })?;
                         match self.element(end) {
                             Some(e) if e.kind == ElementKind::Node => {}
                             _ => {
-                                return Err(corrupt(
-                                    "catalog",
+                                return Err(origin.refuse(
+                                    codes::C42002,
                                     format!(
                                         "{} ends at '{end}', which is no node type here",
                                         where_()
@@ -458,19 +463,70 @@ impl GraphType {
             // graph type is the promise that every element matches a
             // declared type, and a type nothing selects cannot keep it.
             if self.closed && matches!(element.key_labels, KeyLabels::None) {
-                return Err(corrupt(
-                    "catalog",
+                // ISO names this one twice, once per kind: 42012 for a
+                // node type and 42014 for an edge type, both of them
+                // key labels below the supported minimum.
+                let below = match element.kind {
+                    ElementKind::Node => codes::C42012,
+                    ElementKind::Edge => codes::C42014,
+                };
+                return Err(origin.refuse(
+                    below,
                     format!("{} has no key label set in a closed graph type", where_()),
                 ));
             }
             if self.closed && element.open {
-                return Err(corrupt(
-                    "catalog",
+                return Err(origin.refuse(
+                    codes::C42000,
                     format!("{} is open in a closed graph type", where_()),
                 ));
             }
         }
         Ok(())
+    }
+}
+
+/// Where a graph type came from, which is what decides what a failed
+/// check means.
+///
+/// The checks in [`GraphType::validate`] are the same either way, and
+/// the sentence they produce is not. A type a user just declared that
+/// fails one of them is a statement zu will not perform, and the user
+/// can fix it: it gets a GQLSTATUS. The same type read back out of a
+/// file that once held it means the bytes on disk are not the bytes zu
+/// wrote, and the user cannot fix that: it gets `corrupt`, which is
+/// the word for damage and is a lie about anything else.
+///
+/// This is why the lint in `crates/zu/tests/refusals.rs` runs
+/// statements rather than counting call sites. There is one copy of
+/// each check and it is right in one caller and wrong in the other,
+/// and only the caller knows which.
+///
+/// Four of the checks below only ever run as [`Origin::Stored`],
+/// because no statement can build the structure they refuse. A key
+/// label a type does not carry cannot be declared, since the key label
+/// set joins the label set rather than being checked against it. A
+/// label outside the dictionary cannot, since a declaration interns
+/// every label it names. A node type with endpoints and an edge type
+/// whose endpoint is no node type cannot, since an arc's own node
+/// patterns are the node types it ends at. Those four keep the word
+/// corrupt in practice and have a condition anyway, so that the day one
+/// of them becomes reachable it arrives already answered.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// A user declared this type in a statement just now.
+    Declared,
+    /// This type was read out of a file, or built from tables that
+    /// were.
+    Stored,
+}
+
+impl Origin {
+    fn refuse(self, status: GqlStatus, detail: String) -> ZuError {
+        match self {
+            Origin::Declared => ZuError::gql(status, detail),
+            Origin::Stored => corrupt("catalog", detail),
+        }
     }
 }
 
@@ -921,7 +977,7 @@ impl Catalog {
                 ty.name
             )));
         }
-        ty.validate(self.labels.len())?;
+        ty.validate(self.labels.len(), Origin::Declared)?;
         self.graph_types.push(ty);
         Ok(())
     }
@@ -1005,7 +1061,7 @@ impl Catalog {
             )));
         }
         if let GraphTypeOf::Inline(ty) = graph_type {
-            ty.validate(self.labels.len())?;
+            ty.validate(self.labels.len(), Origin::Declared)?;
         }
         self.next_graph_id()?;
         Ok(())
@@ -1196,7 +1252,7 @@ impl Catalog {
                 &to.name,
             ));
         }
-        ty.validate(self.labels.len())?;
+        ty.validate(self.labels.len(), Origin::Stored)?;
         Ok(ty)
     }
 
@@ -1719,7 +1775,7 @@ impl Catalog {
             return Err(corrupt("catalog", "duplicate graph type name".into()));
         }
         for ty in &self.graph_types {
-            ty.validate(self.labels.len())?;
+            ty.validate(self.labels.len(), Origin::Stored)?;
         }
         let mut schemas: Vec<&str> = self.schemas.iter().map(String::as_str).collect();
         schemas.sort_unstable();
@@ -1764,7 +1820,7 @@ impl Catalog {
                         ),
                     ));
                 }
-                GraphTypeOf::Inline(ty) => ty.validate(self.labels.len())?,
+                GraphTypeOf::Inline(ty) => ty.validate(self.labels.len(), Origin::Stored)?,
             }
         }
         // A table in no graph is a table nothing can drop, so it is a

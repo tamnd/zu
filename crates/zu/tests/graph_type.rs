@@ -5,11 +5,11 @@
 //! meets it, which is a `CREATE GRAPH TYPE` and a spelling, and the two
 //! are not the same question: a type the encoder would take is no use
 //! if no spelling reaches it, and a spelling the parser takes is no use
-//! if the catalog then refuses it with a sentence about corruption.
+//! if the catalog then refuses it.
 //!
-//! Both of those are true today and both are pinned below, because S1
-//! and S2 change them and a change nobody is measuring is a change
-//! nobody notices.
+//! S1 made every one of those refusals a condition. What is left is the
+//! frontier itself, which is S2's work, and it is pinned below so that
+//! a type crossing it is a change somebody is measuring.
 
 use zu::query::run;
 use zu_zu1::file::Zu1File;
@@ -26,7 +26,7 @@ fn graph(dir: &std::path::Path) -> Zu1File {
 enum Answer {
     /// The declaration stood.
     Declared,
-    /// The parser did not reach a type at all.
+    /// The parser did not reach a type at all: 42001, invalid syntax.
     NotSpelled,
     /// The parser read a type and the catalog would not write it. The
     /// string is what the user was told.
@@ -35,16 +35,19 @@ enum Answer {
 
 /// Declares one property of `ty`, under a name of its own so that a
 /// file can be asked about many types in a row.
+///
+/// Both refusals carry a condition now, so the two are told apart by
+/// which one: a type with no spelling never reaches the catalog and is
+/// 42001, and a type the catalog will not write is 42000.
 fn declare(db: &mut Zu1File, n: usize, ty: &str) -> Answer {
     let source = format!("CREATE GRAPH TYPE probe{n} {{ (:Probe {{v :: {ty}}}) }}");
     match run(&source, db, &[]) {
         Ok(_) => Answer::Declared,
         Err(e) => {
             let message = e.to_string();
-            if e.gqlstatus().is_some() {
-                Answer::NotSpelled
-            } else {
-                Answer::NotStored(message)
+            match e.gqlstatus().map(|s| s.to_string()).as_deref() {
+                Some("42001") => Answer::NotSpelled,
+                _ => Answer::NotStored(message),
             }
         }
     }
@@ -58,7 +61,7 @@ fn probe() -> Vec<(&'static str, Answer)> {
     let stored = |m: &str| Answer::NotStored(m.into());
     let cannot_write = |n: usize| {
         stored(&format!(
-            "corrupt catalog: element type 'probe{n}.Probe' declares 'v' with a type this file cannot write"
+            "42000: element type 'probe{n}.Probe' declares 'v' with a type this file cannot write"
         ))
     };
     vec![
@@ -86,8 +89,9 @@ fn probe() -> Vec<(&'static str, Answer)> {
         ("CHAR(2)", Answer::Declared),
         ("BINARY(16)", Answer::Declared),
         ("LIST<FLOAT32>", Answer::Declared),
-        // Spelled and not stored. This is the list S2 works through, and
-        // the message is the one S1 replaces with a condition.
+        // Spelled and not stored. This is the list S2 works through.
+        // The condition is 42000 for all of them, which is what S1
+        // replaced the sentence about corruption with.
         ("LIST<FLOAT32 NOT NULL>(768)", cannot_write(24)),
         ("LIST<LIST<STRING>>", cannot_write(25)),
         ("DECIMAL(12,2)", cannot_write(26)),
@@ -164,22 +168,29 @@ fn the_year_month_duration_is_stored_and_cannot_be_declared() {
     assert_eq!(counted.rows.len(), 1);
 }
 
-/// Every refusal above is an error with no GQLSTATUS, which is the
-/// defect S1 fixes.
+/// Every refusal above carries a condition and none of them says
+/// corrupt, which is what S1 changed.
 ///
 /// A user who writes `DECIMAL(12,2)` has written a legal GQL statement
-/// that this engine will not perform. That is a condition the standard
-/// has a code for, and answering it with the word corrupt says the file
-/// is damaged when nothing is. The test is here so that S1 landing is a
-/// visible diff and not a silent improvement.
+/// that this engine will not perform. Before S1 they were told their
+/// file was damaged, with no condition to catch on. Now it is 42000,
+/// syntax error or access rule violation, which is the class the
+/// standard keeps for a statement the engine will not carry out. The
+/// two data exception codes that say invalid value type, 22G03 and
+/// 22G12, are class 22 and are about a value at run time; a type in a
+/// declaration is not a value.
 #[test]
-fn a_type_the_catalog_will_not_write_is_refused_without_a_condition() {
+fn a_type_the_catalog_will_not_write_is_refused_with_a_condition() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
     let source = "CREATE GRAPH TYPE money { (:Purchase {total :: DECIMAL(12,2)}) }";
     let err = run(source, &mut db, &[]).expect_err("a decimal is not storable");
-    assert_eq!(err.gqlstatus(), None, "S1 gives this one a condition");
-    assert!(err.to_string().starts_with("corrupt catalog:"), "{err}");
+    assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42000".into()));
+    assert!(!err.to_string().contains("corrupt"), "{err}");
+    assert!(
+        err.to_string().contains("DECIMAL") || err.to_string().contains("total"),
+        "{err}"
+    );
 }
 
 /// A type the parser refuses is refused as text, with a syntax

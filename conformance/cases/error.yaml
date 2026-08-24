@@ -186,6 +186,26 @@ cases:
     query: "CREATE GRAPH TYPE t { (:A)-[:l0&l1&l2&l3&l4&l5&l6&l7&l8&l9&l10&l11&l12&l13&l14&l15&l16&l17&l18&l19&l20&l21&l22&l23&l24&l25&l26&l27&l28&l29&l30&l31&l32&l33&l34&l35&l36&l37&l38&l39&l40&l41&l42&l43&l44&l45&l46&l47&l48&l49&l50&l51&l52&l53&l54&l55&l56&l57&l58&l59&l60&l61&l62&l63 => :R]->(:A) }"
     raises: "42015"
 
+  - name: a-graph-type-that-declares-an-element-type-twice
+    doc: Two element types of one name in one graph type leave every later question about that name with two answers, so the declaration is refused rather than one of the two being picked. There is no subclass for it, so it is the bare 42000, which is the class the standard keeps for a statement an engine will not carry out.
+    query: "CREATE GRAPH TYPE t { NODE TYPE A (:P), NODE TYPE A (:Q) }"
+    raises: "42000"
+
+  - name: an-element-type-that-declares-a-property-twice
+    doc: The same ambiguity one level down. A property name written twice in one element type is refused at the declaration rather than at the insert that would have to choose which type the column holds.
+    query: "CREATE GRAPH TYPE t { (:P {v :: INT64, v :: INT64}) }"
+    raises: "42000"
+
+  - name: a-property-type-no-column-can-hold
+    doc: A declared type is written into the catalog with the codes a column stores, so a type no column has is a type no element type can name. DECIMAL parses and has no column here, and the refusal is about the statement rather than about the file, which is why it is 42000 and not a report of damage.
+    query: "CREATE GRAPH TYPE t { (:P {v :: DECIMAL(12,2)}) }"
+    raises: "42000"
+
+  - name: a-property-declared-as-a-union-of-two-types
+    doc: The grammar lets a value type be a union and no column holds either an integer or a string, so the union is read and refused. This is the same refusal as the case above reached by a different spelling, and it is here because a union parses where most unstorable types do not.
+    query: "CREATE GRAPH TYPE t { (:P {v :: INT64 | STRING}) }"
+    raises: "42000"
+
   - name: a-string-added-to-a-number
     doc: Addition is arithmetic here and not concatenation, so a string on either side of it is a value of the wrong type and not a coercion.
     query: RETURN 'a' + 1 AS a

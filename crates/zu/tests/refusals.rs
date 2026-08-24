@@ -40,9 +40,12 @@ struct Refusal {
     /// The statement under test.
     source: &'static str,
     /// Whether the refusal says corrupt today. Every `true` here is a
-    /// defect S1 removes, and the count is asserted so removing one is
-    /// a visible diff.
+    /// defect, and the count is asserted so one appearing is a visible
+    /// diff. S1 emptied the list and it stays empty.
     says_corrupt: bool,
+    /// The condition the refusal carries, or `None` where it still
+    /// carries none. Every `None` here is work S1 did not reach.
+    status: Option<&'static str>,
 }
 
 /// Every refusal this test can reach from a statement.
@@ -68,25 +71,29 @@ fn refusals() -> Vec<Refusal> {
             asks: "a type no column holds",
             setup: &[],
             source: "CREATE GRAPH TYPE v1 { (:P {v :: DECIMAL(12,2)}) }",
-            says_corrupt: true,
+            says_corrupt: false,
+            status: Some("42000"),
         },
         Refusal {
             asks: "a union of two property types",
             setup: &[],
             source: "CREATE GRAPH TYPE v2 { (:P {v :: INT64 | STRING}) }",
-            says_corrupt: true,
+            says_corrupt: false,
+            status: Some("42000"),
         },
         Refusal {
             asks: "the same element type twice",
             setup: &[],
             source: "CREATE GRAPH TYPE v3 { NODE TYPE A (:P), NODE TYPE A (:Q) }",
-            says_corrupt: true,
+            says_corrupt: false,
+            status: Some("42000"),
         },
         Refusal {
             asks: "the same property twice",
             setup: &[],
             source: "CREATE GRAPH TYPE v4 { (:P {v :: INT64, v :: INT64}) }",
-            says_corrupt: true,
+            says_corrupt: false,
+            status: Some("42000"),
         },
         // The rest of the catalog, which answers a request it will not
         // perform by saying so.
@@ -95,30 +102,35 @@ fn refusals() -> Vec<Refusal> {
             setup: &["CREATE GRAPH TYPE taken { (:P) }"],
             source: "CREATE GRAPH TYPE taken { (:P) }",
             says_corrupt: false,
+            status: None,
         },
         Refusal {
             asks: "a graph type that is not there",
             setup: &[],
             source: "CREATE GRAPH gg :: nosuch",
             says_corrupt: false,
+            status: None,
         },
         Refusal {
             asks: "a graph to resemble that is not there",
             setup: &[],
             source: "CREATE GRAPH TYPE likeit LIKE nosuch",
             says_corrupt: false,
+            status: None,
         },
         Refusal {
             asks: "a schema that is not there",
             setup: &[],
             source: "CREATE GRAPH /nosuch/g",
             says_corrupt: false,
+            status: None,
         },
         Refusal {
             asks: "a schema name that is taken",
             setup: &["CREATE SCHEMA /s"],
             source: "CREATE SCHEMA /s",
             says_corrupt: false,
+            status: None,
         },
     ]
 }
@@ -140,13 +152,17 @@ fn no_refusal_of_a_healthy_file_says_corrupt() {
             .unwrap_or_else(|| panic!("{}: {} was performed", r.asks, r.source));
         let said = err.to_string().contains("corrupt");
         assert_eq!(said, r.says_corrupt, "{}: {err}", r.asks);
-        // Whether it says corrupt or not, none of these carries a
-        // condition, which is the other half of what S1 owes.
-        assert_eq!(err.gqlstatus(), None, "{}: {err}", r.asks);
+        let got = err.gqlstatus().map(|s| s.to_string());
+        assert_eq!(got.as_deref(), r.status, "{}: {err}", r.asks);
     }
     assert_eq!(
-        admitted, 4,
-        "the allowlist is the work of S1 and it only shrinks"
+        admitted, 0,
+        "S1 emptied the allowlist and nothing puts anything back on it"
+    );
+    let uncondemned = table.iter().filter(|r| r.status.is_none()).count();
+    assert_eq!(
+        uncondemned, 5,
+        "the refusals that still carry no condition, which S1 did not reach"
     );
 }
 

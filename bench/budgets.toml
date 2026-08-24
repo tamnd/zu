@@ -1796,21 +1796,25 @@ merge_stmt_growth_b = 4096.0
 # where they were. That is what makes them gateable on a shared runner
 # when the absolute latency in write.rs cannot be.
 #
-# A durable commit has a floor of between one and two sync periods, and
-# the width does not change it. A writer that staged its frames while a
-# sync was already in the air cannot be covered by that sync, because
-# the sync was told how far to reach before those bytes existed, so it
-# waits the one in flight out and then waits for the next one. What the
-# width decides is how many writers ride in that next sync, which is
-# why the throughput is a straight line in the width and the latency is
-# flat.
+# A durable commit has a floor of one sync period, and the width does
+# not change it. A writer that staged its frames while a sync was
+# already in the air cannot be covered by that sync, because the sync
+# was told how far to reach before those bytes existed, so it used to
+# wait the one in flight out and then wait for the next: two periods,
+# and a burst of n commits cost two flushes. A leader now holds its
+# flush back for an eighth of what a flush costs, which is long enough
+# for the writers still staging to arrive and short enough to be worth
+# less than the period it saves, so the burst costs one. What the width
+# decides is how many writers ride in it, which is why the throughput is
+# a straight line in the width and the latency is flat.
 #
-# Measured 17.1 times the statements a second of one writer at thirty
-# two writers, with the latency at 1.6 times one writer's and the p99 at
-# 1.8. The floor is set well under the measurement and well over the 1.0
-# that writers syncing one at a time would give, because it is a
-# regression gate and not a claim about the machine. Raise this floor as
-# the commit path shares more, never lower it.
+# Measured 28.2 times the statements a second of one writer at thirty
+# two writers, with the latency at 1.2 times one writer's and the p99 at
+# 1.0. It was 17.1 with the latency at 1.8 before the leader waited. The
+# floor is set well under the measurement and well over the 1.0 that
+# writers syncing one at a time would give, because it is a regression
+# gate and not a claim about the machine. Raise this floor as the commit
+# path shares more, never lower it.
 #
 # The p99 is read against the one writer level's own p99 and not against
 # its median. It was the median at first, and on a machine somebody else
@@ -1824,7 +1828,7 @@ merge_stmt_growth_b = 4096.0
 # columns there are thirty two threads bidding for four cores rather
 # than writers sharing a sync. The bench says so and reports without
 # gating; the numbers below are for a machine that syncs.
-commit_x = 6.0
+commit_x = 12.0
 commit_p50_x = 3.0
 commit_p99_x = 6.0
 
@@ -1840,23 +1844,22 @@ commit_p99_x = 6.0
 # was doing that minute, which on a laptop somebody else is also using
 # is a third either way. This one is syscalls over syscalls: one writer
 # reads 1.00 however fast the drive is, and writers that share properly
-# read near their width however slow it is.
+# read their width however slow it is.
 #
-# Measured 1.00 at one writer, 1.01 at two, 2.01 at four, 4.00 at eight,
-# 8.00 at sixteen and 16.00 at thirty two, which is half the width at
-# every level. Half is the shape the design has and not a shortfall: the
-# writers that staged while a flush was in the air cannot be covered by
-# it, so a round of n commits costs the flush already running plus the
-# one that covers the rest, and n over 2 is what that comes to. It is
-# the same fact the 1.9 in commit_p50_x reports, said in a unit a busy
-# machine cannot move.
+# It read half the width when it was first taken, 4.00 at eight and
+# 16.00 at thirty two, because a leader issued its flush the moment it
+# could and the writers still staging missed it by tens of microseconds
+# and waited out the next one. A leader now holds the flush back for an
+# eighth of what a flush costs before issuing it, and only where the
+# last one found a group, so the count is the width: 1.00 at one writer,
+# 1.99 at two, 4.00 at four, 8.00 at eight, 15.48 at sixteen and 32.00
+# at thirty two.
 #
 # The floor is under the measurement and well over the 1.00 that writers
-# syncing one at a time give, because it is a regression gate. Raise it
-# if the commit path ever covers the writers that arrived during a
-# flush, which would take the count to the width. Gated only where one
+# syncing one at a time give, with room for a level that loses one
+# straggler to the scheduler the way sixteen did. Gated only where one
 # writer's commit costs a sync, for the same reason the three above are.
-commit_per_flush = 3.0
+commit_per_flush = 6.0
 
 # A SET of one property of one edge, measured 3.6 ms, 398 us of
 # processor time and 15.7 kB at 10000 rows and 10000 edges. It is the

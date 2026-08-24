@@ -26,15 +26,19 @@
 //! making every client wait for all the others.
 //!
 //! What the two of them together describe is the floor a durable commit
-//! has and cannot go under. A writer that stages its frames while a
-//! sync is already in the air cannot be covered by that sync, because
-//! the sync was told how far to reach before those bytes existed. So it
-//! waits out the one in flight and then waits for the next one, which
-//! is between one and two sync periods however many writers there are,
-//! and the width only decides how many of them ride in the second sync.
-//! That is why the latency column is flat and the throughput column is
-//! a straight line: the shape to watch for is the latency column
-//! climbing with the width, which is what serialised commits look like.
+//! has and cannot go under, which is one sync period. A writer that
+//! stages its frames while a sync is already in the air cannot be
+//! covered by that sync, because the sync was told how far to reach
+//! before those bytes existed, so it used to wait out the one in flight
+//! and then wait for the next: two periods, and a burst of n commits
+//! cost two flushes rather than one. A leader now holds its flush back
+//! for a fraction of a flush before issuing it, which is long enough
+//! for the writers still staging to arrive, so the width decides how
+//! many ride in one sync rather than how many ride in the second of
+//! two. That is why the latency column is flat and the throughput
+//! column is a straight line: the shape to watch for is the latency
+//! column climbing with the width, which is what serialised commits
+//! look like.
 //!
 //! The third number is the same question asked in a unit nothing on
 //! the box can move. `commit_per_flush` is the commits that asked for

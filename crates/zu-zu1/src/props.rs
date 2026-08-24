@@ -3970,6 +3970,223 @@ mod tests {
         assert_eq!(col.rows, 2);
     }
 
+    /// The family a type belongs to, written as a match with no
+    /// wildcard arm so that adding a variant to the lattice fails to
+    /// compile here until [`frontier`] names it.
+    fn family(ty: &LogicalType) -> &'static str {
+        match ty {
+            LogicalType::Null => "null",
+            LogicalType::Nothing => "nothing",
+            LogicalType::Bool => "bool",
+            LogicalType::Int { .. } => "int",
+            LogicalType::Decimal { .. } => "decimal",
+            LogicalType::Float { .. } => "float",
+            LogicalType::Str { .. } => "str",
+            LogicalType::Bytes { .. } => "bytes",
+            LogicalType::Date => "date",
+            LogicalType::LocalTime => "local time",
+            LogicalType::LocalDatetime => "local datetime",
+            LogicalType::ZonedTime => "zoned time",
+            LogicalType::ZonedDatetime => "zoned datetime",
+            LogicalType::Duration(_) => "duration",
+            LogicalType::Node(_) => "node",
+            LogicalType::Edge(_) => "edge",
+            LogicalType::Graph(_) => "graph",
+            LogicalType::BindingTable(_) => "binding table",
+            LogicalType::Path(_) => "path",
+            LogicalType::List { .. } => "list",
+            LogicalType::Record(_) => "record",
+            LogicalType::Any => "any",
+            LogicalType::Union(_) => "union",
+            LogicalType::AnyProperty => "any property",
+            LogicalType::Nullable(_) => "nullable",
+        }
+    }
+
+    /// Every type a graph type may name a property with, and whether
+    /// this file can write a column of it today.
+    ///
+    /// This is the declarable and storable frontier, and it is a table
+    /// rather than a set of ignored tests so that the gap is one diff
+    /// and not a search. Moving a row from `false` to `true` is what
+    /// adding an encoding looks like, and the count assertion below
+    /// stops the frontier growing by accident.
+    fn frontier() -> Vec<(LogicalType, bool)> {
+        let chars = |min, max, fixed| LogicalType::Str { min, max, fixed };
+        let octets = |min, max, fixed| LogicalType::Bytes { min, max, fixed };
+        let bounded_list = |elem: LogicalType, max| LogicalType::List {
+            elem: Box::new(elem),
+            max: Some(max),
+        };
+        vec![
+            // The eighteen column codes, which are the storable set.
+            (LogicalType::Bool, true),
+            (LogicalType::int(IntBits::B8), true),
+            (LogicalType::int(IntBits::B16), true),
+            (LogicalType::int(IntBits::B32), true),
+            (LogicalType::int(IntBits::B64), true),
+            (LogicalType::uint(IntBits::B8), true),
+            (LogicalType::uint(IntBits::B16), true),
+            (LogicalType::uint(IntBits::B32), true),
+            (LogicalType::uint(IntBits::B64), true),
+            (LogicalType::float(FloatBits::B32), true),
+            (LogicalType::float(FloatBits::B64), true),
+            (LogicalType::string(), true),
+            (LogicalType::bytes(), true),
+            (LogicalType::Date, true),
+            (LogicalType::LocalTime, true),
+            (LogicalType::LocalDatetime, true),
+            (LogicalType::Duration(DurationKind::DayTime), true),
+            (LogicalType::Duration(DurationKind::YearMonth), true),
+            // Declarable and storable through the extended form, which
+            // names a type without giving it a lane of its own.
+            (LogicalType::ZonedTime, true),
+            (LogicalType::ZonedDatetime, true),
+            (chars(None, Some(512), false), true),
+            (chars(Some(2), Some(2), true), true),
+            (octets(Some(16), Some(16), true), true),
+            (list_of(LogicalType::int(IntBits::B64)), true),
+            (list_of(LogicalType::float(FloatBits::B32)), true),
+            // Declarable and not storable. Each of these is an entry in
+            // schema/06 section 6, and S2 turns them true one at a time.
+            (bounded_list(LogicalType::float(FloatBits::B32), 768), false),
+            (list_of(list_of(LogicalType::string())), false),
+            (
+                LogicalType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                false,
+            ),
+            (LogicalType::int(IntBits::B128), false),
+            (LogicalType::int(IntBits::B256), false),
+            (LogicalType::uint(IntBits::B128), false),
+            (LogicalType::float(FloatBits::B16), false),
+            (LogicalType::float(FloatBits::B128), false),
+            (LogicalType::float(FloatBits::B256), false),
+            (
+                LogicalType::Record(zu_common::RecordType::closed(vec![
+                    zu_common::Field {
+                        name: "lat".into(),
+                        ty: LogicalType::float(FloatBits::B64),
+                    },
+                    zu_common::Field {
+                        name: "lon".into(),
+                        ty: LogicalType::float(FloatBits::B64),
+                    },
+                ])),
+                false,
+            ),
+            (LogicalType::Any, false),
+            (LogicalType::AnyProperty, false),
+            (
+                LogicalType::Union(vec![LogicalType::int(IntBits::B64), LogicalType::string()]),
+                false,
+            ),
+            (LogicalType::Path(None), false),
+            (LogicalType::Node(None), false),
+            (LogicalType::Edge(None), false),
+            (LogicalType::Graph(None), false),
+            (LogicalType::BindingTable(None), false),
+            (LogicalType::Null, false),
+            (LogicalType::Nothing, false),
+            // Nullability is a flag on the property and not a wrapper on
+            // its type, so a wrapped type never reaches the encoder and
+            // is refused rather than silently unwrapped.
+            (
+                LogicalType::Nullable(Box::new(LogicalType::int(IntBits::B64))),
+                false,
+            ),
+        ]
+    }
+
+    /// A declared type is written and read back as itself, or it is
+    /// refused before anything is written. There is no third answer, and
+    /// which types get which is the table above.
+    #[test]
+    fn the_declarable_and_storable_frontier_is_where_the_table_says() {
+        let mut unstorable = Vec::new();
+        for (ty, storable) in frontier() {
+            let Some(bytes) = declared_type_bytes(&ty) else {
+                assert!(!storable, "{ty} is storable and the encoder refused it");
+                unstorable.push(format!("{ty}"));
+                continue;
+            };
+            assert!(storable, "{ty} is not storable and the encoder wrote it");
+            let mut pos = 0;
+            let back = decode_declared_type(&bytes, &mut pos).unwrap();
+            assert_eq!(pos, bytes.len(), "{ty} left bytes behind");
+            assert_eq!(back, ty, "{ty} did not come back as itself");
+        }
+        // The frontier shrinks and never grows. Each name here is an
+        // encoding S2 owes, and taking one off is a deliberate diff.
+        assert_eq!(
+            unstorable.len(),
+            21,
+            "the unstorable set changed: {unstorable:?}"
+        );
+    }
+
+    /// Every variant of the lattice appears in the frontier table, so a
+    /// type added to `zu_common` cannot arrive without an answer to the
+    /// question of whether a column can hold one.
+    #[test]
+    fn the_frontier_table_covers_every_variant_of_the_lattice() {
+        let covered: BTreeSet<&str> = frontier().iter().map(|(ty, _)| family(ty)).collect();
+        let every = [
+            "null",
+            "nothing",
+            "bool",
+            "int",
+            "decimal",
+            "float",
+            "str",
+            "bytes",
+            "date",
+            "local time",
+            "local datetime",
+            "zoned time",
+            "zoned datetime",
+            "duration",
+            "node",
+            "edge",
+            "graph",
+            "binding table",
+            "path",
+            "list",
+            "record",
+            "any",
+            "union",
+            "any property",
+            "nullable",
+        ];
+        for name in every {
+            assert!(covered.contains(name), "no frontier entry is a {name}");
+        }
+        assert_eq!(covered.len(), every.len(), "a variant has no family name");
+    }
+
+    /// A stored list holds a value in every position, so the encoder
+    /// drops the element's nullability and the read hands back the
+    /// stronger of the two types.
+    ///
+    /// This is the one place a declared type does not come back word for
+    /// word, and it matters beyond a round trip: a graph type that says
+    /// `LIST<FLOAT32 NOT NULL>` is asking for a column with no child
+    /// validity mask, and today the catalog cannot remember it was
+    /// asked. S2 owes the distinction along with the bounded list.
+    #[test]
+    fn a_list_element_loses_its_nullability_on_the_way_to_a_column() {
+        let asked = list_of(LogicalType::Nullable(Box::new(LogicalType::float(
+            FloatBits::B32,
+        ))));
+        let bytes = declared_type_bytes(&asked).expect("a list of floats is storable");
+        let mut pos = 0;
+        let back = decode_declared_type(&bytes, &mut pos).unwrap();
+        assert_eq!(back, list_of(LogicalType::float(FloatBits::B32)));
+        assert_ne!(back, asked);
+    }
+
     #[test]
     fn a_validity_mask_of_the_wrong_length_is_refused() {
         let dir = tempfile::tempdir().unwrap();

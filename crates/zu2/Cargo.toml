@@ -15,6 +15,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
+# For the cold tier compression bench only (#725). zu2 itself links no
+# coder and this does not change that: it is here so the gate that issue
+# set on itself can be measured before the format bump it would need.
+zstd.workspace = true
 tempfile.workspace = true
 # For the storage column in the ycsb bench: zu1 is the engine zu2 has to
 # beat on bytes as well as on operations. A dev dependency only, and it
@@ -34,4 +38,8 @@ harness = false
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "compress"
 harness = false

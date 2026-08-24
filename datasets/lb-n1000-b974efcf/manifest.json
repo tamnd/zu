@@ -1,0 +1,78 @@
+{
+  "name": "lb-n1000",
+  "kind": "synthetic",
+  "generator": "lb",
+  "generatorVersion": "1",
+  "seed": 1,
+  "params": {
+    "gamma": "2",
+    "maxLinks": "999",
+    "minLinks": "1",
+    "nodes": "1000"
+  },
+  "scale": "n1000",
+  "listDelimiter": ";",
+  "null": "empty",
+  "checksum": "sha256:b974efcfb086dc38d03678c4026cfb3300b8115dacb8071690532e66cab033e0",
+  "invariants": {
+    "nodeCount": 1000,
+    "edgeCount": 5342
+  },
+  "schema": {
+    "nodes": {
+      "Obj": {
+        "files": [
+          "nodes/Obj.csv"
+        ],
+        "id": {
+          "name": "id",
+          "type": "ID"
+        },
+        "properties": [
+          {
+            "name": "otype",
+            "type": "INT64"
+          },
+          {
+            "name": "version",
+            "type": "INT64"
+          },
+          {
+            "name": "time",
+            "type": "INT64"
+          },
+          {
+            "name": "payload",
+            "type": "STRING"
+          }
+        ],
+        "labels": [
+          "Obj"
+        ]
+      }
+    },
+    "rels": {
+      "LINK": {
+        "files": [
+          "rels/LINK.csv"
+        ],
+        "start": "Obj",
+        "end": "Obj",
+        "properties": [
+          {
+            "name": "ltype",
+            "type": "INT64"
+          },
+          {
+            "name": "time",
+            "type": "INT64"
+          },
+          {
+            "name": "payload",
+            "type": "STRING"
+          }
+        ]
+      }
+    }
+  }
+}

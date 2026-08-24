@@ -21,6 +21,12 @@
 //! there so that cost stays a fold over a small map rather than
 //! becoming a per statement allocation nobody measured.
 //!
+//! Each of the three has a `_p99_us` companion, because a serving
+//! path is judged on the read that was slow and not on the middle one.
+//! A median holds still through a cache that starts missing one time
+//! in fifty, and that is exactly the regression these gates exist to
+//! catch.
+//!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench session
 
 use std::time::Instant;
@@ -48,6 +54,14 @@ fn xorshift(rng: &mut u64) -> u64 {
     *rng ^= *rng >> 7;
     *rng ^= *rng << 17;
     *rng
+}
+
+/// The p50 and p99 of a latency sample, in microseconds. The sample is
+/// sorted in place because every caller is done with the order.
+fn pcts(lat: &mut [u64]) -> (f64, f64) {
+    lat.sort_unstable();
+    let at = |q: f64| lat[((lat.len() as f64 * q) as usize).min(lat.len() - 1)] as f64 / 1e3;
+    (at(0.50), at(0.99))
 }
 
 const NODES: u32 = 10_000;
@@ -82,8 +96,8 @@ fn count_of(r: &zu::query::QueryResult) -> i64 {
     }
 }
 
-/// Median latency of Session::warm on already-cached text.
-fn run_plan_hit(path: &std::path::Path) -> f64 {
+/// Latency of Session::warm on already-cached text.
+fn run_plan_hit(path: &std::path::Path) -> (f64, f64) {
     let mut session = Session::open(path).expect("open");
     assert!(!session.warm(POINT_Q).expect("compile"), "first sight");
     let mut lat: Vec<u64> = Vec::with_capacity(10_000);
@@ -93,13 +107,12 @@ fn run_plan_hit(path: &std::path::Path) -> f64 {
         lat.push(start.elapsed().as_nanos() as u64);
         assert!(hit, "text stayed cached");
     }
-    lat.sort_unstable();
-    lat[lat.len() / 2] as f64 / 1e3
+    pcts(&mut lat)
 }
 
-/// Median latency of the full warm point read through the session,
+/// Latency of the full warm point read through the session,
 /// random sources, every answer checked against the degree table.
-fn run_session_point(path: &std::path::Path, degree: &[i64]) -> f64 {
+fn run_session_point(path: &std::path::Path, degree: &[i64]) -> (f64, f64) {
     let mut session = Session::open(path).expect("open");
     let mut rng = 0xbeefu64;
     // Warm the plan cache and the reader caches before timing.
@@ -119,8 +132,7 @@ fn run_session_point(path: &std::path::Path, degree: &[i64]) -> f64 {
         lat.push(start.elapsed().as_nanos() as u64);
         assert_eq!(count_of(&r), degree[src as usize], "src {src}");
     }
-    lat.sort_unstable();
-    lat[lat.len() / 2] as f64 / 1e3
+    pcts(&mut lat)
 }
 
 /// The same point read on a session holding three session parameters,
@@ -130,7 +142,7 @@ fn run_session_point(path: &std::path::Path, degree: &[i64]) -> f64 {
 /// is being measured is what a statement pays for a session having
 /// state at all, which is the fold of the held map over the passed
 /// list and the reference check that goes with it.
-fn run_session_point_held(path: &std::path::Path, degree: &[i64]) -> f64 {
+fn run_session_point_held(path: &std::path::Path, degree: &[i64]) -> (f64, f64) {
     let mut session = Session::open(path).expect("open");
     session
         .run("SESSION SET VALUE $cut = 35", &[])
@@ -161,14 +173,13 @@ fn run_session_point_held(path: &std::path::Path, degree: &[i64]) -> f64 {
         lat.push(start.elapsed().as_nanos() as u64);
         assert_eq!(count_of(&r), degree[src as usize], "src {src}");
     }
-    lat.sort_unstable();
-    lat[lat.len() / 2] as f64 / 1e3
+    pcts(&mut lat)
 }
 
 /// The same point read through the one-shot path a bare `zu query`
 /// pays: open, load catalog and stats, parse, plan, run. Printed for
 /// contrast, not gated; the CLI's spawn cost is not even included.
-fn run_one_shot_point(path: &std::path::Path, degree: &[i64]) -> f64 {
+fn run_one_shot_point(path: &std::path::Path, degree: &[i64]) -> (f64, f64) {
     let mut rng = 0xfeedu64;
     let mut lat: Vec<u64> = Vec::with_capacity(200);
     for _ in 0..200 {
@@ -179,8 +190,7 @@ fn run_one_shot_point(path: &std::path::Path, degree: &[i64]) -> f64 {
         lat.push(start.elapsed().as_nanos() as u64);
         assert_eq!(count_of(&r), degree[src as usize], "src {src}");
     }
-    lat.sort_unstable();
-    lat[lat.len() / 2] as f64 / 1e3
+    pcts(&mut lat)
 }
 
 fn main() {
@@ -191,42 +201,62 @@ fn main() {
     let edge_count: i64 = degree.iter().sum();
     println!("session bench graph: {NODES} nodes, {edge_count} edges");
 
-    let plan_hit_us = run_plan_hit(&path);
-    println!("plan cache hit: p50 {plan_hit_us:.2} us over 10000 warm hits");
-    let point_us = run_session_point(&path, &degree);
-    println!("session point read: p50 {point_us:.2} us over 10000 warm reads");
-    let held_us = run_session_point_held(&path, &degree);
+    let (plan_hit_us, plan_hit_p99) = run_plan_hit(&path);
+    println!(
+        "plan cache hit: p50 {plan_hit_us:.2} us, p99 {plan_hit_p99:.2} us over 10000 warm hits"
+    );
+    let (point_us, point_p99) = run_session_point(&path, &degree);
+    println!(
+        "session point read: p50 {point_us:.2} us, p99 {point_p99:.2} us over 10000 warm reads"
+    );
+    let (held_us, held_p99) = run_session_point_held(&path, &degree);
     println!(
         "session point read holding three parameters: p50 {held_us:.2} us, \
-         {over:+.2} us over the empty session",
+         p99 {held_p99:.2} us, {over:+.2} us over the empty session",
         over = held_us - point_us
     );
-    let one_shot_us = run_one_shot_point(&path, &degree);
+    let (one_shot_us, one_shot_p99) = run_one_shot_point(&path, &degree);
     println!(
         "one-shot point read (open+plan+run, no spawn): p50 {one_shot_us:.2} us, \
-         {ratio:.0}x the session path",
+         p99 {one_shot_p99:.2} us, {ratio:.0}x the session path",
         ratio = one_shot_us / point_us.max(0.01)
     );
 
     let mut failed = false;
-    if let Some(ceiling) = budget("session_plan_hit_us")
-        && plan_hit_us > ceiling
-    {
-        println!("GATE FAIL plan cache hit: p50 {plan_hit_us:.2} us > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("session_point_us")
-        && point_us > ceiling
-    {
-        println!("GATE FAIL session point read: p50 {point_us:.2} us > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("session_point_held_us")
-        && held_us > ceiling
-    {
-        println!("GATE FAIL held session point read: p50 {held_us:.2} us > ceiling {ceiling}");
-        failed = true;
-    }
+    let mut check = |what: &str, pct: &str, key: &str, got: f64| {
+        if let Some(ceiling) = budget(key)
+            && got > ceiling
+        {
+            println!("GATE FAIL {what}: {pct} {got:.2} us > ceiling {ceiling}");
+            failed = true;
+        }
+    };
+    check("plan cache hit", "p50", "session_plan_hit_us", plan_hit_us);
+    check(
+        "plan cache hit",
+        "p99",
+        "session_plan_hit_p99_us",
+        plan_hit_p99,
+    );
+    check("session point read", "p50", "session_point_us", point_us);
+    check(
+        "session point read",
+        "p99",
+        "session_point_p99_us",
+        point_p99,
+    );
+    check(
+        "held session point read",
+        "p50",
+        "session_point_held_us",
+        held_us,
+    );
+    check(
+        "held session point read",
+        "p99",
+        "session_point_held_p99_us",
+        held_p99,
+    );
     if gate && failed {
         std::process::exit(1);
     }

@@ -172,7 +172,7 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>, Profi
 /// information, its regression floors live with the LiveJournal keys.
 /// A sample crosschecks against the reference adjacency built from the
 /// raw edge list.
-fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> (f64, f64) {
     let mut outdeg = vec![0u32; node_count as usize];
     for &(s, _) in edges {
         outdeg[s as usize] += 1;
@@ -217,11 +217,11 @@ fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     let secs = started.elapsed().as_secs_f64();
     lat.sort_unstable();
     let p50 = lat[batches / 2].as_secs_f64() * 1e6;
+    let p99 = lat[batches * 99 / 100].as_secs_f64() * 1e6;
     println!(
-        "sf1 1-hop expand (deg <= 100, {} of {} rows): p50 {p50:.3} us, p99 {:.3} us per expand over batches of {batch}, {:.0} K expands/s, {edges_read} edges read",
+        "sf1 1-hop expand (deg <= 100, {} of {} rows): p50 {p50:.3} us, p99 {p99:.3} us per expand over batches of {batch}, {:.0} K expands/s, {edges_read} edges read",
         eligible.len(),
         node_count,
-        lat[batches * 99 / 100].as_secs_f64() * 1e6,
         lookups as f64 / secs / 1e3
     );
     let mut point_lat = Vec::with_capacity(lookups / 10);
@@ -261,12 +261,12 @@ fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
         );
     }
     println!("sf1 1-hop crosscheck: 100 nodes match the edge list on both paths");
-    p50
+    (p50, p99)
 }
 
 /// B2: warm primary-key lookups through the sealed sorted index, all
 /// hits, each asserted against the row the key was loaded at.
-fn run_key_lookups(path: &std::path::Path, by_row: &[u64]) -> f64 {
+fn run_key_lookups(path: &std::path::Path, by_row: &[u64]) -> (f64, f64) {
     let mut db = Zu1File::open(path).expect("open");
     let mut reader = GraphReader::load_table(&mut db, "knows").expect("load knows");
     let lookups = 200_000usize;
@@ -295,9 +295,9 @@ fn run_key_lookups(path: &std::path::Path, by_row: &[u64]) -> f64 {
     let secs = started.elapsed().as_secs_f64();
     lat.sort_unstable();
     let p50 = lat[lookups / 2].as_secs_f64() * 1e6;
+    let p99 = lat[lookups * 99 / 100].as_secs_f64() * 1e6;
     println!(
-        "sf1 key-lookup: p50 {p50:.2} us, p99 {:.2} us, {:.0} K lookups/s, all hits",
-        lat[lookups * 99 / 100].as_secs_f64() * 1e6,
+        "sf1 key-lookup: p50 {p50:.2} us, p99 {p99:.2} us, {:.0} K lookups/s, all hits",
         lookups as f64 / secs / 1e3
     );
     assert_eq!(
@@ -307,14 +307,14 @@ fn run_key_lookups(path: &std::path::Path, by_row: &[u64]) -> f64 {
         None,
         "a key above the domain must miss"
     );
-    p50
+    (p50, p99)
 }
 
 /// B4: the 2-hop factorized count over the whole graph through the
 /// query engine, parse to result. The count is asserted against the
 /// reference sum over the edge list, so the number cannot come from a
 /// plan that drops or duplicates paths.
-fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> (f64, f64) {
     let mut outdeg = vec![0u64; node_count as usize];
     for &(s, _) in edges {
         outdeg[s as usize] += 1;
@@ -339,11 +339,11 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 2-hop count: {expected} paths, p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs",
-        lat[runs * 99 / 100].as_secs_f64() * 1e3
+        "sf1 2-hop count: {expected} paths, p50 {p50:.3} ms, p99 {p99:.3} ms over {runs} runs"
     );
-    p50
+    (p50, p99)
 }
 
 /// Triangle: the unseeded directed triangle count over the whole
@@ -353,7 +353,7 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
 /// list, one adjacency walk with binary search on the sorted dense
 /// pairs, so the number cannot come from a join that drops or invents
 /// closures.
-fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> (f64, f64) {
     let mut adj = vec![Vec::new(); node_count as usize];
     for &(s, d) in edges {
         adj[s as usize].push(d);
@@ -386,8 +386,9 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 triangle count: {expected} triangles, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        "sf1 triangle count: {expected} triangles, p50 {p50:.3} ms, p99 {p99:.3} ms, max {:.3} ms over {runs} runs",
         lat[runs - 1].as_secs_f64() * 1e3
     );
 
@@ -418,7 +419,7 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
         blat[runs / 2].as_secs_f64() * 1e3,
         blat[runs - 1].as_secs_f64() * 1e3
     );
-    p50
+    (p50, p99)
 }
 
 /// Ordered triangle: the same directed cycle with the id ordering
@@ -438,7 +439,7 @@ fn run_ordered_triangle(
     edges: &[(u32, u32)],
     by_row: &[u64],
     node_count: u64,
-) -> f64 {
+) -> (f64, f64) {
     let mut adj = vec![Vec::new(); node_count as usize];
     for &(s, d) in edges {
         adj[s as usize].push(d);
@@ -475,11 +476,12 @@ fn run_ordered_triangle(
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 ordered triangle: {expected} triangles, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        "sf1 ordered triangle: {expected} triangles, p50 {p50:.3} ms, p99 {p99:.3} ms, max {:.3} ms over {runs} runs",
         lat[runs - 1].as_secs_f64() * 1e3
     );
-    p50
+    (p50, p99)
 }
 
 /// Close: the same triangle walked undirected, which is the shape that
@@ -490,7 +492,11 @@ fn run_ordered_triangle(
 /// the closing kernel changes. The reference walks the undirected
 /// adjacency and binary searches the sorted pair list, counting the
 /// same ordered triples the query counts.
-fn run_undirected_close(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+fn run_undirected_close(
+    path: &std::path::Path,
+    edges: &[(u32, u32)],
+    node_count: u64,
+) -> (f64, f64) {
     let mut both: Vec<(u32, u32)> = Vec::with_capacity(edges.len() * 2);
     for &(s, d) in edges {
         both.push((s, d));
@@ -530,11 +536,12 @@ fn run_undirected_close(path: &std::path::Path, edges: &[(u32, u32)], node_count
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 undirected close: {expected} closed paths, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        "sf1 undirected close: {expected} closed paths, p50 {p50:.3} ms, p99 {p99:.3} ms, max {:.3} ms over {runs} runs",
         lat[runs - 1].as_secs_f64() * 1e3
     );
-    p50
+    (p50, p99)
 }
 
 /// IS: the IS1-shaped profile read, all eight person properties by
@@ -542,7 +549,7 @@ fn run_undirected_close(path: &std::path::Path, edges: &[(u32, u32)], node_count
 /// run is asserted field by field against the raw props file, so the
 /// number cannot come from a reader that returns the wrong row or a
 /// column stored out of order.
-fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) -> f64 {
+fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) -> (f64, f64) {
     let mut db = Zu1File::open(path).expect("open");
     let source = "MATCH (p:person {id: $id}) \
                   RETURN p.firstName AS firstName, p.lastName AS lastName, \
@@ -584,11 +591,11 @@ fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) 
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 IS profile read: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all rows crosschecked",
-        lat[runs * 99 / 100].as_secs_f64() * 1e3
+        "sf1 IS profile read: p50 {p50:.3} ms, p99 {p99:.3} ms over {runs} runs, all rows crosschecked"
     );
-    p50
+    (p50, p99)
 }
 
 /// The seeded 2-hop asked as a number rather than as rows: how many
@@ -597,7 +604,11 @@ fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) 
 /// expand and the answer is the distinct set, so this phase is where
 /// the cost of that set shows up unmixed with a projection or a sort.
 /// The reference is the same walk over the raw edge list.
-fn run_distinct_two_hop(path: &std::path::Path, edges: &[(u32, u32)], by_row: &[u64]) -> f64 {
+fn run_distinct_two_hop(
+    path: &std::path::Path,
+    edges: &[(u32, u32)],
+    by_row: &[u64],
+) -> (f64, f64) {
     let n = by_row.len();
     let mut adj = vec![Vec::new(); n];
     for &(s, d) in edges {
@@ -639,11 +650,11 @@ fn run_distinct_two_hop(path: &std::path::Path, edges: &[(u32, u32)], by_row: &[
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 distinct two-hop: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all counts crosschecked",
-        lat[runs * 99 / 100].as_secs_f64() * 1e3
+        "sf1 distinct two-hop: p50 {p50:.3} ms, p99 {p99:.3} ms over {runs} runs, all counts crosschecked"
     );
-    p50
+    (p50, p99)
 }
 
 /// IC: an IC-shaped friends-of-friends read, 2 hops out of one person
@@ -655,7 +666,7 @@ fn run_ic_friends_of_friends(
     edges: &[(u32, u32)],
     by_row: &[u64],
     profiles: &ProfileRows,
-) -> f64 {
+) -> (f64, f64) {
     let n = by_row.len();
     let mut adj = vec![Vec::new(); n];
     for &(s, d) in edges {
@@ -710,11 +721,11 @@ fn run_ic_friends_of_friends(
     }
     lat.sort_unstable();
     let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    let p99 = lat[runs * 99 / 100].as_secs_f64() * 1e3;
     println!(
-        "sf1 IC friends-of-friends: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all rows crosschecked",
-        lat[runs * 99 / 100].as_secs_f64() * 1e3
+        "sf1 IC friends-of-friends: p50 {p50:.3} ms, p99 {p99:.3} ms over {runs} runs, all rows crosschecked"
     );
-    p50
+    (p50, p99)
 }
 
 /// One entry of the cardinality corpus: a name for the printout, the
@@ -1058,16 +1069,15 @@ fn main() {
     let (edges, by_row, profiles) = load(&data, &path);
     let node_count = by_row.len() as u64;
 
-    let hop_p50 = only("hop").then(|| run_one_hop(&path, &edges, node_count));
-    let key_p50 = only("key").then(|| run_key_lookups(&path, &by_row));
-    let two_hop_p50 = only("two-hop").then(|| run_two_hop(&path, &edges, node_count));
-    let triangle_p50 = only("triangle").then(|| run_triangle_count(&path, &edges, node_count));
-    let ordered_p50 =
-        only("ordered").then(|| run_ordered_triangle(&path, &edges, &by_row, node_count));
-    let close_p50 = only("close").then(|| run_undirected_close(&path, &edges, node_count));
-    let is_p50 = only("is").then(|| run_is_reads(&path, &by_row, &profiles));
-    let ic_p50 = only("ic").then(|| run_ic_friends_of_friends(&path, &edges, &by_row, &profiles));
-    let distinct_p50 = only("distinct").then(|| run_distinct_two_hop(&path, &edges, &by_row));
+    let hop = only("hop").then(|| run_one_hop(&path, &edges, node_count));
+    let key = only("key").then(|| run_key_lookups(&path, &by_row));
+    let two_hop = only("two-hop").then(|| run_two_hop(&path, &edges, node_count));
+    let triangle = only("triangle").then(|| run_triangle_count(&path, &edges, node_count));
+    let ordered = only("ordered").then(|| run_ordered_triangle(&path, &edges, &by_row, node_count));
+    let close = only("close").then(|| run_undirected_close(&path, &edges, node_count));
+    let is_read = only("is").then(|| run_is_reads(&path, &by_row, &profiles));
+    let ic = only("ic").then(|| run_ic_friends_of_friends(&path, &edges, &by_row, &profiles));
+    let distinct = only("distinct").then(|| run_distinct_two_hop(&path, &edges, &by_row));
     let cardinality = only("cardinality").then(|| run_cardinality(&path, &by_row, &profiles));
     let kernels = only("call").then(|| run_table_functions(&path, &edges, &by_row, node_count));
 
@@ -1076,32 +1086,43 @@ fn main() {
 
     // A phase the filter skipped has no number to hold against its
     // ceiling, and the run it was left out of is not the gate anyway.
-    let over = |label: &str, got: Option<f64>, key: &str, unit: &str| -> bool {
-        let (Some(got), Some(ceiling)) = (got, budget(key)) else {
+    //
+    // Each phase is held against two ceilings, its p50 and its p99. The
+    // p99 key is the p50 key with `_p99` before the unit, so a phase
+    // that has no tail ceiling yet simply has no key and is not gated
+    // on one.
+    let over = |label: &str, got: Option<(f64, f64)>, key: &str, unit: &str| -> bool {
+        let Some((p50, p99)) = got else {
             return false;
         };
-        if got <= ceiling {
-            return false;
+        let mut bad = false;
+        let p99_key = key.replace(&format!("_p50_{unit}"), &format!("_p99_{unit}"));
+        for (pct, got, key) in [("p50", p50, key), ("p99", p99, p99_key.as_str())] {
+            if let Some(ceiling) = budget(key)
+                && got > ceiling
+            {
+                println!("GATE FAIL {label}: {pct} {got:.3} {unit} > ceiling {ceiling}");
+                bad = true;
+            }
         }
-        println!("GATE FAIL {label}: p50 {got:.3} {unit} > ceiling {ceiling}");
-        true
+        bad
     };
-    let mut failed = over("B1 1-hop", hop_p50, "ldbc_hop_p50_us", "us");
-    failed |= over("B2 key-lookup", key_p50, "ldbc_key_p50_us", "us");
-    failed |= over("B4 2-hop", two_hop_p50, "ldbc_two_hop_p50_ms", "ms");
-    failed |= over("triangle count", triangle_p50, "ldbc_triangle_p50_ms", "ms");
+    let mut failed = over("B1 1-hop", hop, "ldbc_hop_p50_us", "us");
+    failed |= over("B2 key-lookup", key, "ldbc_key_p50_us", "us");
+    failed |= over("B4 2-hop", two_hop, "ldbc_two_hop_p50_ms", "ms");
+    failed |= over("triangle count", triangle, "ldbc_triangle_p50_ms", "ms");
     failed |= over(
         "ordered triangle",
-        ordered_p50,
+        ordered,
         "ldbc_ordered_triangle_p50_ms",
         "ms",
     );
-    failed |= over("undirected close", close_p50, "ldbc_close_p50_ms", "ms");
-    failed |= over("IS profile read", is_p50, "ldbc_is_p50_ms", "ms");
-    failed |= over("IC friends-of-friends", ic_p50, "ldbc_ic_p50_ms", "ms");
+    failed |= over("undirected close", close, "ldbc_close_p50_ms", "ms");
+    failed |= over("IS profile read", is_read, "ldbc_is_p50_ms", "ms");
+    failed |= over("IC friends-of-friends", ic, "ldbc_ic_p50_ms", "ms");
     failed |= over(
         "distinct two-hop",
-        distinct_p50,
+        distinct,
         "ldbc_distinct_two_hop_p50_ms",
         "ms",
     );

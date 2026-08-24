@@ -1931,6 +1931,24 @@ fn main() {
          same window costs with the syncs in it",
         unsynced.cost.cpu, sustained.cost.cpu
     );
+    // And its tail, which is the same window read at the other end.
+    // Every other line in this file prints a p99 with an fsync inside
+    // it, and a ceiling on that is a ceiling on the disk: this is the
+    // one whose tail is the write path's own.
+    //
+    // The ratio beside it is what a fold landing inside the tail would
+    // move. A fold is milliseconds where these statements are tens of
+    // microseconds, and the deferral bound is set so that the share of
+    // statements carrying one stays under what a p99 leaves: this run
+    // folds once every 240 statements, which is 0.4 percent, so the
+    // folds sit just above the p99 and the tail is a statement rather
+    // than a fold. A bound that shrank, or a fold that got slower,
+    // pulls one in and this jumps.
+    let p99_x = unsynced.cost.p99 / unsynced.cost.p50.max(0.001);
+    println!(
+        "write_p99_nosync_us: {:.1} us at the tail against {:.1} at the median, {p99_x:.2}x",
+        unsynced.cost.p99, unsynced.cost.p50
+    );
 
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
@@ -2029,6 +2047,8 @@ fn main() {
         ("sustained_stmt_growth_b", sustained.cost.growth),
         ("sustained_slack_x", slack_x),
         ("write_cpu_nosync_us", unsynced.cost.cpu),
+        ("write_p99_nosync_us", unsynced.cost.p99),
+        ("write_p99_p50_x", p99_x),
     ];
     for (key, got) in checks {
         let Some(written) = budget(key) else { continue };
@@ -2038,7 +2058,7 @@ fn main() {
         // other ceiling here is either a ratio, which a slow box cannot
         // move, or was fitted on the box class that enforces it.
         let ceiling = match key {
-            "write_cpu_nosync_us" => written * scale,
+            "write_cpu_nosync_us" | "write_p99_nosync_us" => written * scale,
             _ => written,
         };
         if key == "write_cpu_nosync_us" {

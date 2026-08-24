@@ -2354,6 +2354,38 @@ sustained_stmt_growth_b = 512.0
 # 1.12. Lower this ceiling, never raise it.
 sustained_slack_x = 1.25
 
+# The tail of a statement on the write path, with no disk under it.
+#
+# Every other latency in the write bench has an fsync in it. A ceiling
+# on one of those is a ceiling on the disk the run happened to have,
+# which is why they sit at 250 ms and catch nothing smaller than a
+# storage stack falling over. So the p50 and the p99 of each statement
+# are printed on its line and none of them is gated, and the write
+# side's tail is gated here instead, on the one window whose syncs
+# return without asking a platter.
+#
+# Scaled by the host calibration, the same way write_cpu_nosync_us is,
+# because this is a product target and not a number fitted to a box.
+# Measured 27 and 43 us over two runs on an M series laptop against a
+# ceiling of 130 there, and 60 us on the gaming box against 93. Twice
+# the measurement rather than the few percent an alloc count gets: a
+# p99 is one statement out of a hundred and it moves with whatever else
+# the box is doing.
+write_p99_nosync_us = 75.0
+
+# The same tail over its own median, which no host can move.
+#
+# A fold is milliseconds where these statements are tens of
+# microseconds, and DEFERRED_COMMITS is set so the share of statements
+# carrying one stays under what a p99 leaves. The run folds once every
+# 240 statements, 0.4 percent, so the folds sit just above the p99 and
+# the tail is a statement and not a fold: 2.05 on the laptop and 1.94
+# on the gaming box, off medians of 21 and 31 us. A deferral bound that
+# shrank, or a fold that got slower, pulls a fold into the tail and
+# doubles this. Lower it as the write path gets flatter, never raise
+# it.
+write_p99_p50_x = 4.0
+
 # The P5 point write gate: processor time a statement excluding fsync,
 # under 30 us (docs/12, zu#78).
 #

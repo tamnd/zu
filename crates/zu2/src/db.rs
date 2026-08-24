@@ -563,9 +563,22 @@ pub struct Compaction {
     pub migrated: AtomicU64,
     /// Bytes the filesystem took back.
     pub reclaimed: AtomicU64,
+    /// Bytes read by a survey that decided against a pass. See #736 and
+    /// [`crate::compact::survey`]: this is what the engine spent finding
+    /// out that a region had nothing in it worth reclaiming, and if it
+    /// is large beside `scanned` then the surveys are the cost rather
+    /// than the saving.
+    pub surveyed: AtomicU64,
+    /// Passes a survey decided not to make.
+    pub skipped: AtomicU64,
 }
 
 impl Compaction {
+    fn skip(&self, seen: &crate::compact::Surveyed) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+        self.surveyed.fetch_add(seen.scanned, Ordering::Relaxed);
+    }
+
     fn note(&self, pass: &crate::compact::Compacted) {
         self.passes.fetch_add(1, Ordering::Relaxed);
         self.scanned.fetch_add(pass.scanned, Ordering::Relaxed);
@@ -1561,9 +1574,22 @@ fn compact_slice(core: &Core, options: Options) -> Result<()> {
     {
         let live = (core.log.span() as u128 * seen.live as u128 / seen.scanned as u128) as u64;
         let target = live.saturating_mul(u64::from(options.space_target_percent)) / 100;
-        if core.log.span() <= target {
-            core.compact_at
-                .store(target.max(options.compact_below), Ordering::Release);
+        let span = core.log.span();
+        if span <= target {
+            // A page past the current span at the least, or a log
+            // sitting exactly on its target would be surveyed again on
+            // every flush and never compacted. At 50 per cent live the
+            // two are equal by construction, since the target is twice
+            // the live set and the span is twice the live set, so that
+            // is not a corner case, it is the steady state the space
+            // target aims at.
+            core.compact_at.store(
+                target
+                    .max(options.compact_below)
+                    .max(span + PAGE_SIZE as u64),
+                Ordering::Release,
+            );
+            core.compaction.skip(&seen);
             return Ok(());
         }
     }

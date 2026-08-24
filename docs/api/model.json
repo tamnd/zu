@@ -1702,8 +1702,8 @@
       "kind": "field",
       "name": "status",
       "of": "zu::Options",
-      "signature": "Option<Value>",
-      "doc": "GA08. The GQL-status object the statement before this one in\nthis session ended with, as the record value\n[`crate::binder::STATUS_FN`] answers, and `None` for a session\nthat has run nothing yet.\n\nHere for the reason the clock is here: it is session state, one\nvalue for the length of a statement, and every path through the\nexecutor already carries the switches. The session builds it\nonce on the way in, so a scan of ten million rows reading it\nclones a record rather than formatting one."
+      "signature": "Option<std::sync::Arc<dyn LastOutcome>>",
+      "doc": "GA08. The GQL-status object the statement before this one in\nthis session ended with, as the record value\n[`crate::binder::STATUS_FN`] answers, and `None` for a session\nthat has run nothing yet.\n\nHere for the reason the clock is here: it is session state, one\nvalue for the length of a statement, and every path through the\nexecutor already carries the switches.\n\nKept as what the statement ended with rather than as the record\nitself, because every statement ends and almost none of them\nasks what the one before ended with: building the record here\nwould put five strings and a list on the way out of every query\nin the session for the sake of the one query in a thousand that\nreads them. [`LastOutcome::value`] builds it where it is read."
     },
     {
       "id": "zu::Options::threads",
@@ -4769,6 +4769,14 @@
       "signature": "fn catalog(&self) -> &Catalog"
     },
     {
+      "id": "zu::query::Zu1Graph::catalog_handle",
+      "kind": "method",
+      "name": "catalog_handle",
+      "of": "zu::query::Zu1Graph",
+      "signature": "fn catalog_handle(&self) -> Arc<Catalog>",
+      "doc": "The catalog as the handle a snapshot wants, so a statement that\nopens one hands over a pointer rather than a copy."
+    },
+    {
       "id": "zu::query::Zu1Graph::file",
       "kind": "method",
       "name": "file",
@@ -4795,14 +4803,14 @@
       "kind": "method",
       "name": "new",
       "of": "zu::query::Zu1Graph",
-      "signature": "fn new(db: &mut Zu1File, catalog: Catalog) -> Self"
+      "signature": "fn new(db: &mut Zu1File, catalog: impl Into<Arc<Catalog>>) -> Self"
     },
     {
       "id": "zu::query::Zu1Graph::owned",
       "kind": "method",
       "name": "owned",
       "of": "zu::query::Zu1Graph",
-      "signature": "fn owned(db: Zu1File, catalog: Catalog) -> Zu1Graph",
+      "signature": "fn owned(db: Zu1File, catalog: impl Into<Arc<Catalog>>) -> Zu1Graph",
       "doc": "A graph that owns its handle outright, the shape a [`Session`]\nkeeps alive across queries so decoded groups and directories\nstay warm instead of dying with each call.\n\n[`Session`]: crate::session::Session"
     },
     {
@@ -4810,7 +4818,7 @@
       "kind": "method",
       "name": "set_catalog",
       "of": "zu::query::Zu1Graph",
-      "signature": "fn set_catalog(&mut self, catalog: Catalog)",
+      "signature": "fn set_catalog(&mut self, catalog: impl Into<Arc<Catalog>>)",
       "doc": "Swaps in a fresh catalog and drops every cached reader; the\nsession calls this when the header epoch moves, because the\ncached directories and decoded groups describe the old epoch."
     },
     {
@@ -5687,6 +5695,14 @@
       "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs.\n\nThe publish before that is what makes the truncation safe. A\ncommit folds without checkpointing and leaves the frames in the\nlog, so a log cut with the header still behind them would lose\ncommitted statements. Publishing first puts the folds on the\nfile and empties the log itself, and the appender then opens a\nlog that says nothing anyone still needs.\n\nWhat goes out is the shared write side, so this session holds\nthe writer lock from here until its next statement or its drop.\nNothing else could be true: the file itself is on loan and the\ncaller says when it is done with it by stopping using it, which\nis not something another connection can wait on."
     },
     {
+      "id": "zu::session::Session::fold_count",
+      "kind": "method",
+      "name": "fold_count",
+      "of": "zu::session::Session",
+      "signature": "fn fold_count(&mut self) -> Result<u64>",
+      "doc": "How many folds the writer behind this session has run since it\nwas opened.\n\nUnlike [`Self::file_mut`] this disturbs nothing. It takes the\nwrite side, reads a counter off it and gives it straight back,\nso a caller can ask between statements without the asking\nchanging what the next statement does. It is here for the write\nbench, which has to know whether the window it just measured\nheld the folds it was sized for."
+    },
+    {
       "id": "zu::session::Session::graph_ref",
       "kind": "method",
       "name": "graph_ref",
@@ -6139,6 +6155,14 @@
       "name": "file_mut",
       "of": "zu::shared::WriteSide",
       "signature": "fn file_mut(&mut self) -> &mut Zu1File"
+    },
+    {
+      "id": "zu::shared::WriteSide::fold_count",
+      "kind": "method",
+      "name": "fold_count",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn fold_count(&self) -> u64",
+      "doc": "How many folds the writer on this side has run since it was\nopened, or none where no writer has been opened. See\n[`Writer::fold_count`]."
     },
     {
       "id": "zu::shared::WriteSide::fold_patches",
@@ -6702,7 +6726,7 @@
       "kind": "method",
       "name": "new",
       "of": "zu::snapshot::Zu1Snapshot",
-      "signature": "fn new(db: &mut Zu1File, catalog: Catalog) -> Self"
+      "signature": "fn new(db: &mut Zu1File, catalog: impl Into<Arc<Catalog>>) -> Self"
     },
     {
       "id": "zu::snapshot::Zu1Snapshot::open",
@@ -6717,7 +6741,7 @@
       "kind": "method",
       "name": "with_cache",
       "of": "zu::snapshot::Zu1Snapshot",
-      "signature": "fn with_cache(db: &mut Zu1File, catalog: Catalog, cache: SnapshotCache) -> Self",
+      "signature": "fn with_cache(db: &mut Zu1File, catalog: impl Into<Arc<Catalog>>, cache: SnapshotCache) -> Self",
       "doc": "A snapshot that starts from what an earlier one already read."
     },
     {
@@ -6874,6 +6898,14 @@
       "doc": "Seals every committed overlay into the file, publishes it and\ntruncates the log. On return the file alone answers what the\noverlays answered, and the header epoch has moved, so anything\ncaching the catalog or a decoded layout has to reload."
     },
     {
+      "id": "zu::write::Writer::fold_count",
+      "kind": "method",
+      "name": "fold_count",
+      "of": "zu::write::Writer",
+      "signature": "fn fold_count(&self) -> u64",
+      "doc": "How many folds this writer has run since it was opened. See\n[`Writer::folds`]."
+    },
+    {
       "id": "zu::write::Writer::open",
       "kind": "method",
       "name": "open",
@@ -6944,6 +6976,13 @@
       "doc": "Whatever the staging closure returned, which for an insert is\nusually how many rows it appended."
     },
     {
+      "id": "zu::write::checkpoint_slack_bytes",
+      "kind": "function",
+      "name": "checkpoint_slack_bytes",
+      "signature": "fn checkpoint_slack_bytes(file_bytes: u64) -> u64",
+      "doc": "How much the file may grow before the next commit stops staging and\ncheckpoints, given what the file already is.\n\nThe rule is [`GROWTH_SHARE`] of the file held between\n[`FLOOR_BYTES`] and [`CEILING_BYTES`]. It is public because it is\nthe bound on how big a file gets between checkpoints, which is a\nthing a bench checks and an operator sizing a disk wants, and\nbecause a copy of the rule written down somewhere else would go\nstale the first time one of the three numbers moved."
+    },
+    {
       "id": "zu::zu1",
       "kind": "module",
       "name": "zu1",
@@ -6955,7 +6994,7 @@
       "kind": "constant",
       "name": "BLOCK_SIZE",
       "signature": "u32",
-      "doc": "Fixed block size in bytes."
+      "doc": "Fixed block size in bytes.\n\nIt was 256 KiB, from the research note that took DuckDB's block and\ndid not ask what zu writes into one. What zu writes into one is a\npacking scope: a column directory, one table's adjacency, one key\nindex, each of which has to be freeable on its own, so each starts a\nblock of its own and the tail of that block is waste. A thousand\nnode linkbench graph came to 3.75 MiB of file holding about 400 KiB\nof graph, and a fold, which takes a fresh scope for everything it\nrewrites, spent a megabyte a time on it.\n\nThe waste falls linearly with the block and what a smaller block\ncosts is one more pointer in a segment meta and one more read per\nblock of a big segment. At 32 KiB the same graph loads into 768 KiB\nand a 10k node one into 3.8 MiB rather than 6.5, and the reads came\nout faster rather than slower: a point read pulls a 32 KiB frame\ninto the cache where it used to pull 256."
     },
     {
       "id": "zu::zu1::FORMAT_VERSION",
@@ -6968,7 +7007,7 @@
       "id": "zu::zu1::Layout",
       "kind": "struct",
       "name": "Layout",
-      "doc": "How a store's blocks divide between what the schema costs and what\nthe graph in it costs.\n\nThis exists because a store's size on its own does not divide by a\ngraph. Every engine writes something before it holds anything, and\nzu writes rather a lot of it: the header block, the catalog, the\ntable index and the statistics are four blocks of 256 KiB before a\nsingle node exists. A tool dividing 1 MiB by three edges gets a\nnumber in the millions of bits per edge and publishes it as an\nencoding, which happened, repeatedly, to a benchmark harness that\nhad no way to ask this question.\n\nThe split is drawn where it can be drawn honestly. The four schema\nstructures are fixed by the shape of the database and do not know\nhow many rows are under them. Everything else, node groups, column\nsegments, adjacency, key indexes and the per-table directories that\nname them, grows with the graph and is data. The free list is\nneither: it is space this file owns and is not currently using, so\nit is counted apart from both rather than charged to the graph."
+      "doc": "How a store's blocks divide between what the schema costs and what\nthe graph in it costs.\n\nThis exists because a store's size on its own does not divide by a\ngraph. Every engine writes something before it holds anything, and\nzu writes rather a lot of it: the header block, the catalog, the\ntable index and the statistics are four blocks before a single node\nexists. A tool dividing those four blocks by three edges gets a\nnumber in the millions of bits per edge and publishes it as an\nencoding, which happened, repeatedly, to a benchmark harness that\nhad no way to ask this question.\n\nThe split is drawn where it can be drawn honestly. The four schema\nstructures are fixed by the shape of the database and do not know\nhow many rows are under them. Everything else, node groups, column\nsegments, adjacency, key indexes and the per-table directories that\nname them, grows with the graph and is data. The free list is\nneither: it is space this file owns and is not currently using, so\nit is counted apart from both rather than charged to the graph."
     },
     {
       "id": "zu::zu1::Layout::block_size",
@@ -7195,7 +7234,7 @@
       "id": "zu::zu1::cache",
       "kind": "module",
       "name": "cache",
-      "doc": "The block cache under every read path (perf/04 section 1).\n\nBefore this module existed every block read heap-allocated 256 KiB\nand hit the file, so a warm scan paid malloc plus memcpy plus a\nsyscall per block per touch. Now [`Zu1File`](crate::file::Zu1File)\npins blocks through a shared [`BlockCache`]: a hit is a shard lock,\na map probe, and an `Arc` clone, no allocation and no copy; a miss\nreads the whole block once into a recycled frame. Frames are 256 KiB\n`Arc<Vec<u8>>`s, so a [`PinnedBlock`] guard keeps its frame alive\neven after eviction drops it from the map, which is what makes the\nguard safe to hold across other cache traffic with no invalidation\nprotocol: committed blocks never change in place, and the one path\nthat rewrites a block, [`Zu1File::write_block`], drops the cached\nframe so the next read sees the new bytes.\n\nEviction keeps the SIEVE retention rule: every hit sets a visited\nbit, the hand clears visited slots and takes the first unvisited,\nunpinned one. The slots live in a fixed per-shard array scanned in\nrotation rather than SIEVE's insertion-order queue; on block traffic\nthe difference is the scan order of survivors, not what survives.\nWhen every slot in a shard is pinned the read is served from a\ntransient frame that bypasses the pool, so the budget bounds the\ncache itself and pin storms degrade to today's allocate-per-read\nbehavior instead of deadlocking."
+      "doc": "The block cache under every read path (perf/04 section 1).\n\nBefore this module existed every block read heap-allocated a whole\nblock and hit the file, so a warm scan paid malloc plus memcpy plus a\nsyscall per block per touch. Now [`Zu1File`](crate::file::Zu1File)\npins blocks through a shared [`BlockCache`]: a hit is a shard lock,\na map probe, and an `Arc` clone, no allocation and no copy; a miss\nreads the whole block once into a recycled frame. A frame is one\nblock of `Arc<Vec<u8>>`, so a [`PinnedBlock`] guard keeps its frame\nalive even after eviction drops it from the map, which is what makes\nthe guard safe to hold across other cache traffic with no\ninvalidation protocol: committed blocks never change in place, and\nthe one path that rewrites a block, [`Zu1File::write_block`], drops\nthe cached frame so the next read sees the new bytes.\n\nEviction keeps the SIEVE retention rule: every hit sets a visited\nbit, the hand clears visited slots and takes the first unvisited,\nunpinned one. The slots live in a fixed per-shard array scanned in\nrotation rather than SIEVE's insertion-order queue; on block traffic\nthe difference is the scan order of survivors, not what survives.\nWhen every slot in a shard is pinned the read is served from a\ntransient frame that bypasses the pool, so the budget bounds the\ncache itself and pin storms degrade to today's allocate-per-read\nbehavior instead of deadlocking."
     },
     {
       "id": "zu::zu1::cache::BlockCache",
@@ -7294,7 +7333,7 @@
       "id": "zu::zu1::cache::PinnedBlock",
       "kind": "struct",
       "name": "PinnedBlock",
-      "doc": "A pinned 256 KiB block frame. Holding it keeps the frame alive; the\ncache may evict the block meanwhile, which only means the next\nreader refills. Dereferences to the full block's bytes."
+      "doc": "A pinned block frame. Holding it keeps the frame alive; the\ncache may evict the block meanwhile, which only means the next\nreader refills. Dereferences to the full block's bytes."
     },
     {
       "id": "zu::zu1::cache::PoolBytes",
@@ -9811,7 +9850,7 @@
       "id": "zu::zu1::meta",
       "kind": "module",
       "name": "meta",
-      "doc": "Meta-block chains: linked lists of 256 KiB blocks carrying a byte\npayload, used for the catalog, group directories, free list, and stats.\n\nPer-block layout: `next: u64 LE` (NULL_BLOCK terminates), `len: u32 LE`\nbytes of payload in this block, `crc32c: u32 LE` of that payload, then\nthe payload itself. The chain is written back to front so every `next`\npointer is known before its block is written."
+      "doc": "Meta-block chains: linked lists of blocks carrying a byte payload,\nused for the catalog, group directories, free list, and stats.\n\nPer-block layout: `next: u64 LE` (NULL_BLOCK terminates), `len: u32 LE`\nbytes of payload in this block, `crc32c: u32 LE` of that payload, then\nthe payload itself. The chain is written back to front so every `next`\npointer is known before its block is written."
     },
     {
       "id": "zu::zu1::meta::CHAIN_CAPACITY",
@@ -11939,7 +11978,7 @@
       "id": "zu::zu1::wal::Commits",
       "kind": "struct",
       "name": "Commits",
-      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit.\n\nThe room those frames go into is asked for ahead of them. A write\nthat makes a file longer is a write plus an allocation plus a size\nthe sync has to carry, and a commit that does that every time pays\nfor it every time: measured on this laptop, a hundred byte frame\nand its sync cost 34 us of processor time and 3.75 ms of wall\nappending, against 25 us and 3.17 ms into space the file already\nhad. So the log takes its space in chunks and writes zeros over it,\nand a commit writes inside what it already has.\n\nZeros are not padding, they are the end of the log. A frame is a\nlength and a crc, and a length of zero is shorter than the smallest\nrecord, so the scan that replay and open both use stops at the\nfirst byte of unused reservation. That is the same stop a torn tail\ngets and it is why nothing else is needed to say where the log\nends. It is also why every path that takes frames away, the cut\nafter a checkpoint and the rollback of a transaction the process\ndied inside, writes zeros over what it took rather than leaving\nbytes that once parsed.\nThe sync a commit waits on, shared by every writer on one log.\n\nA commit is durable once the log is on the platter through the byte\nits commit frame ends at. The log is append only, so that is a\nprefix property: one sync makes durable everything staged before it,\nwhoever staged it. Which is what lets commits share one.\n\nA writer that finds nobody syncing becomes the leader, and syncs the\nlog as far as it has been staged rather than only as far as its own\nframes go, so the writers that staged behind it while it waited for\nthe write side come along for free. A writer that finds a sync\nalready running waits for it, and either it covered them or they\nlead the next one. So a burst of n commits costs two syncs rather\nthan n: the one already in flight when the burst arrived, and the\none that covers the rest.\n\nThe sync runs on a second handle on the log, because by then the\nwriter that staged the frames has given the write side back and the\nlog belongs to somebody else."
+      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit.\n\nThe room those frames go into is asked for ahead of them. A write\nthat makes a file longer is a write plus an allocation plus a size\nthe sync has to carry, and a commit that does that every time pays\nfor it every time: measured on this laptop, a hundred byte frame\nand its sync cost 34 us of processor time and 3.75 ms of wall\nappending, against 25 us and 3.17 ms into space the file already\nhad. So the log takes its space in chunks and writes zeros over it,\nand a commit writes inside what it already has.\n\nZeros are not padding, they are the end of the log. A frame is a\nlength and a crc, and a length of zero is shorter than the smallest\nrecord, so the scan that replay and open both use stops at the\nfirst byte of unused reservation. That is the same stop a torn tail\ngets and it is why nothing else is needed to say where the log\nends. It is also why every path that takes frames away, the cut\nafter a checkpoint and the rollback of a transaction the process\ndied inside, writes zeros over what it took rather than leaving\nbytes that once parsed.\nThe sync a commit waits on, shared by every writer on one log.\n\nA commit is durable once the log is on the platter through the byte\nits commit frame ends at. The log is append only, so that is a\nprefix property: one sync makes durable everything staged before it,\nwhoever staged it. Which is what lets commits share one.\n\nA writer that finds nobody syncing becomes the leader, and syncs the\nlog as far as it has been staged rather than only as far as its own\nframes go, so the writers that staged behind it while it waited for\nthe write side come along for free. A writer that finds a sync\nalready running waits for it, and either it covered them or they\nlead the next one. So a burst of n commits costs one sync rather\nthan n, and the leader pauses before issuing it so that the writers\nwho are still staging when it takes the lead are in that one too.\n\nThe sync runs on a second handle on the log, because by then the\nwriter that staged the frames has given the write side back and the\nlog belongs to somebody else."
     },
     {
       "id": "zu::zu1::wal::Commits::settled",
@@ -11955,7 +11994,7 @@
       "name": "sync_through",
       "of": "zu::zu1::wal::Commits",
       "signature": "fn sync_through(&self, need: u64) -> Result<()>",
-      "doc": "Returns once the log is durable through `need` bytes, syncing it\nhere if nobody else is already doing it.\n\nThis is the commit point. It runs with the write side let go of,\nso the writers behind this one are staging their own frames\nwhile this sync is in the air, and the sync that covers them is\nthe next one rather than one each."
+      "doc": "Returns once the log is durable through `need` bytes, syncing it\nhere if nobody else is already doing it.\n\nThis is the commit point. It runs with the write side let go of,\nso the writers behind this one are staging their own frames\nwhile this sync is in the air, and one sync covers all of them."
     },
     {
       "id": "zu::zu1::wal::Wal",
@@ -12211,6 +12250,13 @@
       "name": "len",
       "of": "zu::zu1::wal::WalValues",
       "signature": "fn len(&self) -> usize"
+    },
+    {
+      "id": "zu::zu1::wal::commit_counters",
+      "kind": "function",
+      "name": "commit_counters",
+      "signature": "fn commit_counters() -> (u64, u64)",
+      "doc": "The two counters above, as they stand."
     }
   ]
 }

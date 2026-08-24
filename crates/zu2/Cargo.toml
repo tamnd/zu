@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "traverse"
 harness = false
+
+[[bench]]
+name = "scan"
+harness = false

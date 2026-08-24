@@ -565,6 +565,22 @@ impl Session {
             .file_mut())
     }
 
+    /// How many folds the writer behind this session has run since it
+    /// was opened.
+    ///
+    /// Unlike [`Self::file_mut`] this disturbs nothing. It takes the
+    /// write side, reads a counter off it and gives it straight back,
+    /// so a caller can ask between statements without the asking
+    /// changing what the next statement does. It is here for the write
+    /// bench, which has to know whether the window it just measured
+    /// held the folds it was sized for.
+    pub fn fold_count(&mut self) -> Result<u64> {
+        let entered = self.enter()?;
+        let count = self.side.as_ref().expect("entered just above").fold_count();
+        self.leave(entered);
+        Ok(count)
+    }
+
     /// The catalog this session last loaded, which is how a caller
     /// staging a write turns a label into the table id the transaction
     /// wants.

@@ -150,6 +150,9 @@ const SAMPLE: u64 = 25;
 /// each other and the gate machines are shared vCPUs.
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
+/// The store's block, which is the granularity everything the fold
+/// takes and gives back is counted in.
+const BLOCK: u32 = zu::zu1::BLOCK_SIZE;
 
 /// How many rows the store [`calibrate`] reads holds.
 ///
@@ -485,11 +488,31 @@ fn parts(dir: &Path) -> (u64, u64) {
     (store, log)
 }
 
+/// The median statement of a run and its tail, in microseconds, off
+/// the per statement times in `lat`. Sorts in place.
+fn tail(lat: &mut [std::time::Duration]) -> (f64, f64) {
+    lat.sort_unstable();
+    let us = |d: std::time::Duration| d.as_nanos() as f64 / 1e3;
+    (us(lat[lat.len() / 2]), us(lat[lat.len() * 99 / 100]))
+}
+
 /// What one run of a statement cost, per statement where that is the
 /// sensible unit and over the whole run where it is not.
 struct Cost {
-    /// Latency a caller waits, in microseconds.
+    /// Latency a caller waits, in microseconds, averaged over the run.
     us: f64,
+    /// The median statement of the run and its tail, in microseconds.
+    ///
+    /// The average above is what the run cost divided by the statements
+    /// in it, so one statement that stalled for a hundred milliseconds
+    /// moves it by half a millisecond and hides inside it. These two
+    /// come from timing each statement on its own. A run is [`WRITES`]
+    /// statements, so the p99 is the second slowest of them: coarse,
+    /// but a checkpoint or a fold landing on one caller is exactly the
+    /// thing it is there to show, and the ceilings on it are set with
+    /// that coarseness in mind.
+    p50: f64,
+    p99: f64,
     /// Processor time the statement burned, in microseconds. A commit
     /// is a log append and an fsync, and on this laptop that fsync is
     /// 3.9 ms on its own, so the latency column is mostly the storage
@@ -521,9 +544,11 @@ impl Cost {
 
     fn header() {
         println!(
-            "{:<26} {:>10} {:>9} {:>11} {:>12} {:>13} {:>12} {:>10} {:>12}",
+            "{:<26} {:>10} {:>9} {:>9} {:>9} {:>11} {:>12} {:>13} {:>12} {:>10} {:>12}",
             "statement",
             "latency",
+            "p50",
+            "p99",
             "cpu",
             "cpu-sync",
             "throughput",
@@ -536,8 +561,10 @@ impl Cost {
 
     fn report(&self, what: &str, sync: f64) {
         println!(
-            "{what:<26} {:>7.0} us {:>6.0} us {:>8.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
+            "{what:<26} {:>7.0} us {:>6.0} us {:>6.0} us {:>6.0} us {:>8.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
             self.us,
+            self.p50,
+            self.p99,
             self.cpu,
             self.cpu_less_sync(sync),
             1e6 / self.us.max(0.001),
@@ -707,17 +734,29 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
     // look like a store that grows a third as much if the same growth
     // were spread over three passes.
     let mut elapsed = std::time::Duration::MAX;
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let mut once: Option<(Usage, u64)> = None;
     for _ in 0..PASSES {
+        let mut pass = Vec::with_capacity(WRITES as usize);
         let start = Instant::now();
         for i in 0..WRITES {
             let age = i % rows;
+            let at = Instant::now();
             conn.query(&format!(
                 "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
             ))
             .expect("set");
+            pass.push(at.elapsed());
         }
-        elapsed = elapsed.min(start.elapsed());
+        // The median and the tail come off whichever pass was fastest
+        // end to end, the same pass the average above is taken from, so
+        // the three numbers on the line describe one run rather than
+        // three different ones.
+        let took = start.elapsed();
+        if took < elapsed {
+            elapsed = took;
+            lat = pass;
+        }
         if once.is_none() {
             once = Some((usage(), disk(dir)));
         }
@@ -738,8 +777,11 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
         1,
         "and the value written back is the value that was there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -769,13 +811,16 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         conn.query(&format!(
             "MATCH (p:person) WHERE p.age = {age} SET p = {{age: {age}, name: 'seed{age}'}}"
         ))
         .expect("set a record");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -794,8 +839,11 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
         1,
         "and both values written back are the values that were there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -829,8 +877,10 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         let verb = match i % 2 {
             0 => "SET",
@@ -840,6 +890,7 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
             "MATCH (p:person) WHERE p.age = {age} {verb} p:Bot"
         ))
         .expect("set a label");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -855,8 +906,11 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
         (WRITES / 2) as i64,
         "every other write put the label on and the one after took it off"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -891,13 +945,16 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         conn.query(&format!(
             "MATCH (p:person)-[f:follows]->(q:person) WHERE p.age = {age} SET f.since = {age}"
         ))
         .expect("set");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -919,8 +976,11 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
         1,
         "and the value written back is the value that was there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -958,9 +1018,12 @@ fn run_merge(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&merge(i % rows, rows + 1 + i)).expect("merge");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -979,8 +1042,11 @@ fn run_merge(dir: &Path, rows: u64) -> Cost {
         WRITES.min(rows) as i64,
         "and the half that matched changed the rows it matched"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1004,13 +1070,16 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!(
             "INSERT (p:person {{age: {}, name: 'new'}})",
             rows + i
         ))
         .expect("insert");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1021,8 +1090,11 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
         (rows + WRITES + 1) as i64,
         "every element written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1072,9 +1144,12 @@ fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&insert(i + 1)).expect("insert");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1088,8 +1163,11 @@ fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
         (rows + WRITES + 1) as i64,
         "every edge written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1142,9 +1220,12 @@ fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         write(&mut session, i + 1);
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1161,8 +1242,11 @@ fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
         Some(&Value::Int((rows + WRITES + 1) as i64)),
         "every edge written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1198,10 +1282,13 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!("MATCH (p:person) WHERE p.age = {i} DELETE p"))
             .expect("delete");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1212,8 +1299,11 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
         (rows - WRITES - 1) as i64,
         "every element deleted is gone, and no other one is"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1255,12 +1345,15 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!(
             "MATCH (p:person) WHERE p.age = {i} DETACH DELETE p"
         ))
         .expect("detach delete");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1279,8 +1372,11 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
         left < edges - WRITES as i64,
         "every deleted element took its edges with it: {left} left of {edges}"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1332,16 +1428,11 @@ fn fold_every(rows: u64) -> u64 {
         &ring(rows),
     );
 
-    let mut spent = Vec::with_capacity(PROBE as usize);
+    let before = folds_so_far(&mut conn);
     for age in 0..PROBE {
-        let at = Instant::now();
         set(&mut conn, age % rows);
-        spent.push(at.elapsed().as_nanos() as f64 / 1e3);
     }
-    let mut sorted = spent.clone();
-    sorted.sort_by(f64::total_cmp);
-    let slow = slow_us(&sorted);
-    let folds = spent.iter().filter(|us| **us > slow).count() as u64;
+    let folds = folds_so_far(&mut conn) - before;
 
     // A probe with no fold in it has not measured a rate, and a window
     // sized off the answer would run for as long as the bound is wrong
@@ -1351,12 +1442,13 @@ fn fold_every(rows: u64) -> u64 {
     (PROBE / folds.max(1)).min(PROBE / FOLDS_WINDOW)
 }
 
-/// The time above which a statement is a fold, out of a sorted run of
-/// them. Twenty times the median, and never under a fifth of a
-/// millisecond, which is well above a statement and well under a fold
-/// on any store this file builds.
-fn slow_us(sorted: &[f64]) -> f64 {
-    (sorted[sorted.len() / 2] * 20.0).max(200.0)
+/// How many folds the store behind this connection has run since it
+/// was opened.
+///
+/// Asking costs the writer lock and gives it straight back, so it is
+/// something to do between windows rather than inside one.
+fn folds_so_far(conn: &mut zu::Connection) -> u64 {
+    conn.session_mut().fold_count().expect("fold count")
 }
 
 /// What a sustained run cost, which is a [`Cost`] and the two things
@@ -1369,6 +1461,16 @@ struct Sustained {
     /// The store at its biggest inside the measured window against what
     /// it was when the window opened.
     window_x: f64,
+    /// The store as the window opened and at its biggest inside it, in
+    /// bytes. The ratio above says how much it grew, these say what it
+    /// grew from, and the checkpoint slack that bounds the growth is a
+    /// share of the file held between a floor and a ceiling, so which
+    /// of the three is in force cannot be read off the ratio alone.
+    opened: u64,
+    peak: u64,
+    /// The store as it was loaded, before the ramp. The pair above
+    /// bounds the measured window, this bounds the whole run.
+    loaded: u64,
 }
 
 /// The write path measured across its own housekeeping rather than
@@ -1420,9 +1522,12 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
     let before = usage();
     let store_before = parts(dir).0;
     let mut peak = store_before;
+    let mut lat = Vec::with_capacity(window as usize);
     let start = Instant::now();
     for i in 0..window {
+        let at = Instant::now();
         set(&mut conn, age % rows);
+        lat.push(at.elapsed());
         age += 1;
         if (i + 1) % SAMPLE == 0 {
             peak = peak.max(parts(dir).0);
@@ -1437,9 +1542,12 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
         rows as i64,
         "no row was added or lost"
     );
+    let (p50, p99) = tail(&mut lat);
     Sustained {
         cost: Cost {
             us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+            p50,
+            p99,
             cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
             written: after.written.saturating_sub(before.written) as f64 / window as f64,
             growth: store_after.saturating_sub(store_before) as f64 / window as f64,
@@ -1448,6 +1556,9 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
         },
         file_x: peak as f64 / loaded.max(1) as f64,
         window_x: peak as f64 / store_before.max(1) as f64,
+        opened: store_before,
+        peak,
+        loaded,
     }
 }
 
@@ -1508,12 +1619,16 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     }
 
     let before = usage();
+    let folds_before = folds_so_far(&mut conn);
     let start = Instant::now();
-    // Timed one at a time as well as end to end, because with no sync
-    // in the way the folds are the only statements that take
-    // milliseconds and counting them is counting the folds. That is the
-    // check that the window held its housekeeping, and it is a count of
-    // the thing itself rather than an inference from a byte total.
+    // Timed one at a time as well as end to end, for the median and the
+    // tail. The folds in the window are counted off the writer rather
+    // than read out of these times: they used to be whatever statement
+    // came in over twenty times the median, and on a box with a
+    // neighbour that line catches statements that are not folds and
+    // misses folds that are. Three runs on this laptop put the rate at
+    // one fold every 91, 153 and 356 statements for the same store and
+    // the same statements.
     let mut spent = Vec::with_capacity(window as usize);
     for _ in 0..window {
         let at = Instant::now();
@@ -1531,9 +1646,10 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     );
     let mut sorted = spent.clone();
     sorted.sort_by(f64::total_cmp);
-    let slow = slow_us(&sorted);
     let cost = Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+        p50: sorted[sorted.len() / 2],
+        p99: sorted[sorted.len() * 99 / 100],
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
         // A store with no file under it pushes nothing at a disk and
         // grows no file, so both columns are zero by construction
@@ -1545,7 +1661,7 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     };
     Unsynced {
         cost,
-        folds: spent.iter().filter(|us| **us > slow).count() as u64,
+        folds: folds_so_far(&mut conn) - folds_before,
     }
 }
 
@@ -1670,8 +1786,11 @@ fn main() {
     let sustained_fold_x = sustained.cost.written / set_small.written.max(1.0);
     println!("sustained_fold_x: {sustained_fold_x:.2}x the bytes of a run that never folds");
     println!(
-        "sustained_window_x: {:.2}x store at its peak against the store as the window opened",
-        sustained.window_x
+        "sustained_window_x: {:.2}x store at its peak against the store as the window opened, \
+         {:.1} MB to {:.1} MB",
+        sustained.window_x,
+        sustained.opened as f64 / MB,
+        sustained.peak as f64 / MB
     );
     // The byte counter is the operating system's, and it counts what
     // reached a block device. A store on a memory filesystem, which is
@@ -1692,20 +1811,25 @@ fn main() {
     // the headroom this check has, and raising it spends some. The
     // count of folds in the unsynced window is the direct form of the
     // same question and is checked further down.
-    let bytes_counted = set_small.written > 0.0 || sustained.cost.written > 0.0;
-    match bytes_counted {
-        true => assert!(
-            sustained_fold_x > 1.03,
-            "the sustained window has to contain the folds it is measuring, and it pushed \
-             {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
-            sustained.cost.written / 1024.0,
-            set_small.written / 1024.0
-        ),
-        false => println!(
-            "sustained_fold_x: nothing this run wrote reached a block device, so the bytes \
-             are the counter and not the folds: reported, not checked"
-        ),
-    }
+    //
+    // Reported and not checked, on either kind of host. On Linux the
+    // counter reads zero because nothing the run wrote reached a block
+    // device inside it. On Darwin it reads 16.1 kB a statement for
+    // every run in this file including the ones that write a single
+    // cell, which is one block per commit gone out under the fsync, and
+    // a fold's share of a statement is a few hundred bytes: under the
+    // granularity of the thing measuring it. So the ratio came back
+    // 1.01 for a window whose file grew by 540 B a statement, and a
+    // counter that cannot resolve the signal is not evidence either
+    // way. The file growth below is the same question asked of the
+    // file, and the fold count in the unsynced window is it asked of
+    // the folds themselves, so the check is made twice over without
+    // this one.
+    println!(
+        "sustained_fold_x: reported, not checked. The bytes are a process counter at block \
+         granularity and one commit already writes a block, so a fold's few hundred bytes \
+         do not clear it"
+    );
     // What the folds did to the file, which is on the file itself and
     // so is there to read wherever the store is. A run whose folds
     // stopped is a run that loaded a store and left it the size it
@@ -1716,11 +1840,50 @@ fn main() {
          out of it {:.2}x the size it was loaded at",
         sustained.file_x
     );
+    // A fold that nobody published takes fresh blocks for every block
+    // it rewrote and gives none of them back, so what the file may grow
+    // by between checkpoints is exactly the checkpoint slack. That is a
+    // share of the file held between a floor and a ceiling rather than
+    // a flat ratio, and for a store under the floor the floor is what
+    // is in force: this store opens its window at 0.7 MB and the floor
+    // is a megabyte, so a bound of 1.25x was one the rule never
+    // promised and the check failed on a run that was behaving. The
+    // rule itself comes from the write path so the two cannot drift,
+    // and a run whose blocks stop coming back still fails, because it
+    // runs past the slack instead of checkpointing at it.
+    //
+    // Half a block of headroom on top, for the fold that crosses the
+    // threshold: the check fires at the commit after, so the last fold
+    // is over the line by whatever it took.
+    let slack = zu::write::checkpoint_slack_bytes(sustained.opened) + BLOCK as u64 / 2;
+    let allowed = sustained.opened + slack;
+    println!(
+        "sustained_window_slack: {:.1} MB grown against the {:.1} MB the checkpoint rule \
+         allows a store this size",
+        (sustained.peak - sustained.opened) as f64 / MB,
+        slack as f64 / MB
+    );
+    // The same question over the whole run rather than over the
+    // measured window, and the one that is gated. The ramp folds too,
+    // so the file is already carrying churn when the window opens and
+    // a bound on the window alone would not see it.
+    let run_slack = zu::write::checkpoint_slack_bytes(sustained.loaded);
+    let slack_x = (sustained.peak - sustained.loaded) as f64 / run_slack as f64;
+    println!(
+        "sustained_slack_x: {slack_x:.2}x the checkpoint slack, {:.1} MB loaded to {:.1} MB at \
+         its biggest against the {:.1} MB the rule allows a store this size",
+        sustained.loaded as f64 / MB,
+        sustained.peak as f64 / MB,
+        run_slack as f64 / MB
+    );
     assert!(
-        sustained.window_x < 1.25,
+        sustained.peak <= allowed,
         "a fold nobody published grows the file by every block it rewrote, and this one \
-         grew {:.2}x over the window, so the blocks are not coming back",
-        sustained.window_x
+         went from {:.1} MB to {:.1} MB over the window against the {:.1} MB the \
+         checkpoint slack allows, so the blocks are not coming back",
+        sustained.opened as f64 / MB,
+        sustained.peak as f64 / MB,
+        allowed as f64 / MB
     );
 
     // Best of PASSES, the way every other number in this file is taken.
@@ -1767,6 +1930,24 @@ fn main() {
         "write_cpu_nosync_us: {:.1} us of processor time a statement, against the {:.1} the \
          same window costs with the syncs in it",
         unsynced.cost.cpu, sustained.cost.cpu
+    );
+    // And its tail, which is the same window read at the other end.
+    // Every other line in this file prints a p99 with an fsync inside
+    // it, and a ceiling on that is a ceiling on the disk: this is the
+    // one whose tail is the write path's own.
+    //
+    // The ratio beside it is what a fold landing inside the tail would
+    // move. A fold is milliseconds where these statements are tens of
+    // microseconds, and the deferral bound is set so that the share of
+    // statements carrying one stays under what a p99 leaves: this run
+    // folds once every 240 statements, which is 0.4 percent, so the
+    // folds sit just above the p99 and the tail is a statement rather
+    // than a fold. A bound that shrank, or a fold that got slower,
+    // pulls one in and this jumps.
+    let p99_x = unsynced.cost.p99 / unsynced.cost.p50.max(0.001);
+    println!(
+        "write_p99_nosync_us: {:.1} us at the tail against {:.1} at the median, {p99_x:.2}x",
+        unsynced.cost.p99, unsynced.cost.p50
     );
 
     // How much of a one cell write is the table it sits in, in time and
@@ -1864,8 +2045,10 @@ fn main() {
         ),
         ("sustained_stmt_kb", sustained.cost.written / 1024.0),
         ("sustained_stmt_growth_b", sustained.cost.growth),
-        ("sustained_file_x", sustained.file_x),
+        ("sustained_slack_x", slack_x),
         ("write_cpu_nosync_us", unsynced.cost.cpu),
+        ("write_p99_nosync_us", unsynced.cost.p99),
+        ("write_p99_p50_x", p99_x),
     ];
     for (key, got) in checks {
         let Some(written) = budget(key) else { continue };
@@ -1875,7 +2058,7 @@ fn main() {
         // other ceiling here is either a ratio, which a slow box cannot
         // move, or was fitted on the box class that enforces it.
         let ceiling = match key {
-            "write_cpu_nosync_us" => written * scale,
+            "write_cpu_nosync_us" | "write_p99_nosync_us" => written * scale,
             _ => written,
         };
         if key == "write_cpu_nosync_us" {

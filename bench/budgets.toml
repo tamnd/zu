@@ -2327,18 +2327,67 @@ sustained_stmt_kb = 96.0
 # are coming back rather than that nothing has taken any yet.
 sustained_stmt_growth_b = 512.0
 
-# The store at its biggest against the store as it was loaded.
+# The store at its biggest against what the checkpoint rule lets it
+# hold.
 #
 # A fold takes fresh blocks for whatever it rewrites and gives back none
 # of them until a checkpoint publishes, because until then the header a
-# crash would find still reads what they replaced. So this ratio is the
-# transient garbage the deferred write path carries, and it is bounded
-# by the checkpoint threshold and by nothing else. It read 18.3 once, a
-# store of 3.9 MB running to 71.8, on a threshold that was a flat 256
-# blocks whatever the store was; a quarter of the file held between a
-# floor and that ceiling puts it at 2.27. Lower this ceiling, never
-# raise it.
-sustained_file_x = 3.0
+# crash would find still reads what they replaced. So the file carries
+# transient garbage, and what bounds it is the checkpoint slack and
+# nothing else. It read 18.3 times the store once, 3.9 MB running to
+# 71.8, on a threshold that was a flat 256 blocks whatever the store
+# was.
+#
+# This was that ratio, peak over loaded, with a ceiling of 3.0. The
+# ratio is the wrong shape: the slack is a quarter of the file held
+# between a one megabyte floor and a 64 MB ceiling, so for a store
+# under the floor the floor is what is in force and the file is allowed
+# to be several times the store while behaving exactly as designed. The
+# bench store is 0.4 MB and the flat ceiling failed it at 3.92 on a run
+# where the churn never came near the megabyte it was entitled to. What
+# is gated now is the churn against the rule, at any store size: one
+# means the file used every byte of slack it had.
+#
+# Over one because the slack is read at the commit after the fold that
+# crossed it, so the fold that crosses is over the line by whatever it
+# took. A fold of this store is a couple of blocks and the run measures
+# 1.12. Lower this ceiling, never raise it.
+sustained_slack_x = 1.25
+
+# The tail of a statement on the write path, with no disk under it.
+#
+# Every other latency in the write bench has an fsync in it. A ceiling
+# on one of those is a ceiling on the disk the run happened to have,
+# which is why they sit at 250 ms and catch nothing smaller than a
+# storage stack falling over. So the p50 and the p99 of each statement
+# are printed on its line and none of them is gated, and the write
+# side's tail is gated here instead, on the one window whose syncs
+# return without asking a platter.
+#
+# Scaled by the host calibration, the same way write_cpu_nosync_us is,
+# because this is a product target and not a number fitted to a box.
+# Measured 27, 28 and 43 us over three runs on an M series laptop, and
+# 60 and 62 on the gaming box. The gaming box is the tight one: its
+# calibration has come back at both 1.24 and 1.00 for the same
+# hardware, so the ceiling it enforces is somewhere between 100 and
+# 124 against a 62 us reading. That is the headroom a p99 wants, since
+# it is one statement in a hundred and moves with whatever else is on
+# the box, where the alloc counts a few keys up sit a few percent over
+# their measurement because nothing about them is a clock.
+write_p99_nosync_us = 100.0
+
+# The same tail over its own median, which no host can move.
+#
+# A fold is milliseconds where these statements are tens of
+# microseconds, and DEFERRED_COMMITS is set so the share of statements
+# carrying one stays under what a p99 leaves. The run folds once every
+# 240 statements, 0.4 percent, so the folds sit just above the p99 and
+# the tail is a statement and not a fold: 1.44 to 2.05 on the laptop
+# and 1.94 to 2.68 on the gaming box, off medians of 19 to 31 us. A deferral bound that
+# shrank, or a fold that got slower, pulls a fold into the tail and
+# doubles this. Lower it as the write path gets flatter, never raise
+# it.
+write_p99_p50_x = 4.0
 
 # The P5 point write gate: processor time a statement excluding fsync,
 # under 30 us (docs/12, zu#78).

@@ -81,17 +81,33 @@ const CEILING_BYTES: u64 = 64 * 1024 * 1024;
 /// a small store folds a handful of blocks at a time, which puts a
 /// checkpoint every few folds and a few folds is a thousand statements
 /// or so. Far enough apart that the syncs land nowhere near the
-/// interesting end of the latency distribution, close enough that a
-/// four megabyte store stays an eight megabyte file rather than a
-/// seventy megabyte one.
+/// interesting end of the latency distribution, close enough that the
+/// file a small store sits in stays about the store.
 ///
-/// Both of these are bytes rather than blocks because that is what they
-/// are about. They were block counts when a block was 256 KiB, and a
-/// block that is now 32 would have taken the floor from four megabytes
-/// to half of one without anybody saying so: the same number of folds
-/// worth of slack is the same number of bytes, not the same number of
-/// blocks.
-const FLOOR_BYTES: u64 = 4 * 1024 * 1024;
+/// It was four megabytes, which was that same rate when a block was
+/// 256 KiB and a fold of a small table took a block or two of it. A
+/// block is 32 KiB now and a fold takes a block or two of that, so the
+/// same four megabytes had become forty folds and six thousand
+/// statements of slack, and a 0.7 MB store was entitled to sit in a
+/// 4.7 MB file. The unit is still bytes, because what the floor bounds
+/// is file growth, but the number has to follow what a fold costs and
+/// that fell with the block. One megabyte is thirty two blocks, which
+/// at the couple of blocks a small fold takes is back to the every few
+/// folds this was always meant to be.
+const FLOOR_BYTES: u64 = 1024 * 1024;
+
+/// How much the file may grow before the next commit stops staging and
+/// checkpoints, given what the file already is.
+///
+/// The rule is [`GROWTH_SHARE`] of the file held between
+/// [`FLOOR_BYTES`] and [`CEILING_BYTES`]. It is public because it is
+/// the bound on how big a file gets between checkpoints, which is a
+/// thing a bench checks and an operator sizing a disk wants, and
+/// because a copy of the rule written down somewhere else would go
+/// stale the first time one of the three numbers moved.
+pub fn checkpoint_slack_bytes(file_bytes: u64) -> u64 {
+    (file_bytes / GROWTH_SHARE).clamp(FLOOR_BYTES, CEILING_BYTES)
+}
 
 /// What the file may grow by between checkpoints, as a fraction of what
 /// it already is.
@@ -111,10 +127,12 @@ const GROWTH_SHARE: u64 = 4;
 /// slack is a quarter of the file, held between the two of them.
 fn checkpoint_due(db: &Zu1File) -> bool {
     let block = u64::from(crate::zu1::BLOCK_SIZE);
-    let floor = FLOOR_BYTES.div_ceil(block);
-    let ceiling = CEILING_BYTES.div_ceil(block);
-    let slack = (db.db_header().block_count / GROWTH_SHARE).clamp(floor, ceiling);
-    db.unpublished_blocks() >= slack
+    // Floored, not rounded up: a slack of a block and a half is a
+    // block, and a fold is due once it has taken that much. Rounding
+    // the other way hands out an extra block at every file size where
+    // the share does not land on one.
+    let slack = checkpoint_slack_bytes(db.db_header().block_count * block);
+    db.unpublished_blocks() >= slack / block
 }
 
 /// How many commits in a row may go without a fold.
@@ -372,6 +390,17 @@ pub struct Writer {
     patches: Arc<Patches>,
     /// How many commits have gone without a fold.
     deferred: u32,
+    /// How many folds this writer has run, staged or checkpointed,
+    /// since it was opened.
+    ///
+    /// Nothing in the write path reads it. It is here because a fold is
+    /// otherwise only visible as a slow statement, and a bench that
+    /// wants to know whether its window held the housekeeping it is
+    /// measuring had to draw a line through a latency distribution and
+    /// call what was above it folds. That line moves with the machine
+    /// and it was calling noise a fold on a shared box, so the count is
+    /// kept here where it is exact.
+    folds: u64,
     /// How many of them left something the patch copies rather than
     /// shares. See [`DEFERRED_COPIED`].
     copied: u32,
@@ -433,6 +462,7 @@ impl Writer {
             path,
             patches: Arc::new(Patches::new()),
             deferred: 0,
+            folds: 0,
             copied: 0,
             graves: IdMap::default(),
             readers: IdMap::default(),
@@ -491,6 +521,7 @@ impl Writer {
                 // marker before the next commit goes on top.
                 db.stage_deferred();
             } else {
+                self.folds += 1;
                 match checkpoint_due(db) {
                     true => self.fold(db)?,
                     false => {
@@ -508,6 +539,12 @@ impl Writer {
             owed = None;
         }
         Ok(Written { value, epoch, owed })
+    }
+
+    /// How many folds this writer has run since it was opened. See
+    /// [`Writer::folds`].
+    pub fn fold_count(&self) -> u64 {
+        self.folds
     }
 
     /// What makes this writer's commits durable, held past the write

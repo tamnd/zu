@@ -89,11 +89,16 @@ fn probe() -> Vec<(&'static str, Answer)> {
         ("CHAR(2)", Answer::Declared),
         ("BINARY(16)", Answer::Declared),
         ("LIST<FLOAT32>", Answer::Declared),
+        // S2's first two rows. A bounded list and a nested one are both
+        // declarable now: the catalog remembers the bound and the
+        // element's nullability, which is what every later check about
+        // an embedding is against. Neither has a column encoding yet,
+        // so a declaration is still all they are.
+        ("LIST<FLOAT32 NOT NULL>[768]", Answer::Declared),
+        ("LIST<LIST<STRING>>", Answer::Declared),
         // Spelled and not stored. This is the list S2 works through.
         // The condition is 42000 for all of them, which is what S1
         // replaced the sentence about corruption with.
-        ("LIST<FLOAT32 NOT NULL>[768]", cannot_write(24)),
-        ("LIST<LIST<STRING>>", cannot_write(25)),
         ("DECIMAL(12,2)", cannot_write(26)),
         ("INT128", cannot_write(27)),
         ("INT256", cannot_write(28)),
@@ -130,7 +135,7 @@ fn a_graph_type_declares_the_types_the_frontier_says_it_can() {
             declared += 1;
         }
     }
-    assert_eq!(declared, 23, "the declarable set changed");
+    assert_eq!(declared, 25, "the declarable set changed");
 }
 
 /// The frontier has a far side, and one type is on it.

@@ -242,6 +242,10 @@ const EXT_ZONED_TIME: u8 = 0;
 const EXT_ZONED_DATETIME: u8 = 1;
 const EXT_STR: u8 = 2;
 const EXT_BYTES: u8 = 3;
+/// A list as it was declared rather than as a column holds one: the
+/// element's own nullability, the maximum length, and the element type
+/// written out in full so that a list of lists has somewhere to go.
+const EXT_LIST: u8 = 4;
 
 /// The count that stands for a bound nobody wrote, since a length is a
 /// `u32` and every one of them is a length somebody could write.
@@ -251,6 +255,15 @@ const NO_BOUND: u32 = u32::MAX;
 /// a type without storing values of it. `None` is a type nothing can be
 /// declared with, which the caller refuses before writing anything.
 pub(crate) fn declared_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
+    // A list takes the extended form even where a column code would
+    // have held it. The column form drops the element's nullability on
+    // purpose, because a stored list holds a value in every position,
+    // and dropping it here would mean the catalog handing back
+    // `LIST<FLOAT32 NOT NULL>` to somebody who wrote `LIST<FLOAT32>`.
+    // Those are two types, and the catalog holds what was declared.
+    if matches!(ty, LogicalType::List { .. }) {
+        return extended_bytes(ty);
+    }
     if let Some(bytes) = type_bytes(ty) {
         return Some(bytes);
     }
@@ -270,6 +283,19 @@ fn extended_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
         LogicalType::ZonedDatetime => vec![EXTENDED_CODE, EXT_ZONED_DATETIME],
         LogicalType::Str { min, max, fixed } => bounded(EXT_STR, min, max, *fixed),
         LogicalType::Bytes { min, max, fixed } => bounded(EXT_BYTES, min, max, *fixed),
+        // The element is written by the same function, so a list of
+        // lists is a list whose element happens to be one. That is the
+        // whole of what nesting costs here, and it is why the maximum
+        // and the flag come first: they are this list's, and everything
+        // behind them belongs to the element.
+        LogicalType::List { elem, max } => {
+            let not_null = !matches!(**elem, LogicalType::Nullable(_));
+            let inner = list_elem(elem)?;
+            let mut out = vec![EXTENDED_CODE, EXT_LIST, u8::from(not_null)];
+            out.extend(max.unwrap_or(NO_BOUND).to_le_bytes());
+            out.extend(declared_type_bytes(inner)?);
+            out
+        }
         _ => return None,
     })
 }
@@ -324,11 +350,28 @@ fn decode_extended_type(bytes: &[u8], pos: &mut usize) -> Result<LogicalType> {
             bound => Some(bound),
         })
     }
-    let fixed = match bytes.get(*pos) {
-        Some(&flag) => flag != 0,
-        None => return Err(corrupt("truncated extended type".into())),
+    let flag = |bytes: &[u8], pos: &mut usize| -> Result<bool> {
+        let set = match bytes.get(*pos) {
+            Some(&byte) => byte != 0,
+            None => return Err(corrupt("truncated extended type".into())),
+        };
+        *pos += 1;
+        Ok(set)
     };
-    *pos += 1;
+    if kind == EXT_LIST {
+        let not_null = flag(bytes, pos)?;
+        let max = count(bytes, pos)?;
+        let elem = decode_declared_type(bytes, pos)?;
+        let elem = match not_null {
+            true => elem,
+            false => LogicalType::Nullable(Box::new(elem)),
+        };
+        return Ok(LogicalType::List {
+            elem: Box::new(elem),
+            max,
+        });
+    }
+    let fixed = flag(bytes, pos)?;
     let (min, max) = (count(bytes, pos)?, count(bytes, pos)?);
     match kind {
         EXT_STR => Ok(LogicalType::Str { min, max, fixed }),
@@ -4047,10 +4090,28 @@ mod tests {
             (octets(Some(16), Some(16), true), true),
             (list_of(LogicalType::int(IntBits::B64)), true),
             (list_of(LogicalType::float(FloatBits::B32)), true),
+            // The four list types of schema/02 section 2 D3, which are
+            // two words about two different things: the one in front of
+            // the list name is about the elements and the one behind
+            // the length is about the list. All four are declarable and
+            // the embedding column is the last of them.
+            (
+                list_of(LogicalType::Nullable(Box::new(LogicalType::float(
+                    FloatBits::B32,
+                )))),
+                true,
+            ),
+            (
+                bounded_list(
+                    LogicalType::Nullable(Box::new(LogicalType::float(FloatBits::B32))),
+                    768,
+                ),
+                true,
+            ),
+            (bounded_list(LogicalType::float(FloatBits::B32), 768), true),
+            (list_of(list_of(LogicalType::string())), true),
             // Declarable and not storable. Each of these is an entry in
             // schema/06 section 6, and S2 turns them true one at a time.
-            (bounded_list(LogicalType::float(FloatBits::B32), 768), false),
-            (list_of(list_of(LogicalType::string())), false),
             (
                 LogicalType::Decimal {
                     precision: 12,
@@ -4122,7 +4183,7 @@ mod tests {
         // encoding S2 owes, and taking one off is a deliberate diff.
         assert_eq!(
             unstorable.len(),
-            21,
+            19,
             "the unstorable set changed: {unstorable:?}"
         );
     }
@@ -4166,25 +4227,73 @@ mod tests {
         assert_eq!(covered.len(), every.len(), "a variant has no family name");
     }
 
-    /// A stored list holds a value in every position, so the encoder
-    /// drops the element's nullability and the read hands back the
-    /// stronger of the two types.
+    /// A declared list keeps the element's nullability, which a column
+    /// of one does not.
     ///
-    /// This is the one place a declared type does not come back word for
-    /// word, and it matters beyond a round trip: a graph type that says
-    /// `LIST<FLOAT32 NOT NULL>` is asking for a column with no child
-    /// validity mask, and today the catalog cannot remember it was
-    /// asked. S2 owes the distinction along with the bounded list.
+    /// These are two different questions and they used to have one
+    /// answer. A stored list holds a value in every position, so the
+    /// column form drops the wrapper and is right to. The catalog is
+    /// not storing values, it is remembering a promise, and
+    /// `LIST<FLOAT32 NOT NULL>` promises something `LIST<FLOAT32>` does
+    /// not: a column with no child validity mask, which is the whole
+    /// difference between an embedding a SIMD kernel can be handed flat
+    /// and one it cannot. S2 needs the distinction to survive the round
+    /// trip before it can spend it.
     #[test]
-    fn a_list_element_loses_its_nullability_on_the_way_to_a_column() {
-        let asked = list_of(LogicalType::Nullable(Box::new(LogicalType::float(
+    fn a_declared_list_remembers_whether_its_elements_admit_null() {
+        let nulls = list_of(LogicalType::Nullable(Box::new(LogicalType::float(
             FloatBits::B32,
         ))));
-        let bytes = declared_type_bytes(&asked).expect("a list of floats is storable");
+        let none = list_of(LogicalType::float(FloatBits::B32));
+        assert_ne!(nulls, none, "the two are two types");
+        for asked in [&nulls, &none] {
+            let bytes = declared_type_bytes(asked).expect("a list of floats is declarable");
+            let mut pos = 0;
+            let back = decode_declared_type(&bytes, &mut pos).unwrap();
+            assert_eq!(pos, bytes.len());
+            assert_eq!(&back, asked);
+        }
+        // The column form still drops it, because a column really does
+        // hold a value in every position.
+        let bytes = type_bytes(&nulls).expect("a column takes a list of floats");
         let mut pos = 0;
-        let back = decode_declared_type(&bytes, &mut pos).unwrap();
-        assert_eq!(back, list_of(LogicalType::float(FloatBits::B32)));
-        assert_ne!(back, asked);
+        assert_eq!(decode_declared_type(&bytes, &mut pos).unwrap(), none);
+    }
+
+    /// A bounded list is declarable, and the bound comes back.
+    ///
+    /// `LIST<FLOAT32 NOT NULL>[768]` is the embedding column of
+    /// schema/06 section 6 item 1, and until this it was a legal GQL
+    /// declaration that zu refused with `a type this file cannot
+    /// write`. It has no column encoding yet, so what this pins is the
+    /// catalog remembering the number: 768 is the dimension every later
+    /// check is against, and a catalog that forgot it could not make
+    /// one of them.
+    #[test]
+    fn a_bounded_list_is_declarable_and_keeps_its_bound() {
+        let asked = LogicalType::List {
+            elem: Box::new(LogicalType::float(FloatBits::B32)),
+            max: Some(768),
+        };
+        let bytes = declared_type_bytes(&asked).expect("a bounded list is declarable");
+        let mut pos = 0;
+        assert_eq!(decode_declared_type(&bytes, &mut pos).unwrap(), asked);
+        assert_eq!(pos, bytes.len());
+        // And a column still will not take one, which is the next item
+        // rather than this one.
+        assert!(type_bytes(&asked).is_none(), "a column has no lane for it");
+    }
+
+    /// A list of lists is declarable, because the element is written by
+    /// the same function that wrote the list.
+    #[test]
+    fn a_list_of_lists_is_declarable() {
+        let asked = list_of(list_of(LogicalType::string()));
+        let bytes = declared_type_bytes(&asked).expect("nesting costs nothing here");
+        let mut pos = 0;
+        assert_eq!(decode_declared_type(&bytes, &mut pos).unwrap(), asked);
+        assert_eq!(pos, bytes.len());
+        assert!(type_bytes(&asked).is_none(), "a column has no lane for it");
     }
 
     #[test]

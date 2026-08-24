@@ -4171,13 +4171,13 @@ mod tests {
         let mut session = Session::open(&path).expect("open");
         let epoch = session.epoch;
         let labels = session.graph.catalog().labels().len();
-        // The catalog writes a property type with the codes a column
-        // stores, and a list of lists is not one of them. The statement
-        // interned `Ghost` on the way to finding that out, and the file
-        // still has to come out unchanged.
+        // The catalog writes a property type in a declared form, and a
+        // decimal has no shape in it. The statement interned `Ghost` on
+        // the way to finding that out, and the file still has to come
+        // out unchanged.
         let err = session
             .run(
-                "CREATE GRAPH TYPE strict { (:Ghost {seen :: LIST<LIST<STRING>>}) }",
+                "CREATE GRAPH TYPE strict { (:Ghost {seen :: DECIMAL(12,2)}) }",
                 &[],
             )
             .expect_err("a property type no column can hold")

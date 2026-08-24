@@ -201,6 +201,30 @@ cases:
     query: "CREATE GRAPH TYPE t { (:P {v :: DECIMAL(12,2)}) }"
     raises: "42000"
 
+  - name: an-embedding-column-is-a-declaration-a-graph-type-takes
+    doc: A property declared LIST<FLOAT32 NOT NULL>[768] is the embedding column, and a graph type takes it. The declaration is the setup here because a catalog statement returns no rows, so what the case asserts is that it did not raise. What the catalog keeps is the bound and the element's nullability, which are what every later check about the column is made against, and a catalog that took the declaration and forgot either of them would be worse than one that refused it.
+    setup:
+      - "CREATE GRAPH TYPE embeddings { (:Doc {v :: LIST<FLOAT32 NOT NULL>[768]}) }"
+    query: RETURN 768 AS dim
+    columns:
+      - dim
+    rows:
+      - values:
+          - type: INT64
+            value: "768"
+
+  - name: a-list-of-lists-is-a-declaration-a-graph-type-takes
+    doc: A nested list is declarable for the same reason a bounded one is, since the declared form writes the element with the function that wrote the list and a list is a type like any other. No column holds one, which is a different promise from naming one.
+    setup:
+      - "CREATE GRAPH TYPE nested { (:Tree {v :: LIST<LIST<STRING>>}) }"
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
   - name: a-property-declared-as-a-union-of-two-types
     doc: The grammar lets a value type be a union and no column holds either an integer or a string, so the union is read and refused. This is the same refusal as the case above reached by a different spelling, and it is here because a union parses where most unstorable types do not.
     query: "CREATE GRAPH TYPE t { (:P {v :: INT64 | STRING}) }"

@@ -197,9 +197,21 @@ pub fn render(t: &Tally) -> String {
 
     out.push_str("## Conditions\n\n");
     out.push_str(&format!(
-        "The standard defines {} GQLSTATUS conditions and zu answers a case with the right one for {} of them. The rest are conditions no statement can reach here, and each one is named with its reason in `conformance.toml` at the root of this repository, because a condition that never fires because the engine cannot fail that way and a condition that never fires because the engine gets it wrong read identically from outside.\n\n",
+        "The standard defines {} GQLSTATUS conditions and zu answers a case with the right one for {} of them. Each of the rest is named with its reason in `conformance.toml` at the root of this repository, because a condition that never fires because the engine cannot fail that way and a condition that never fires because the engine gets it wrong read identically from outside.\n\n",
         t.conditions_total, t.conditions_passing
     ));
+    // The two kinds of unpassed condition are separated here rather than
+    // left as one remainder, because the remainder is the number a reader
+    // is entitled to be suspicious of and the two halves answer that
+    // suspicion in different ways.
+    if t.conditions_unreachable > 0 || t.conditions_measured > 0 {
+        out.push_str(&format!(
+            "Of the {} that have no passing case, {} cannot be raised by anything zu is sent: the standard defines them for an engine that lacks a feature zu has, so the only way to make one fire would be to take the feature out, which would be a worse engine with a better number. The other {} are limits the standard leaves to the implementation. A case asked for a size and zu simply took it, so nothing was refused and there is no verdict, but the answer is still a measurement: zu's limit on that item is at least what was asked.\n\n",
+            t.conditions_total - t.conditions_passing,
+            t.conditions_unreachable,
+            t.conditions_measured
+        ));
+    }
     out.push_str(&format!(
         "Across the whole run zu produced {} distinct GQLSTATUS codes, counted off the replies rather than off a summary, since a code the engine emitted once is the evidence that the machinery behind it works at all.\n\n",
         t.conditions_seen
@@ -223,6 +235,33 @@ pub fn render(t: &Tally) -> String {
         "The corpus behind this claim cites the standard mechanically, and the two numbers that say how much of the standard it has reached at all are these: {} of the {} normative subclauses have a passing case, and {} of the {} productions of the published grammar do. Those are properties of the corpus and not of zu. A subclause with no case is one nobody has written a case for; it is not one zu failed, and it is not one zu passed either.\n\n",
         t.subclauses_passing, t.subclauses_total, t.productions_passing, t.productions_total
     ));
+    // Neither difference above need be a gap, and saying which part of it
+    // is takes the rest of the arithmetic. Without it a reader has to
+    // assume the whole remainder is untested ground, which is the
+    // opposite of what the harness checked.
+    out.push_str(&format!(
+        "Not all of either difference is untested ground. {} of the productions are rules the harness registers as uncitable, each because the rule spells the name of a catalog object no GQL statement creates or hangs off a feature the standard leaves unspelled. On the subclause side {} are registered the same way and {} are clause headings that no case names directly and a passing case reaches through what they hold, since a heading specifies nothing on its own. The reasons are checked against the standard's own text by the harness rather than asserted here.\n\n",
+        t.productions_registered, t.subclauses_registered, t.subclauses_beneath
+    ));
+    let open_productions = t
+        .productions_total
+        .saturating_sub(t.productions_passing)
+        .saturating_sub(t.productions_registered);
+    let open_subclauses = t
+        .subclauses_total
+        .saturating_sub(t.subclauses_passing)
+        .saturating_sub(t.subclauses_registered)
+        .saturating_sub(t.subclauses_beneath);
+    if open_productions == 0 && open_subclauses == 0 {
+        out.push_str(
+            "Those account for both remainders exactly, so on this run there is no production and no subclause of the standard that the corpus has neither reached nor given a reason for. That is a statement about the corpus rather than about zu, and it is the one the corpus was built to be able to make.\n\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "What is left after those is {} productions and {} subclauses that the corpus has neither reached nor given a reason for. Those are the ones still to write cases for, and they are printed here rather than folded into a remainder because a number nobody has accounted for is the only kind worth chasing.\n\n",
+            open_productions, open_subclauses
+        ));
+    }
 
     out.push_str("## What this statement is not\n\n");
     out.push_str(

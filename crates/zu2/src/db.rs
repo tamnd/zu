@@ -2348,14 +2348,69 @@ impl<'a> Session<'a> {
 
     /// Reads the newest value for `key` into `out`.
     pub fn read(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+        self.read_walk(key, out, false, &mut |_, _| {})
+    }
+
+    /// Reads without dropping the epoch protection at the end, so a
+    /// slice the callback was told was stable stays readable after this
+    /// returns. The read half of [`Session::scan_borrowed`] and it works
+    /// the same way, including that the caller owes exactly one
+    /// [`Session::scan_release`] for every call that handed out a stable
+    /// slice.
+    ///
+    /// `each` is called at most once, with the value and whether it
+    /// points into a log page that the held protection covers. When the
+    /// flag is false the bytes are in `out` and are only good until the
+    /// next use of it, which is the same contract [`Session::read`] has
+    /// always had. A record that is cold or still above the read only
+    /// boundary is the false case: the first has no resident bytes to
+    /// point at and the second may still be rewritten where it lies.
+    ///
+    /// Promotion is not a case this has to handle, which is worth
+    /// stating because it looks like it should be. A read promotes only
+    /// when the record it found is cold, and a cold record is exactly
+    /// the one this cannot borrow, so a call that borrows never promotes
+    /// and a call that promotes has already copied.
+    ///
+    /// # Safety
+    /// The slice handed over with a true flag is only valid until the
+    /// release, and every entry point on this session releases before it
+    /// does anything, so it is valid until the caller's next call.
+    pub unsafe fn read_borrowed(
+        &mut self,
+        key: &[u8],
+        out: &mut Vec<u8>,
+        each: &mut dyn FnMut(&[u8], bool),
+    ) -> Result<bool> {
+        self.read_walk(key, out, true, each)
+    }
+
+    fn read_walk(
+        &mut self,
+        key: &[u8],
+        out: &mut Vec<u8>,
+        hold: bool,
+        each: &mut dyn FnMut(&[u8], bool),
+    ) -> Result<bool> {
         let hash = index::hash(key);
         let tag = Index::tag(hash);
         self.promote = None;
         self.slot.protect();
-        let answer = self
-            .bucket_of(hash)
-            .and_then(|bucket| self.read_protected(bucket, tag, key, out));
-        self.slot.unprotect();
+        let mut borrowed = false;
+        let answer = self.bucket_of(hash).and_then(|bucket| {
+            self.read_protected(bucket, tag, key, out, hold, each, &mut borrowed)
+        });
+        // Held only when the caller asked for it and the value it got is
+        // one of the ones the protection actually covers. A miss, a
+        // tombstone, a cold record or an error all come back with
+        // nothing worth borrowing, and the caller owes no release for
+        // any of them. See [`crate::epoch::Slotted::park`] for why the
+        // park is a second thing rather than just the epoch.
+        if borrowed && answer.is_ok() {
+            self.slot.park();
+        } else {
+            self.slot.unprotect();
+        }
         // Outside the epoch, because the copy takes one of its own and a
         // session holds one at a time. The value it writes is the one
         // just read, so the promotion costs an append and no second read
@@ -2381,12 +2436,16 @@ impl<'a> Session<'a> {
         answer
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_protected(
         &mut self,
         bucket: &Bucket,
         tag: u64,
         key: &[u8],
         out: &mut Vec<u8>,
+        hold: bool,
+        each: &mut dyn FnMut(&[u8], bool),
+        borrowed: &mut bool,
     ) -> Result<bool> {
         let Some((address, base)) = self.newest_record(bucket, tag, key)? else {
             return Ok(false);
@@ -2397,7 +2456,18 @@ impl<'a> Session<'a> {
             if r.tombstone() {
                 false
             } else {
-                r.read_value(out);
+                // The same test `scan_walk` makes, and for the same two
+                // reasons: a cold record has no resident bytes to point
+                // at, and one still above the read only boundary may be
+                // rewritten where it lies.
+                let stable = !cold::is_cold(address) && address < self.core.log.read_only();
+                if hold && stable {
+                    *borrowed = true;
+                    each(r.value_unchecked(), true);
+                } else {
+                    r.read_value(out);
+                    each(out, false);
+                }
                 if self.promoting && cold::is_cold(address) {
                     self.promote = Some((address, r.version(), r.kind()));
                 }

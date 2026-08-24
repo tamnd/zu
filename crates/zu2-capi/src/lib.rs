@@ -865,16 +865,52 @@ pub unsafe extern "C" fn zu2_read(
         return Zu2Status::MisuseConcurrent;
     };
     let state = &mut *call.state;
+    // Borrowed straight out of the log page where it lies, the way
+    // `zu2_scan` does since #738, so a point read costs no copy at all
+    // for a record that is resident and below the read only boundary
+    // (#742). The fallback still fills `state.value`, so the pointer
+    // handed back is one of two things and the caller cannot tell them
+    // apart, which is the point: both are good until its next call.
     let mut buffer = std::mem::take(&mut state.value);
-    let outcome = state.session.read(key, &mut buffer);
+    let mut found_at: Option<(*const u8, usize)> = None;
+    let mut held = false;
+    let outcome = unsafe {
+        state
+            .session
+            .read_borrowed(key, &mut buffer, &mut |bytes, stable| {
+                // Only the stable case is worth recording. In the other
+                // one `bytes` is `buffer`, which moves back into the
+                // state below and is read from there, so taking a
+                // pointer to it here would be a pointer to a Vec that is
+                // about to be moved.
+                if stable {
+                    held = true;
+                    found_at = Some((bytes.as_ptr(), bytes.len()));
+                }
+            })
+    };
     state.value = buffer;
     let hit = match note(&mut state.error, outcome) {
         Ok(hit) => hit,
         Err(status) => return status,
     };
+    // After the error check, because a call that failed parked nothing
+    // and recording a hold it does not have would leak the epoch until
+    // the session closed.
+    if held {
+        state.scan_held = true;
+    }
     if hit {
-        unsafe { value.write(state.value.as_ptr()) };
-        unsafe { value_len.write(state.value.len()) };
+        match found_at {
+            Some((at, len)) => {
+                unsafe { value.write(at) };
+                unsafe { value_len.write(len) };
+            }
+            None => {
+                unsafe { value.write(state.value.as_ptr()) };
+                unsafe { value_len.write(state.value.len()) };
+            }
+        }
     }
     if !found.is_null() {
         unsafe { found.write(c_int::from(hit)) };

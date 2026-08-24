@@ -1526,3 +1526,158 @@ fn a_borrowed_scan_holds_while_a_compaction_runs_beside_it() {
     unsafe { zu2::zu2_session_close(s) };
     unsafe { zu2::zu2_close(db) };
 }
+
+/// A point read borrows too, and the borrow holds under compaction.
+///
+/// #742, and the same test as the scan one above because it is the same
+/// mechanism and the same thing can go wrong with it. `zu2_read` used to
+/// hand back a pointer into a buffer the session owned, which was safe
+/// for a dull reason: the bytes had already been copied there. Now it
+/// points into the log page when it can, so the epoch the read left
+/// parked is the only thing keeping the page alive, and a compaction
+/// pass beside it is what would find out if it were not.
+///
+/// Reading several keys rather than one, because only the last read is
+/// held: every entry point releases the previous borrow on the way in,
+/// so the earlier pointers are stale by design and the test would be
+/// wrong to keep them.
+#[test]
+fn a_borrowed_read_holds_while_a_compaction_runs_beside_it() {
+    const ROWS: u32 = 25_000;
+    const ROUNDS: u32 = 4;
+    const VALUE: usize = 1000;
+    let (_dir, db) = open_ordered_compacting("borrow-read-compact.zu2");
+    let s = session_on(db);
+    let mut value = vec![b'v'; VALUE];
+    for _ in 0..ROUNDS {
+        for i in 0..ROWS {
+            let key = format!("user{i:019}");
+            value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(
+                unsafe { zu2::zu2_upsert(s, key.as_ptr(), key.len(), value.as_ptr(), value.len()) },
+                Zu2Status::Ok
+            );
+        }
+    }
+    // As in the scan test: compaction has nothing it is allowed to touch
+    // until the log is on the device.
+    assert_eq!(unsafe { zu2::zu2_sync(db) }, Zu2Status::Ok);
+
+    let want = 4242u64;
+    let key = format!("user{want:019}");
+    let mut got: *const u8 = ptr::null();
+    let mut got_len = 0usize;
+    let mut found = 0;
+    assert_eq!(
+        unsafe {
+            zu2::zu2_read(
+                s,
+                key.as_ptr(),
+                key.len(),
+                &mut got,
+                &mut got_len,
+                &mut found,
+            )
+        },
+        Zu2Status::Ok
+    );
+    assert_eq!(found, 1);
+    assert_eq!(got_len, VALUE);
+
+    let address = db as usize;
+    let compactor = std::thread::spawn(move || {
+        let db = address as *mut Zu2Db;
+        let mut total = 0u64;
+        for _ in 0..8 {
+            let mut reclaimed = 0u64;
+            if unsafe { zu2::zu2_compact(db, &mut reclaimed) } == Zu2Status::Ok {
+                total += reclaimed;
+            }
+        }
+        total
+    });
+
+    let mut checked = 0u64;
+    while !compactor.is_finished() {
+        let seen = unsafe { std::slice::from_raw_parts(got, got_len) };
+        assert_eq!(
+            u64::from_le_bytes(seen[..8].try_into().expect("eight bytes")),
+            want,
+            "the value changed under a read that had borrowed it"
+        );
+        assert!(
+            seen[8..].iter().all(|&b| b == b'v'),
+            "the value is not intact"
+        );
+        checked += 1;
+    }
+    let reclaimed = compactor.join().expect("compactor");
+
+    assert!(
+        reclaimed > 0,
+        "compaction reclaimed nothing, so nothing was ever at risk"
+    );
+    assert!(checked > 0, "the compactor finished before a single read");
+
+    unsafe { zu2::zu2_session_close(s) };
+    unsafe { zu2::zu2_close(db) };
+}
+
+/// The next call ends the borrow, and the read after it is its own.
+///
+/// The contract #742 hands the host is that a pointer is good until its
+/// next call on that session, and this is the sharp edge of it: two
+/// reads in a row, and the first pointer must not be assumed to still
+/// name the first key. What is asserted here is the half that matters
+/// for correctness, that the second read answers correctly, since the
+/// first pointer is stale by contract and reading it would be the test
+/// doing the thing the contract forbids.
+#[test]
+fn a_second_read_ends_the_first_borrow_and_answers_for_itself() {
+    const ROWS: u32 = 25_000;
+    const VALUE: usize = 1000;
+    let (_dir, db) = open_ordered_compacting("borrow-read-twice.zu2");
+    let s = session_on(db);
+    let mut value = vec![b'v'; VALUE];
+    for i in 0..ROWS {
+        let key = format!("user{i:019}");
+        value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        assert_eq!(
+            unsafe { zu2::zu2_upsert(s, key.as_ptr(), key.len(), value.as_ptr(), value.len()) },
+            Zu2Status::Ok
+        );
+    }
+    assert_eq!(unsafe { zu2::zu2_sync(db) }, Zu2Status::Ok);
+
+    for want in [7u64, 19_998, 3, 24_999, 12_345] {
+        let key = format!("user{want:019}");
+        let mut got: *const u8 = ptr::null();
+        let mut got_len = 0usize;
+        let mut found = 0;
+        assert_eq!(
+            unsafe {
+                zu2::zu2_read(
+                    s,
+                    key.as_ptr(),
+                    key.len(),
+                    &mut got,
+                    &mut got_len,
+                    &mut found,
+                )
+            },
+            Zu2Status::Ok
+        );
+        assert_eq!(found, 1, "key {want} is gone");
+        assert_eq!(got_len, VALUE);
+        let seen = unsafe { std::slice::from_raw_parts(got, got_len) };
+        assert_eq!(
+            u64::from_le_bytes(seen[..8].try_into().expect("eight bytes")),
+            want,
+            "read of {want} answered with another key's value"
+        );
+        assert!(seen[8..].iter().all(|&b| b == b'v'));
+    }
+
+    unsafe { zu2::zu2_session_close(s) };
+    unsafe { zu2::zu2_close(db) };
+}

@@ -1,5 +1,5 @@
-//! Meta-block chains: linked lists of 256 KiB blocks carrying a byte
-//! payload, used for the catalog, group directories, free list, and stats.
+//! Meta-block chains: linked lists of blocks carrying a byte payload,
+//! used for the catalog, group directories, free list, and stats.
 //!
 //! Per-block layout: `next: u64 LE` (NULL_BLOCK terminates), `len: u32 LE`
 //! bytes of payload in this block, `crc32c: u32 LE` of that payload, then
@@ -117,11 +117,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta.zu1");
         let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 253) as u8).collect();
+        let want = payload.len().div_ceil(CHAIN_CAPACITY) as u64;
         let head;
         {
             let mut db = Zu1File::create(&path).unwrap();
             head = write_chain(&mut db, &payload).unwrap();
-            assert_eq!(db.db_header().block_count, 3, "600 KB needs three blocks");
+            assert!(want > 1, "the point of this test is more than one block");
+            assert_eq!(db.db_header().block_count, want);
             db.db_header_mut().catalog_root = head;
             db.checkpoint().unwrap();
         }

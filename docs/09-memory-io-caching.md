@@ -17,7 +17,7 @@ Key lever (research §2): **cache compressed, decode on touch**. Decode at ≥ 1
 
 mmap rejected per Crotty/Pavlo CIDR 2022 (no write control, TLB storms). vmcache (Leis SIGMOD 2023) adapted:
 
-- Reserve a virtual region = file size (grows by remap); page state machine per 256 KiB block in a packed atomic u64 array: `Evicted → Loading → Resident → Dirty`, epoch-stamped for optimistic readers.
+- Reserve a virtual region = file size (grows by remap); page state machine per block in a packed atomic u64 array: `Evicted → Loading → Resident → Dirty`, epoch-stamped for optimistic readers.
 - Read path: optimistic, load state word, if Resident, read bytes, re-check state+epoch (seqlock pattern); miss ⇒ CAS to Loading, `pread` into the region, publish Resident.
 - Eviction: SIEVE (NSDI 2024, beats LRU-family with one visited bit and a hand; no promotion writes on hit path) over Resident blocks; Dirty blocks are only written by checkpoint (shadow publishing, eviction of Dirty is impossible by construction; dirty set is bounded by checkpoint threshold).
 - No exmap dependency; syscall-per-miss is acceptable at our I/O rates (research §2.3), keeps it portable (macOS/Linux/Windows: plain `pread`/`ReadFile` fallback without the reservation trick).

@@ -51,7 +51,7 @@ Findings from a four-track survey (systems, storage formats, S3-native design, q
 - **CoW B-tree school** (LMDB/libmdbx/redb): elegant, but write-amplifies whole root-to-leaf paths per commit and falls apart under write load (vmcache paper TPC-C); redb is the healthy pure-Rust member.
 - **mmap considered harmful** (Crotty/Pavlo CIDR 2022): TLB shootdowns, no write control. **vmcache** (Leis SIGMOD 2023): reserve virtual range, DBMS controls fault/evict explicitly; supports variable pages and arbitrary page graphs; ≈ LeanStore performance without swizzling's constraints; exmap kernel module only needed at extreme I/O rates. LeanStore-NVMe (VLDB 2024) + ZLeanStore (PVLDB 2026): out-of-place writes cut SSD write-amp 6–10×.
 - **io_uring in Rust 2026**: `io-uring` crate healthy; tokio-uring stalled; glommio/monoio/compio active. Conclusion: don't marry a runtime; trait-based I/O backend, psync+O_DIRECT default, io_uring feature-gated.
-- **zu conclusion**: DuckDB-style dual headers + fixed 256 KiB blocks + sidecar WAL + checkpoint-into-columns; vmcache-style explicit buffer manager; cache *compressed* segments (decode is cheap; RAM stretches by the compression ratio).
+- **zu conclusion**: DuckDB-style dual headers + fixed 32 KiB blocks + sidecar WAL + checkpoint-into-columns; vmcache-style explicit buffer manager; cache *compressed* segments (decode is cheap; RAM stretches by the compression ratio).
 
 ## 3. S3-native design
 

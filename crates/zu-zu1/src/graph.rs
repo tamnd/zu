@@ -1624,20 +1624,52 @@ pub(crate) fn copy_blocks(
 /// the two spaces do not overlap and an unfolded edge names its own
 /// values. Both directions carry the ordinal, which is what makes the
 /// same edge read forward and read backward carry the same row.
+///
+/// It is held as a sealed run with the recent edges beside it, the way
+/// [`CellPatch`](crate::props::CellPatch) holds the cells and for the
+/// same reason. A commit that added to the lists used to copy the whole
+/// of them, because a reader was holding the patch as it stood before,
+/// and a run of a few thousand commits of that is quadratic in how long
+/// the run gets. So the run sits behind an `Arc` a copy shares, the
+/// edges since the last seal sit in a side of their own, and what a
+/// commit copies is bounded by [`EDGE_SEAL`] however many edges the run
+/// has reached.
 #[derive(Debug, Default, Clone)]
 pub struct EdgePatch {
     /// Ordinals the base file already holds, which is the first
     /// ordinal an edge in here can take.
     base: u64,
+    /// The edges a seal has already put in the shape a reader wants.
+    /// Behind an `Arc` so that a copy of this patch shares them rather
+    /// than copying them, which is the whole point of the split.
+    run: Arc<EdgeSide>,
+    /// The edges since that seal, which is what a copy does copy.
+    /// Bounded by [`EDGE_SEAL`].
+    recent: EdgeSide,
+    /// How many entries the recent side holds between its lists and its
+    /// dead set, carried rather than counted because the seal bound is
+    /// asked on every write.
+    fresh: usize,
+    /// How many edges are in here, which is what the next one's
+    /// ordinal counts from.
+    added: u64,
+    /// How many pairs have been taken away, for the same reason: a
+    /// writer bounds it and the two sides would have to be walked.
+    dropped: u64,
+}
+
+/// One side of an [`EdgePatch`]: edges by the node they leave and by
+/// the node they arrive at, and the pairs taken away keyed both ways.
+/// The run and the recent edges are the same shape, and every read
+/// below asks both and puts the answers together.
+#[derive(Debug, Default, Clone)]
+struct EdgeSide {
     /// Destinations and their ordinals per source, ascending, which is
     /// the order the forward lists are in.
     fwd: BTreeMap<u64, Vec<(u64, u64)>>,
     /// Sources and their ordinals per destination, the same the other
     /// way round.
     bwd: BTreeMap<u64, Vec<(u64, u64)>>,
-    /// How many edges are in here, which is what the next one's
-    /// ordinal counts from.
-    added: u64,
     /// Pairs taken away, source first. A pair is the whole name of an
     /// edge, so what goes in here takes every copy of it with it, which
     /// is what the fold does with the same pair and what a
@@ -1647,6 +1679,129 @@ pub struct EdgePatch {
     /// one node's list and a set keyed the way that list runs answers
     /// it as a range.
     dead_bwd: BTreeSet<(u64, u64)>,
+}
+
+/// How many edges a patch takes before its recent side is sealed into
+/// the run beside it.
+///
+/// The same trade as `PATCH_SEAL` on the cells, and the same
+/// arithmetic. A commit copies the recent side, so a short one is a
+/// cheap commit; a seal walks the run, so a long one is fewer seals.
+/// Sealing every `k` over a run that reaches `n` copies about `n`
+/// squared over `k` entries in the seals and `k` a commit, which is
+/// smallest where `k` is the square root of `n`. The deferral bounds
+/// hold a run to about four thousand edges, so sixty four is that.
+const EDGE_SEAL: usize = 64;
+
+impl EdgeSide {
+    fn side(&self, dir: Direction) -> &BTreeMap<u64, Vec<(u64, u64)>> {
+        match dir {
+            Direction::Fwd => &self.fwd,
+            Direction::Bwd => &self.bwd,
+        }
+    }
+
+    fn dead_side(&self, dir: Direction) -> &BTreeSet<(u64, u64)> {
+        match dir {
+            Direction::Fwd => &self.dead,
+            Direction::Bwd => &self.dead_bwd,
+        }
+    }
+
+    /// `node`'s edges in `dir`, as neighbor and ordinal pairs in list
+    /// order.
+    fn of(&self, node: u64, dir: Direction) -> &[(u64, u64)] {
+        self.side(dir).get(&node).map_or(&[][..], Vec::as_slice)
+    }
+
+    fn drops_any(&self, node: u64, dir: Direction) -> bool {
+        self.dead_side(dir)
+            .range((node, 0)..=(node, u64::MAX))
+            .next()
+            .is_some()
+    }
+
+    /// Whether this side says anything about the nodes `base..end`,
+    /// added or taken away.
+    fn touches(&self, base: u64, end: u64, dir: Direction) -> bool {
+        self.side(dir).range(base..end).next().is_some()
+            || self
+                .dead_side(dir)
+                .range((base, 0)..(end, 0))
+                .next()
+                .is_some()
+    }
+}
+
+/// One node's unfolded edges in one direction: the sealed run's and
+/// the recent ones. Both halves are in list order, so the reads below
+/// walk them as the one list they stand for.
+#[derive(Clone, Copy, Debug)]
+struct EdgeList<'a> {
+    run: &'a [(u64, u64)],
+    recent: &'a [(u64, u64)],
+}
+
+impl<'a> EdgeList<'a> {
+    fn len(self) -> usize {
+        self.run.len() + self.recent.len()
+    }
+
+    fn is_empty(self) -> bool {
+        self.run.is_empty() && self.recent.is_empty()
+    }
+
+    /// The two halves as one list, in the order a CSR list is in.
+    fn iter(self) -> EdgeMerge<'a> {
+        EdgeMerge {
+            run: self.run,
+            recent: self.recent,
+        }
+    }
+
+    /// The ordinal of the first edge to `other`, which is the earliest
+    /// of the run and the recent edges where both hold the pair.
+    fn first(self, other: u64) -> Option<u64> {
+        let pick = |list: &[(u64, u64)]| {
+            let at = list.partition_point(|&(n, _)| n < other);
+            list.get(at).filter(|&&(n, _)| n == other).map(|&(_, o)| o)
+        };
+        match (pick(self.run), pick(self.recent)) {
+            (Some(run), Some(recent)) => Some(run.min(recent)),
+            (run, recent) => run.or(recent),
+        }
+    }
+
+    fn holds(self, other: u64) -> bool {
+        self.first(other).is_some()
+    }
+}
+
+/// The two halves of an [`EdgeList`] walked as one, which is a merge
+/// because each is in list order and neither is in the other's.
+struct EdgeMerge<'a> {
+    run: &'a [(u64, u64)],
+    recent: &'a [(u64, u64)],
+}
+
+impl Iterator for EdgeMerge<'_> {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<(u64, u64)> {
+        let from_run = match (self.run.first(), self.recent.first()) {
+            (Some(run), Some(recent)) => run <= recent,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        let list = match from_run {
+            true => &mut self.run,
+            false => &mut self.recent,
+        };
+        let (head, rest) = list.split_first().expect("peeked");
+        *list = rest;
+        Some(*head)
+    }
 }
 
 impl EdgePatch {
@@ -1667,12 +1822,35 @@ impl EdgePatch {
     /// to want.
     pub fn add(&mut self, src: u64, dst: u64) -> u64 {
         let ord = self.base + self.added;
-        put(&mut self.fwd, src, dst, ord);
-        put(&mut self.bwd, dst, src, ord);
-        self.dead.remove(&(src, dst));
-        self.dead_bwd.remove(&(dst, src));
+        put(&mut self.recent.fwd, src, dst, ord);
+        put(&mut self.recent.bwd, dst, src, ord);
+        self.fresh += 1;
+        self.revive(src, dst);
         self.added += 1;
+        self.seal();
         ord
+    }
+
+    /// Takes a pair back out of whichever dead set holds it.
+    ///
+    /// The recent one nearly always, because a pair is taken away and
+    /// put back by statements that run near each other or not at all,
+    /// and only that one is free: reaching into the run copies it, and
+    /// this is the one write that has to.
+    fn revive(&mut self, src: u64, dst: u64) {
+        if self.recent.dead.remove(&(src, dst)) {
+            self.recent.dead_bwd.remove(&(dst, src));
+            self.dropped -= 1;
+            self.fresh -= 1;
+            return;
+        }
+        if !self.run.dead.contains(&(src, dst)) {
+            return;
+        }
+        let run = Arc::make_mut(&mut self.run);
+        run.dead.remove(&(src, dst));
+        run.dead_bwd.remove(&(dst, src));
+        self.dropped -= 1;
     }
 
     /// The first ordinal this patch handed out, so a caller holding one
@@ -1693,13 +1871,62 @@ impl EdgePatch {
     /// the next edge takes the next ordinal either way, so what is left
     /// behind is a row nothing reads rather than a hole in a run
     /// something counts on.
+    ///
+    /// A pair added before the last seal is in the run, and taking it
+    /// out of there copies the run. That is the same write the recent
+    /// side answers for free, and it is rare for the same reason
+    /// [`Self::revive`] is: an edge and the delete that takes it back
+    /// arrive together or not at all.
     pub fn remove(&mut self, src: u64, dst: u64) {
-        if take(&mut self.fwd, src, dst) {
-            take(&mut self.bwd, dst, src);
+        let took = take(&mut self.recent.fwd, src, dst);
+        if took > 0 {
+            take(&mut self.recent.bwd, dst, src);
+            self.fresh -= took;
             return;
         }
-        self.dead.insert((src, dst));
-        self.dead_bwd.insert((dst, src));
+        if self
+            .run
+            .of(src, Direction::Fwd)
+            .iter()
+            .any(|&(n, _)| n == dst)
+        {
+            let run = Arc::make_mut(&mut self.run);
+            take(&mut run.fwd, src, dst);
+            take(&mut run.bwd, dst, src);
+            return;
+        }
+        if self.run.dead.contains(&(src, dst)) || !self.recent.dead.insert((src, dst)) {
+            return;
+        }
+        self.recent.dead_bwd.insert((dst, src));
+        self.dropped += 1;
+        self.fresh += 1;
+        self.seal();
+    }
+
+    /// Folds the recent side into the run beside it.
+    ///
+    /// This is the whole of what the run costs: the copy a commit was
+    /// making of every edge it had accumulated happens here instead,
+    /// once every [`EDGE_SEAL`] edges rather than once a commit. A
+    /// reader holding the patch as it was keeps the run it was given,
+    /// which is why `Arc::make_mut` builds the new one beside it rather
+    /// than into it.
+    fn seal(&mut self) {
+        if self.fresh < EDGE_SEAL {
+            return;
+        }
+        let recent = std::mem::take(&mut self.recent);
+        let run = Arc::make_mut(&mut self.run);
+        for (node, list) in recent.fwd {
+            merge_list(run.fwd.entry(node).or_default(), list);
+        }
+        for (node, list) in recent.bwd {
+            merge_list(run.bwd.entry(node).or_default(), list);
+        }
+        run.dead.extend(recent.dead);
+        run.dead_bwd.extend(recent.dead_bwd);
+        self.fresh = 0;
     }
 
     /// How many edges this holds, which is what a writer bounds when it
@@ -1711,12 +1938,12 @@ impl EdgePatch {
     /// How many pairs it has taken away, the other half of the same
     /// bound.
     pub fn removed(&self) -> u64 {
-        self.dead.len() as u64
+        self.dropped
     }
 
     /// Whether it has neither added nor taken anything away.
     pub fn is_empty(&self) -> bool {
-        self.added == 0 && self.dead.is_empty()
+        self.added == 0 && self.dropped == 0
     }
 
     /// Whether this holds an edge from `src` to `dst`, which is what a
@@ -1724,9 +1951,7 @@ impl EdgePatch {
     /// take ordinals that are not consecutive, and every read of an
     /// edge property counts on a pair's copies being so.
     pub fn holds(&self, src: u64, dst: u64) -> bool {
-        let list = self.of(src, Direction::Fwd);
-        let at = list.partition_point(|&(n, _)| n < dst);
-        list.get(at).is_some_and(|&(n, _)| n == dst)
+        self.of(src, Direction::Fwd).holds(dst)
     }
 
     /// The neighbors `node` has in `dir` that this patch put there,
@@ -1735,22 +1960,20 @@ impl EdgePatch {
     /// own list, because between the two is the whole list a fold would
     /// have found on the row.
     pub fn adds_on(&self, node: u64, dir: Direction) -> impl Iterator<Item = u64> + '_ {
-        self.of(node, dir).iter().map(|&(other, _)| other)
+        self.of(node, dir).iter().map(|(other, _)| other)
     }
 
     /// Whether this has taken away the edges between `node` and `other`,
     /// `node` being the end the list is keyed by.
     pub fn drops(&self, node: u64, other: u64, dir: Direction) -> bool {
-        self.dead_side(dir).contains(&(node, other))
+        self.run.dead_side(dir).contains(&(node, other))
+            || self.recent.dead_side(dir).contains(&(node, other))
     }
 
     /// Whether it has taken anything off `node`'s list in `dir`, which
     /// is what says the list has to be filtered rather than read.
     fn drops_any(&self, node: u64, dir: Direction) -> bool {
-        self.dead_side(dir)
-            .range((node, 0)..=(node, u64::MAX))
-            .next()
-            .is_some()
+        self.run.drops_any(node, dir) || self.recent.drops_any(node, dir)
     }
 
     /// Whether any node of `group` has an unfolded edge in `dir`, added
@@ -1759,33 +1982,35 @@ impl EdgePatch {
     fn touches(&self, group: usize, dir: Direction) -> bool {
         let base = group as u64 * GROUP_ROWS as u64;
         let end = base + GROUP_ROWS as u64;
-        self.side(dir).range(base..end).next().is_some()
-            || self
-                .dead_side(dir)
-                .range((base, 0)..(end, 0))
-                .next()
-                .is_some()
+        self.run.touches(base, end, dir) || self.recent.touches(base, end, dir)
     }
 
-    fn side(&self, dir: Direction) -> &BTreeMap<u64, Vec<(u64, u64)>> {
-        match dir {
-            Direction::Fwd => &self.fwd,
-            Direction::Bwd => &self.bwd,
+    /// `node`'s edges in `dir`, the sealed ones and the recent ones.
+    fn of(&self, node: u64, dir: Direction) -> EdgeList<'_> {
+        EdgeList {
+            run: self.run.of(node, dir),
+            recent: self.recent.of(node, dir),
         }
     }
+}
 
-    fn dead_side(&self, dir: Direction) -> &BTreeSet<(u64, u64)> {
-        match dir {
-            Direction::Fwd => &self.dead,
-            Direction::Bwd => &self.dead_bwd,
+/// Merges one node's recent list into the run it belongs to, both being
+/// in list order and the result with them.
+fn merge_list(run: &mut Vec<(u64, u64)>, add: Vec<(u64, u64)>) {
+    if run.is_empty() {
+        *run = add;
+        return;
+    }
+    let was = std::mem::take(run);
+    run.reserve(was.len() + add.len());
+    let mut older = was.into_iter().peekable();
+    for entry in add {
+        while older.peek().is_some_and(|&older| older < entry) {
+            run.push(older.next().expect("peeked"));
         }
+        run.push(entry);
     }
-
-    /// `node`'s edges in `dir`, as neighbor and ordinal pairs in list
-    /// order.
-    fn of(&self, node: u64, dir: Direction) -> &[(u64, u64)] {
-        self.side(dir).get(&node).map_or(&[][..], Vec::as_slice)
-    }
+    run.extend(older);
 }
 
 /// Puts one end of one edge in its list, keeping the list in the order
@@ -1797,17 +2022,18 @@ fn put(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64, ord: u6
 }
 
 /// Takes every copy of a pair back out of one side's list, and answers
-/// whether there was one, which is what says the pair was this patch's
-/// own rather than the file's. The node's entry goes when its list
-/// empties, because an entry that is there at all is what the reads
-/// take to mean the patch has something to say about that list.
-fn take(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64) -> bool {
+/// with how many there were, which says whether the pair was this
+/// patch's own rather than the file's and how much of the recent side
+/// went with it. The node's entry goes when its list empties, because
+/// an entry that is there at all is what the reads take to mean the
+/// patch has something to say about that list.
+fn take(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64) -> usize {
     let Some(list) = side.get_mut(&node) else {
-        return false;
+        return 0;
     };
     let before = list.len();
     list.retain(|&(n, _)| n != other);
-    let took = list.len() < before;
+    let took = before - list.len();
     if list.is_empty() {
         side.remove(&node);
     }
@@ -2129,7 +2355,7 @@ impl GraphReader {
             if patch.drops_any(node, dir) {
                 out.retain(|&(other, _)| !patch.drops(node, other, dir));
             }
-            for &(other, ord) in patch.of(node, dir) {
+            for (other, ord) in patch.of(node, dir).iter() {
                 let at = out.partition_point(|&(n, o)| (n, o) < (other, ord));
                 out.insert(at, (other, ord));
             }
@@ -2230,7 +2456,7 @@ impl GraphReader {
             let lo = offsets[row] as usize;
             let hi = offsets[row + 1] as usize;
             let mut at = lo;
-            for &(other, _) in patch.of(node, dir) {
+            for (other, _) in patch.of(node, dir).iter() {
                 let take = at + neighbors[at..hi].partition_point(|&n| n <= other);
                 live(&mut merged, &neighbors[at..take], patch, node, dir);
                 merged.push(other);
@@ -2427,7 +2653,7 @@ impl GraphReader {
                 }
                 out.truncate(kept);
             }
-            for &(other, _) in patch.of(node, dir) {
+            for (other, _) in patch.of(node, dir).iter() {
                 let at = from + out[from..].partition_point(|&n| n <= other);
                 out.insert(at, other);
             }
@@ -2453,9 +2679,7 @@ impl GraphReader {
         dir: Direction,
     ) -> Result<bool> {
         if let Some(patch) = &self.edges {
-            let added = patch.of(node, dir);
-            let at = added.partition_point(|&(n, _)| n < other);
-            if added.get(at).is_some_and(|&(n, _)| n == other) {
+            if patch.of(node, dir).holds(other) {
                 return Ok(true);
             }
             // A pair the patch took away is gone however many copies of
@@ -2521,11 +2745,7 @@ impl GraphReader {
     /// scan is over equal values a decoded group already holds.
     pub fn edge_run(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
         if let Some(patch) = self.edges.clone() {
-            let added = patch.of(src, Direction::Fwd);
-            let at = added.partition_point(|&(n, _)| n < dst);
-            if let Some(&(n, ord)) = added.get(at)
-                && n == dst
-            {
+            if let Some(ord) = patch.of(src, Direction::Fwd).first(dst) {
                 // An unfolded edge is only ever deferred over a pair the
                 // graph does not hold, so the run it names is itself
                 // and there is nothing of the file's to count in.
@@ -2972,6 +3192,89 @@ mod tests {
                 .unwrap();
             assert_eq!(out, want, "ordinals of {node} in {dir:?}");
         }
+    }
+
+    /// The patch holds its edges as a sealed run with the recent ones
+    /// beside it, and what that split has to be is invisible: every
+    /// read answers the same whether the edge it names was sealed a
+    /// thousand commits ago or arrived a moment ago. This walks a run
+    /// several seals long, which is what the writer's deferral bound of
+    /// four thousand edges leaves it holding.
+    #[test]
+    fn a_sealed_patch_reads_the_way_an_unsealed_one_does() {
+        let base = 100;
+        let mut patch = EdgePatch::new(base);
+        // Four sources taking their destinations in descending order,
+        // so every add lands before the ones already on the list and a
+        // seal has to place it rather than push it.
+        let n = EDGE_SEAL as u64 * 3 + 5;
+        let mut want: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+        for i in 0..n {
+            let (src, dst) = (i % 4, 1000 - i);
+            let ord = patch.add(src, dst);
+            assert_eq!(ord, base + i, "the ordinals run on across a seal");
+            want.entry(src).or_default().push((dst, ord));
+        }
+        assert_eq!(patch.adds(), n);
+
+        for (src, list) in &mut want {
+            list.sort_unstable();
+            let got: Vec<(u64, u64)> = patch.of(*src, Direction::Fwd).iter().collect();
+            assert_eq!(&got, list, "forward list of {src}");
+            assert_eq!(patch.of(*src, Direction::Fwd).len(), list.len());
+            for &(dst, ord) in list.iter() {
+                assert_eq!(patch.of(*src, Direction::Fwd).first(dst), Some(ord));
+                assert!(patch.holds(*src, dst), "{src} to {dst}");
+            }
+        }
+        // Every destination was written once, so its backward list is
+        // the one edge and the ordinal that edge took.
+        for i in 0..n {
+            let dst = 1000 - i;
+            let got: Vec<(u64, u64)> = patch.of(dst, Direction::Bwd).iter().collect();
+            assert_eq!(got, vec![(i % 4, base + i)], "backward list of {dst}");
+        }
+
+        // A copy is the graph as it stood, which is what a reader holds
+        // while the writer goes on committing into the one it took the
+        // copy from.
+        let held = patch.clone();
+        let before: Vec<(u64, u64)> = held.of(0, Direction::Fwd).iter().collect();
+        for i in 0..EDGE_SEAL as u64 * 2 {
+            patch.add(0, 2000 + i);
+        }
+        assert_eq!(
+            held.of(0, Direction::Fwd).iter().collect::<Vec<_>>(),
+            before,
+            "a writer's seals reached into a copy a reader was holding"
+        );
+
+        // An edge the patch added itself comes back out of it wherever
+        // the seal left it, and leaves no dead pair behind, because the
+        // file holds no copy of it to be told about.
+        assert!(patch.holds(0, 1000));
+        patch.remove(0, 1000);
+        assert!(!patch.holds(0, 1000));
+        assert!(!patch.drops(0, 1000, Direction::Fwd));
+        assert_eq!(patch.removed(), 0);
+
+        // A pair only the file could hold goes into the dead set, and
+        // stays there through however many seals run over it.
+        patch.remove(7, 8);
+        assert_eq!(patch.removed(), 1);
+        for i in 0..EDGE_SEAL as u64 {
+            patch.add(9, 3000 + i);
+        }
+        assert!(patch.drops(7, 8, Direction::Fwd), "a seal lost a dead pair");
+        assert!(patch.drops(8, 7, Direction::Bwd));
+        assert!(patch.drops_any(7, Direction::Fwd));
+        // And putting it back takes it out of the dead set, from the
+        // run as readily as from the recent side.
+        patch.add(7, 8);
+        assert!(!patch.drops(7, 8, Direction::Fwd));
+        assert!(!patch.drops(8, 7, Direction::Bwd));
+        assert!(patch.holds(7, 8));
+        assert_eq!(patch.removed(), 0);
     }
 
     #[test]

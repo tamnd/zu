@@ -152,15 +152,16 @@ const DEFERRED_COMMITS: u32 = 4096;
 /// fold every 256 commits against 35.2 at every 1024. Both of those
 /// were the same patch, so it is the reads paying, not the writes.
 ///
-/// An added edge is on this side of the line too, for the other of the
-/// two reasons. A read of it is cheap, because the patch holds the
-/// added edges by the node they leave, so a traversal asks about one
-/// node's list rather than looking through every edge the run added.
-/// What is not cheap is the commit: those lists are still copied whole
-/// each time one is added to, the way the cells were before they were
-/// split into a run and a tail. Give the edges the same treatment and
-/// they move over to the other bound; until then they fold with the
-/// overwrites.
+/// An added edge is not on this side of the line, though it was until
+/// the patch that holds it was split the way the cells are. A read of
+/// one was always cheap, because the patch holds the added edges by the
+/// node they leave, so a traversal asks about one node's list rather
+/// than looking through every edge the run added. What was not cheap
+/// was the commit: those lists were copied whole each time one was
+/// added to. They sit in a sealed run now with the recent ones beside
+/// it, so a commit copies a few dozen of them however many the run has
+/// reached, and an edge is bounded by [`DEFERRED_ROWS`] with the
+/// appended rows, which is what it is.
 ///
 /// Which leaves the tail. A run of writes over rows that are already
 /// there folds as often as it did before any of this, and a run that
@@ -263,13 +264,25 @@ impl Patches {
     /// does not copy. See [`DEFERRED_CELLS`] and [`DEFERRED_ROWS`].
     fn cells(&self) -> usize {
         self.cells.values().map(|p| p.cells()).sum::<usize>()
-            + self
-                .edges
-                .values()
-                .map(|p| (p.adds() + p.removed()) as usize)
-                .sum::<usize>()
             + self.gone.values().map(|rows| rows.len()).sum::<usize>()
             + self.marks.values().map(|p| p.len()).sum::<usize>()
+    }
+
+    /// How many edges the deferred commits have added or taken away
+    /// between them.
+    ///
+    /// Counted apart from the cells because the cost is not the same
+    /// one. An added edge goes into a sealed run a copy shares, so what
+    /// a commit pays for the ones already there is a pointer, and this
+    /// bounds the memory and what a fold has to seal rather than what
+    /// the commit before it cost. It is bounded with the appended rows
+    /// because that is the shape of it: an added edge is a row of the
+    /// rel table as well as a pair on two lists.
+    fn edges(&self) -> usize {
+        self.edges
+            .values()
+            .map(|p| (p.adds() + p.removed()) as usize)
+            .sum()
     }
 
     /// How many rows the deferred commits have appended between them.
@@ -549,6 +562,7 @@ impl Writer {
             || self.copied >= DEFERRED_COPIED
             || self.patches.cells() + written_cells(&changes) > DEFERRED_CELLS
             || self.patches.appended() + written_rows(&changes) > DEFERRED_ROWS
+            || self.patches.edges() + written_edges(&changes) > DEFERRED_ROWS
             || self.patches.bytes() + written_bytes(&changes) > DEFERRED_BYTES
             || checkpoint_due(db)
         {
@@ -1338,13 +1352,28 @@ fn written_bytes(changes: &[Deferred]) -> usize {
 
 /// How many cells a commit's changes would put in the patch, which is
 /// the other thing the run of them is bounded by. Most shapes are one
-/// cell each; rows added to a node table are as many as there are.
+/// cell each; rows added to a node table are as many as there are, and
+/// an edge either way is none, because both of those go into parts of
+/// the patch a copy shares rather than copies.
 fn written_cells(changes: &[Deferred]) -> usize {
     changes
         .iter()
         .map(|change| match change {
-            Deferred::Rows(..) => 0,
+            Deferred::Rows(..) | Deferred::Edge(..) | Deferred::DeadRel(..) => 0,
             _ => 1,
+        })
+        .sum()
+}
+
+/// How many edges a commit's changes would put in the patch or take
+/// out of it, which is bounded with the appended rows. See
+/// [`Patches::edges`].
+fn written_edges(changes: &[Deferred]) -> usize {
+    changes
+        .iter()
+        .map(|change| match change {
+            Deferred::Edge(..) | Deferred::DeadRel(..) => 1,
+            _ => 0,
         })
         .sum()
 }
@@ -3066,6 +3095,68 @@ mod tests {
             .expect("read");
         assert_eq!(r.rows.len(), 1, "the write is outside the stored zone");
         assert_eq!(ages(&mut session), [20, 30, 40, 999]);
+    }
+
+    /// A run of added edges longer than [`DEFERRED_COPIED`] does not
+    /// fold, because an added edge is bounded with the appended rows
+    /// rather than with the overwrites.
+    ///
+    /// It used to be bounded with the overwrites, and for a reason that
+    /// has gone: the patch held its lists as plain maps and copied them
+    /// whole every time a commit added to one, so the length of the run
+    /// was what the copy cost. The lists are a sealed run with the
+    /// recent edges beside them now, so a commit copies a few dozen of
+    /// them however many the run has reached. The epoch is what says the
+    /// bound moved with it: a fold moves the epoch, and this run is over
+    /// the copied bound and under the appended one.
+    #[test]
+    fn a_run_of_added_edges_outlasts_the_copied_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edges.zu1");
+        let nodes = u64::from(DEFERRED_COPIED) + 32;
+        {
+            let mut db = Zu1File::create(&path).expect("create");
+            bulk_load_as(&mut db, "person", "knows", nodes, &[(0, 1)]).expect("load");
+            let ages: Vec<u64> = (0..nodes).collect();
+            store_props(&mut db, "person", &[("age", PropValues::Int(&ages))]).expect("props");
+        }
+
+        let mut session = Session::open(&path).expect("open");
+        // The first write opens the writer, which recovers and folds,
+        // so the epoch to hold against is the one after it.
+        let edge = |to: i64| {
+            format!(
+                "MATCH (a:person), (b:person) WHERE a.age = 0 AND b.age = {to} \
+                 INSERT (a)-[:knows]->(b)"
+            )
+        };
+        session.run(&edge(2), &[]).expect("first write");
+        let before = session.epoch();
+
+        let added = (nodes - 3) as usize;
+        for to in 3..nodes as i64 {
+            session.run(&edge(to), &[]).expect("edge");
+        }
+        assert!(
+            added > DEFERRED_COPIED as usize,
+            "{added} edges is not past the copied bound"
+        );
+        assert_eq!(
+            session.epoch(),
+            before,
+            "a run of {added} added edges folded"
+        );
+
+        // And they are all there, which is what says the run was
+        // deferred rather than dropped.
+        let r = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) WHERE a.age = 0 \
+                 RETURN count(b) AS n",
+                &[],
+            )
+            .expect("count");
+        assert_eq!(r.rows[0][0], Value::Int(added as i64 + 2));
     }
 
     /// A run of point writes longer than a writer will defer folds

@@ -1941,6 +1941,13 @@ impl EdgePatch {
         self.of(src, Direction::Fwd).holds(dst)
     }
 
+    /// The ordinal the copy of `src -> dst` this patch added took, which
+    /// is also the row of the rel table its property values sit in, so
+    /// a writer with a value to put on that edge knows where it goes.
+    pub fn ordinal(&self, src: u64, dst: u64) -> Option<u64> {
+        self.of(src, Direction::Fwd).first(dst)
+    }
+
     /// The neighbors `node` has in `dir` that this patch put there,
     /// which are exactly the ones no read of the file turns up. A
     /// writer deciding whether a row can go asks this beside the file's

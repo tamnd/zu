@@ -1946,6 +1946,66 @@ impl RowPatch {
         }
     }
 
+    /// The `at`th row again, to write into. The chunk holding it is
+    /// copied where a reader is still looking at the one this patch
+    /// was handed, which is the same copy on write [`Self::push`]
+    /// makes of the chunk it fills.
+    fn row_at_mut(&mut self, at: usize) -> Option<&mut Vec<Cell>> {
+        let sealed = self.chunks.len() * PATCH_CHUNK;
+        if at >= sealed {
+            return Arc::make_mut(&mut self.tail).get_mut(at - sealed);
+        }
+        let chunk = Arc::make_mut(&mut self.chunks).get_mut(at / PATCH_CHUNK)?;
+        Arc::make_mut(chunk).get_mut(at % PATCH_CHUNK)
+    }
+
+    /// Whether [`Self::set`] would take a write of `col` on row `row`,
+    /// which a writer asks before it takes the commit that would make
+    /// one. It has to be asked rather than tried, because a commit that
+    /// cannot be patched has to fold whole and nothing of it may reach
+    /// the patch first.
+    pub fn settable(&self, col: usize, row: u64) -> bool {
+        self.key != Some(col) && self.get(col, row).is_some()
+    }
+
+    /// Writes `value` over what row `row` holds in `col`, and answers
+    /// whether it could.
+    ///
+    /// A row this patch appended is one no column holds yet, so a
+    /// statement writing onto it has nowhere else for the value to go:
+    /// the lane patch lays words over stored rows and there is no
+    /// stored row under this one. The value goes over the one the
+    /// append carried and a read gets what the last write left, which
+    /// is what the fold seals as well, because it asks the overlay for
+    /// each appended row rather than taking the append at its word.
+    ///
+    /// The key column is refused. Each sealed chunk carries an index of
+    /// it, built as the chunk was sealed and shared with every reader
+    /// holding an older copy of this patch, so moving a key here would
+    /// mean rebuilding an index those readers are still reading out of.
+    /// A key write onto an unfolded row folds instead.
+    pub fn set(&mut self, col: usize, row: u64, value: Cell) -> bool {
+        if !self.settable(col, row) {
+            return false;
+        }
+        // Read before the write, because the byte count this carries
+        // has to lose what the row held here and gain what it is about
+        // to hold, and neither is countable once the cell is gone.
+        let was = match self.get(col, row) {
+            Some(Cell::Str(bytes)) => bytes.len(),
+            _ => 0,
+        };
+        let now = match &value {
+            Cell::Str(bytes) => bytes.len(),
+            _ => 0,
+        };
+        let at = (row - self.base) as usize;
+        let cells = self.row_at_mut(at).expect("settable found the row");
+        cells[col] = value;
+        self.bytes = self.bytes - was + now;
+        true
+    }
+
     /// Every row it holds, in the order their ordinals are in.
     fn all(&self) -> impl Iterator<Item = &Vec<Cell>> + '_ {
         self.chunks
@@ -2856,6 +2916,59 @@ mod tests {
         // row holds answers with the last of them either way.
         assert_eq!(patch.row_with(1, 7), Some(100 + rows as u64 - 1));
         assert_eq!(patch.row_with(1, 8), None);
+    }
+
+    /// A write over an appended row lands wherever the row is, in a
+    /// sealed chunk or in the one being filled, and leaves the copy a
+    /// reader was handed alone.
+    #[test]
+    fn a_write_over_an_appended_row_leaves_an_older_copy_alone() {
+        let rows = PATCH_CHUNK * 2 + 5;
+        let mut patch = RowPatch::new(100, Some(0));
+        for at in 0..rows {
+            patch.push(vec![
+                Cell::Int(1000 + at as u64),
+                Cell::Int(7),
+                Cell::Str(b"ab".to_vec()),
+            ]);
+        }
+        assert_eq!(patch.bytes(), rows * 2);
+
+        // What a reader opened at this commit is holding, which nothing
+        // written after it may move.
+        let held = patch.clone();
+
+        for at in 0..rows {
+            let row = 100 + at as u64;
+            assert!(patch.set(1, row, Cell::Int(at as u64)), "row {at}");
+            assert!(patch.set(2, row, Cell::Str(b"long".to_vec())), "row {at}");
+        }
+        // Two bytes a row given up and four taken, counted rather than
+        // walked, so the count has to come out where a walk would.
+        assert_eq!(patch.bytes(), rows * 4);
+
+        for at in 0..rows {
+            let row = 100 + at as u64;
+            assert_eq!(patch.word(1, row), Some(at as u64), "row {at}");
+            assert_eq!(patch.bytes_of(2, row), Some(&b"long"[..]), "row {at}");
+            assert_eq!(held.word(1, row), Some(7), "row {at} of the older copy");
+            assert_eq!(held.bytes_of(2, row), Some(&b"ab"[..]), "row {at}");
+        }
+        assert_eq!(held.bytes(), rows * 2);
+
+        // The key column is refused, because the sealed chunks carry an
+        // index of it that older copies are still reading out of.
+        assert!(!patch.set(0, 100, Cell::Int(9)));
+        assert_eq!(patch.word(0, 100), Some(1000));
+        // So are a row the patch does not hold, on either side of it,
+        // and a column the rows do not have.
+        assert!(!patch.set(1, 99, Cell::Int(9)));
+        assert!(!patch.set(1, 100 + rows as u64, Cell::Int(9)));
+        assert!(!patch.set(3, 100, Cell::Int(9)));
+        // And what it refuses is what it says it would refuse.
+        assert!(!patch.settable(0, 100));
+        assert!(!patch.settable(1, 99));
+        assert!(patch.settable(1, 100));
     }
 
     /// Two rows under one key answer with the second, which is the only

@@ -662,11 +662,20 @@ impl Writer {
     /// the edges of `src -> dst` lands on, and `None` when the write has
     /// to be folded instead.
     ///
-    /// A pair this run of deferred commits added is turned away. Its
-    /// values are in the rows the patch appended rather than in the
-    /// column underneath, so a value aimed at the column would be
-    /// written where nothing reads it, and folding is the cheap answer
-    /// to a write onto an edge that has not been sealed yet.
+    /// A pair this run of deferred commits added holds its values in
+    /// the row the patch appended for it rather than in the column
+    /// underneath, and its ordinal is past everything the column has,
+    /// so the write goes over the appended row. The reader answers for
+    /// that ordinal out of the same row, so what the next `MATCH` gets
+    /// is what the `SET` left.
+    ///
+    /// This is the second half of what a bracketed write does: the
+    /// insert that sets the edge up, the write being measured onto it,
+    /// and the delete that takes it away, none of them folding. The
+    /// insert on its own stopped folding when the delete before it
+    /// began leaving a mark [`Self::edge_patchable`] reads; without
+    /// this the write in the middle folded instead and the run was no
+    /// longer for it.
     fn edge_cells(
         &mut self,
         db: &mut Zu1File,
@@ -676,32 +685,52 @@ impl Writer {
         col: usize,
         value: &Cell,
     ) -> Result<Option<std::ops::Range<u64>>> {
-        if self
-            .patches
-            .edges
-            .get(&rel)
-            .is_some_and(|p| p.holds(src, dst))
-        {
-            return Ok(None);
-        }
-        self.load_reader(db, rel)?;
-        let Some(reader) = self.readers.get_mut(&rel) else {
-            return Ok(None);
-        };
-        let Some((base, count)) = reader.edge_run(db, src, dst)? else {
-            return Ok(None);
+        // The patch first, and on its own where it answers, because the
+        // readers here are the file's: they are loaded once for the run
+        // and never handed the patch, so what they know of a pair is
+        // what the last fold sealed. A pair the patch added runs once,
+        // at the ordinal the add gave it.
+        let patch = self.patches.edges.get(&rel);
+        let held = patch.and_then(|p| p.ordinal(src, dst));
+        let (base, count) = match held {
+            Some(ord) => (ord, 1),
+            None => {
+                // A pair the patch took away is one no reader sees, so
+                // there is nothing under it to write onto and the file's
+                // copies of it are not the answer.
+                if patch.is_some_and(|p| p.drops(src, dst, Direction::Fwd)) {
+                    return Ok(None);
+                }
+                self.load_reader(db, rel)?;
+                let Some(reader) = self.readers.get_mut(&rel) else {
+                    return Ok(None);
+                };
+                let Some(run) = reader.edge_run(db, src, dst)? else {
+                    return Ok(None);
+                };
+                run
+            }
         };
         if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(rel) {
             slot.insert(load_rel_props(db, rel)?);
         }
-        let patchable = self.dirs[&rel]
+        let Some(column) = self.dirs[&rel]
             .as_ref()
             .and_then(|directory| directory.columns.get(col))
-            .is_some_and(|column| {
-                holds(column, value)
-                    && column.validity.is_none()
-                    && base + count <= column.meta.value_count
-            });
+        else {
+            return Ok(None);
+        };
+        if !holds(column, value) || column.validity.is_some() {
+            return Ok(None);
+        }
+        // A run is either wholly the file's or wholly the patch's: the
+        // patch holds one copy of a pair at most, so a run it answers
+        // for is the one edge it added, and a run the file answers for
+        // is edges the last fold sealed.
+        let patchable = match base < column.meta.value_count {
+            true => base + count <= column.meta.value_count,
+            false => self.appended_cell(rel, base, col),
+        };
         Ok(patchable.then_some(base..base + count))
     }
 
@@ -900,9 +929,21 @@ impl Writer {
     /// The column has to be one the patch can describe: the kind that
     /// stores what was written, and no validity segment, because a
     /// column that can hold nothing in a row keeps that in a bitmap the
-    /// patch does not carry. The row has to be one the column already
-    /// has a value for, which is what says the write is an update
-    /// rather than part of an append.
+    /// patch does not carry.
+    ///
+    /// A row the column has a value for is patched by laying a word
+    /// over it. A row past the column is one an earlier commit of this
+    /// run appended, and there is nothing under it to lay a word over:
+    /// its values are the ones the append carried and they sit in the
+    /// row patch, so a write onto it goes over them there. That is what
+    /// the fold does with the same pair of commits, because it asks the
+    /// overlay what each appended row holds rather than taking the
+    /// append at its word, so the two paths seal the same column.
+    ///
+    /// Both are refused past what the patch actually holds, a row this
+    /// same commit is appending above all: the append has not been
+    /// staged when this is asked, so the row is in neither place yet
+    /// and the commit folds.
     fn patchable(
         &mut self,
         db: &mut Zu1File,
@@ -920,7 +961,22 @@ impl Writer {
         let Some(column) = directory.columns.get(col) else {
             return Ok(false);
         };
-        Ok(holds(column, value) && column.validity.is_none() && row < column.meta.value_count)
+        if !holds(column, value) || column.validity.is_some() {
+            return Ok(false);
+        }
+        Ok(match row < column.meta.value_count {
+            true => true,
+            false => self.appended_cell(table, row, col),
+        })
+    }
+
+    /// Whether `row` is one the run appended and its `col` can be
+    /// written over where it lies.
+    fn appended_cell(&self, table: u32, row: u64, col: usize) -> bool {
+        self.patches
+            .rows
+            .get(&table)
+            .is_some_and(|rows| rows.settable(col, row))
     }
 
     /// Whether a reader can be shown this row as gone without the file
@@ -1165,6 +1221,20 @@ impl Writer {
         for change in changes {
             match change {
                 Deferred::Cell((table, row, col, value)) => {
+                    // A row this run appended keeps its values in the
+                    // row patch, because no column holds it yet and
+                    // there is nothing under it to lay a word over. So
+                    // a write onto one goes there instead, which is
+                    // what [`Self::patchable`] let the commit through
+                    // on. Nothing else puts such a row in the lane
+                    // patch, so no read has to choose between them.
+                    if let Some(rows) = patches.rows.get_mut(&table)
+                        && row >= rows.base()
+                    {
+                        let wrote = Arc::make_mut(rows).set(col as usize, row, value);
+                        debug_assert!(wrote, "taken where the patch could not hold it");
+                        continue;
+                    }
                     let cells = Arc::make_mut(patches.cells.entry(table).or_default());
                     match value {
                         Cell::Int(word) => cells.set(col as usize, row, word),
@@ -2742,12 +2812,11 @@ mod tests {
         assert!(err.to_string().contains("taken away"), "got: {err}");
     }
 
-    /// A write onto an edge this same unfolded run added folds instead.
-    /// Its values are in the rows the patch appended and not in the
-    /// column underneath, so a word aimed at the column would land where
-    /// nothing reads it.
+    /// A year written onto an edge this same unfolded run added goes
+    /// over the row the patch appended for it, and only that column of
+    /// it: the note stays what the insert carried.
     #[test]
-    fn a_year_written_onto_an_edge_just_added_folds() {
+    fn a_year_written_onto_an_edge_just_added_leaves_the_note() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("edge-set-fresh.zu1");
         seeded_dated(&path);
@@ -2769,7 +2838,7 @@ mod tests {
                 &[],
             )
             .expect("write a year onto it");
-        assert!(session.epoch() > before, "the write did not fold");
+        assert_eq!(session.epoch(), before, "the write folded");
 
         let out = session
             .run(
@@ -3228,6 +3297,202 @@ mod tests {
         // the adds that went on top of it.
         session.run(add_it, &[]).expect("add");
         assert_eq!(count(&mut session), Value::Int(1));
+    }
+
+    /// A write onto a row the same unfolded run appended does not fold
+    /// either, which is the node side of the same thing.
+    #[test]
+    fn a_write_onto_a_row_the_run_appended_does_not_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("row-set.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        // Past the chunk the row patch fills, so the writes land on
+        // sealed chunks as well as on the one being filled.
+        let rows = 100;
+        for at in 0..rows {
+            session
+                .run(
+                    "INSERT (:person {age: $a, name: $n})",
+                    &[
+                        ("a", Value::Int(1000 + at)),
+                        ("n", Value::Str(format!("new{at}"))),
+                    ],
+                )
+                .expect("insert");
+            session
+                .run(
+                    "MATCH (p:person) WHERE p.age = $a SET p.age = $b, p.name = $n",
+                    &[
+                        ("a", Value::Int(1000 + at)),
+                        ("b", Value::Int(2000 + at)),
+                        ("n", Value::Str(format!("set{at}"))),
+                    ],
+                )
+                .expect("set");
+        }
+        assert_eq!(
+            session.epoch(),
+            before,
+            "{rows} rows appended and written over folded"
+        );
+
+        // What the writes left is what a read gets, and what the fold
+        // seals: the appended row carries the value the `SET` put on it
+        // rather than the one the `INSERT` did.
+        let check = |session: &mut Session| {
+            let out = session
+                .run(
+                    "MATCH (p:person) WHERE p.age >= 2000 \
+                     RETURN p.age AS age, p.name AS name ORDER BY age",
+                    &[],
+                )
+                .expect("read");
+            let seen: Vec<(Value, String)> = out
+                .rows
+                .iter()
+                .map(|row| (row[0].clone(), string(row, 1)))
+                .collect();
+            let want: Vec<(Value, String)> = (0..rows)
+                .map(|at| (Value::Int(2000 + at), format!("set{at}")))
+                .collect();
+            assert_eq!(seen, want);
+            // And nothing of the rows the file came with moved.
+            let out = session
+                .run(
+                    "MATCH (p:person) WHERE p.age < 100 RETURN p.age AS age ORDER BY age",
+                    &[],
+                )
+                .expect("read the old rows");
+            let ages: Vec<Value> = out.rows.iter().map(|row| row[0].clone()).collect();
+            assert_eq!(
+                ages,
+                [
+                    Value::Int(11),
+                    Value::Int(20),
+                    Value::Int(30),
+                    Value::Int(40)
+                ]
+            );
+        };
+        check(&mut session);
+        drop(session);
+        let mut session = Session::open(&path).expect("reopen");
+        check(&mut session);
+    }
+
+    /// A write onto an edge the same unfolded run added does not fold,
+    /// and what it wrote is what a read gets and what the fold seals.
+    ///
+    /// This is the whole of a bracketed write: the insert that sets the
+    /// edge up, the write being measured onto it, and the delete that
+    /// takes it away, round after round over one pair. The write in the
+    /// middle used to fold because the edge's values are in the row the
+    /// patch appended rather than in the column, and a value aimed at
+    /// the column would have been written where nothing reads it. It
+    /// goes over the appended row now.
+    #[test]
+    fn a_write_onto_an_edge_the_run_added_does_not_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge-set.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let add_it = "MATCH (a:person), (b:person) \
+                      WHERE a.name = 'amy' AND b.name = 'ada' \
+                      INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)";
+        let drop_it = "MATCH (a:person)-[k:knows]->(b:person) \
+                       WHERE a.name = 'amy' AND b.name = 'ada' DELETE k";
+        let read_it = |session: &mut Session| {
+            let out = session
+                .run(
+                    "MATCH (a:person)-[k:knows]->(b:person) \
+                     WHERE a.name = 'amy' AND b.name = 'ada' \
+                     RETURN k.since AS since, k.note AS note",
+                    &[],
+                )
+                .expect("read the edge");
+            assert_eq!(out.rows.len(), 1, "the edge is not there");
+            (out.rows[0][0].clone(), string(&out.rows[0], 1))
+        };
+
+        // The first write opens the writer, which recovers and folds, so
+        // the epoch to hold against is the one after it.
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        let rounds = 40;
+        for round in 0..rounds {
+            session.run(add_it, &[]).expect("add");
+            assert_eq!(read_it(&mut session), (Value::Int(2020), "gym".into()));
+            let year = 3000 + round;
+            session
+                .run(
+                    "MATCH (a:person)-[k:knows]->(b:person) \
+                     WHERE a.name = 'amy' AND b.name = 'ada' \
+                     SET k.since = $y, k.note = $n",
+                    &[("y", Value::Int(year)), ("n", Value::Str("pub".into()))],
+                )
+                .expect("set");
+            assert_eq!(read_it(&mut session), (Value::Int(year), "pub".into()));
+            session.run(drop_it, &[]).expect("drop");
+            session.run(add_it, &[]).expect("add back");
+            // Put back with the values the insert carries, not the ones
+            // the write left on the copy that went away.
+            assert_eq!(read_it(&mut session), (Value::Int(2020), "gym".into()));
+            session.run(drop_it, &[]).expect("drop again");
+        }
+        assert_eq!(
+            session.epoch(),
+            before,
+            "{rounds} rounds of insert, write and delete over one edge folded"
+        );
+
+        // And what the last write left is what the fold seals, which
+        // reopening is the check on: it reads the file and the log and
+        // nothing this session was holding.
+        session.run(add_it, &[]).expect("add");
+        session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) \
+                 WHERE a.name = 'amy' AND b.name = 'ada' \
+                 SET k.since = 2077, k.note = 'last'",
+                &[],
+            )
+            .expect("set");
+        drop(session);
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(read_it(&mut session), (Value::Int(2077), "last".into()));
+        // And the edges the file came with are where they were.
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) \
+                 RETURN a.name AS src, k.since AS since ORDER BY src",
+                &[],
+            )
+            .expect("walk");
+        let seen: Vec<(String, Value)> = out
+            .rows
+            .iter()
+            .map(|row| (string(row, 0), row[1].clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("ada".into(), Value::Int(1990)),
+                ("amy".into(), Value::Int(2077)),
+                ("joe".into(), Value::Int(2010)),
+                ("kay".into(), Value::Int(2000)),
+            ]
+        );
     }
 
     /// A run of point writes longer than a writer will defer folds

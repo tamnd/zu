@@ -169,10 +169,13 @@ fn kill_a_writer(dir: &std::path::Path, modes: &[&str]) -> (std::path::PathBuf, 
     // writing, and then the kill would land on an idle process.
     let (sender, receiver) = mpsc::channel();
     let stdout = child.stdout.take().expect("stdout");
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counting = std::sync::Arc::clone(&seen);
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if let Ok(i) = line.trim().parse::<u64>() {
+                counting.fetch_add(1, std::sync::atomic::Ordering::Release);
                 let _ = sender.send(i);
             }
         }
@@ -180,11 +183,44 @@ fn kill_a_writer(dir: &std::path::Path, modes: &[&str]) -> (std::path::PathBuf, 
 
     // Where in the child's life the kill lands decides what it is caught
     // in the middle of: a page still being filled, a flush, a pass.
+    //
     let delay: u64 = std::env::var("ZU2_CRASH_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
     std::thread::sleep(Duration::from_millis(delay));
+
+    // And then however much longer it takes the child to have done
+    // enough work to be worth killing (#734).
+    //
+    // The delay used to be the whole wait and it asks the wrong
+    // question. What the assertions below need is that the child got far
+    // enough to lap the log and double its index, and how long that
+    // takes is a fact about the machine rather than about the engine. At
+    // 1500 milliseconds it was reliable on an idle laptop and failed
+    // under a parallel build, which is a test reporting the load
+    // average.
+    //
+    // This only ever extends the wait and never shortens it, which is
+    // the property that matters. The moment the kill lands on an
+    // unloaded machine is the moment it has always landed on, so the
+    // range in the module header still means what it says and #570 is
+    // still reachable at the delays that found it.
+    //
+    // Two thousand acknowledgements clears both bars: the sixteen this
+    // function asserts and the `keys / 2` capped at 512 that
+    // `last_per_key` does, since the child writes its keys in order and
+    // cycles, so n acknowledgements cover the first n keys.
+    const ENOUGH: u64 = 2048;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while seen.load(std::sync::atomic::Ordering::Acquire) < ENOUGH
+        && std::time::Instant::now() < deadline
+    {
+        // Killed on the deadline rather than waited on forever. The
+        // assertions below say what went wrong far better than a test
+        // that never returns.
+        std::thread::sleep(Duration::from_millis(5));
+    }
     child.kill().expect("kill");
     child.wait().expect("wait");
     reader.join().expect("reader");

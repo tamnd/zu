@@ -2389,6 +2389,36 @@ write_p99_nosync_us = 100.0
 # it.
 write_p99_p50_x = 4.0
 
+# The flatness ratios, perf/13 section 3 and its exit gate: every class
+# that has a p50 ceiling gets a companion p99 over p50, because a p50
+# that improved while the tail doubled is not an improvement and a
+# ceiling on each of the two separately does not say so.
+#
+# Two numbers because skew is real and unbounded is not. Five is for a
+# graph with a uniform degree, which is what the session bench builds
+# for itself: nothing in the data can make one read slower than
+# another, so a tail there is the engine. Ten is for SF1, where the
+# knows degree is power-law and a seeded phase drawing a person at
+# random draws a hub some of the time.
+#
+# Session, laptop then gaming box: plan cache hit 1.00 and 1.04, point
+# read 1.58 and 2.33, held 1.71 and 2.64, one-shot 3.22 and 2.59. SF1
+# on the gaming box: 1-hop 3.00, key lookup 1.66, 2-hop 2.24, triangle
+# 1.24, ordered triangle 1.28, undirected close 1.06, IS read 2.63, IC
+# friends-of-friends 6.13, distinct two-hop 3.17. The IC read is the
+# closest to its ceiling on both hosts and it is the one that walks two
+# hops out of a randomly drawn person, which is the shape the
+# power-law allowance is for. Lower these, never raise them.
+#
+# A ratio is not immune to a busy box, it is more exposed to one than
+# either number in it: the same SF1 sweep on a laptop under a load
+# average of 28 read 24.81 on the 2-hop and 60.83 on the IS read,
+# against 2.24 and 2.63 quiet. That is the gate working. It is also
+# the reason a flatness failure is worth re-running once on a quiet
+# machine before it is believed.
+uniform_flatness_x = 5.0
+powerlaw_flatness_x = 10.0
+
 # The P5 point write gate: processor time a statement excluding fsync,
 # under 30 us (docs/12, zu#78).
 #

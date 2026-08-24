@@ -223,6 +223,27 @@ fn main() {
     );
 
     let mut failed = false;
+    // perf/13 flatness: a class gate gets a companion ratio, because a
+    // p50 that improved while the tail doubled is not an improvement.
+    // Five, because this bench builds its own graph with a uniform
+    // degree and there is no skew here for a tail to come from. The
+    // SF1 benches run on a real social graph and get ten.
+    let flat = |what: &str, p50: f64, p99: f64| {
+        let Some(ceiling) = budget("uniform_flatness_x") else {
+            return false;
+        };
+        let ratio = p99 / p50.max(0.001);
+        println!("{what} flatness: p99 is {ratio:.2}x the p50");
+        if ratio > ceiling {
+            println!("GATE FAIL {what} flatness: {ratio:.2}x > ceiling {ceiling}");
+            return true;
+        }
+        false
+    };
+    failed |= flat("plan cache hit", plan_hit_us, plan_hit_p99);
+    failed |= flat("session point read", point_us, point_p99);
+    failed |= flat("held session point read", held_us, held_p99);
+    failed |= flat("one-shot point read", one_shot_us, one_shot_p99);
     let mut check = |what: &str, pct: &str, key: &str, got: f64| {
         if let Some(ceiling) = budget(key)
             && got > ceiling

@@ -31,13 +31,13 @@
 //! difference between a commit that costs what the device charges and
 //! one that costs whatever the other threads happen to be doing.
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use crate::addr::{page_of, page_start, Address, FIRST, MAX_PAGES, PAGE_SIZE};
+use crate::addr::{Address, FIRST, MAX_PAGES, PAGE_SIZE, page_of, page_start};
 use crate::epoch::{Epochs, Slotted};
 use crate::error::{Error, Result};
 use crate::{file, record};

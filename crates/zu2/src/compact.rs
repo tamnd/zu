@@ -126,6 +126,102 @@ pub fn ceiling(session: &Session<'_>) -> Address {
     page_start(page_of(safe))
 }
 
+/// What a region holds, read without moving any of it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Surveyed {
+    /// Bytes of log the survey read.
+    pub scanned: u64,
+    /// Of those, the bytes the index still reaches.
+    pub live: u64,
+}
+
+/// Reads `[begin, upto)` and says how much of it is still live, without
+/// copying, migrating or reclaiming anything.
+///
+/// This exists because a pass had no way to find out whether it was
+/// worth making until it had already made it. The trigger for the first
+/// pass is a size, `Options::compact_below`, taken before anything is
+/// known about how much of the log is stale, so a database that has only
+/// ever been loaded compacts at 128 MiB, finds every record live,
+/// reclaims nothing, and moves the survivors to the cold tier because
+/// surviving a pass is this engine's definition of cold. A third of a
+/// gigabyte load ended up in the tier that way, and a scan pays a
+/// `pread` for every row of it (#736).
+///
+/// So the caller surveys first and only runs a pass when the region has
+/// something in it to reclaim. The survey costs a read of the region and
+/// an index lookup per record, which is what the pass costs before it
+/// writes anything, so a pass that goes ahead reads the region twice and
+/// a pass that should not have run writes nothing.
+///
+/// Returns `None` when the region holds an edge record. Edges are not
+/// keyed, so the index cannot answer for them and the only thing that
+/// can is the adjacency, which `keep_edge` asks by appending. There is
+/// no way to survey that without doing it, so a region with edges in it
+/// goes straight to a pass, which is what happened before this existed.
+pub fn survey(session: &mut Session<'_>, upto: Address) -> Result<Option<Surveyed>> {
+    let mut done = Surveyed::default();
+    let begin = session.core_ref().log.begin();
+    let upto = upto.min(ceiling(session));
+    if upto <= begin {
+        return Ok(Some(done));
+    }
+
+    let mut page = vec![0u64; PAGE_SIZE / 8];
+    let mut key = Vec::new();
+    for number in page_of(begin)..page_of(upto) {
+        // SAFETY: as in `compact`. The buffer is PAGE_SIZE bytes and 8
+        // byte aligned because it is a Vec<u64>.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(page.as_mut_ptr().cast::<u8>(), PAGE_SIZE) };
+        session.core_ref().log.read_page(number, bytes)?;
+        let mut offset = if number == page_of(begin) {
+            (begin - page_start(number)) as usize
+        } else {
+            0
+        };
+        while offset + record::HEADER <= PAGE_SIZE {
+            let address = page_start(number) + offset as u64;
+            if address >= upto {
+                return Ok(Some(done));
+            }
+            // SAFETY: as in `compact`. Nothing past the header is
+            // touched until the lengths have been checked against what
+            // is left of the page.
+            let (size, kind) = unsafe {
+                let r = RecordRef::new(page.as_ptr().cast::<u8>().add(offset));
+                let key_len = r.key_len();
+                let value_len = r.value_len();
+                if key_len == 0 && value_len == 0 {
+                    break;
+                }
+                let size = record::size_of(key_len, value_len);
+                if offset + size > PAGE_SIZE {
+                    break;
+                }
+                key.clear();
+                key.extend_from_slice(r.key());
+                (size, r.kind())
+            };
+            match kind {
+                record::KIND_EDGE => return Ok(None),
+                // A marker has nothing left to say by the time a pass can
+                // reach it, so it is dead, which is what `compact` does
+                // with it too.
+                record::KIND_BEGIN | record::KIND_END => {}
+                _ => {
+                    if session.is_live(&key, address)? {
+                        done.live += size as u64;
+                    }
+                }
+            }
+            done.scanned += size as u64;
+            offset += size;
+        }
+    }
+    Ok(Some(done))
+}
+
 /// Compacts `[begin, upto)`, which must be a page boundary at or below
 /// [`ceiling`].
 ///

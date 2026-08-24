@@ -1408,9 +1408,8 @@ fn warm(core: &Core, options: Options) {
                     // the process. Every read of a record down there
                     // then costs a read of the file. #665.
                     let floor = core.log.begin().saturating_sub(page_start(page)) as usize;
-                    let check = |page: &[u8]| {
-                        floor <= page.len() && recover::page_intact(&page[floor..])
-                    };
+                    let check =
+                        |page: &[u8]| floor <= page.len() && recover::page_intact(&page[floor..]);
                     if core.log.warm_page(page, bytes, check).is_err() {
                         // A page that cannot be read is a page the read
                         // path will fail on too, and it will say so with
@@ -1543,6 +1542,31 @@ fn compact_slice(core: &Core, options: Options) -> Result<()> {
     };
     let mut session = core.maintenance_session()?;
     let upto = compact::slice(&session);
+    // Find out what the region holds before moving any of it. The first
+    // pass of a database's life is triggered by `compact_below`, which
+    // is a size and knows nothing about how much of the log is stale, so
+    // without this a database that has only ever been loaded compacts at
+    // 128 MiB, finds every record live, reclaims nothing, and moves the
+    // survivors to the cold tier because surviving a pass is what cold
+    // means here. That put a third of a gigabyte load in the tier, and a
+    // scan pays a pread per row of it (#736).
+    //
+    // The survey answers the same question the trigger does, whether the
+    // log is over its space budget, but with a live figure measured
+    // rather than assumed. When it is not over, nothing moves and the
+    // next pass is scheduled from what the survey learned, which is the
+    // same arithmetic the end of this function does after a real pass.
+    if let Some(seen) = compact::survey(&mut session, upto)?
+        && seen.scanned > 0
+    {
+        let live = (core.log.span() as u128 * seen.live as u128 / seen.scanned as u128) as u64;
+        let target = live.saturating_mul(u64::from(options.space_target_percent)) / 100;
+        if core.log.span() <= target {
+            core.compact_at
+                .store(target.max(options.compact_below), Ordering::Release);
+            return Ok(());
+        }
+    }
     let pass = compact::compact(&mut session, upto)?;
     core.compaction.note(&pass);
     if pass.scanned > 0 {
@@ -3053,6 +3077,31 @@ impl<'a> Session<'a> {
     /// behind after a reopen. Carrying the original version means the
     /// replay can tell which of the two records is the newer one without
     /// knowing anything about compaction.
+    /// Whether the index still reaches `at` for `key`, which is the one
+    /// question [`copy_forward`](Self::copy_forward) asks, asked without
+    /// writing anything.
+    ///
+    /// For [`crate::compact::survey`], which needs to know what a region
+    /// holds before it decides whether moving the region is worth
+    /// anything. See #736: a pass over a region that is entirely live
+    /// reclaims nothing and moves a third of a freshly loaded database
+    /// into the cold tier for it.
+    pub(crate) fn is_live(&mut self, key: &[u8], at: Address) -> Result<bool> {
+        let hash = index::hash(key);
+        let tag = Index::tag(hash);
+        self.slot.protect();
+        let entered = self.bucket_of(hash);
+        let outcome = (|| -> Result<bool> {
+            let bucket = entered?;
+            let Some((_, _, address, _)) = self.newest(bucket, tag, key)?.found else {
+                return Ok(false);
+            };
+            Ok(address == at)
+        })();
+        self.slot.unprotect();
+        outcome
+    }
+
     pub(crate) fn copy_forward(
         &mut self,
         carried: &Carried<'_>,

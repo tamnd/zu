@@ -82,16 +82,39 @@ pub(crate) struct Tally {
     /// standard defines.
     pub(crate) conditions_passing: u64,
     pub(crate) conditions_total: u64,
+    /// Codes with no passing case that nothing this engine is sent can
+    /// raise, because ISO names them for engines lacking a feature this
+    /// one has, and codes with no passing case where the engine took what
+    /// a limit case asked for.
+    ///
+    /// Both are the difference between the codes reached and the 68, and
+    /// they are two counts rather than one because they close differently.
+    /// An unreachable code closes by taking a feature out, which is not an
+    /// improvement anybody should make to move a number. A measured one
+    /// closes by a case asking for more, and whether asking for more is
+    /// worth doing is a question about the standard's silence.
+    pub(crate) conditions_unreachable: u64,
+    pub(crate) conditions_measured: u64,
     /// Normative subclauses with a passing case, and the number the
     /// standard has. This pair and the next are corpus reach rather than
     /// engine behaviour: a subclause no case cites is one nobody has
     /// written a case for yet, not one the engine failed.
     pub(crate) subclauses_passing: u64,
     pub(crate) subclauses_total: u64,
+    /// Subclauses the harness registers as uncitable, and clause headings
+    /// no case cites and a passing case cites something inside. A heading
+    /// specifies nothing on its own, so it is reached through what it
+    /// holds rather than named directly.
+    pub(crate) subclauses_registered: u64,
+    pub(crate) subclauses_beneath: u64,
     /// Grammar productions with a passing case, and the number the
     /// published BNF holds.
     pub(crate) productions_passing: u64,
     pub(crate) productions_total: u64,
+    /// Productions the harness registers as uncitable, each because the
+    /// rule spells the name of a catalog object no GQL statement creates
+    /// or hangs off a feature the standard leaves unspelled.
+    pub(crate) productions_registered: u64,
 }
 
 impl Tally {
@@ -185,6 +208,32 @@ fn distil(report: &Json) -> Result<Tally, String> {
         }
     };
 
+    // The same three tables read the other way: an entry with no passing
+    // case that carries a count saying why. A code with a passing case is
+    // never counted here, whatever else its other cases did, because what
+    // this measures is the difference between what was reached and the
+    // standard's own total.
+    let unpassed = |name: &str, field: &str| -> u64 {
+        match report.get("coverage").and_then(|c| c.get(name)) {
+            Some(Json::Obj(entries)) => entries
+                .iter()
+                .filter(|(_, e)| u(e.get("pass")) == 0 && u(e.get(field)) > 0)
+                .count() as u64,
+            _ => 0,
+        }
+    };
+
+    // The registers, which are lists rather than tables: things ISO names
+    // and no portable case can reach, each with a reason the harness
+    // checks. Only the count travels, since the reasons are the harness's
+    // to publish and a tally that carried them would grow by a page.
+    let listed = |name: &str| -> u64 {
+        match report.get("coverage").and_then(|c| c.get(name)) {
+            Some(Json::Arr(entries)) => entries.len() as u64,
+            _ => 0,
+        }
+    };
+
     // Distinct codes the engine produced, counted off the cases rather
     // than off a summary, because a code the engine emitted once is the
     // evidence that the machinery works at all.
@@ -230,14 +279,19 @@ fn distil(report: &Json) -> Result<Tally, String> {
         conditions_total: u(report
             .get("coverage")
             .and_then(|c| c.get("conditions_total"))),
+        conditions_unreachable: unpassed("conditions", "unreachable"),
+        conditions_measured: unpassed("conditions", "measured"),
         subclauses_passing: reached("subclauses"),
         subclauses_total: u(report
             .get("coverage")
             .and_then(|c| c.get("subclauses_total"))),
+        subclauses_registered: listed("uncitable_subclauses"),
+        subclauses_beneath: listed("subclauses_beneath"),
         productions_passing: reached("productions"),
         productions_total: u(report
             .get("coverage")
             .and_then(|c| c.get("productions_total"))),
+        productions_registered: listed("uncitable"),
     })
 }
 
@@ -275,6 +329,14 @@ fn render_tally(t: &Tally) -> String {
         t.conditions_total
     ));
     out.push_str(&format!(
+        "  \"conditions_unreachable\": {},\n",
+        t.conditions_unreachable
+    ));
+    out.push_str(&format!(
+        "  \"conditions_measured\": {},\n",
+        t.conditions_measured
+    ));
+    out.push_str(&format!(
         "  \"subclauses_passing\": {},\n",
         t.subclauses_passing
     ));
@@ -283,12 +345,24 @@ fn render_tally(t: &Tally) -> String {
         t.subclauses_total
     ));
     out.push_str(&format!(
+        "  \"subclauses_registered\": {},\n",
+        t.subclauses_registered
+    ));
+    out.push_str(&format!(
+        "  \"subclauses_beneath\": {},\n",
+        t.subclauses_beneath
+    ));
+    out.push_str(&format!(
         "  \"productions_passing\": {},\n",
         t.productions_passing
     ));
     out.push_str(&format!(
         "  \"productions_total\": {},\n",
         t.productions_total
+    ));
+    out.push_str(&format!(
+        "  \"productions_registered\": {},\n",
+        t.productions_registered
     ));
     out.push_str("  \"features_claimed\": [");
     for (i, code) in t.features_claimed.iter().enumerate() {
@@ -382,10 +456,15 @@ fn load_tally(text: &str) -> Result<Tally, String> {
         features_total: u(j.get("features_total")),
         conditions_passing: u(j.get("conditions_passing")),
         conditions_total: u(j.get("conditions_total")),
+        conditions_unreachable: u(j.get("conditions_unreachable")),
+        conditions_measured: u(j.get("conditions_measured")),
         subclauses_passing: u(j.get("subclauses_passing")),
         subclauses_total: u(j.get("subclauses_total")),
+        subclauses_registered: u(j.get("subclauses_registered")),
+        subclauses_beneath: u(j.get("subclauses_beneath")),
         productions_passing: u(j.get("productions_passing")),
         productions_total: u(j.get("productions_total")),
+        productions_registered: u(j.get("productions_registered")),
     })
 }
 
@@ -412,6 +491,96 @@ fn pct(pass: u64, judged: u64) -> String {
     let tenths = (pass * 1000 + judged / 2) / judged;
     format!("{}.{}%", tenths / 10, tenths % 10)
 }
+
+/// One surface of the standard, and how to read a tally's counts for it.
+///
+/// The four are listed once, here, so that adding a fifth is a line in
+/// this table rather than a fifth arm in the renderer.
+struct Surface {
+    name: &'static str,
+    /// Whether a heading of this kind can be reached through what it
+    /// holds. Only subclauses nest, so only subclauses have a beneath.
+    has_beneath: bool,
+    of: fn(&Tally) -> Reach,
+}
+
+/// The seven counts of one row, before the last is worked out.
+struct Reach {
+    reached: u64,
+    registered: u64,
+    unreachable: u64,
+    measured: u64,
+    beneath: u64,
+    total: u64,
+}
+
+impl Reach {
+    /// What is left after everything accounted for is taken off the
+    /// standard's own total.
+    ///
+    /// Saturating rather than wrapping: a tally whose accounted counts
+    /// somehow exceed the total is a tally to fix, and a row reading zero
+    /// is a better way to be told that than one reading four billion.
+    fn open(&self) -> u64 {
+        self.total
+            .saturating_sub(self.reached)
+            .saturating_sub(self.registered)
+            .saturating_sub(self.unreachable)
+            .saturating_sub(self.measured)
+            .saturating_sub(self.beneath)
+    }
+}
+
+const SURFACES: [Surface; 4] = [
+    Surface {
+        name: "optional features",
+        has_beneath: false,
+        of: |t| Reach {
+            reached: t.features_passing,
+            registered: t.features_unwritable.len() as u64,
+            unreachable: 0,
+            measured: 0,
+            beneath: 0,
+            total: t.features_total,
+        },
+    },
+    Surface {
+        name: "GQLSTATUS codes",
+        has_beneath: false,
+        of: |t| Reach {
+            reached: t.conditions_passing,
+            registered: 0,
+            unreachable: t.conditions_unreachable,
+            measured: t.conditions_measured,
+            beneath: 0,
+            total: t.conditions_total,
+        },
+    },
+    Surface {
+        name: "grammar productions",
+        has_beneath: false,
+        of: |t| Reach {
+            reached: t.productions_passing,
+            registered: t.productions_registered,
+            unreachable: 0,
+            measured: 0,
+            beneath: 0,
+            total: t.productions_total,
+        },
+    },
+    Surface {
+        name: "normative subclauses",
+        has_beneath: true,
+        of: |t| Reach {
+            reached: t.subclauses_passing,
+            registered: t.subclauses_registered,
+            unreachable: 0,
+            measured: 0,
+            beneath: t.subclauses_beneath,
+            total: t.subclauses_total,
+        },
+    },
+];
 
 /// Whether every column of the page came out of one sitting.
 ///
@@ -455,7 +624,7 @@ fn render_scoreboard(tallies: &[Tally]) -> String {
         );
     } else {
         out.push_str(
-            "These columns were not all taken together, so they are not a race. Read the dates and the machines first: two of them measured months apart on different hardware say something about each engine and very little about the difference between them.\n\n",
+            "These columns were not all taken together, so they are not a race. Read the four provenance rows first, since a column from another day, another machine, another harness build or another slice of the corpus says something about that engine and less than it looks about the difference between it and the one beside it. How much less depends on how far apart they are, which the rows say and this sentence deliberately does not guess.\n\n",
         );
     }
 
@@ -520,6 +689,35 @@ fn render_scoreboard(tallies: &[Tally]) -> String {
         }
     }
     out.push('\n');
+
+    out.push_str("## What each engine reached of the standard\n\n");
+    out.push_str("Four surfaces, four denominators, and every one of them from ISO 39075 rather than from the corpus. A row adds up: what a run reached, plus what the harness registers as unreachable by any portable case, plus what nothing sent to this engine can raise, plus what the engine took instead of refusing, plus the headings reached through what they hold, leaves what is still open. Open is the column to read. It is the work left, and it is the only one of the seven that a case can move.\n\n");
+    out.push_str("| surface | engine | reached | registered | unreachable | measured | beneath | open | ISO total |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    for surface in SURFACES {
+        for t in tallies {
+            let r = (surface.of)(t);
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                surface.name,
+                t.engine,
+                r.reached,
+                r.registered,
+                r.unreachable,
+                r.measured,
+                if surface.has_beneath {
+                    r.beneath.to_string()
+                } else {
+                    "-".to_string()
+                },
+                r.open(),
+                r.total
+            ));
+        }
+    }
+    out.push('\n');
+    out.push_str("A registered item is one the harness holds a written reason for, checked against the standard's own text, so the count is an argument rather than a rounding. An unreachable code is one ISO defines for engines lacking a feature this engine has, which means the only way to raise it is to take the feature out. A measured one is a limit the standard leaves to the implementation, where the case asked for a number and the engine simply took it, so what was learned is that the limit is higher than the question.\n\n");
+    out.push_str("A tally taken before the harness carried these registers reads zero in the middle columns and puts the whole difference in open, which is the honest reading of a file that never counted them.\n\n");
 
     out.push_str("## What the numbers do not say\n\n");
     out.push_str("A skip is not a pass. It means the engine declared it cannot hold the fixture the case needs, so the case never ran, and for zu almost every one of those is a limit of the loader rather than of the evaluator. The declaration behind those skips is in `conformance.toml` at the root of this repository, with a reason on every line.\n\n");
@@ -718,9 +916,25 @@ mod tests {
           "mandatory": {"cases": 2, "pass": 1, "fail": 1, "skip": 0, "error": 0},
           "condition": {"cases": 2, "pass": 1, "fail": 0, "skip": 1, "error": 0},
           "optional": {"cases": 2, "pass": 0, "fail": 0, "skip": 1, "error": 1}}},
-      "coverage": {"features": {
-        "G004": {"cases": 1, "pass": 1, "fail": 0},
-        "G010": {"cases": 1, "pass": 0, "fail": 1}}},
+      "coverage": {
+        "features": {
+          "G004": {"cases": 1, "pass": 1, "fail": 0},
+          "G010": {"cases": 1, "pass": 0, "fail": 1}},
+        "features_total": 4,
+        "conditions": {
+          "22G03": {"cases": 1, "pass": 1},
+          "22G04": {"cases": 1, "pass": 0, "unreachable": 1},
+          "22G10": {"cases": 1, "pass": 0, "measured": 1},
+          "42001": {"cases": 1, "pass": 0}},
+        "conditions_total": 5,
+        "productions": {"path element list step": {"cases": 1, "pass": 1}},
+        "productions_total": 3,
+        "subclauses": {"16.1": {"cases": 1, "pass": 1}},
+        "subclauses_total": 5,
+        "unwritable": [{"feature": "G099", "reason": "nothing portable asks for it"}],
+        "uncitable": [{"rule": "a rule", "reason": "it spells a catalog object"}],
+        "uncitable_subclauses": [{"subclause": "9.1", "reason": "no case can cite it"}],
+        "subclauses_beneath": ["16"]},
       "cases": [
         {"id": "a", "got_gqlstatus": "22G03"},
         {"id": "b", "got_gqlstatus": "22G03"},
@@ -790,6 +1004,117 @@ mod tests {
         assert_eq!(after.by_kind, before.by_kind);
         assert_eq!(after.features_passing, before.features_passing);
         assert_eq!(after.conditions_seen, before.conditions_seen);
+        assert_eq!(after.conditions_unreachable, before.conditions_unreachable);
+        assert_eq!(after.conditions_measured, before.conditions_measured);
+        assert_eq!(after.subclauses_registered, before.subclauses_registered);
+        assert_eq!(after.subclauses_beneath, before.subclauses_beneath);
+        assert_eq!(after.productions_registered, before.productions_registered);
+    }
+
+    #[test]
+    fn a_code_with_no_passing_case_is_counted_by_the_reason_it_carries() {
+        // Four codes: one passed, one is unreachable, one was measured
+        // and one is simply open. The first is never counted as anything
+        // but reached, since a code a case raised is reached whatever
+        // else its other cases did.
+        let t = sample();
+        assert_eq!(t.conditions_passing, 1);
+        assert_eq!(t.conditions_unreachable, 1);
+        assert_eq!(t.conditions_measured, 1);
+    }
+
+    #[test]
+    fn a_register_travels_as_its_count_and_not_as_its_reasons() {
+        // The reasons belong to the harness's own report, which prints
+        // them in full. What a tally needs is the number, so that the
+        // arithmetic of a row can be checked without the page growing a
+        // page of prose it did not measure.
+        let t = sample();
+        assert_eq!(t.features_unwritable.len(), 1);
+        assert_eq!(t.productions_registered, 1);
+        assert_eq!(t.subclauses_registered, 1);
+        assert_eq!(t.subclauses_beneath, 1);
+    }
+
+    #[test]
+    fn every_row_of_the_reach_table_accounts_for_its_own_denominator() {
+        // The one property worth asserting about that table: each row
+        // adds up to the standard's total, so a column that appears
+        // without another column shrinking is a column that is wrong.
+        let t = sample();
+        let expected = [
+            (1, 1, 0, 0, 0, 4),
+            (1, 0, 1, 1, 0, 5),
+            (1, 1, 0, 0, 0, 3),
+            (1, 1, 0, 0, 1, 5),
+        ];
+        for (surface, want) in SURFACES.iter().zip(expected) {
+            let r = (surface.of)(&t);
+            assert_eq!(
+                (
+                    r.reached,
+                    r.registered,
+                    r.unreachable,
+                    r.measured,
+                    r.beneath,
+                    r.total
+                ),
+                want,
+                "{} read wrong",
+                surface.name
+            );
+            assert_eq!(
+                r.reached + r.registered + r.unreachable + r.measured + r.beneath + r.open(),
+                r.total,
+                "{} does not add up",
+                surface.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_nothing_left_reads_open_zero() {
+        // The shape a conformance claim is trying to reach. Nothing here
+        // is rounded down to get there: what is not reached is named, and
+        // when everything is named the remainder is zero.
+        let r = Reach {
+            reached: 63,
+            registered: 0,
+            unreachable: 3,
+            measured: 2,
+            beneath: 0,
+            total: 68,
+        };
+        assert_eq!(r.open(), 0);
+    }
+
+    #[test]
+    fn a_tally_older_than_the_registers_puts_the_whole_difference_in_open() {
+        // A checked-in tally from before the harness counted registers
+        // has zeros in the middle columns. The row still has to add up,
+        // with the gap sitting in open where a reader can see it, rather
+        // than the page quietly borrowing a number it was never given.
+        let mut t = sample();
+        t.conditions_unreachable = 0;
+        t.conditions_measured = 0;
+        let codes = SURFACES
+            .iter()
+            .find(|s| s.name == "GQLSTATUS codes")
+            .expect("the codes row");
+        let r = (codes.of)(&t);
+        assert_eq!(r.open(), 4);
+    }
+
+    #[test]
+    fn the_reach_table_names_every_surface_and_says_what_open_means() {
+        let page = render_scoreboard(&[sample()]);
+        for surface in SURFACES {
+            assert!(page.contains(surface.name), "{} is missing", surface.name);
+        }
+        assert!(page.contains("Open is the column to read"));
+        // Only subclauses nest, so the other three rows have to say so
+        // with a dash rather than with a zero that reads as a measurement.
+        assert!(page.contains("| - |"), "{page}");
     }
 
     #[test]

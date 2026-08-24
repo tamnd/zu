@@ -11,24 +11,24 @@ ISO/IEC 39075:2024 Clause 24 says what a conformance claim has to contain and st
 | | |
 |---|---|
 | engine | zu 0.0.1 |
-| measured | 2026-08-22 |
+| measured | 2026-08-24 |
 | on | darwin arm64, Apple M4 |
 | harness | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures |
-| cases | 429 |
-| passed | 420 |
+| cases | 577 |
+| passed | 570 |
 | failed | 1 |
-| skipped | 8 |
+| skipped | 6 |
 | never reached a verdict | 0 |
 
 Broken out by what each case is asking, since the five kinds ask different questions and a total over them would answer none of them. Every claim below rests on one of these rows and says which.
 
 | kind | cases | pass | fail | skip | no verdict |
 |---|---|---|---|---|---|
-| mandatory | 70 | 70 | 0 | 0 | 0 |
-| optional | 250 | 250 | 0 | 0 | 0 |
-| condition | 69 | 61 | 0 | 8 | 0 |
-| grammar | 17 | 17 | 0 | 0 | 0 |
+| mandatory | 107 | 107 | 0 | 0 | 0 |
+| optional | 360 | 360 | 0 | 0 | 0 |
+| condition | 69 | 63 | 0 | 6 | 0 |
+| grammar | 18 | 18 | 0 | 0 | 0 |
 | performance | 23 | 22 | 1 | 0 | 0 |
 
 A performance case is graded on the answer and on a budget for the time and the memory it took to produce it, so a failure in that row can be either an answer that was wrong or a bound that was missed, and the report says which. Nothing below is claimed off a case that did not pass.
@@ -37,7 +37,7 @@ A performance case is graded on the answer and on a budget for the time and the 
 
 Minimum conformance is all or nothing. An implementation either provides the mandatory language or it is not GQL, and no percentage means anything at this level, so the only useful thing a statement can say here is which of the two it is and what the evidence is.
 
-**zu claims minimum conformance.** All 70 cases the corpus writes for the mandatory surface pass, none is skipped, and none failed to reach a verdict. What that is evidence of and what it is not is in the last section: the corpus is one reading of the standard's prose and nobody has adjudicated it.
+**zu claims minimum conformance.** All 107 cases the corpus writes for the mandatory surface pass, none is skipped, and none failed to reach a verdict. What that is evidence of and what it is not is in the last section: the corpus is one reading of the standard's prose and nobody has adjudicated it.
 
 ## Optional features, Clause 24.3
 
@@ -357,9 +357,11 @@ Clause 24.3 makes every optional feature a separate claim, addressed by its code
 
 ## Conditions
 
-The standard defines 68 GQLSTATUS conditions and zu answers a case with the right one for 61 of them. The rest are conditions no statement can reach here, and each one is named with its reason in `conformance.toml` at the root of this repository, because a condition that never fires because the engine cannot fail that way and a condition that never fires because the engine gets it wrong read identically from outside.
+The standard defines 68 GQLSTATUS conditions and zu answers a case with the right one for 63 of them. Each of the rest is named with its reason in `conformance.toml` at the root of this repository, because a condition that never fires because the engine cannot fail that way and a condition that never fires because the engine gets it wrong read identically from outside.
 
-Across the whole run zu produced 47 distinct GQLSTATUS codes, counted off the replies rather than off a summary, since a code the engine emitted once is the evidence that the machinery behind it works at all.
+Of the 5 that have no passing case, 3 cannot be raised by anything zu is sent: the standard defines them for an engine that lacks a feature zu has, so the only way to make one fire would be to take the feature out, which would be a worse engine with a better number. The other 2 are limits the standard leaves to the implementation. A case asked for a size and zu simply took it, so nothing was refused and there is no verdict, but the answer is still a measurement: zu's limit on that item is at least what was asked.
+
+Across the whole run zu produced 49 distinct GQLSTATUS codes, counted off the replies rather than off a summary, since a code the engine emitted once is the evidence that the machinery behind it works at all.
 
 ## What the standard leaves open, Clause 24.5.2
 
@@ -373,7 +375,11 @@ What zu adds is outside the language: a command line, a JSON line protocol on a 
 
 ## How far the evidence reaches
 
-The corpus behind this claim cites the standard mechanically, and the two numbers that say how much of the standard it has reached at all are these: 160 of the 317 normative subclauses have a passing case, and 403 of the 814 productions of the published grammar do. Those are properties of the corpus and not of zu. A subclause with no case is one nobody has written a case for; it is not one zu failed, and it is not one zu passed either.
+The corpus behind this claim cites the standard mechanically, and the two numbers that say how much of the standard it has reached at all are these: 252 of the 317 normative subclauses have a passing case, and 800 of the 814 productions of the published grammar do. Those are properties of the corpus and not of zu. A subclause with no case is one nobody has written a case for; it is not one zu failed, and it is not one zu passed either.
+
+Not all of either difference is untested ground. 14 of the productions are rules the harness registers as uncitable, each because the rule spells the name of a catalog object no GQL statement creates or hangs off a feature the standard leaves unspelled. On the subclause side 24 are registered the same way and 41 are clause headings that no case names directly and a passing case reaches through what they hold, since a heading specifies nothing on its own. The reasons are checked against the standard's own text by the harness rather than asserted here.
+
+Those account for both remainders exactly, so on this run there is no production and no subclause of the standard that the corpus has neither reached nor given a reason for. That is a statement about the corpus rather than about zu, and it is the one the corpus was built to be able to make.
 
 ## What this statement is not
 

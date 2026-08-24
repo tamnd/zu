@@ -320,6 +320,45 @@ ldbc_close_p50_ms = 200.0
 # Lower this ceiling, never raise it.
 ldbc_ordered_triangle_p50_ms = 150.0
 
+# The p99 companions on the nine SF1 latency gates above (Px, zu#79).
+# Every one of those phases already measured its own tail and printed
+# it; none of them held it against anything, so a query whose median
+# stayed put while its tail doubled passed the gate. These are the
+# ceilings that stop it.
+#
+# Six are twice their p50 companion, which is a rule and not a
+# measurement. The rule is there because a warm read whose tail is
+# more than double its own ceiling has a tail that is not warm, and
+# because the fleet cannot pin these tighter today: server1 sits at a
+# load average of 70 on 4 cores, server3 at 42 and server2 at 29, and
+# a p99 taken on a box in that state measures the neighbors. The two
+# hosts that can measure read 0.024 us, 0.08 us, 4.954 ms, 9.419 ms,
+# 21.713 ms and 0.185 ms on the local M series and 0.077 us, 0.06 us,
+# 5.095 ms, 7.536 ms, 16.467 ms and 0.269 ms on gamingpc, so the room
+# is large on purpose.
+#
+# The other three are set off measurements instead, because their own
+# comments above already record a tail the 2x rule would fail on. The
+# 2-hop read a 19.9 ms p99 on server1 under vCPU steal against an 8 ms
+# p50 ceiling, IC read 23 ms on hub seeds, and the distinct 2-hop read
+# 7.764 ms on hub seeds in a pass whose p50 was 0.466. Those are real
+# tails of real shapes, hub seeds and a shared box, and the ceiling
+# has to clear them or the gate is just a slow way of failing. The
+# quiet hosts read 0.339 and 0.249 ms, 2.277 and 1.994 ms, and 0.571
+# and 0.561 ms against those three.
+#
+# Lower these ceilings, never raise them, and lower the three
+# measured ones first: they are the ones with a number under them.
+ldbc_hop_p99_us = 20.0
+ldbc_key_p99_us = 4.0
+ldbc_two_hop_p99_ms = 24.0
+ldbc_triangle_p99_ms = 200.0
+ldbc_ordered_triangle_p99_ms = 300.0
+ldbc_close_p99_ms = 400.0
+ldbc_is_p99_ms = 2.0
+ldbc_ic_p99_ms = 30.0
+ldbc_distinct_two_hop_p99_ms = 10.0
+
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
 # directly against the loaded knows CSR: pagerank is 20 power
 # iterations at damping 0.85, wcc is union-find by minimum with path
@@ -387,6 +426,31 @@ open_p99_ms = 10.0
 # fleet. Lower these ceilings, never raise them.
 session_plan_hit_us = 5.0
 session_point_us = 10.0
+
+# The p99 companions on the same three reads (Px, zu#79). A serving
+# path is judged on the read that was slow, and a median holds still
+# through a cache that starts missing one time in fifty, which is the
+# regression these gates exist to catch in the first place. The point
+# read gate already had that happen to it once: it drifted 2 us to 14
+# and nobody noticed, because the p50 ceiling was loose enough to hold
+# it.
+#
+# Each ceiling is twice its p50 companion. That is a rule and not a
+# measurement, and it is a rule because the fleet cannot pin these any
+# tighter today: server1 is at a load average of 70 on 4 cores,
+# server3 at 42, server2 at 29, and a p99 taken on a box in that state
+# is a measurement of the neighbors. The two hosts that can measure
+# read 0.07, 9.50 and 10.61 on gamingpc and 0.08, 4.92 and 4.50 on the
+# local M series, with the local point read swinging to 9.92 on a
+# second pass inside the same minute, so the room over gamingpc is
+# that swing and not slack. What the rule asserts is the shape of the
+# distribution and not a number: a warm read whose tail is more than
+# double its own ceiling has a tail that is not warm. Lower these
+# ceilings when a quiet server1 pass can set them off a measurement,
+# never raise them.
+session_plan_hit_p99_us = 10.0
+session_point_p99_us = 20.0
+session_point_held_p99_us = 20.0
 
 # G8 (zu#123). The same point read on a session holding three session
 # parameters, one of each kind, none of which the query reads. What it

@@ -56,8 +56,12 @@ use crate::txn::Cell;
 /// directories are still read, because a file written before this is
 /// not wrong, it is just narrow. Version 5 adds the label bitset, the
 /// second thing after validity that is about the rows rather than about
-/// what a column holds.
-const PROPS_VERSION: u16 = 6;
+/// what a column holds. Version 6 packs segment payloads beside each
+/// other. Version 7 writes a list element at its own width instead of in
+/// eight bytes, which is the first version change that is about the
+/// inside of a row rather than about the directory: nothing here moves,
+/// and `list_elements` reads a version 6 row and a version 7 one alike.
+const PROPS_VERSION: u16 = 7;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -408,25 +412,59 @@ impl PropColumn {
 
 /// Whether values of this type ride the fixed width lane.
 fn lane_type(ty: &LogicalType) -> bool {
-    matches!(
-        ty.physical(),
-        Some(
-            PhysicalType::Bool
-                | PhysicalType::I8
-                | PhysicalType::I16
-                | PhysicalType::I32
-                | PhysicalType::I64
-                | PhysicalType::U8
-                | PhysicalType::U16
-                | PhysicalType::U32
-                | PhysicalType::U64
-                | PhysicalType::F32
-                | PhysicalType::F64
-                | PhysicalType::Days32
-                | PhysicalType::Nanos64
-                | PhysicalType::Months32
-        )
-    )
+    lane_width(ty).is_some()
+}
+
+/// How wide one value of this type is where it is written out at its
+/// natural size, and whether the lane word it came from carries a sign.
+///
+/// `None` is a type that does not ride the lane at all, so this is the
+/// one place the lane set is written down and `lane_type` asks it.
+///
+/// The scalar lane holds every one of these in a 64 bit word, because
+/// the integer cascade encodes words and gets its own narrowing from
+/// the values it meets. A list row has no cascade under it: it is a run
+/// of bytes inside a blob, so a width that is not the type's is a width
+/// paid on every element of every row. Hence the second half of the
+/// answer: an `INT32` lane word is sign extended to 64 bits, and a
+/// reader that cuts it to four bytes has to put the sign back.
+fn lane_width(ty: &LogicalType) -> Option<(usize, bool)> {
+    Some(match ty.physical()? {
+        // A truth value is one byte here rather than one bit. A bit
+        // would want a mask over the whole row, and a list row is
+        // read one element at a time by a caller that asks for the
+        // element and not for the run.
+        PhysicalType::Bool | PhysicalType::U8 => (1, false),
+        PhysicalType::I8 => (1, true),
+        PhysicalType::U16 => (2, false),
+        PhysicalType::I16 => (2, true),
+        // A float is bits and not a number, so nothing is extended
+        // into the half above it and it is read back unsigned.
+        PhysicalType::U32 | PhysicalType::F32 => (4, false),
+        // Days before the epoch and months before a zero duration are
+        // both negative, so both of these are signed.
+        PhysicalType::I32 | PhysicalType::Days32 | PhysicalType::Months32 => (4, true),
+        PhysicalType::I64 | PhysicalType::U64 | PhysicalType::F64 | PhysicalType::Nanos64 => {
+            (8, false)
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a lane word survives being cut to `width` bytes.
+///
+/// A word that does not is a word the column's own type says it cannot
+/// hold, so the cut would not be a narrowing but a loss, and the write
+/// is refused instead. Eight bytes is the whole word and always fits.
+fn fits_width(word: u64, width: usize, signed: bool) -> bool {
+    if width >= 8 {
+        return true;
+    }
+    let spare = 64 - width * 8;
+    match signed {
+        true => (((word as i64) << spare) >> spare) as u64 == word,
+        false => word >> (width * 8) == 0,
+    }
 }
 
 /// The property columns of one node table.
@@ -573,16 +611,33 @@ pub enum ListElement<'a> {
 }
 
 /// Encodes one row of a list column: `count: u32`, then the elements,
-/// each a little endian word for a lane element type or a `len: u32`
-/// and its bytes otherwise.
+/// each a little endian run of `lane_width` bytes for a lane element
+/// type or a `len: u32` and its bytes otherwise.
+///
+/// Version 6 and older wrote every lane element in eight bytes whatever
+/// its type. A list of 768 `FLOAT32` is the type this series is for and
+/// that cost it 6148 bytes a row against the 3076 the floats need, so
+/// version 7 writes each element at its own width. The reader below
+/// still reads both, and schema/06 §2 is the rule this is an instance
+/// of: the catalog holds the declaration, the bytes hold the narrowest
+/// thing that carries it.
 fn encode_list_row(elem: &LogicalType, items: &[ListElement<'_>]) -> Result<Vec<u8>> {
-    let lane = lane_type(elem);
-    let mut out = Vec::with_capacity(4 + items.len() * 8);
+    let lane = lane_width(elem);
+    let stride = lane.map_or(4, |(width, _)| width);
+    let mut out = Vec::with_capacity(4 + items.len() * stride);
     out.extend_from_slice(&(items.len() as u32).to_le_bytes());
     for item in items {
         match (item, lane) {
-            (ListElement::Word(w), true) => out.extend_from_slice(&w.to_le_bytes()),
-            (ListElement::Blob(b), false) => {
+            (ListElement::Word(w), Some((width, signed))) => {
+                if !fits_width(*w, width, signed) {
+                    return Err(ZuError::InvalidArgument(format!(
+                        "a list of {elem} does not hold {}",
+                        *w as i64
+                    )));
+                }
+                out.extend_from_slice(&w.to_le_bytes()[..width]);
+            }
+            (ListElement::Blob(b), None) => {
                 out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 out.extend_from_slice(b);
             }
@@ -606,28 +661,55 @@ pub fn list_elements<'a>(elem: &LogicalType, bytes: &'a [u8]) -> Result<Vec<List
         .get(..4)
         .ok_or_else(|| corrupt("truncated list length".into()))?;
     let count = u32::from_le_bytes(head.try_into().unwrap()) as usize;
-    let lane = lane_type(elem);
-    // A count is four bytes of header away from its smallest possible
-    // payload, so a count the row cannot hold is caught before it sizes
-    // an allocation.
-    let least = if lane { 8 } else { 4 };
-    if count > (bytes.len() - 4) / least {
-        return Err(corrupt(format!(
-            "a list of {count} does not fit {} bytes",
-            bytes.len()
-        )));
-    }
+    let body = bytes.len() - 4;
+    // Which width the row was written at is a question its own length
+    // answers, and no directory version has to be carried here to ask
+    // it. A lane row is a count and a run of equal elements, so the
+    // eight byte form and the natural one differ in length on every row
+    // that holds an element unless the natural width is eight, and
+    // where they do not differ they are the same bytes. A length that
+    // is neither is a row nothing wrote.
+    let lane = match lane_width(elem) {
+        Some((width, signed)) if body == count.saturating_mul(width) => Some((width, signed)),
+        Some(_) if body == count.saturating_mul(8) => Some((8, false)),
+        Some(_) => {
+            return Err(corrupt(format!(
+                "a list of {count} {elem} does not fit {} bytes",
+                bytes.len()
+            )));
+        }
+        // A blob element is four bytes of length away from its smallest
+        // possible payload, so a count the row cannot hold is caught
+        // before it sizes an allocation.
+        None if count > body / 4 => {
+            return Err(corrupt(format!(
+                "a list of {count} does not fit {} bytes",
+                bytes.len()
+            )));
+        }
+        None => None,
+    };
     let mut out = Vec::with_capacity(count);
     let mut pos = 4usize;
     for _ in 0..count {
-        if lane {
+        if let Some((width, signed)) = lane {
             let raw = bytes
-                .get(pos..pos + 8)
+                .get(pos..pos + width)
                 .ok_or_else(|| corrupt("truncated list element".into()))?;
-            out.push(ListElement::Word(u64::from_le_bytes(
-                raw.try_into().unwrap(),
-            )));
-            pos += 8;
+            let mut word = 0u64;
+            for (i, byte) in raw.iter().enumerate() {
+                word |= u64::from(*byte) << (i * 8);
+            }
+            // The lane hands every reader a 64 bit word and the scalar
+            // columns sign extend into it, so a negative element that
+            // was cut to four bytes has to arrive back as the same
+            // word a scalar column of that type would have held.
+            if signed && width < 8 {
+                let spare = 64 - width * 8;
+                word = (((word as i64) << spare) >> spare) as u64;
+            }
+            out.push(ListElement::Word(word));
+            pos += width;
         } else {
             let raw = bytes
                 .get(pos..pos + 4)
@@ -830,7 +912,10 @@ impl PropsDirectory {
         // codes 0 and 1 and version 2 never wrote the list code, and
         // every code means in this version what it meant then, so the
         // difference between the versions is which codes may appear
-        // rather than how any of them decodes.
+        // rather than how any of them decodes. Version 7 narrowed the
+        // list row and that is the one difference inside a value, but
+        // it is settled by the row's own length in `list_elements` and
+        // never by this number, which is why it is not passed down.
         if version > PROPS_VERSION || version == 0 {
             return Err(ZuError::Unsupported {
                 what: "props directory version",
@@ -3887,6 +3972,104 @@ mod tests {
         hostile[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(list_elements(&int, &hostile).is_err());
         assert!(list_elements(&text, &good).is_err());
+    }
+
+    /// A list element takes the width its own type needs. This is where
+    /// the embedding column's size comes from: 768 `FLOAT32` is 3076
+    /// bytes of row against the 6148 the eight byte form cost, and an
+    /// `INT8` list is an eighth of what it was.
+    #[test]
+    fn a_list_element_takes_the_width_its_type_needs() {
+        let int = |bits, signed| LogicalType::Int {
+            signed,
+            bits,
+            precision: None,
+        };
+        let float = |bits| LogicalType::Float {
+            bits,
+            precision: None,
+        };
+        // The word is what the lane holds for that element, so the
+        // signed rows are given the sign extended word a scalar column
+        // of that type would have carried.
+        let table: &[(LogicalType, usize, u64)] = &[
+            (LogicalType::Bool, 1, 1),
+            (int(IntBits::B8, true), 1, -128i64 as u64),
+            (int(IntBits::B8, false), 1, 255),
+            (int(IntBits::B16, true), 2, -32768i64 as u64),
+            (int(IntBits::B32, true), 4, -2147483648i64 as u64),
+            (int(IntBits::B32, false), 4, u32::MAX as u64),
+            (float(FloatBits::B32), 4, f32::to_bits(-1.5) as u64),
+            (LogicalType::Date, 4, -1i64 as u64),
+            (
+                LogicalType::Duration(DurationKind::YearMonth),
+                4,
+                -13i64 as u64,
+            ),
+            (int(IntBits::B64, true), 8, -1i64 as u64),
+            (float(FloatBits::B64), 8, f64::to_bits(-1.5)),
+            (LogicalType::LocalDatetime, 8, -1i64 as u64),
+        ];
+        for (elem, width, word) in table {
+            let row = encode_list_row(elem, &[ListElement::Word(*word)]).unwrap();
+            assert_eq!(row.len(), 4 + width, "{elem}");
+            assert_eq!(
+                list_elements(elem, &row).unwrap(),
+                vec![ListElement::Word(*word)],
+                "{elem}"
+            );
+        }
+        // The number the milestone is about, on the type it is about.
+        let row =
+            encode_list_row(&float(FloatBits::B32), &vec![ListElement::Word(0); 768]).unwrap();
+        assert_eq!(row.len(), 3076, "a 768 dimension FLOAT32 embedding row");
+    }
+
+    /// A word wider than the element type is a value that column cannot
+    /// hold, so cutting it would be a loss and not a narrowing.
+    #[test]
+    fn a_list_element_too_wide_for_its_type_is_refused() {
+        let byte = LogicalType::Int {
+            signed: false,
+            bits: IntBits::B8,
+            precision: None,
+        };
+        assert!(encode_list_row(&byte, &[ListElement::Word(255)]).is_ok());
+        assert!(encode_list_row(&byte, &[ListElement::Word(256)]).is_err());
+        let small = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B16,
+            precision: None,
+        };
+        assert!(encode_list_row(&small, &[ListElement::Word(-32768i64 as u64)]).is_ok());
+        assert!(encode_list_row(&small, &[ListElement::Word(-32769i64 as u64)]).is_err());
+        assert!(encode_list_row(&small, &[ListElement::Word(32768)]).is_err());
+    }
+
+    /// Version 6 and older wrote every lane element in eight bytes, and
+    /// those rows are still in files. The row's own length is what says
+    /// which form it is, so no version has to reach the reader.
+    #[test]
+    fn a_list_row_written_in_the_old_eight_byte_form_still_reads() {
+        let elem = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        };
+        let words = [7i64, -7, i32::MIN as i64];
+        let mut old = (words.len() as u32).to_le_bytes().to_vec();
+        for word in words {
+            old.extend_from_slice(&word.to_le_bytes());
+        }
+        let want: Vec<ListElement> = words.iter().map(|w| ListElement::Word(*w as u64)).collect();
+        assert_eq!(list_elements(&elem, &old).unwrap(), want);
+        // And the same values written now are the same values read
+        // back, in half the bytes.
+        let new = encode_list_row(&elem, &want).unwrap();
+        assert_eq!(new.len(), 4 + 3 * 4);
+        assert_eq!(list_elements(&elem, &new).unwrap(), want);
+        // A length that is neither form is a row nothing wrote.
+        assert!(list_elements(&elem, &old[..old.len() - 1]).is_err());
     }
 
     /// A version 2 directory holds every code but the list one, and a

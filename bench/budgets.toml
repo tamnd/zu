@@ -2366,12 +2366,15 @@ sustained_slack_x = 1.25
 #
 # Scaled by the host calibration, the same way write_cpu_nosync_us is,
 # because this is a product target and not a number fitted to a box.
-# Measured 27 and 43 us over two runs on an M series laptop against a
-# ceiling of 130 there, and 60 us on the gaming box against 93. Twice
-# the measurement rather than the few percent an alloc count gets: a
-# p99 is one statement out of a hundred and it moves with whatever else
-# the box is doing.
-write_p99_nosync_us = 75.0
+# Measured 27, 28 and 43 us over three runs on an M series laptop, and
+# 60 and 62 on the gaming box. The gaming box is the tight one: its
+# calibration has come back at both 1.24 and 1.00 for the same
+# hardware, so the ceiling it enforces is somewhere between 100 and
+# 124 against a 62 us reading. That is the headroom a p99 wants, since
+# it is one statement in a hundred and moves with whatever else is on
+# the box, where the alloc counts a few keys up sit a few percent over
+# their measurement because nothing about them is a clock.
+write_p99_nosync_us = 100.0
 
 # The same tail over its own median, which no host can move.
 #
@@ -2379,8 +2382,8 @@ write_p99_nosync_us = 75.0
 # microseconds, and DEFERRED_COMMITS is set so the share of statements
 # carrying one stays under what a p99 leaves. The run folds once every
 # 240 statements, 0.4 percent, so the folds sit just above the p99 and
-# the tail is a statement and not a fold: 2.05 on the laptop and 1.94
-# on the gaming box, off medians of 21 and 31 us. A deferral bound that
+# the tail is a statement and not a fold: 1.44 to 2.05 on the laptop
+# and 1.94 to 2.68 on the gaming box, off medians of 19 to 31 us. A deferral bound that
 # shrank, or a fold that got slower, pulls a fold into the tail and
 # doubles this. Lower it as the write path gets flatter, never raise
 # it.

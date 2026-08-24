@@ -13,14 +13,14 @@ These columns were taken together: same corpus, same harness build, same machine
 | | zu | ladybug | neo4j |
 |---|---|---|---|
 | version | zu 0.0.1 | Lbug 0.19.1 | Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25 |
-| measured | 2026-08-22 | 2026-08-22 | 2026-08-22 |
+| measured | 2026-08-24 | 2026-08-24 | 2026-08-24 |
 | on | darwin arm64, Apple M4 | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
 | harness | gql-compat devel | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
-| round trip, `RETURN 1 AS n` | 0.082 ms | 94.069 ms | 3.742 ms |
-| cheapest case it passed | 0.019 ms | 180.752 ms | 0.597 ms |
-| **floor taken** | **0.019 ms** | **94.069 ms** | **0.597 ms** |
-| usable above | 0.185 ms | 940.693 ms | 5.970 ms |
+| round trip, `RETURN 1 AS n` | 0.044 ms | 279.594 ms | 3.614 ms |
+| cheapest case it passed | 0.035 ms | 288.852 ms | 1.879 ms |
+| **floor taken** | **0.035 ms** | **279.594 ms** | **1.879 ms** |
+| usable above | 0.350 ms | 2795.939 ms | 18.787 ms |
 | empty store on disk | 256.00 KiB | 32.00 KiB | not on this machine |
 
 An engine's floor is what the cheapest thing it can do costs, and it is why a fast query and a fast engine are not the same claim. The harness measures it directly, once per run, by timing a statement whose answer is already known. That measurement is taken before the run warms up, and on this route it is not always the smallest thing seen: a floor that a real query gets under is not a floor. So the smaller of the two is taken, and both are printed so a reader can see which one it was.
@@ -33,31 +33,31 @@ The target is the best usable rival p50 divided by ten, best meaning the lowest,
 
 | case | zu p50 | ladybug p50 | neo4j p50 | target | zu faster by | verdict |
 |---|---:|---:|---:|---:|---:|---|
-| `filter/one-in-a-hundred` | 0.297 ms | error | 36.807 ms | 3.681 ms | 124.10x | met |
-| `filter/one-in-ten` | 0.370 ms | error | 15.230 ms | 1.523 ms | 41.13x | met |
-| `group/count-by-bucket` | 0.834 ms | error | 32.563 ms | 3.256 ms | 39.03x | met |
-| `ingest/load-a-hundred-thousand-nodes` | 0.052 ms | error | 32.271 ms | 3.227 ms | 617.62x | met |
-| `join/clique-edge-scan` | 0.051 ms | 180.752 ms † | 62.744 ms | 6.274 ms | 1220.31x | met |
-| `join/grid-two-hop` | 0.264 ms | 232.460 ms † | 42.512 ms | 4.251 ms | 161.21x | met |
-| `join/random-two-hop` | 1.915 ms | 288.607 ms † | 191.856 ms | 19.186 ms | 100.17x | met |
-| `join/scale-free-two-hop` | 0.545 ms | 340.462 ms † | 54.651 ms | 5.465 ms | 100.28x | met |
-| `join/star-fan-out` | 0.044 ms | 235.467 ms † | 4.229 ms † | n/a | n/a | no usable rival |
-| `join/two-hop-path-10k` | 0.103 ms | 208.203 ms † | 6.315 ms | 0.631 ms | 61.28x | met |
-| `lookup/point-by-property` | 0.022 ms | error | 11.745 ms | 1.174 ms | 535.90x | met |
-| `recursion/all-shortest-through-diamonds` | 0.131 ms | fail | 9.237 ms | 0.924 ms | 70.64x | met |
-| `recursion/any-shortest-through-diamonds` | 0.045 ms | fail | 3.156 ms † | n/a | n/a | no usable rival |
-| `recursion/bounded-quantifier-five-hops` | 0.051 ms | fail | 3.269 ms † | n/a | n/a | no usable rival |
-| `recursion/unbounded-reachability` | 1.663 ms | fail | 4.693 ms † | n/a | n/a | no usable rival |
-| `scan/count-path-100k` | 0.040 ms | error | 0.893 ms † | n/a | n/a | no usable rival |
-| `scan/count-path-10k` | 0.019 ms | 333.348 ms † | 0.597 ms † | n/a | n/a | no usable rival |
-| `scan/count-path-1k` | 0.127 ms | 420.579 ms † | 0.646 ms † | n/a | n/a | no usable rival |
-| `scan/read-several-properties` | 0.085 ms | 524.335 ms † | 6.671 ms | 0.667 ms | 78.33x | met |
-| `scan/sum-property-100k` | 0.475 ms | error | 15.017 ms | 1.502 ms | 31.64x | met |
-| `sort/top-three-of-a-hundred-thousand` | 0.618 ms | error | 14.815 ms | 1.481 ms | 23.98x | met |
-| `write/insert-one-node` | 3.940 ms | fail | 0.639 ms † | n/a | n/a | no usable rival |
-| `write/set-property-on-every-node` | fail | fail | 36.708 ms | n/a | n/a | zu did not pass |
+| `filter/one-in-a-hundred` | 0.544 ms | error | 40.477 ms | 4.048 ms | 74.36x | met |
+| `filter/one-in-ten` | 0.688 ms | error | 49.871 ms | 4.987 ms | 72.45x | met |
+| `group/count-by-bucket` | 1.319 ms | error | 100.284 ms | 10.028 ms | 76.01x | met |
+| `ingest/load-a-hundred-thousand-nodes` | 0.062 ms | error | 49.199 ms | 4.920 ms | 798.37x | met |
+| `join/clique-edge-scan` | 0.143 ms | 293.363 ms † | 487.563 ms | 48.756 ms | 3420.49x | met |
+| `join/grid-two-hop` | 0.630 ms | 288.852 ms † | 269.158 ms | 26.916 ms | 426.98x | met |
+| `join/random-two-hop` | 2.235 ms | 724.085 ms † | 245.227 ms | 24.523 ms | 109.72x | met |
+| `join/scale-free-two-hop` | 1.090 ms | 4989.271 ms | 131.660 ms | 13.166 ms | 120.82x | met |
+| `join/star-fan-out` | 0.045 ms | 540.933 ms † | 11.993 ms † | n/a | n/a | no usable rival |
+| `join/two-hop-path-10k` | 0.220 ms | 370.280 ms † | 26.881 ms | 2.688 ms | 122.23x | met |
+| `lookup/point-by-property` | 0.035 ms | error | 48.917 ms | 4.892 ms | 1399.31x | met |
+| `recursion/all-shortest-through-diamonds` | 0.332 ms | fail | 11.347 ms † | n/a | n/a | no usable rival |
+| `recursion/any-shortest-through-diamonds` | 0.051 ms | fail | 3.809 ms † | n/a | n/a | no usable rival |
+| `recursion/bounded-quantifier-five-hops` | 0.123 ms | fail | 2.161 ms † | n/a | n/a | no usable rival |
+| `recursion/unbounded-reachability` | 3.567 ms | fail | 2.647 ms † | n/a | n/a | no usable rival |
+| `scan/count-path-100k` | 0.101 ms | error | 4.035 ms † | n/a | n/a | no usable rival |
+| `scan/count-path-10k` | 0.072 ms | 343.962 ms † | 2.631 ms † | n/a | n/a | no usable rival |
+| `scan/count-path-1k` | 0.118 ms | 377.797 ms † | 1.879 ms † | n/a | n/a | no usable rival |
+| `scan/read-several-properties` | 0.277 ms | 382.118 ms † | 6.460 ms † | n/a | n/a | no usable rival |
+| `scan/sum-property-100k` | 0.874 ms | error | 16.611 ms † | n/a | n/a | no usable rival |
+| `sort/top-three-of-a-hundred-thousand` | 1.027 ms | error | 28.743 ms | 2.874 ms | 28.00x | met |
+| `write/insert-one-node` | 4.017 ms | fail | 2.161 ms † | n/a | n/a | no usable rival |
+| `write/set-property-on-every-node` | fail | fail | 58.631 ms | n/a | n/a | zu did not pass |
 
-23 timed cases. A usable rival number on 14 of them, of which 14 meet the ten times target and 0 do not. On the other 9 the page states nothing either way: either zu did not pass the case, or every rival that did sits under its own floor.
+23 timed cases. A usable rival number on 11 of them, of which 11 meet the ten times target and 0 do not. On the other 12 the page states nothing either way: either zu did not pass the case, or every rival that did sits under its own floor.
 
 ## Where a rival came within ten times
 
@@ -65,9 +65,8 @@ These are the cases to look at next. Most of them are excluded from the table ab
 
 | case | rival | subject p50 | rival p50 | ratio |
 |---|---|---:|---:|---:|
-| `recursion/unbounded-reachability` | neo4j | 1.663 ms | 4.693 ms | 2.82x |
-| `scan/count-path-1k` | neo4j | 0.127 ms | 0.646 ms | 5.09x |
-| `write/insert-one-node` | neo4j | 3.940 ms | 0.639 ms | 0.16x |
+| `recursion/unbounded-reachability` | neo4j | 3.567 ms | 2.647 ms | 0.74x |
+| `write/insert-one-node` | neo4j | 4.017 ms | 2.161 ms | 0.54x |
 
 ## Ingest
 
@@ -77,35 +76,35 @@ Both rates are printed because neither one describes every fixture. A path of a 
 
 | fixture | engine | nodes | edges | whole load | engine's part | nodes per second | edges per second |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `perf-path-100k` | zu | 100 000 | 99 999 | 596.482 ms | 78.036 ms | 1 281 467 | 1 281 454 |
-| `perf-path-100k` | neo4j | 100 000 | 99 999 | 5943.738 ms | 5940.748 ms | 16 832 | 16 832 |
-| `perf-clique-512` | zu | 512 | 261 632 | 1914.853 ms | 63.031 ms | 8 122 | 4 150 824 |
-| `perf-clique-512` | ladybug | 512 | 261 632 | 23159.362 ms | 22877.396 ms | 22 | 11 436 |
-| `perf-clique-512` | neo4j | 512 | 261 632 | 7132.594 ms | 6251.079 ms | 81 | 41 853 |
-| `perf-grid-10k` | zu | 10 000 | 19 800 | 127.311 ms | 38.708 ms | 258 342 | 511 518 |
-| `perf-grid-10k` | ladybug | 10 000 | 19 800 | 8158.044 ms | 7921.693 ms | 1 262 | 2 499 |
-| `perf-grid-10k` | neo4j | 10 000 | 19 800 | 2315.170 ms | 1961.413 ms | 5 098 | 10 094 |
-| `perf-random-10k` | zu | 10 000 | 79 994 | 484.415 ms | 49.164 ms | 203 402 | 1 627 094 |
-| `perf-random-10k` | ladybug | 10 000 | 79 994 | 31276.481 ms | 30963.047 ms | 322 | 2 583 |
-| `perf-random-10k` | neo4j | 10 000 | 79 994 | 1168.105 ms | 1122.900 ms | 8 905 | 71 238 |
-| `perf-scale-free-10k` | zu | 10 000 | 40 000 | 247.348 ms | 39.651 ms | 252 202 | 1 008 811 |
-| `perf-scale-free-10k` | ladybug | 10 000 | 40 000 | 14066.010 ms | 13733.624 ms | 728 | 2 912 |
-| `perf-scale-free-10k` | neo4j | 10 000 | 40 000 | 1023.074 ms | 899.713 ms | 11 114 | 44 458 |
-| `perf-star-10k` | zu | 10 000 | 9 999 | 97.515 ms | 32.370 ms | 308 926 | 308 895 |
-| `perf-star-10k` | ladybug | 10 000 | 9 999 | 10125.088 ms | 9711.622 ms | 1 029 | 1 029 |
-| `perf-star-10k` | neo4j | 10 000 | 9 999 | 772.103 ms | 634.367 ms | 15 763 | 15 762 |
-| `perf-path-10k` | zu | 10 000 | 9 999 | 85.317 ms | 31.595 ms | 316 509 | 316 477 |
-| `perf-path-10k` | ladybug | 10 000 | 9 999 | 6121.457 ms | 5876.211 ms | 1 701 | 1 701 |
-| `perf-path-10k` | neo4j | 10 000 | 9 999 | 244.204 ms | 212.807 ms | 46 990 | 46 986 |
-| `perf-diamonds-8` | zu | 25 | 32 | 44.234 ms | 30.780 ms | 812 | 1 039 |
-| `perf-diamonds-8` | ladybug | 25 | 32 | 505.479 ms | 265.180 ms | 94 | 120 |
-| `perf-diamonds-8` | neo4j | 25 | 32 | 1252.869 ms | 1006.451 ms | 24 | 31 |
-| `perf-path-1k` | zu | 1 000 | 999 | 48.068 ms | 29.111 ms | 34 351 | 34 317 |
-| `perf-path-1k` | ladybug | 1 000 | 999 | 851.286 ms | 534.994 ms | 1 869 | 1 867 |
-| `perf-path-1k` | neo4j | 1 000 | 999 | 111.134 ms | 96.903 ms | 10 319 | 10 309 |
-| `perf-wide-10k` | zu | 10 000 | 9 999 | 86.919 ms | 34.140 ms | 292 914 | 292 885 |
-| `perf-wide-10k` | ladybug | 10 000 | 9 999 | 8997.758 ms | 8581.641 ms | 1 165 | 1 165 |
-| `perf-wide-10k` | neo4j | 10 000 | 9 999 | 242.937 ms | 240.774 ms | 41 532 | 41 528 |
+| `perf-path-100k` | zu | 100 000 | 99 999 | 1010.384 ms | 111.559 ms | 896 388 | 896 379 |
+| `perf-path-100k` | neo4j | 100 000 | 99 999 | 14169.314 ms | 14166.109 ms | 7 059 | 7 059 |
+| `perf-clique-512` | zu | 512 | 261 632 | 1312.060 ms | 103.982 ms | 4 923 | 2 516 119 |
+| `perf-clique-512` | ladybug | 512 | 261 632 | 29360.205 ms | 29001.846 ms | 17 | 9 021 |
+| `perf-clique-512` | neo4j | 512 | 261 632 | 28702.586 ms | 25974.440 ms | 19 | 10 072 |
+| `perf-grid-10k` | zu | 10 000 | 19 800 | 170.374 ms | 49.477 ms | 202 113 | 400 184 |
+| `perf-grid-10k` | ladybug | 10 000 | 19 800 | 7511.219 ms | 7057.462 ms | 1 416 | 2 805 |
+| `perf-grid-10k` | neo4j | 10 000 | 19 800 | 15369.844 ms | 11479.731 ms | 871 | 1 724 |
+| `perf-random-10k` | zu | 10 000 | 79 994 | 469.074 ms | 70.273 ms | 142 302 | 1 138 335 |
+| `perf-random-10k` | ladybug | 10 000 | 79 994 | 39469.314 ms | 39005.773 ms | 256 | 2 050 |
+| `perf-random-10k` | neo4j | 10 000 | 79 994 | 7732.816 ms | 6986.051 ms | 1 431 | 11 450 |
+| `perf-scale-free-10k` | zu | 10 000 | 40 000 | 251.045 ms | 56.883 ms | 175 798 | 703 192 |
+| `perf-scale-free-10k` | ladybug | 10 000 | 40 000 | 26266.709 ms | 25387.282 ms | 393 | 1 575 |
+| `perf-scale-free-10k` | neo4j | 10 000 | 40 000 | 2991.536 ms | 2700.553 ms | 3 702 | 14 811 |
+| `perf-star-10k` | zu | 10 000 | 9 999 | 178.153 ms | 87.126 ms | 114 776 | 114 764 |
+| `perf-star-10k` | ladybug | 10 000 | 9 999 | 16512.703 ms | 10599.933 ms | 943 | 943 |
+| `perf-star-10k` | neo4j | 10 000 | 9 999 | 1932.329 ms | 1790.369 ms | 5 585 | 5 584 |
+| `perf-path-10k` | zu | 10 000 | 9 999 | 159.445 ms | 90.331 ms | 110 704 | 110 693 |
+| `perf-path-10k` | ladybug | 10 000 | 9 999 | 6224.152 ms | 5434.670 ms | 1 840 | 1 839 |
+| `perf-path-10k` | neo4j | 10 000 | 9 999 | 1835.060 ms | 1722.302 ms | 5 806 | 5 805 |
+| `perf-diamonds-8` | zu | 25 | 32 | 68.786 ms | 43.049 ms | 580 | 743 |
+| `perf-diamonds-8` | ladybug | 25 | 32 | 824.428 ms | 464.040 ms | 53 | 68 |
+| `perf-diamonds-8` | neo4j | 25 | 32 | 3470.991 ms | 2539.311 ms | 9 | 12 |
+| `perf-path-1k` | zu | 1 000 | 999 | 69.314 ms | 36.895 ms | 27 104 | 27 077 |
+| `perf-path-1k` | ladybug | 1 000 | 999 | 1201.361 ms | 788.852 ms | 1 267 | 1 266 |
+| `perf-path-1k` | neo4j | 1 000 | 999 | 112.768 ms | 97.606 ms | 10 245 | 10 235 |
+| `perf-wide-10k` | zu | 10 000 | 9 999 | 141.750 ms | 48.351 ms | 206 818 | 206 798 |
+| `perf-wide-10k` | ladybug | 10 000 | 9 999 | 7799.978 ms | 7368.544 ms | 1 357 | 1 356 |
+| `perf-wide-10k` | neo4j | 10 000 | 9 999 | 529.638 ms | 524.047 ms | 19 082 | 19 080 |
 
 ## Memory and disk
 
@@ -113,41 +112,41 @@ Peak resident set is the worst the harness sampled, once over the load and once 
 
 | fixture | engine | peak RSS loading | peak RSS answering | store after load | bits per edge |
 |---|---|---:|---:|---:|---:|
-| `perf-path-100k` | zu | 45.28 MiB | 10.67 MiB | 4.06 MiB | withheld |
+| `perf-path-100k` | zu | 46.14 MiB | 10.86 MiB | 2.75 MiB | withheld |
 | `perf-path-100k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-clique-512` | zu | 34.34 MiB | 7.64 MiB | 3.56 MiB | withheld |
-| `perf-clique-512` | ladybug | 2434.80 MiB | 99.44 MiB | 41.98 MiB | 1345.879 |
+| `perf-clique-512` | zu | 35.22 MiB | 9.09 MiB | 2.75 MiB | withheld |
+| `perf-clique-512` | ladybug | 2255.39 MiB | 97.97 MiB | 41.98 MiB | 1345.879 |
 | `perf-clique-512` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-grid-10k` | zu | 10.81 MiB | 8.23 MiB | 3.56 MiB | withheld |
-| `perf-grid-10k` | ladybug | 2224.13 MiB | 115.41 MiB | 4.87 MiB | 2063.722 |
+| `perf-grid-10k` | zu | 9.97 MiB | 9.72 MiB | 2.75 MiB | withheld |
+| `perf-grid-10k` | ladybug | 1584.58 MiB | 110.16 MiB | 4.87 MiB | 2063.722 |
 | `perf-grid-10k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-random-10k` | zu | 15.66 MiB | 10.86 MiB | 3.56 MiB | withheld |
-| `perf-random-10k` | ladybug | 2176.77 MiB | 115.63 MiB | 10.43 MiB | 1094.124 |
+| `perf-random-10k` | zu | 16.81 MiB | 11.42 MiB | 3.00 MiB | withheld |
+| `perf-random-10k` | ladybug | 1829.56 MiB | 124.92 MiB | 10.43 MiB | 1094.124 |
 | `perf-random-10k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-scale-free-10k` | zu | 11.86 MiB | 8.00 MiB | 3.56 MiB | withheld |
-| `perf-scale-free-10k` | ladybug | 2204.80 MiB | 118.95 MiB | 6.65 MiB | 1395.098 |
+| `perf-scale-free-10k` | zu | 13.94 MiB | 9.48 MiB | 2.75 MiB | withheld |
+| `perf-scale-free-10k` | ladybug | 1679.61 MiB | 130.36 MiB | 6.65 MiB | 1395.098 |
 | `perf-scale-free-10k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-star-10k` | zu | 8.30 MiB | 7.67 MiB | 3.56 MiB | withheld |
-| `perf-star-10k` | ladybug | 1082.19 MiB | 95.91 MiB | 3.72 MiB | 3119.826 |
+| `perf-star-10k` | zu | 10.98 MiB | 8.22 MiB | 2.75 MiB | withheld |
+| `perf-star-10k` | ladybug | 1053.67 MiB | 105.81 MiB | 3.72 MiB | 3119.826 |
 | `perf-star-10k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-path-10k` | zu | 9.59 MiB | 9.80 MiB | 3.56 MiB | withheld |
-| `perf-path-10k` | ladybug | 1160.53 MiB | 102.36 MiB | 3.89 MiB | 3267.296 |
+| `perf-path-10k` | zu | 10.75 MiB | 10.50 MiB | 2.75 MiB | withheld |
+| `perf-path-10k` | ladybug | 1113.14 MiB | 101.81 MiB | 3.89 MiB | 3267.296 |
 | `perf-path-10k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-diamonds-8` | zu | 8.13 MiB | 9.41 MiB | 3.56 MiB | withheld |
-| `perf-diamonds-8` | ladybug | 95.52 MiB | 73.70 MiB | 380.00 KiB | 97280.000 |
+| `perf-diamonds-8` | zu | 8.59 MiB | 10.50 MiB | 2.75 MiB | withheld |
+| `perf-diamonds-8` | ladybug | 98.38 MiB | 80.45 MiB | 380.00 KiB | 97280.000 |
 | `perf-diamonds-8` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-path-1k` | zu | 7.63 MiB | 9.05 MiB | 3.56 MiB | withheld |
-| `perf-path-1k` | ladybug | 221.77 MiB | 81.03 MiB | 2.24 MiB | 18827.660 |
+| `perf-path-1k` | zu | 8.80 MiB | 10.67 MiB | 2.75 MiB | withheld |
+| `perf-path-1k` | ladybug | 226.36 MiB | 82.28 MiB | 2.24 MiB | 18827.660 |
 | `perf-path-1k` | neo4j | not visible | not visible | not visible | withheld |
-| `perf-wide-10k` | zu | 11.73 MiB | 7.80 MiB | 4.81 MiB | 2569.268 |
-| `perf-wide-10k` | ladybug | 1122.14 MiB | 89.08 MiB | 4.31 MiB | 3617.949 |
+| `perf-wide-10k` | zu | 14.42 MiB | 9.34 MiB | 2.75 MiB | withheld |
+| `perf-wide-10k` | ladybug | 1047.50 MiB | 81.27 MiB | 4.31 MiB | 3617.949 |
 | `perf-wide-10k` | neo4j | not visible | not visible | not visible | withheld |
 
 Why a density is withheld, in the harness's words:
 
-- the graph occupies 2.31MiB, under the 10 allocation units of 256.00KiB a density figure needs before the rounding up to a whole unit is less than a tenth of it
+- the whole 2.75MiB store is the fixed part, measured as a load of this fixture's schema with none of its rows, so this graph added nothing that can be divided
 - the engine's store is not on this machine, so there is nothing to divide
-- the graph occupies 1.81MiB, under the 10 allocation units of 256.00KiB a density figure needs before the rounding up to a whole unit is less than a tenth of it
+- the graph occupies 256.00KiB, under the 10 allocation units of 256.00KiB a density figure needs before the rounding up to a whole unit is less than a tenth of it
 
 ## What the numbers do not say
 

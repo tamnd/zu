@@ -1505,24 +1505,66 @@ pub(crate) enum NotAQuery {
     Session(zu_query::ast::SessionStmt),
 }
 
+/// Which of the five kinds a statement is, with the tree the parse made
+/// rather than a verdict about it.
+pub(crate) enum Categorised {
+    /// A query, and what it parsed to. The caller compiles this rather
+    /// than parsing the text a second time to get it back. #658.
+    Query(Box<zu_query::ast::Query>),
+    /// Anything else, which has no binding table and no plan.
+    Other(NotAQuery),
+}
+
+/// Which of the five kinds `source` is.
+///
+/// Every entry point that takes statement text asks this first: the four
+/// that are not queries have no binding table and no plan, so a caller
+/// that sent one and got "expected MATCH" back would be told the wrong
+/// thing.
+pub(crate) fn categorise(source: &str) -> Result<Categorised> {
+    Ok(match zu_query::parser::parse_statement(source)? {
+        zu_query::ast::Statement::Catalog(stmt) => Categorised::Other(NotAQuery::Catalog(stmt)),
+        zu_query::ast::Statement::Transaction(stmt) => {
+            Categorised::Other(NotAQuery::Transaction(stmt))
+        }
+        zu_query::ast::Statement::Block(parts) => Categorised::Other(NotAQuery::Block(parts)),
+        zu_query::ast::Statement::Session(stmt) => Categorised::Other(NotAQuery::Session(stmt)),
+        zu_query::ast::Statement::Query(query) => Categorised::Query(Box::new(query)),
+    })
+}
+
 /// What this source is when it is not a query, `None` when it is one.
 ///
-/// Every entry point that takes statement text checks this first: these
-/// statements have no binding table and no plan, so a caller that sent
-/// one and got "expected MATCH" back would be told the wrong thing.
+/// The parse this makes is thrown away, so a caller that goes on to
+/// compile the query wants [`categorise`] instead.
 pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
-    match zu_query::parser::parse_statement(source)? {
-        zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
-        zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
-        zu_query::ast::Statement::Block(parts) => Ok(Some(NotAQuery::Block(parts))),
-        zu_query::ast::Statement::Session(stmt) => Ok(Some(NotAQuery::Session(stmt))),
-        zu_query::ast::Statement::Query(_) => Ok(None),
-    }
+    Ok(match categorise(source)? {
+        Categorised::Query(_) => None,
+        Categorised::Other(other) => Some(other),
+    })
 }
 
 fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
+    prepare_from(source, None, db, params)
+}
+
+/// The same, for a caller that has already parsed the text.
+///
+/// [`run_with`] categorises before it prepares, and categorising is a
+/// parse, so the tree is already made by the time this is reached and
+/// parsing again would be the second of two identical parses (#658).
+/// `parsed` is `None` for the callers that arrive with only the text.
+fn prepare_from(
+    source: &str,
+    parsed: Option<Box<zu_query::ast::Query>>,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+) -> Result<Prepared> {
     let catalog = Catalog::load(db)?;
-    let parsed = parser::parse(source)?;
+    let parsed = match parsed {
+        Some(parsed) => *parsed,
+        None => parser::parse(source)?,
+    };
     // A one-shot call has no session, so the graph it works in is the
     // home graph and a `USE` is the only way to name another one.
     let graph = graph_of(
@@ -1591,8 +1633,9 @@ pub fn run_with(
     params: &[(&str, Value)],
     options: &exec::Options,
 ) -> Result<QueryResult> {
-    match not_a_query(source)? {
-        Some(NotAQuery::Catalog(stmt)) => {
+    let parsed = match categorise(source)? {
+        Categorised::Query(parsed) => parsed,
+        Categorised::Other(NotAQuery::Catalog(stmt)) => {
             crate::catalog_stmt::apply(db, &stmt, params)?;
             return Ok(QueryResult::new(Vec::new(), Vec::new()));
         }
@@ -1600,14 +1643,14 @@ pub fn run_with(
         // entry point runs one statement against a file handle it hands
         // straight back, so there is nothing here for the next
         // statement to be held together with.
-        Some(NotAQuery::Transaction(_)) => {
+        Categorised::Other(NotAQuery::Transaction(_)) => {
             return Err(ZuError::InvalidArgument(
                 "a transaction runs across statements, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
         // A block is several statements taken back together when one of
         // them raises, which is a transaction and needs the same thing.
-        Some(NotAQuery::Block(_)) => {
+        Categorised::Other(NotAQuery::Block(_)) => {
             return Err(ZuError::InvalidArgument(
                 "a statement block runs its parts as one transaction, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
@@ -1615,14 +1658,13 @@ pub fn run_with(
         // A session statement changes the session the statements after
         // it run in, and this entry point has none: what it changed
         // would go away with the call that changed it.
-        Some(NotAQuery::Session(_)) => {
+        Categorised::Other(NotAQuery::Session(_)) => {
             return Err(ZuError::InvalidArgument(
                 "a session statement changes what the statements after it run in, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
             ));
         }
-        None => {}
-    }
-    let p = prepare(source, db, params)?;
+    };
+    let p = prepare_from(source, Some(parsed), db, params)?;
     // A match written several ways is a plan per way over the rows the
     // clauses in front of it answered, which is a seam and not an
     // operator, so a statement that holds one runs as its parts. Only a

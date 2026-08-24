@@ -79,6 +79,24 @@ fn focused_key(source: &str, graph: u32) -> String {
     format!("{graph}\0{source}")
 }
 
+/// What [`Session::categorised`] found a text to be.
+///
+/// The point of the `Query` arm holding the tree is that the miss path
+/// used to parse the same text three times: once to say it was a query,
+/// once to read the `USE` in front of it, and once to compile it. The
+/// tree is the same tree every time and it is carried now rather than
+/// made again. #658.
+enum Kind {
+    /// A text the plan cache already holds a plan or a refusal for,
+    /// which is a text that parsed as a query the first time it was
+    /// sent and parses as one now. Nothing was parsed to say so.
+    Planned,
+    /// A query, and what it parsed to.
+    Query(Box<zu_query::ast::Query>),
+    /// One of the four kinds that is not a query.
+    Other(NotAQuery),
+}
+
 enum Compiled {
     Plan(Arc<CachedPlan>),
     /// Only a GQL condition is kept. An io failure reading the stats a
@@ -1835,11 +1853,15 @@ impl Session {
         self.check_open()?;
         self.sync()?;
         self.check_refs(params)?;
-        if self.categorised(source)?.is_some() {
-            let result = self.run_in(source, params)?;
-            return exec::stream_result(result, batch_rows, sink);
-        }
-        let cached = self.plan_for(source, params)?;
+        let parsed = match self.categorised(source)? {
+            Kind::Other(_) => {
+                let result = self.run_in(source, params)?;
+                return exec::stream_result(result, batch_rows, sink);
+            }
+            Kind::Query(parsed) => Some(parsed),
+            Kind::Planned => None,
+        };
+        let cached = self.plan_from(source, parsed, params)?;
         let args = self.args_for(&cached.query.params, params)?;
         if cached.parts.is_some() {
             let result = self.run_in(source, params)?;
@@ -1954,17 +1976,17 @@ impl Session {
         // parameters. So a text with a plan behind it parsed as a query
         // once and parses as one every time, and asking again costs a
         // full parse of the source on the warmest path there is. #655.
-        match self.categorised(source)? {
-            Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
+        let parsed = match self.categorised(source)? {
+            Kind::Other(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
             // GS01 through GS16. It changes this session and answers no
             // rows, and it is not held in the plan cache: there is
             // nothing compiled to hold.
-            Some(NotAQuery::Session(stmt)) => return self.session_stmt(stmt, params),
+            Kind::Other(NotAQuery::Session(stmt)) => return self.session_stmt(stmt, params),
             // A catalog statement publishes a new epoch, and the plans
             // and readers this session holds describe the old one.
             // Refreshing after it is what drops them, so the next query
             // compiles against the catalog the statement just wrote.
-            Some(NotAQuery::Catalog(stmt)) => {
+            Kind::Other(NotAQuery::Catalog(stmt)) => {
                 self.refuse_a_write()?;
                 let held = self.hold()?;
                 // It reads the tables off the file rather than through
@@ -1980,15 +2002,16 @@ impl Session {
             // graph a `CREATE` in the middle made is there for the
             // statements behind it and a part that raises takes the
             // whole block back, catalog and rows together.
-            Some(NotAQuery::Block(parts)) => {
+            Kind::Other(NotAQuery::Block(parts)) => {
                 self.refuse_a_write()?;
                 let held = self.hold()?;
                 let out = self.run_block(&parts, params);
                 return self.settle(out, held);
             }
-            None => {}
-        }
-        let cached = match self.plan_for(source, params) {
+            Kind::Query(parsed) => Some(parsed),
+            Kind::Planned => None,
+        };
+        let cached = match self.plan_from(source, parsed, params) {
             Ok(cached) => cached,
             // A label under `INSERT` that names no node table is a table
             // the statement means the graph to have, and there is no
@@ -2670,19 +2693,12 @@ impl Session {
         self.run_parts(&cached, parts, args, params)
     }
 
-    /// The plan for a text, compiled on the first statement that writes
-    /// it and held for the ones after.
-    ///
-    /// The parameters are read only by a text whose `USE` named one,
-    /// because that is the only text whose graph is not in it. Every
-    /// other text is one lookup and nothing else, which is what the P0
-    /// plan-hit gate times.
     /// What this text is when it is not a query, skipping the parse
     /// that decides it when the cache already holds a plan for it.
     ///
     /// A plan is only ever kept for a text that compiled, and only a
     /// query compiles, so a hit is the answer: this text is a query and
-    /// [`query::not_a_query`] would say `None`. It is worth the lookup
+    /// [`query::categorise`] would say the same. It is worth the lookup
     /// because that call is a whole parse of the source and it sits in
     /// front of the cache, so a client sending the same point read a
     /// million times parses it a million times and throws every tree
@@ -2702,11 +2718,20 @@ impl Session {
     /// A text keyed on the graph a `USE` parameter named is not looked
     /// up here: it is keyed on more than the text, and this is the text
     /// on its own.
-    fn categorised(&mut self, source: &str) -> Result<Option<NotAQuery>> {
+    /// Whether the plan cache already holds this text, which is what
+    /// [`crate::db::Connection::refuse_if_read_only`] asks before it
+    /// parses. See [`Session::categorised`] for why a hit is an answer.
+    pub(crate) fn holds_plan(&self, source: &str) -> bool {
+        self.plans.contains_key(source)
+    }
+
+    fn categorised(&mut self, source: &str) -> Result<Kind> {
         if self.plans.contains_key(source) {
-            return Ok(None);
+            return Ok(Kind::Planned);
         }
-        match query::not_a_query(source) {
+        match query::categorise(source) {
+            Ok(query::Categorised::Query(parsed)) => Ok(Kind::Query(parsed)),
+            Ok(query::Categorised::Other(other)) => Ok(Kind::Other(other)),
             // Nothing here for `declaring` to make: a text with no
             // parse has no clauses, so it has no `INSERT` in it.
             Err(ZuError::Gql(record)) => {
@@ -2719,11 +2744,34 @@ impl Session {
                 );
                 Err(ZuError::Gql(record))
             }
-            other => other,
+            Err(other) => Err(other),
         }
     }
 
+    /// The plan for a text, compiled on the first statement that writes
+    /// it and held for the ones after.
+    ///
+    /// The parameters are read only by a text whose `USE` named one,
+    /// because that is the only text whose graph is not in it. Every
+    /// other text is one lookup and nothing else, which is what the P0
+    /// plan-hit gate times.
     fn plan_for(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Arc<CachedPlan>> {
+        self.plan_from(source, None, params)
+    }
+
+    /// The same, given the tree the text parsed to.
+    ///
+    /// `parsed` is what [`Session::categorised`] made on the way in, and
+    /// it is `None` for the callers that never categorised the text,
+    /// which parse it here as they always did. A text that arrives with
+    /// its tree is parsed once for the whole miss path rather than three
+    /// times. #658.
+    fn plan_from(
+        &mut self,
+        source: &str,
+        parsed: Option<Box<zu_query::ast::Query>>,
+        params: &[(&str, Value)],
+    ) -> Result<Arc<CachedPlan>> {
         if let Some(compiled) = self.plans.get(source) {
             return compiled.result();
         }
@@ -2734,29 +2782,32 @@ impl Session {
             if let Some(compiled) = self.plans.get(&key) {
                 return compiled.result();
             }
-            return self.keep(key, source, graph, None);
+            return self.keep(key, source, graph, parsed.as_deref());
         }
         // The text is parsed before anything is compiled because the
         // `USE` clause in front of it says which graph's tables the
         // names below it are names of. A text that will not parse is
         // held as the refusal it is: it will not parse next time
         // either.
-        let parsed = match zu_query::parser::parse(source) {
-            Ok(parsed) => parsed,
-            Err(ZuError::Gql(record)) => {
-                // A text that will not parse has no `INSERT` clause in
-                // it, because it has no clauses at all, so there is
-                // nothing here for `declaring` to make.
-                self.remember(
-                    source.to_string(),
-                    Compiled::Refused {
-                        record: record.clone(),
-                        declarable: false,
-                    },
-                );
-                return Err(ZuError::Gql(record));
-            }
-            Err(other) => return Err(other),
+        let parsed = match parsed {
+            Some(parsed) => parsed,
+            None => match zu_query::parser::parse(source) {
+                Ok(parsed) => Box::new(parsed),
+                Err(ZuError::Gql(record)) => {
+                    // A text that will not parse has no `INSERT` clause
+                    // in it, because it has no clauses at all, so there
+                    // is nothing here for `declaring` to make.
+                    self.remember(
+                        source.to_string(),
+                        Compiled::Refused {
+                            record: record.clone(),
+                            declarable: false,
+                        },
+                    );
+                    return Err(ZuError::Gql(record));
+                }
+                Err(other) => return Err(other),
+            },
         };
         let graph = query::graph_of(
             self.graph.catalog(),
@@ -2793,7 +2844,7 @@ impl Session {
         graph: u32,
         parsed: Option<&zu_query::ast::Query>,
     ) -> Result<Arc<CachedPlan>> {
-        let compiled = match self.compile(source, graph) {
+        let compiled = match self.compiled_from(source, graph, parsed) {
             Ok(plan) => Compiled::Plan(plan),
             Err(ZuError::Gql(record)) => Compiled::Refused {
                 record,
@@ -2849,6 +2900,20 @@ impl Session {
     fn compile(&mut self, source: &str, graph: u32) -> Result<Arc<CachedPlan>> {
         let parsed = zu_query::parser::parse(source)?;
         Ok(Arc::new(self.compile_ast(&parsed, graph)?))
+    }
+
+    /// The compile [`Self::keep`] makes, from the tree where the caller
+    /// has one and from the text where it has not.
+    fn compiled_from(
+        &mut self,
+        source: &str,
+        graph: u32,
+        parsed: Option<&zu_query::ast::Query>,
+    ) -> Result<Arc<CachedPlan>> {
+        match parsed {
+            Some(parsed) => Ok(Arc::new(self.compile_ast(parsed, graph)?)),
+            None => self.compile(source, graph),
+        }
     }
 
     /// The same compile from the parse rather than the text, which is
@@ -3714,7 +3779,10 @@ mod tests {
         let mut session = Session::open(&path).expect("open");
         let query = "MATCH (a:person) RETURN count(a) AS n";
         session.run(query, &[]).expect("warm");
-        assert!(session.categorised(query).expect("a query").is_none());
+        assert!(matches!(
+            session.categorised(query).expect("a query"),
+            Kind::Planned
+        ));
         assert!(session.plans.contains_key(query), "the plan is held");
 
         // A session statement is not held, so it is categorised on
@@ -3723,7 +3791,7 @@ mod tests {
         assert!(
             matches!(
                 session.categorised(stmt).expect("not a query"),
-                Some(NotAQuery::Session(_))
+                Kind::Other(NotAQuery::Session(_))
             ),
             "a session statement is one every time"
         );

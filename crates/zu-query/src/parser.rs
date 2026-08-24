@@ -4992,29 +4992,16 @@ impl Parser<'_> {
 
     /// What the slashes hold: the terms and the bars between them.
     fn parse_simple_contents(&mut self) -> Result<Vec<Simplified>> {
+        if self.at_simple_multiset() {
+            return self.parse_simple_multiset();
+        }
         let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
         let mut ways = vec![self.parse_simple_term()?];
-        let mut multiset = false;
         while self.eat(&TokenKind::Pipe) {
-            if self.eat(&TokenKind::Plus) {
-                multiset = true;
-                self.expect(&TokenKind::Pipe)?;
-            }
             ways.push(self.parse_simple_term()?);
         }
         if ways.len() == 1 {
             return Ok(ways.pop().expect("a term was read"));
-        }
-        if multiset {
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                at,
-                "a multiset alternation answers a path once per way that found it, and \
-                 the ways inside a simplified path pattern are labels on one step \
-                 rather than walks of their own; write the alternatives as path \
-                 patterns with a bar between them",
-            ));
         }
         // Two ways of one step each are the one step with either label
         // on it, which is what a step written `[:A|B]` is. Ways of more
@@ -5049,6 +5036,129 @@ impl Parser<'_> {
             direction: ways[0][0].direction,
             range: None,
         }])
+    }
+
+    /// Whether the contents in hand hold a multiset alternation at the
+    /// top level of them, which is what tells the two bars apart before
+    /// either is read.
+    ///
+    /// It has to be asked before rather than after, because the two
+    /// operators want the terms read differently: a union is folded
+    /// into one step and a multiset alternation is the terms kept
+    /// apart, so a reader that found out afterwards would have read
+    /// them the wrong way round already. The scan stops at the slash
+    /// that closes the contents and steps over anything bracketed,
+    /// since a bar inside brackets belongs to what is in them.
+    fn at_simple_multiset(&self) -> bool {
+        let mut at = self.pos;
+        let mut depth = 0usize;
+        while let Some(token) = self.tokens.get(at) {
+            match &token.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                }
+                TokenKind::Slash if depth == 0 => return false,
+                TokenKind::Pipe if depth == 0 => {
+                    let plus = matches!(
+                        self.tokens.get(at + 1).map(|t| &t.kind),
+                        Some(TokenKind::Plus)
+                    );
+                    let bar = matches!(
+                        self.tokens.get(at + 2).map(|t| &t.kind),
+                        Some(TokenKind::Pipe)
+                    );
+                    if plus && bar {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        false
+    }
+
+    /// A multiset alternation inside the slashes (ISO 16.12, features
+    /// G080 and G030).
+    ///
+    /// This is the one operator in the contents that is not a question
+    /// about a step. `|` asks the one step to wear either label and
+    /// answers a path once however many labels matched it, and `|+|`
+    /// answers a path once per term that found it, so its terms are
+    /// walks that stay apart and a walk is not something a label
+    /// expression can hold. What holds them apart is the same machinery
+    /// a quantified stretch uses: the alternation is a span of as many
+    /// choices as there are walks, the contents are read once per
+    /// choice, and what comes out is the pattern written as many ways
+    /// as the operator has terms. The clause above answers the rows of
+    /// each way in turn without folding them together, which is what
+    /// makes a walk both terms found two rows rather than one.
+    fn parse_simple_multiset(&mut self) -> Result<Vec<Simplified>> {
+        let mut ways = self.parse_simple_term_ways()?;
+        while self.at(&TokenKind::Pipe) {
+            let at = self.peek().expect("peeked").start;
+            self.pos += 1;
+            if !self.eat(&TokenKind::Plus) {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "one bar answers a path once however many alternatives matched it \
+                     and the other answers it once per alternative, so a pattern \
+                     written with both is asking for two answers at once; write the \
+                     alternatives with one of them",
+                ));
+            }
+            self.expect(&TokenKind::Pipe)?;
+            ways.append(&mut self.parse_simple_term_ways()?);
+        }
+        let at = self.taken;
+        self.taken += 1;
+        self.spans.push((0, ways.len() - 1));
+        let pick = self.lengths.get(at).copied().unwrap_or(0);
+        Ok(ways.swap_remove(pick))
+    }
+
+    /// One term of a multiset alternation, as the walks it stands for.
+    ///
+    /// A term holding a stretch that repeats a variable number of times
+    /// is a walk per length, the way a path pattern's term is, and the
+    /// lengths are found the way that one finds them: the term is read
+    /// once to discover the spans and once more per combination of
+    /// them. They are discovered in a context of their own so that the
+    /// terms of the alternation cannot see each other's, since a length
+    /// chosen for one term is nothing to do with which term was picked
+    /// and a shared context would answer a term once per length of the
+    /// term beside it.
+    fn parse_simple_term_ways(&mut self) -> Result<Vec<Vec<Simplified>>> {
+        let from = self.pos;
+        let held = std::mem::take(&mut self.spans);
+        let chosen = std::mem::take(&mut self.lengths);
+        let taken = std::mem::replace(&mut self.taken, 0);
+        let first = self.parse_simple_term();
+        let spans = std::mem::replace(&mut self.spans, held);
+        self.lengths = chosen;
+        self.taken = taken;
+        let first = first?;
+        if spans.is_empty() {
+            return Ok(vec![first]);
+        }
+        let to = self.pos;
+        let mut out = Vec::new();
+        for lengths in Self::choices(&spans) {
+            self.pos = from;
+            let held = std::mem::take(&mut self.spans);
+            let chosen = std::mem::replace(&mut self.lengths, lengths);
+            let taken = std::mem::replace(&mut self.taken, 0);
+            let walk = self.parse_simple_term();
+            self.spans = held;
+            self.lengths = chosen;
+            self.taken = taken;
+            out.push(walk?);
+        }
+        self.pos = to;
+        Ok(out)
     }
 
     /// One term: the factors written one after another, which are the

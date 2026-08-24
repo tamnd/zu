@@ -9238,7 +9238,7 @@
       "name": "add",
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn add(&mut self, src: u64, dst: u64) -> u64",
-      "doc": "Takes one edge and answers with the ordinal it was given.\n\nA pair the dead set holds comes out of it, so that a pair is\never only in one of the two. The file holds no copy of one that\ngets this far, because a pair it does hold is refused before it\nis added, so there is nothing in the dead set for a reader still\nto want."
+      "doc": "Takes one edge and answers with the ordinal it was given.\n\nA pair the dead set holds stays in it. The two sets say different\nthings about different copies: the dead set covers whatever the\nfile holds under that pair, and the lists here hold the one copy\nthis patch has added. A pair that was taken away and put back is\nexactly that shape, and it has to be, because the copy going in\ncarries the values this statement wrote and the file's copies\ncarry the ones the last fold sealed. Reviving the file's copies\ninstead would put the old values back and leave two edges where\nthe statement asked for one.\n\nWhat this does rest on is that the patch holds at most one copy\nof a pair, which is what [`Self::holds`] is asked before a\ndeferred add is taken."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::adds",
@@ -9302,7 +9302,7 @@
       "name": "remove",
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn remove(&mut self, src: u64, dst: u64)",
-      "doc": "Takes one edge away, by the pair it runs between, which is every\ncopy of it the file holds.\n\nA pair this patch added itself comes out of the lists instead of\ngoing into the dead set, because the file holds no copy of it to\nbe told about: a pair the file already runs through is refused\nbefore it is ever added here. The ordinal it took stays spent,\nand so does the row of edge properties that went with it. Both\nare only ever reached through the lists this drops it from, and\nthe next edge takes the next ordinal either way, so what is left\nbehind is a row nothing reads rather than a hole in a run\nsomething counts on.\n\nA pair added before the last seal is in the run, and taking it\nout of there copies the run. That is the same write the recent\nside answers for free, and it is rare for the same reason\n[`Self::revive`] is: an edge and the delete that takes it back\narrive together or not at all."
+      "doc": "Takes one edge away, by the pair it runs between, which is every\ncopy of it the file holds.\n\nA pair this patch added itself comes out of the lists first. The\ndead set is left alone either way, because what it says is what\nthe file holds under the pair, and taking the patch's own copy\naway does not change that: a pair the file holds and the patch\nhas added is already marked, and one the file does not hold has\nnothing to mark. The ordinal the copy took stays spent, and so\ndoes the row of edge properties that went with it. Both are only\never reached through the lists this drops it from, and the next\nedge takes the next ordinal either way, so what is left behind is\na row nothing reads rather than a hole in a run something counts\non.\n\nA pair added before the last seal is in the run, and taking it\nout of there copies the run. That is the same write the recent\nside answers for free, and it is rare for the same reason: an\nedge and the delete that takes it back arrive together or not at\nall."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::removed",
@@ -11355,7 +11355,7 @@
       "name": "dead_edges",
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn dead_edges(&self, rel: u32, epoch: Epoch) -> Vec<(u64, u64)>",
-      "doc": "The pairs `rel` has lost by `epoch`, ascending, which is what a\nfold drops out of the CSR it rebuilds."
+      "doc": "The pairs `rel` has lost by `epoch`, ascending, which is what a\nfold drops out of the CSR it rebuilds. The base copies of a pair\ngo on the first delete of it, so that is the stamp this reads."
     },
     {
       "id": "zu::zu1::txn::Mvcc::edge_cells",
@@ -11370,8 +11370,8 @@
       "kind": "method",
       "name": "edge_gone",
       "of": "zu::zu1::txn::Mvcc",
-      "signature": "fn edge_gone(&self, rel: u32, src: u64, dst: u64, epoch: Epoch) -> bool",
-      "doc": "Whether the edges between two rows are gone for a reader at\n`epoch`. The base holds edges the overlay never saw, so this is\nasked about a pair rather than about an overlay entry, and the\nfacade asks it of every base edge it reads."
+      "signature": "fn edge_gone(&self, rel: u32, src: u64, dst: u64, since: Epoch, epoch: Epoch) -> bool",
+      "doc": "Whether an edge over two rows that has stood since `since` is\ngone for a reader at `epoch`.\n\nThe pair is the name of the edge, so what this asks is whether\nanything took the pair away in the window the edge has been\nthere for. An edge the base holds has stood since the file was\nsealed, which is epoch zero as far as the overlay is concerned,\nand an overlay edge has stood since the commit that added it: a\ndelete before that one is about the copies that were there then\nand says nothing about this one."
     },
     {
       "id": "zu::zu1::txn::Mvcc::edge_updates",

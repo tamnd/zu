@@ -4605,9 +4605,10 @@ fn fill_key_col(
                         Some(b) => view.bytes(b),
                         None => view.inline_bytes(),
                     };
-                    if std::str::from_utf8(bytes).is_err() {
-                        return Err(invalid("string property is not UTF-8".to_string()));
-                    }
+                    // Not checked for UTF-8 here. The table checks the
+                    // key of each group it creates, which is one check
+                    // per distinct key rather than one per row, and a
+                    // row that joins a group has that group's bytes.
                     batch.set_str(row, off, bytes);
                 }
             }

@@ -1581,10 +1581,23 @@ impl Parser<'_> {
     }
 
     /// Where the element types come from: written out in braces (GG03),
-    /// or read off a graph's tables after `LIKE` (GG04). `AS` before
-    /// either is a word ISO allows and neither reading needs.
+    /// read off a graph's tables after `LIKE` (GG04), or taken from a
+    /// graph type the catalog already holds after `COPY OF`. `AS`
+    /// before any of them is a word ISO allows and no reading needs.
+    ///
+    /// `COPY OF` is written in two catalog statements and means a
+    /// different thing in each. A graph copied from a graph starts with
+    /// the elements that one holds, which is GG05 and is read where the
+    /// graph is created. A graph type has no elements to hold, only the
+    /// element types it declares, so a copy of one is that declaration
+    /// under another name and the two are unrelated from there on.
     fn parse_graph_type_source(&mut self) -> Result<GraphTypeSource> {
         self.eat_kw("AS");
+        if self.eat_kw("COPY") {
+            self.expect_kw("OF")?;
+            let ty = self.expect_name("the graph type a copy is taken from")?;
+            return Ok(GraphTypeSource::Copy(ty));
+        }
         if self.eat_kw("LIKE") {
             // A zu1 file holds one graph, so the reference here names
             // it whatever it is called and the type is read off the
@@ -7877,6 +7890,27 @@ mod tests {
                 if_exists: true,
             }
         );
+        // `COPY OF` names a graph type where `LIKE` names a graph, and
+        // both spellings of it read the same way.
+        for source in [
+            "CREATE GRAPH TYPE mirror COPY OF social",
+            "CREATE PROPERTY GRAPH TYPE mirror AS COPY OF social",
+        ] {
+            assert_eq!(
+                catalog_stmt(source),
+                CatalogStmt::CreateGraphType {
+                    name: "mirror".into(),
+                    if_not_exists: false,
+                    or_replace: false,
+                    source: GraphTypeSource::Copy("social".into()),
+                },
+                "{source}"
+            );
+        }
+        // A graph copied from a graph is the other statement `COPY OF`
+        // is written in, and it takes what the graph holds rather than
+        // what it declares (GG05).
+        assert!(catalog_err("CREATE GRAPH TYPE mirror COPY social").contains("expected OF"));
         // An endpoint written as a name alone points at a type declared
         // elsewhere rather than declaring one.
         let stmt = catalog_stmt(

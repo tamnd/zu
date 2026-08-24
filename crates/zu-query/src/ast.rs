@@ -205,6 +205,11 @@ pub enum GraphTypeSource {
     /// GG04: the closed type a graph's tables already describe, read
     /// off the catalog and not off the data.
     Like(String),
+    /// `COPY OF` and the name of a graph type the catalog holds, which
+    /// is the element types of that one under a name of its own. A
+    /// graph type declares and holds nothing, so the copy is the whole
+    /// of it and the two go their separate ways from here.
+    Copy(String),
 }
 
 /// One element type as it was written, in ISO's pattern spelling:

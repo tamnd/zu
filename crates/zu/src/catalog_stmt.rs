@@ -222,9 +222,9 @@ fn graph_type_of(catalog: &mut Catalog, name: &str, of: &GraphTypeRef) -> Result
     match of {
         GraphTypeRef::Any => Ok(GraphTypeOf::Open),
         GraphTypeRef::Named(ty) => Ok(GraphTypeOf::Named(ty.clone())),
-        GraphTypeRef::Source(source @ GraphTypeSource::Elements(_)) => {
-            Ok(GraphTypeOf::Inline(build(catalog, name, source)?))
-        }
+        GraphTypeRef::Source(
+            source @ (GraphTypeSource::Elements(_) | GraphTypeSource::Copy(_)),
+        ) => Ok(GraphTypeOf::Inline(build(catalog, name, source)?)),
         GraphTypeRef::Source(GraphTypeSource::Like(source)) => {
             let graph = graph_named(catalog, source)?;
             match &graph.graph_type {
@@ -315,12 +315,26 @@ fn graph_named<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a crate::zu1::c
 /// `LIKE` reads the tables and not the data, so it costs a catalog walk
 /// on a file of any size (GG04). A type written out in braces is closed:
 /// somebody listed the element types, and a list nobody qualified is
-/// the whole list.
+/// the whole list. `COPY OF` names a graph type this file already
+/// holds and takes its element types whole, so what it costs is the
+/// clone and nothing else.
 fn build(catalog: &mut Catalog, name: &str, source: &GraphTypeSource) -> Result<GraphType> {
     let defs = match source {
         GraphTypeSource::Like(graph) => {
             let id = graph_named(catalog, graph)?.id;
             return catalog.infer_graph_type(name, id);
+        }
+        GraphTypeSource::Copy(from) => {
+            // The labels a copied element type names are already
+            // interned, since the type it came from named them, so
+            // nothing about the dictionary changes here.
+            let ty = catalog.graph_type(from).ok_or_else(|| {
+                ZuError::InvalidArgument(format!("'{from}' is no graph type here"))
+            })?;
+            return Ok(GraphType {
+                name: name.to_string(),
+                ..ty.clone()
+            });
         }
         GraphTypeSource::Elements(defs) => defs,
     };
@@ -606,6 +620,55 @@ mod tests {
         let knows = ty.element("Knows").expect("Knows");
         assert_eq!(knows.from.as_deref(), Some("PersonType"));
         assert_eq!(knows.to.as_deref(), Some("PersonType"));
+    }
+
+    /// `COPY OF` takes the element types of a graph type the file
+    /// holds and files them under a new name. There is nothing else in
+    /// a graph type, so the copy is the whole of it, and the two are
+    /// separate objects from there on: dropping the one it came from
+    /// leaves the copy standing.
+    #[test]
+    fn a_graph_type_may_be_copied_from_another_graph_type() {
+        let mut catalog = applied(&[
+            "CREATE PROPERTY GRAPH TYPE gg03_src {
+               NODE TYPE PersonType (:Person {name :: STRING}),
+               EDGE TYPE Knows (PersonType)-[:KNOWS]->(PersonType)
+             }",
+            "CREATE PROPERTY GRAPH TYPE gg03_copy COPY OF gg03_src",
+        ]);
+        let src = catalog.graph_type("gg03_src").expect("gg03_src").clone();
+        let copy = catalog.graph_type("gg03_copy").expect("gg03_copy");
+        assert_eq!(copy.name, "gg03_copy");
+        assert!(copy.closed, "a copy of a closed type is closed");
+        assert_eq!(copy.elements, src.elements);
+        assert!(catalog.drop_graph_type("gg03_src"));
+        assert!(catalog.graph_type("gg03_copy").is_some());
+    }
+
+    /// The name is resolved before anything is written, so a copy of a
+    /// type the file does not hold leaves the file as it was and says
+    /// which name it could not find.
+    #[test]
+    fn a_copy_of_a_graph_type_nobody_declared_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("copy.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1)]).expect("load");
+        let Statement::Catalog(stmt) =
+            parse_statement("CREATE GRAPH TYPE t COPY OF absent").expect("parse")
+        else {
+            panic!("not a catalog statement");
+        };
+        let err = apply(&mut db, &stmt, &[])
+            .expect_err("no such graph type")
+            .to_string();
+        assert!(err.contains("'absent' is no graph type here"), "{err}");
+        assert!(
+            Catalog::load(&mut db)
+                .expect("catalog")
+                .graph_types()
+                .is_empty()
+        );
     }
 
     #[test]

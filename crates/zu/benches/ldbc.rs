@@ -142,6 +142,30 @@ mod platform {
     }
 }
 
+/// The seven timed phases that go through the query engine, each as
+/// the one text its phase runs and its attribution profiles. A gate
+/// that failed reruns the query from here rather than from a copy, so
+/// what the attribution explains cannot drift from what was timed.
+const Q_TWO_HOP: &str = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks";
+const Q_TRIANGLE: &str = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+                          RETURN count(*) AS triangles";
+const Q_ORDERED: &str = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+                         WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS triangles";
+const Q_CLOSE: &str = "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+                       RETURN count(*) AS closed";
+const Q_IS: &str = "MATCH (p:person {id: $id}) \
+                    RETURN p.firstName AS firstName, p.lastName AS lastName, \
+                           p.gender AS gender, p.birthday AS birthday, \
+                           p.locationIP AS locationIP, p.browserUsed AS browserUsed, \
+                           p.cityId AS cityId, p.creationDate AS creationDate";
+const Q_IC: &str = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
+                    WHERE ff.id <> $id \
+                    RETURN DISTINCT ff.id AS id, ff.firstName AS firstName, \
+                           ff.lastName AS lastName \
+                    ORDER BY id LIMIT 20";
+const Q_DISTINCT: &str = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
+                          RETURN count(DISTINCT ff) AS n";
+
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -412,7 +436,7 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     }
     let expected: i64 = edges.iter().map(|&(_, d)| outdeg[d as usize] as i64).sum();
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS walks";
+    let source = Q_TWO_HOP;
     let runs = 50usize;
     for _ in 0..5 {
         zu::query::run(source, &mut db, &[]).expect("warmup run");
@@ -458,8 +482,7 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
         }
     }
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
-                  RETURN count(*) AS triangles";
+    let source = Q_TRIANGLE;
     let runs = 15usize;
     for _ in 0..3 {
         zu::query::run(source, &mut db, &[]).expect("warmup run");
@@ -548,8 +571,7 @@ fn run_ordered_triangle(
         }
     }
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
-                  WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS triangles";
+    let source = Q_ORDERED;
     let runs = 15usize;
     for _ in 0..3 {
         zu::query::run(source, &mut db, &[]).expect("warmup run");
@@ -608,8 +630,7 @@ fn run_undirected_close(
         }
     }
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
-                  RETURN count(*) AS closed";
+    let source = Q_CLOSE;
     let runs = 15usize;
     for _ in 0..3 {
         zu::query::run(source, &mut db, &[]).expect("warmup run");
@@ -642,11 +663,7 @@ fn run_undirected_close(
 /// column stored out of order.
 fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) -> (f64, f64) {
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (p:person {id: $id}) \
-                  RETURN p.firstName AS firstName, p.lastName AS lastName, \
-                         p.gender AS gender, p.birthday AS birthday, \
-                         p.locationIP AS locationIP, p.browserUsed AS browserUsed, \
-                         p.cityId AS cityId, p.creationDate AS creationDate";
+    let source = Q_IS;
     let n = by_row.len() as u64;
     let mut rng = 0xD1B5_4A32_D192_ED03u64;
     for _ in 0..200 {
@@ -716,8 +733,7 @@ fn run_distinct_two_hop(
         hits.len() as i64
     };
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
-                  RETURN count(DISTINCT ff) AS n";
+    let source = Q_DISTINCT;
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     for _ in 0..50 {
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
@@ -784,11 +800,7 @@ fn run_ic_friends_of_friends(
             .collect()
     };
     let mut db = Zu1File::open(path).expect("open");
-    let source = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
-                  WHERE ff.id <> $id \
-                  RETURN DISTINCT ff.id AS id, ff.firstName AS firstName, \
-                         ff.lastName AS lastName \
-                  ORDER BY id LIMIT 20";
+    let source = Q_IC;
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     for _ in 0..50 {
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
@@ -1131,6 +1143,43 @@ fn only(name: &str) -> bool {
     }
 }
 
+/// Reruns one phase's query under the profiler and prints where its
+/// time went. This only runs for a phase that missed its ceiling: the
+/// ceiling says the phase got slower, this says which operator did.
+/// The query is warmed first so the plan cache and the block cache are
+/// in the state the phase measured them in, and the numbers come from
+/// a single run after that, so read the shape rather than the third
+/// decimal.
+fn attribute(path: &std::path::Path, label: &str, source: &str, seed: Option<u64>) {
+    let mut db = match Zu1File::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            println!("attribution for {label}: cannot reopen the database, {e}");
+            return;
+        }
+    };
+    let params: Vec<(&str, Value)> = seed
+        .map(|id| vec![("id", Value::Int(id as i64))])
+        .unwrap_or_default();
+    for _ in 0..3 {
+        if let Err(e) = zu::query::run(source, &mut db, &params) {
+            println!("attribution for {label}: query failed, {e}");
+            return;
+        }
+    }
+    match zu::query::profile(source, &mut db, &params) {
+        Ok(profile) => {
+            let seeded = match seed {
+                Some(id) => format!(", one run seeded with person {id}"),
+                None => String::new(),
+            };
+            println!("attribution for {label}{seeded}:");
+            print!("{}", profile.render());
+        }
+        Err(e) => println!("attribution for {label}: profile failed, {e}"),
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     // A run of one phase is not the gate, and a gate that quietly
@@ -1216,7 +1265,10 @@ fn main() {
     // p99 key is the p50 key with `_p99` before the unit, so a phase
     // that has no tail ceiling yet simply has no key and is not gated
     // on one.
-    let over = |label: &str, got: Option<(f64, f64)>, key: &str, unit: &str| -> bool {
+    // Phases that missed a ceiling, in the order they were checked, so
+    // the attribution below can rerun each one under the profiler.
+    let mut missed: Vec<&str> = Vec::new();
+    let mut over = |label: &'static str, got: Option<(f64, f64)>, key: &str, unit: &str| -> bool {
         let Some((p50, p99)) = got else {
             return false;
         };
@@ -1229,6 +1281,9 @@ fn main() {
                 println!("GATE FAIL {label}: {pct} {got:.3} {unit} > ceiling {ceiling}");
                 bad = true;
             }
+        }
+        if bad {
+            missed.push(label);
         }
         bad
     };
@@ -1297,6 +1352,29 @@ fn main() {
             failed = true;
         }
     }
+    // A ceiling that failed has told us a phase is slow and nothing
+    // else. The seeded phases run thousands of different seeds, so the
+    // attribution picks one the way the cardinality phase does and says
+    // which, and a phase whose work is not a query has nothing here.
+    if !missed.is_empty() {
+        let seed = by_row[by_row.len() / 3];
+        let table: [(&str, &str, Option<u64>); 7] = [
+            ("B4 2-hop", Q_TWO_HOP, None),
+            ("triangle count", Q_TRIANGLE, None),
+            ("ordered triangle", Q_ORDERED, None),
+            ("undirected close", Q_CLOSE, None),
+            ("IS profile read", Q_IS, Some(seed)),
+            ("IC friends-of-friends", Q_IC, Some(seed)),
+            ("distinct two-hop", Q_DISTINCT, Some(seed)),
+        ];
+        for label in &missed {
+            match table.iter().find(|(name, ..)| name == label) {
+                Some((_, source, seed)) => attribute(&path, label, source, *seed),
+                None => println!("attribution for {label}: this phase does not run a query"),
+            }
+        }
+    }
+
     if gate && failed {
         std::process::exit(1);
     }

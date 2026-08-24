@@ -34,4 +34,6 @@ make gate                        # same thing locally
 
 The gate is `ZU_GATE=1 cargo bench -p zu-encoding --bench decode`: it measures decoded bytes per second per encoding against the floors in `bench/budgets.toml` and exits nonzero below floor. Every new bench added in later milestones follows the same pattern: a harness-free bench binary, a floor in `budgets.toml`, real input from `~/data/zu`.
 
+When an SF1 phase misses its ceiling the ldbc bench reruns that phase's query under `zu::query::profile` and prints the per operator profile under the GATE FAIL line, so the failure names an operator instead of just a phase. The seeded phases pick one seed for the rerun and print which, and a phase whose work is not a query says so rather than printing nothing.
+
 Merging rule: a PR that touches a hot path does not merge until the gate passes on gamingpc and server1, and the numbers go into the milestone issue comment.

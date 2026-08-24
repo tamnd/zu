@@ -334,3 +334,73 @@ cases:
       - values:
           - type: INT64
             value: "4"
+
+  - name: a-graph-written-where-a-value-goes
+    doc: GE01. A graph reference is a value of graph type, and ISO 20.1 lets a query write one where a value goes rather than only pass one in. The word in front says which of the two reference types is meant, and it adds nothing the value does not already say, so the long spelling and the short one answer the same graph the session is working in.
+    query: RETURN (PROPERTY GRAPH CURRENT_PROPERTY_GRAPH IS TYPED ANY PROPERTY GRAPH) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-short-word-in-front-of-a-graph-written-out
+    doc: The same reference under the other spelling. GRAPH alone is a name a query may write and a slash behind one is a division as often as it is a path, so the short word is read this way only in front of the words that can be nothing else, of which the two graphs the session already has are two.
+    query: RETURN (GRAPH CURRENT_PROPERTY_GRAPH = HOME_PROPERTY_GRAPH) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-graph-written-out-and-then-named
+    doc: What makes it a value and not a clause is that it flows. A definition may hold what the words answered and the name reads back the graph they named, which is the same claim GP11 makes about a graph variable holding a reference.
+    query: LET g = PROPERTY GRAPH CURRENT_PROPERTY_GRAPH RETURN (g = HOME_PROPERTY_GRAPH) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-binding-table-written-where-a-value-goes
+    doc: GE02. A binding table is the rows of a query held as one value, and ISO 20.1 writes one by writing the query. Four people are four rows, which is the count the definition form answers for the same query, because it is the same value written in a different place.
+    query: "RETURN cardinality(BINDING TABLE { MATCH (p:person) RETURN p.name AS name }) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-short-spelling-of-a-binding-table-written-out
+    doc: BINDING is a word the form may carry and neither reading needs, the same way the definition may carry it. The rows are the rows either way, so a FOR over the short spelling runs the three that are over the cut.
+    query: "FOR r IN TABLE { MATCH (p:person) WHERE p.age > 35 RETURN p.name AS name } RETURN count(*) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-binding-table-written-out-and-then-named
+    doc: A written table is a value like any other, so a definition may hold one and the name reads back the table rather than a one row table holding it. That is the same thing a definition naming another definition says, checked from the side where nobody named the first one.
+    query: "BINDING TABLE t = TABLE { MATCH (p:person) RETURN p.name AS name } RETURN cardinality(t) AS a"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-binding-table-written-out-that-reads-its-row
+    doc: GP10 from the side that shows what the shape costs. The query in the braces is worked out once, before the first row, the way every definition is, so there is no row for it to read and a name from the match around it is a name nothing bound.
+    query: "MATCH (p:person) RETURN cardinality(TABLE { MATCH (q:person) WHERE q.name = p.name RETURN q.name AS name }) AS a"
+    raises: "42002"
+
+  - name: a-binding-table-written-out-that-writes
+    doc: A value is read and not written, and what makes a query a value here is that it ends by returning rows. One that ends by changing the graph has no rows to be, so it is refused where it is written rather than run for its effect.
+    query: "RETURN cardinality(TABLE { MATCH (p:person) SET p.seen = true }) AS a"
+    raises: "42001"

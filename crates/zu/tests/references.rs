@@ -9,6 +9,12 @@
 //! back in, and the statement sees a value of the right type. The
 //! other half is lifetime, because a handle outlives the thing it
 //! names and the two ways it can do that are not the same one.
+//!
+//! Both types can also be written out rather than passed in. A graph
+//! is named by the words that name one, with `PROPERTY GRAPH` or
+//! `GRAPH` in front to say a value of graph type is meant, and a
+//! binding table is written as the query whose rows it holds. What is
+//! checked of those is that they answer what the parameter answers.
 
 use zu::query::Value;
 use zu::session::Session;
@@ -532,4 +538,143 @@ fn the_cardinality_of_a_binding_table_is_its_row_count() {
         .run("RETURN cardinality($t) AS n", &[("t", empty)])
         .expect("a table of no rows still has a cardinality");
     assert_eq!(out.rows[0], vec![Value::Int(0)]);
+}
+
+/// GE01, the word in front of a graph written out rather than passed
+/// in. ISO 20.1 puts a graph expression where a value goes and the
+/// word in front is what says a value of graph type is meant, so the
+/// claim is the one the parameter form makes: the word adds nothing
+/// the value does not already say, and every graph the `USE` clause
+/// can name can be named here too.
+#[test]
+fn the_word_in_front_of_a_written_graph_reference_says_nothing_the_value_does_not() {
+    let (_dir, mut session) = opened("written-graph-ref.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+    for source in [
+        "RETURN PROPERTY GRAPH CURRENT_PROPERTY_GRAPH AS g",
+        "RETURN PROPERTY GRAPH HOME_GRAPH AS g",
+        "RETURN PROPERTY GRAPH /home AS g",
+        "RETURN PROPERTY GRAPH VARIABLE home AS g",
+        "RETURN GRAPH CURRENT_GRAPH AS g",
+        "RETURN GRAPH HOME_PROPERTY_GRAPH AS g",
+        "RETURN GRAPH VARIABLE home AS g",
+    ] {
+        let out = session
+            .run(source, &[])
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![home.clone()], "{source}");
+    }
+    yes(
+        &mut session,
+        "PROPERTY GRAPH CURRENT_GRAPH IS TYPED ANY PROPERTY GRAPH",
+        &[],
+    );
+}
+
+/// The two words are read differently on purpose. `PROPERTY GRAPH`
+/// is two words nobody writes by accident, so whatever the `USE`
+/// clause takes may stand behind it, while a bare `GRAPH` is a name a
+/// query may write and `graph / home` is a division, so the short
+/// spelling is read only in front of the words that can be nothing
+/// else. Both halves of that are what this checks.
+#[test]
+fn property_and_graph_are_still_names_where_no_graph_can_follow_them() {
+    let (_dir, mut session) = opened("graph-words-are-names.zu1");
+    let out = session
+        .run(
+            "LET property = 5, graph = 2 RETURN property / graph AS n",
+            &[],
+        )
+        .expect("two variables and a division");
+    assert_eq!(out.rows[0], vec![Value::Int(2)]);
+
+    let out = session
+        .run("LET graph = 7 RETURN graph + 1 AS n", &[])
+        .expect("a variable of that name");
+    assert_eq!(out.rows[0], vec![Value::Int(8)]);
+}
+
+/// GE02, a binding table written out rather than passed in. What the
+/// value holds is the rows of the query inside the braces, so the
+/// count of it is the count of them, and it is a value of table type
+/// wherever a table can go: counted, run over by a `FOR`, or named by
+/// a definition.
+#[test]
+fn a_table_written_where_a_value_goes_holds_the_rows_of_the_query_in_it() {
+    let (_dir, mut session) = opened("written-table.zu1");
+    for source in [
+        "RETURN cardinality(BINDING TABLE { MATCH (p:person) RETURN p.id AS id }) AS n",
+        "RETURN cardinality(TABLE { MATCH (p:person) RETURN p.id AS id }) AS n",
+        "FOR r IN TABLE { MATCH (p:person) RETURN p.id AS id } RETURN count(*) AS n",
+        "LET t = TABLE { MATCH (p:person) RETURN p.id AS id } RETURN cardinality(t) AS n",
+    ] {
+        let out = session
+            .run(source, &[])
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![Value::Int(2)], "{source}");
+    }
+    yes(
+        &mut session,
+        "TABLE { MATCH (p:person) RETURN p.id AS id } IS TYPED BINDING TABLE",
+        &[],
+    );
+    no(
+        &mut session,
+        "TABLE { MATCH (p:person) RETURN p.id AS id } IS TYPED GRAPH",
+        &[],
+    );
+}
+
+/// The query in the braces is worked out once before the first row,
+/// which is the rule every definition of this engine is worked out
+/// under and is why the same count comes back for each row of a match
+/// that has nothing to do with it.
+#[test]
+fn a_written_table_is_worked_out_once_however_many_rows_read_it() {
+    let (_dir, mut session) = opened("written-table-once.zu1");
+    let out = session
+        .run(
+            "MATCH (p:person) RETURN cardinality(TABLE { MATCH (q:person) RETURN q.id AS id }) AS n",
+            &[],
+        )
+        .expect("a count for each row of the outer match");
+    assert_eq!(out.rows.len(), 2);
+    assert_eq!(out.rows[0], vec![Value::Int(2)]);
+    assert_eq!(out.rows[1], vec![Value::Int(2)]);
+}
+
+/// Being worked out once is a limit as much as it is a rule, and the
+/// limits it brings are the ones a named definition has: the query may
+/// not read the row it stands in, and it may not write. Both are
+/// refused by name rather than by the name nobody wrote, which is what
+/// says the shape does not leak.
+#[test]
+fn a_written_table_may_not_read_its_row_or_write() {
+    let (_dir, mut session) = opened("written-table-limits.zu1");
+    let err = session
+        .run(
+            "MATCH (p:person)
+             RETURN cardinality(TABLE { MATCH (q:person) WHERE q.id = p.id RETURN q.id AS id }) AS n",
+            &[],
+        )
+        .expect_err("the query inside runs before there is a row");
+    let record = err.diagnostic().expect("a condition");
+    assert_eq!(record.status.code(), "42002");
+    assert!(
+        record.detail.contains("'p'"),
+        "the message names what was read: {}",
+        record.detail
+    );
+
+    let err = session
+        .run(
+            "RETURN cardinality(TABLE { MATCH (p:person) SET p:bot }) AS n",
+            &[],
+        )
+        .expect_err("a value is read and not written");
+    let message = err.to_string();
+    assert!(
+        message.contains("BINDING TABLE"),
+        "the message names the words that were written: {message}"
+    );
 }

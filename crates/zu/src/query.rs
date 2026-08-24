@@ -289,7 +289,10 @@ fn unreadable(ty: &LogicalType, key: &str) -> ZuError {
 /// readers load lazily per node table the same way.
 pub struct Zu1Graph<'a> {
     db: Db<'a>,
-    catalog: Catalog,
+    /// Shared rather than owned: a session hands the same catalog to a
+    /// snapshot on every statement and a fork hands it to every worker,
+    /// and a catalog is a few dozen allocations to copy.
+    catalog: Arc<Catalog>,
     readers: IdMap<u32, GraphReader>,
     props: IdMap<u32, Option<PropsReader>>,
     /// The rows a `DELETE` took away, the file's chains with whatever a
@@ -309,10 +312,10 @@ pub struct Zu1Graph<'a> {
 }
 
 impl<'a> Zu1Graph<'a> {
-    pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
+    pub fn new(db: &'a mut Zu1File, catalog: impl Into<Arc<Catalog>>) -> Self {
         Zu1Graph {
             db: Db::Borrowed(db),
-            catalog,
+            catalog: catalog.into(),
             readers: IdMap::default(),
             props: IdMap::default(),
             gone: None,
@@ -326,10 +329,10 @@ impl<'a> Zu1Graph<'a> {
     /// stay warm instead of dying with each call.
     ///
     /// [`Session`]: crate::session::Session
-    pub fn owned(db: Zu1File, catalog: Catalog) -> Zu1Graph<'static> {
+    pub fn owned(db: Zu1File, catalog: impl Into<Arc<Catalog>>) -> Zu1Graph<'static> {
         Zu1Graph {
             db: Db::Owned(Some(Box::new(db))),
-            catalog,
+            catalog: catalog.into(),
             readers: IdMap::default(),
             props: IdMap::default(),
             gone: None,
@@ -350,6 +353,12 @@ impl<'a> Zu1Graph<'a> {
         &self.catalog
     }
 
+    /// The catalog as the handle a snapshot wants, so a statement that
+    /// opens one hands over a pointer rather than a copy.
+    pub fn catalog_handle(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog)
+    }
+
     /// The frames a statement run through this graph reads as tables.
     pub fn frames(&self) -> &Arc<FrameSet> {
         &self.frames
@@ -365,8 +374,8 @@ impl<'a> Zu1Graph<'a> {
     /// Swaps in a fresh catalog and drops every cached reader; the
     /// session calls this when the header epoch moves, because the
     /// cached directories and decoded groups describe the old epoch.
-    pub fn set_catalog(&mut self, catalog: Catalog) {
-        self.catalog = catalog;
+    pub fn set_catalog(&mut self, catalog: impl Into<Arc<Catalog>>) {
+        self.catalog = catalog.into();
         self.readers.clear();
         self.props.clear();
         // A write is what moves the epoch and a delete is a write, so
@@ -1016,7 +1025,7 @@ impl Graph for Zu1Graph<'_> {
         let db = self.db.reopen().ok()?;
         Some(Box::new(Zu1Graph {
             db: Db::Owned(Some(Box::new(db))),
-            catalog: self.catalog.clone(),
+            catalog: Arc::clone(&self.catalog),
             readers: IdMap::default(),
             props: IdMap::default(),
             gone: self.gone.clone(),

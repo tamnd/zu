@@ -944,10 +944,15 @@ pub struct Options {
     ///
     /// Here for the reason the clock is here: it is session state, one
     /// value for the length of a statement, and every path through the
-    /// executor already carries the switches. The session builds it
-    /// once on the way in, so a scan of ten million rows reading it
-    /// clones a record rather than formatting one.
-    pub status: Option<Value>,
+    /// executor already carries the switches.
+    ///
+    /// Kept as what the statement ended with rather than as the record
+    /// itself, because every statement ends and almost none of them
+    /// asks what the one before ended with: building the record here
+    /// would put five strings and a list on the way out of every query
+    /// in the session for the sake of the one query in a thousand that
+    /// reads them. [`LastOutcome::value`] builds it where it is read.
+    pub status: Option<Arc<dyn LastOutcome>>,
     /// GS07 and GS15. The session time zone as minutes east of UTC,
     /// which is the displacement the clock read below is stamped with.
     /// Nought is UTC, which is what a session opens in and what every
@@ -958,6 +963,18 @@ pub struct Options {
     /// thing today and another after an upgrade, while a session set to
     /// an offset answers the offset for as long as it holds it.
     pub zone: i16,
+}
+
+/// What a statement ended with, as the session kept it, and the GQL
+/// status object of GA08 built out of it on demand.
+///
+/// A trait rather than a struct because the pieces are the session's:
+/// the executor wants the record and nothing else about them.
+pub trait LastOutcome: std::fmt::Debug + Send + Sync {
+    /// The record [`crate::binder::STATUS_FN`] answers, built fresh per
+    /// call. A row that reads it pays for it; the thousand statements
+    /// that never ask do not.
+    fn value(&self) -> Value;
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -6707,7 +6724,12 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         // nothing yet answers null rather than a record of nulls,
         // because there is no status before the first statement and a
         // record saying nothing would read as one that said so.
-        BoundExpr::Status => Ok(ctx.scalars.options.status.clone().unwrap_or(Value::Null)),
+        BoundExpr::Status => Ok(ctx
+            .scalars
+            .options
+            .status
+            .as_ref()
+            .map_or(Value::Null, |last| last.value())),
         // GE01. The binder already asked the catalog which graph this
         // is, so the row's work is a clone of the handle and nothing
         // else.

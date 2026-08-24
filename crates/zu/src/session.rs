@@ -221,29 +221,70 @@ pub struct Pin {
 /// than a record of nulls. "Nothing was diagnosed" and "something was
 /// diagnosed and it was blank" are different answers and a client
 /// should not have to tell them apart by reading the fields.
-fn status_value(answer: &Result<QueryResult>) -> Value {
+///
+/// What the session keeps between one statement and the next is this,
+/// the pieces, rather than the record built out of them. A statement
+/// that ended well and said nothing is three words here and five
+/// strings and a list as a record, and every statement ends while
+/// almost none of them reads what the one before ended with, so the
+/// record is built in [`exec::LastOutcome::value`] where it is asked
+/// for.
+#[derive(Debug)]
+struct LastAnswer {
+    /// `None` for an engine fault, which is no condition the standard
+    /// has five characters for.
+    status: Option<GqlStatus>,
+    /// The detail of the record a refusal carried, or the message of a
+    /// fault. `None` for a statement that ended well.
+    detail: Option<String>,
+    records: Vec<DiagnosticRecord>,
+}
+
+impl exec::LastOutcome for LastAnswer {
+    fn value(&self) -> Value {
+        match self.status {
+            Some(status) => status_object(status, self.detail.as_deref(), &self.records),
+            // An engine fault is not a condition, so this says so with
+            // a null rather than reaching for the nearest five
+            // characters. The severity is still an exception, because
+            // the statement still did not complete.
+            None => Value::record(vec![
+                ("gqlstatus".to_string(), Value::Null),
+                ("condition".to_string(), Value::Null),
+                (
+                    "severity".to_string(),
+                    Value::Str(Severity::Exception.letter().to_string()),
+                ),
+                (
+                    "message".to_string(),
+                    Value::Str(self.detail.clone().unwrap_or_default()),
+                ),
+                ("diagnostics".to_string(), Value::List(Vec::new())),
+            ]),
+        }
+    }
+}
+
+fn last_answer(answer: &Result<QueryResult>) -> LastAnswer {
     match answer {
-        Ok(result) => status_object(result.status(), None, &result.notices),
-        Err(ZuError::Gql(record)) => status_object(
-            record.status,
-            Some(&record.detail),
-            std::slice::from_ref(&**record),
-        ),
-        // An engine fault is not a condition and the standard has no
-        // code for one, so this says so with a null rather than
-        // reaching for the nearest five characters. The severity is
-        // still an exception, because the statement still did not
-        // complete.
-        Err(other) => Value::record(vec![
-            ("gqlstatus".to_string(), Value::Null),
-            ("condition".to_string(), Value::Null),
-            (
-                "severity".to_string(),
-                Value::Str(Severity::Exception.letter().to_string()),
-            ),
-            ("message".to_string(), Value::Str(other.to_string())),
-            ("diagnostics".to_string(), Value::List(Vec::new())),
-        ]),
+        // The one that runs a million times, and the one that has to
+        // cost nothing: a statement that ended well and warned about
+        // nothing allocates not a byte here.
+        Ok(result) => LastAnswer {
+            status: Some(result.status()),
+            detail: None,
+            records: result.notices.clone(),
+        },
+        Err(ZuError::Gql(record)) => LastAnswer {
+            status: Some(record.status),
+            detail: Some(record.detail.clone()),
+            records: vec![(**record).clone()],
+        },
+        Err(other) => LastAnswer {
+            status: None,
+            detail: Some(other.to_string()),
+            records: Vec::new(),
+        },
     }
 }
 
@@ -642,7 +683,7 @@ impl Session {
     /// caches go: a plan compiled before this bound its table names
     /// against a schema that did not hold these frames.
     fn publish_frames(&mut self, mut set: FrameSet) -> Result<()> {
-        let catalog = self.graph.catalog().clone();
+        let catalog = self.graph.catalog_handle();
         let mut schema = query::schema_of_graph(&catalog, self.working, self.epoch)?;
         set.set_labels(&query::merge_frames(&mut schema, &set)?);
         let set = Arc::new(set);
@@ -1871,7 +1912,7 @@ impl Session {
         // when it answers false, so the fallback below starts on a
         // handoff nothing has been fed through.
         if options.engine == exec::Engine::Pipeline {
-            let catalog = self.graph.catalog().clone();
+            let catalog = self.graph.catalog_handle();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
                 crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
@@ -1932,17 +1973,28 @@ impl Session {
     /// session's answer would be wrong.
     fn run_in(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         let mut answer = self.run_within(source, params);
-        let (graph, schema) = self.where_it_ran();
-        match &mut answer {
-            Err(ZuError::Gql(record)) => record.within(&graph, &schema),
-            Ok(result) => {
-                for notice in &mut result.notices {
-                    notice.within(&graph, &schema);
+        // Only where there is a record to write it onto. Naming the
+        // graph costs a lookup and two strings, and the statement that
+        // was refused or warned is the rare one, so the ordinary answer
+        // does not pay for the diagnostic it does not carry.
+        let diagnosed = match &answer {
+            Err(ZuError::Gql(_)) => true,
+            Ok(result) => !result.notices.is_empty(),
+            Err(_) => false,
+        };
+        if diagnosed {
+            let (graph, schema) = self.where_it_ran();
+            match &mut answer {
+                Err(ZuError::Gql(record)) => record.within(&graph, &schema),
+                Ok(result) => {
+                    for notice in &mut result.notices {
+                        notice.within(&graph, &schema);
+                    }
                 }
+                Err(_) => {}
             }
-            Err(_) => {}
         }
-        self.options.status = Some(status_value(&answer));
+        self.options.status = Some(Arc::new(last_answer(&answer)));
         answer
     }
 
@@ -2044,7 +2096,7 @@ impl Session {
     fn run_plan(&mut self, cached: &CachedPlan, args: Vec<Value>) -> Result<QueryResult> {
         let options = self.options.clone();
         if options.engine == exec::Engine::Pipeline {
-            let catalog = self.graph.catalog().clone();
+            let catalog = self.graph.catalog_handle();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
                 crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
@@ -2154,7 +2206,7 @@ impl Session {
             let carry = write.carry().len();
             let next = match write {
                 crate::split::Write::Insert(insert) => {
-                    let catalog = self.graph.catalog().clone();
+                    let catalog = self.graph.catalog_handle();
                     let patches = Arc::clone(&self.patches);
                     let mut batch = crate::insert::Batch::open(
                         self.graph.file_mut(),
@@ -2173,7 +2225,7 @@ impl Session {
                     let created = batch.created_rows();
                     let keys = batch.new_keys();
                     let (new, edges) = batch.staged();
-                    let catalog = self.graph.catalog().clone();
+                    let catalog = self.graph.catalog_handle();
                     crate::insert::refuse_duplicate_keys(&mut self.graph, &catalog, &keys)?;
                     crate::insert::refuse_duplicate_pairs(
                         &mut self.graph,
@@ -2228,7 +2280,7 @@ impl Session {
                     // is for: null where the pattern is means the walk
                     // found nothing, and that is what the insert runs
                     // for.
-                    let catalog = self.graph.catalog().clone();
+                    let catalog = self.graph.catalog_handle();
                     let patches = Arc::clone(&self.patches);
                     let mut batch = crate::insert::Batch::open(
                         self.graph.file_mut(),
@@ -2259,7 +2311,7 @@ impl Session {
                     let (new, edges) = batch.staged();
                     let inserting = !new.is_empty() || !edges.is_empty();
                     if inserting {
-                        let catalog = self.graph.catalog().clone();
+                        let catalog = self.graph.catalog_handle();
                         crate::insert::refuse_duplicate_keys(&mut self.graph, &catalog, &keys)?;
                         crate::insert::refuse_duplicate_pairs(
                             &mut self.graph,
@@ -2277,7 +2329,7 @@ impl Session {
                     // touch them.
                     let mut updates = Vec::new();
                     if !merge.matched.items.is_empty() {
-                        let catalog = self.graph.catalog().clone();
+                        let catalog = self.graph.catalog_handle();
                         let mut changes = crate::set::Changes::open(&merge.matched, catalog);
                         for row in &rows {
                             let (carried, values) = row.split_at(carry);
@@ -2321,7 +2373,7 @@ impl Session {
                     next
                 }
                 crate::split::Write::Set(set) => {
-                    let catalog = self.graph.catalog().clone();
+                    let catalog = self.graph.catalog_handle();
                     let mut changes = crate::set::Changes::open(set, catalog);
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
@@ -2393,7 +2445,7 @@ impl Session {
         options: &exec::Options,
     ) -> Result<QueryResult> {
         if options.engine == exec::Engine::Pipeline {
-            let catalog = self.graph.catalog().clone();
+            let catalog = self.graph.catalog_handle();
             let warm = std::mem::take(&mut self.snap);
             let mut snap =
                 crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
@@ -2570,7 +2622,7 @@ impl Session {
         let cached = self.plan_for(source, params)?;
         let args = self.args_for(&cached.query.params, params)?;
         let options = self.options.clone();
-        let catalog = self.graph.catalog().clone();
+        let catalog = self.graph.catalog_handle();
         let warm = std::mem::take(&mut self.snap);
         let mut snap =
             crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
@@ -2890,7 +2942,7 @@ impl Session {
         if let Some(schema) = self.schemas.get(&graph) {
             return Ok(schema.clone());
         }
-        let catalog = self.graph.catalog().clone();
+        let catalog = self.graph.catalog_handle();
         let mut built = query::schema_with_stats(self.graph.file_mut(), &catalog, graph)?;
         // The frames go in after the statistics, so a schema loaded
         // with them keeps them, and they go into the working graph

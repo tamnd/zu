@@ -90,7 +90,9 @@ impl Drop for Db<'_> {
 /// The vectorized view of one open zu1 file at its current epoch.
 pub struct Zu1Snapshot<'a> {
     db: Db<'a>,
-    catalog: Catalog,
+    /// Shared rather than owned, because a snapshot is opened per
+    /// statement and forked per worker and neither one changes it.
+    catalog: Arc<Catalog>,
     readers: IdMap<u32, GraphReader>,
     props: IdMap<u32, Option<PropsReader>>,
     /// Decoded-chunk scratch shared by scan and gather, with the
@@ -179,15 +181,19 @@ impl SnapshotCache {
 }
 
 impl<'a> Zu1Snapshot<'a> {
-    pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
+    pub fn new(db: &'a mut Zu1File, catalog: impl Into<Arc<Catalog>>) -> Self {
         Self::with_cache(db, catalog, SnapshotCache::default())
     }
 
     /// A snapshot that starts from what an earlier one already read.
-    pub fn with_cache(db: &'a mut Zu1File, catalog: Catalog, cache: SnapshotCache) -> Self {
+    pub fn with_cache(
+        db: &'a mut Zu1File,
+        catalog: impl Into<Arc<Catalog>>,
+        cache: SnapshotCache,
+    ) -> Self {
         Zu1Snapshot {
             db: Db::Borrowed(db),
-            catalog,
+            catalog: catalog.into(),
             readers: cache.readers,
             props: cache.props,
             scratch: cache.scratch,
@@ -905,7 +911,7 @@ impl Snapshot for Zu1Snapshot<'_> {
         let db = self.db.reopen().ok()?;
         Some(Box::new(Zu1Snapshot {
             db: Db::Owned(Some(Box::new(db))),
-            catalog: self.catalog.clone(),
+            catalog: Arc::clone(&self.catalog),
             readers: IdMap::default(),
             props: IdMap::default(),
             scratch: Vec::new(),

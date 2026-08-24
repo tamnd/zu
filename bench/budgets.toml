@@ -495,10 +495,21 @@ session_point_held_us = 10.0
 # that catches an allocation per neighbour rather than per call: it
 # measures equal to the point read today, and if it ever stops the
 # expand started allocating per edge. The ceilings sit just over the
-# 67 measured, tight because there is no host noise in a count.
+# 36 measured, tight because there is no host noise in a count.
+#
+# It was 67 until the session stopped copying two things per statement.
+# One was the catalog, which the session handed a snapshot by value on
+# every run and every parallel worker: it is a handle now, and a catalog
+# a statement widens is copied where it widens it. The other was the
+# GQL-status object of GA08, which every statement built on its way out
+# for the sake of the rare statement that asks what the one before it
+# ended with: the session keeps the outcome and builds the record where
+# it is read. Together they took 31 allocations off the warm point read
+# and its p50 from 2.88 us to 2.21 on the local M series, medians of
+# five runs paired against main under the same load.
 hot_plan_hit_allocs = 0
-hot_point_allocs = 70
-hot_hop_allocs = 70
+hot_point_allocs = 40
+hot_hop_allocs = 40
 
 # P9 resource gate (Px, zu#79), benches/ldbc.rs. The whole SF1 sweep
 # in one process under the default 128 MiB memory_limit, held to a

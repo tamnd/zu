@@ -167,6 +167,13 @@ impl WriteSide {
         writer.write(&mut self.file, stage)
     }
 
+    /// How many folds the writer on this side has run since it was
+    /// opened, or none where no writer has been opened. See
+    /// [`Writer::fold_count`].
+    pub fn fold_count(&self) -> u64 {
+        self.writer.as_ref().map_or(0, Writer::fold_count)
+    }
+
     /// What makes this side's commits durable, held past the side
     /// itself going back so the wait happens off the queue. `None`
     /// before a writer has been opened, which is a side with nothing to

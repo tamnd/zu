@@ -2327,18 +2327,32 @@ sustained_stmt_kb = 96.0
 # are coming back rather than that nothing has taken any yet.
 sustained_stmt_growth_b = 512.0
 
-# The store at its biggest against the store as it was loaded.
+# The store at its biggest against what the checkpoint rule lets it
+# hold.
 #
 # A fold takes fresh blocks for whatever it rewrites and gives back none
 # of them until a checkpoint publishes, because until then the header a
-# crash would find still reads what they replaced. So this ratio is the
-# transient garbage the deferred write path carries, and it is bounded
-# by the checkpoint threshold and by nothing else. It read 18.3 once, a
-# store of 3.9 MB running to 71.8, on a threshold that was a flat 256
-# blocks whatever the store was; a quarter of the file held between a
-# floor and that ceiling puts it at 2.27. Lower this ceiling, never
-# raise it.
-sustained_file_x = 3.0
+# crash would find still reads what they replaced. So the file carries
+# transient garbage, and what bounds it is the checkpoint slack and
+# nothing else. It read 18.3 times the store once, 3.9 MB running to
+# 71.8, on a threshold that was a flat 256 blocks whatever the store
+# was.
+#
+# This was that ratio, peak over loaded, with a ceiling of 3.0. The
+# ratio is the wrong shape: the slack is a quarter of the file held
+# between a one megabyte floor and a 64 MB ceiling, so for a store
+# under the floor the floor is what is in force and the file is allowed
+# to be several times the store while behaving exactly as designed. The
+# bench store is 0.4 MB and the flat ceiling failed it at 3.92 on a run
+# where the churn never came near the megabyte it was entitled to. What
+# is gated now is the churn against the rule, at any store size: one
+# means the file used every byte of slack it had.
+#
+# Over one because the slack is read at the commit after the fold that
+# crossed it, so the fold that crosses is over the line by whatever it
+# took. A fold of this store is a couple of blocks and the run measures
+# 1.12. Lower this ceiling, never raise it.
+sustained_slack_x = 1.25
 
 # The P5 point write gate: processor time a statement excluding fsync,
 # under 30 us (docs/12, zu#78).

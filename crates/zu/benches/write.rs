@@ -150,6 +150,9 @@ const SAMPLE: u64 = 25;
 /// each other and the gate machines are shared vCPUs.
 const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
+/// The store's block, which is the granularity everything the fold
+/// takes and gives back is counted in.
+const BLOCK: u32 = zu::zu1::BLOCK_SIZE;
 
 /// How many rows the store [`calibrate`] reads holds.
 ///
@@ -1425,16 +1428,11 @@ fn fold_every(rows: u64) -> u64 {
         &ring(rows),
     );
 
-    let mut spent = Vec::with_capacity(PROBE as usize);
+    let before = folds_so_far(&mut conn);
     for age in 0..PROBE {
-        let at = Instant::now();
         set(&mut conn, age % rows);
-        spent.push(at.elapsed().as_nanos() as f64 / 1e3);
     }
-    let mut sorted = spent.clone();
-    sorted.sort_by(f64::total_cmp);
-    let slow = slow_us(&sorted);
-    let folds = spent.iter().filter(|us| **us > slow).count() as u64;
+    let folds = folds_so_far(&mut conn) - before;
 
     // A probe with no fold in it has not measured a rate, and a window
     // sized off the answer would run for as long as the bound is wrong
@@ -1444,12 +1442,13 @@ fn fold_every(rows: u64) -> u64 {
     (PROBE / folds.max(1)).min(PROBE / FOLDS_WINDOW)
 }
 
-/// The time above which a statement is a fold, out of a sorted run of
-/// them. Twenty times the median, and never under a fifth of a
-/// millisecond, which is well above a statement and well under a fold
-/// on any store this file builds.
-fn slow_us(sorted: &[f64]) -> f64 {
-    (sorted[sorted.len() / 2] * 20.0).max(200.0)
+/// How many folds the store behind this connection has run since it
+/// was opened.
+///
+/// Asking costs the writer lock and gives it straight back, so it is
+/// something to do between windows rather than inside one.
+fn folds_so_far(conn: &mut zu::Connection) -> u64 {
+    conn.session_mut().fold_count().expect("fold count")
 }
 
 /// What a sustained run cost, which is a [`Cost`] and the two things
@@ -1462,6 +1461,16 @@ struct Sustained {
     /// The store at its biggest inside the measured window against what
     /// it was when the window opened.
     window_x: f64,
+    /// The store as the window opened and at its biggest inside it, in
+    /// bytes. The ratio above says how much it grew, these say what it
+    /// grew from, and the checkpoint slack that bounds the growth is a
+    /// share of the file held between a floor and a ceiling, so which
+    /// of the three is in force cannot be read off the ratio alone.
+    opened: u64,
+    peak: u64,
+    /// The store as it was loaded, before the ramp. The pair above
+    /// bounds the measured window, this bounds the whole run.
+    loaded: u64,
 }
 
 /// The write path measured across its own housekeeping rather than
@@ -1547,6 +1556,9 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
         },
         file_x: peak as f64 / loaded.max(1) as f64,
         window_x: peak as f64 / store_before.max(1) as f64,
+        opened: store_before,
+        peak,
+        loaded,
     }
 }
 
@@ -1607,12 +1619,16 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     }
 
     let before = usage();
+    let folds_before = folds_so_far(&mut conn);
     let start = Instant::now();
-    // Timed one at a time as well as end to end, because with no sync
-    // in the way the folds are the only statements that take
-    // milliseconds and counting them is counting the folds. That is the
-    // check that the window held its housekeeping, and it is a count of
-    // the thing itself rather than an inference from a byte total.
+    // Timed one at a time as well as end to end, for the median and the
+    // tail. The folds in the window are counted off the writer rather
+    // than read out of these times: they used to be whatever statement
+    // came in over twenty times the median, and on a box with a
+    // neighbour that line catches statements that are not folds and
+    // misses folds that are. Three runs on this laptop put the rate at
+    // one fold every 91, 153 and 356 statements for the same store and
+    // the same statements.
     let mut spent = Vec::with_capacity(window as usize);
     for _ in 0..window {
         let at = Instant::now();
@@ -1630,7 +1646,6 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     );
     let mut sorted = spent.clone();
     sorted.sort_by(f64::total_cmp);
-    let slow = slow_us(&sorted);
     let cost = Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
         p50: sorted[sorted.len() / 2],
@@ -1646,7 +1661,7 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     };
     Unsynced {
         cost,
-        folds: spent.iter().filter(|us| **us > slow).count() as u64,
+        folds: folds_so_far(&mut conn) - folds_before,
     }
 }
 
@@ -1771,8 +1786,11 @@ fn main() {
     let sustained_fold_x = sustained.cost.written / set_small.written.max(1.0);
     println!("sustained_fold_x: {sustained_fold_x:.2}x the bytes of a run that never folds");
     println!(
-        "sustained_window_x: {:.2}x store at its peak against the store as the window opened",
-        sustained.window_x
+        "sustained_window_x: {:.2}x store at its peak against the store as the window opened, \
+         {:.1} MB to {:.1} MB",
+        sustained.window_x,
+        sustained.opened as f64 / MB,
+        sustained.peak as f64 / MB
     );
     // The byte counter is the operating system's, and it counts what
     // reached a block device. A store on a memory filesystem, which is
@@ -1793,20 +1811,25 @@ fn main() {
     // the headroom this check has, and raising it spends some. The
     // count of folds in the unsynced window is the direct form of the
     // same question and is checked further down.
-    let bytes_counted = set_small.written > 0.0 || sustained.cost.written > 0.0;
-    match bytes_counted {
-        true => assert!(
-            sustained_fold_x > 1.03,
-            "the sustained window has to contain the folds it is measuring, and it pushed \
-             {:.1} kB a statement against the {:.1} kB of a window with no fold in it",
-            sustained.cost.written / 1024.0,
-            set_small.written / 1024.0
-        ),
-        false => println!(
-            "sustained_fold_x: nothing this run wrote reached a block device, so the bytes \
-             are the counter and not the folds: reported, not checked"
-        ),
-    }
+    //
+    // Reported and not checked, on either kind of host. On Linux the
+    // counter reads zero because nothing the run wrote reached a block
+    // device inside it. On Darwin it reads 16.1 kB a statement for
+    // every run in this file including the ones that write a single
+    // cell, which is one block per commit gone out under the fsync, and
+    // a fold's share of a statement is a few hundred bytes: under the
+    // granularity of the thing measuring it. So the ratio came back
+    // 1.01 for a window whose file grew by 540 B a statement, and a
+    // counter that cannot resolve the signal is not evidence either
+    // way. The file growth below is the same question asked of the
+    // file, and the fold count in the unsynced window is it asked of
+    // the folds themselves, so the check is made twice over without
+    // this one.
+    println!(
+        "sustained_fold_x: reported, not checked. The bytes are a process counter at block \
+         granularity and one commit already writes a block, so a fold's few hundred bytes \
+         do not clear it"
+    );
     // What the folds did to the file, which is on the file itself and
     // so is there to read wherever the store is. A run whose folds
     // stopped is a run that loaded a store and left it the size it
@@ -1817,11 +1840,50 @@ fn main() {
          out of it {:.2}x the size it was loaded at",
         sustained.file_x
     );
+    // A fold that nobody published takes fresh blocks for every block
+    // it rewrote and gives none of them back, so what the file may grow
+    // by between checkpoints is exactly the checkpoint slack. That is a
+    // share of the file held between a floor and a ceiling rather than
+    // a flat ratio, and for a store under the floor the floor is what
+    // is in force: this store opens its window at 0.7 MB and the floor
+    // is a megabyte, so a bound of 1.25x was one the rule never
+    // promised and the check failed on a run that was behaving. The
+    // rule itself comes from the write path so the two cannot drift,
+    // and a run whose blocks stop coming back still fails, because it
+    // runs past the slack instead of checkpointing at it.
+    //
+    // Half a block of headroom on top, for the fold that crosses the
+    // threshold: the check fires at the commit after, so the last fold
+    // is over the line by whatever it took.
+    let slack = zu::write::checkpoint_slack_bytes(sustained.opened) + BLOCK as u64 / 2;
+    let allowed = sustained.opened + slack;
+    println!(
+        "sustained_window_slack: {:.1} MB grown against the {:.1} MB the checkpoint rule \
+         allows a store this size",
+        (sustained.peak - sustained.opened) as f64 / MB,
+        slack as f64 / MB
+    );
+    // The same question over the whole run rather than over the
+    // measured window, and the one that is gated. The ramp folds too,
+    // so the file is already carrying churn when the window opens and
+    // a bound on the window alone would not see it.
+    let run_slack = zu::write::checkpoint_slack_bytes(sustained.loaded);
+    let slack_x = (sustained.peak - sustained.loaded) as f64 / run_slack as f64;
+    println!(
+        "sustained_slack_x: {slack_x:.2}x the checkpoint slack, {:.1} MB loaded to {:.1} MB at \
+         its biggest against the {:.1} MB the rule allows a store this size",
+        sustained.loaded as f64 / MB,
+        sustained.peak as f64 / MB,
+        run_slack as f64 / MB
+    );
     assert!(
-        sustained.window_x < 1.25,
+        sustained.peak <= allowed,
         "a fold nobody published grows the file by every block it rewrote, and this one \
-         grew {:.2}x over the window, so the blocks are not coming back",
-        sustained.window_x
+         went from {:.1} MB to {:.1} MB over the window against the {:.1} MB the \
+         checkpoint slack allows, so the blocks are not coming back",
+        sustained.opened as f64 / MB,
+        sustained.peak as f64 / MB,
+        allowed as f64 / MB
     );
 
     // Best of PASSES, the way every other number in this file is taken.
@@ -1965,7 +2027,7 @@ fn main() {
         ),
         ("sustained_stmt_kb", sustained.cost.written / 1024.0),
         ("sustained_stmt_growth_b", sustained.cost.growth),
-        ("sustained_file_x", sustained.file_x),
+        ("sustained_slack_x", slack_x),
         ("write_cpu_nosync_us", unsynced.cost.cpu),
     ];
     for (key, got) in checks {

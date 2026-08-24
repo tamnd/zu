@@ -36,6 +36,17 @@
 //! a straight line: the shape to watch for is the latency column
 //! climbing with the width, which is what serialised commits look like.
 //!
+//! The third number is the same question asked in a unit nothing on
+//! the box can move. `commit_per_flush` is the commits that asked for
+//! durability over the flushes that gave it to them, counted at the
+//! log, and a commit counts whether it waited or not: one that found
+//! its bytes already on the platter got its promise out of somebody
+//! else's flush, which is what sharing means. One writer reads one
+//! however fast the drive is, and eight writers sharing properly read
+//! near eight however slow it is. The two ratios above are milliseconds
+//! over milliseconds and move with whatever the disk was doing that
+//! minute; this one is syscalls over syscalls.
+//!
 //! Latency is reported per statement rather than per level, because a
 //! writer that has to queue for the write side spends most of a burst
 //! waiting and the mean hides it. The p99 is the column that catches a
@@ -83,6 +94,7 @@ use zu::query::Value;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
 use zu::zu1::props::{PropValues, store_props};
+use zu::zu1::wal::commit_counters;
 use zu::{Config, Database};
 
 /// The table the writers write into. Small, because what is measured is
@@ -160,25 +172,27 @@ struct Level {
     max: f64,
     over: f64,
     stmts: f64,
+    per_flush: f64,
 }
 
 impl Level {
     fn header() {
         println!(
-            "{:<8} {:>11} {:>11} {:>11} {:>9} {:>13}",
-            "writers", "p50", "p99", "max", "over 1ms", "throughput"
+            "{:<8} {:>11} {:>11} {:>11} {:>9} {:>13} {:>10}",
+            "writers", "p50", "p99", "max", "over 1ms", "throughput", "per flush"
         );
     }
 
     fn report(&self) {
         println!(
-            "{:<8} {:>8.0} us {:>8.0} us {:>8.0} us {:>8.2}% {:>6.0} stmt/s",
+            "{:<8} {:>8.0} us {:>8.0} us {:>8.0} us {:>8.2}% {:>6.0} stmt/s {:>10.2}",
             self.writers,
             self.p50,
             self.p99,
             self.max,
             self.over * 100.0,
-            self.stmts
+            self.stmts,
+            self.per_flush
         );
     }
 }
@@ -268,8 +282,12 @@ fn run(dir: &Path, writers: usize, store: Store) -> Level {
     };
     let each = writes / writers;
 
-    let start = std::sync::Barrier::new(writers);
-    let ran: Vec<Ran> = std::thread::scope(|scope| {
+    // One more than the writers, so this thread crosses with them and
+    // reads the counters at the start of the burst rather than before
+    // the warmups, which are a commit and a flush each and would
+    // otherwise be counted as a level that shared nothing.
+    let start = std::sync::Barrier::new(writers + 1);
+    let (ran, flushed): (Vec<Ran>, (u64, u64)) = std::thread::scope(|scope| {
         let threads: Vec<_> = (0..writers)
             .map(|w| {
                 let db = &db;
@@ -299,10 +317,14 @@ fn run(dir: &Path, writers: usize, store: Store) -> Level {
                 })
             })
             .collect();
-        threads
+        start.wait();
+        let before = commit_counters();
+        let ran: Vec<Ran> = threads
             .into_iter()
             .map(|t| t.join().expect("writer"))
-            .collect()
+            .collect();
+        let after = commit_counters();
+        (ran, (after.0 - before.0, after.1 - before.1))
     });
 
     // The level's window is the first writer starting to the last one
@@ -333,6 +355,15 @@ fn run(dir: &Path, writers: usize, store: Store) -> Level {
         max: *all.last().expect("a writer ran"),
         over: all.iter().filter(|w| **w > 1000.0).count() as f64 / all.len() as f64,
         stmts: all.len() as f64 / to.duration_since(from).as_secs_f64().max(1e-9),
+        // Commits that asked for durability over the flushes that gave
+        // it to them. A commit that found its bytes already on the
+        // platter counts, because that is what sharing is: it got its
+        // promise out of somebody else's flush.
+        per_flush: if flushed.0 == 0 {
+            0.0
+        } else {
+            flushed.1 as f64 / flushed.0 as f64
+        },
     }
 }
 
@@ -372,6 +403,14 @@ fn main() {
         "commit_p99_x: {p99_x:.2}x the latency of one writer, at {} writers",
         wide.writers
     );
+    let gated = levels
+        .iter()
+        .find(|level| level.writers == GATE_WIDTH)
+        .expect("the gate width is one of the widths");
+    println!(
+        "commit_per_flush: {:.2} commits a flush, at {GATE_WIDTH} writers, against {:.2} at one",
+        gated.per_flush, one.per_flush
+    );
 
     // Whether the storage under this run has a sync worth sharing. The
     // one writer level is the answer: it is one thread waiting out one
@@ -395,13 +434,18 @@ fn main() {
             failed |= !ok;
         }
     }
-    // A floor and not a ceiling: this is the one number here that has to
-    // be large, because it is the sharing itself.
-    if let Some(floor) = budget("commit_x") {
-        let ok = commit_x >= floor;
-        let verdict = if ok { "ok" } else { "under" };
-        println!("commit_x: {commit_x:.2} against a floor of {floor:.2} ({verdict})");
-        failed |= !ok;
+    // Floors and not ceilings: these two are the sharing itself, and the
+    // sharing is the thing that has to be large.
+    for (key, got) in [
+        ("commit_x", commit_x),
+        ("commit_per_flush", gated.per_flush),
+    ] {
+        if let Some(floor) = budget(key) {
+            let ok = got >= floor;
+            let verdict = if ok { "ok" } else { "under" };
+            println!("{key}: {got:.2} against a floor of {floor:.2} ({verdict})");
+            failed |= !ok;
+        }
     }
 
     // The same burst again with the storage taken out from under it.

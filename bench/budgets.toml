@@ -1828,6 +1828,36 @@ commit_x = 6.0
 commit_p50_x = 3.0
 commit_p99_x = 6.0
 
+# The same question with the clock taken out of it: commits that asked
+# for durability over the flushes that gave it to them, counted at the
+# log at eight writers (crates/zu/benches/commit.rs). A commit counts
+# whether it waited or not, because one that found its bytes already on
+# the platter got its promise out of somebody else's flush, and that is
+# what sharing is.
+#
+# The three ratios above are milliseconds over milliseconds. They are
+# honest about the engine and they still move with whatever the drive
+# was doing that minute, which on a laptop somebody else is also using
+# is a third either way. This one is syscalls over syscalls: one writer
+# reads 1.00 however fast the drive is, and writers that share properly
+# read near their width however slow it is.
+#
+# Measured 1.00 at one writer, 1.01 at two, 2.01 at four, 4.00 at eight,
+# 8.00 at sixteen and 16.00 at thirty two, which is half the width at
+# every level. Half is the shape the design has and not a shortfall: the
+# writers that staged while a flush was in the air cannot be covered by
+# it, so a round of n commits costs the flush already running plus the
+# one that covers the rest, and n over 2 is what that comes to. It is
+# the same fact the 1.9 in commit_p50_x reports, said in a unit a busy
+# machine cannot move.
+#
+# The floor is under the measurement and well over the 1.00 that writers
+# syncing one at a time give, because it is a regression gate. Raise it
+# if the commit path ever covers the writers that arrived during a
+# flush, which would take the count to the width. Gated only where one
+# writer's commit costs a sync, for the same reason the three above are.
+commit_per_flush = 3.0
+
 # A SET of one property of one edge, measured 3.6 ms, 398 us of
 # processor time and 15.7 kB at 10000 rows and 10000 edges. It is the
 # same statement as the node SET against a column of a different shape:

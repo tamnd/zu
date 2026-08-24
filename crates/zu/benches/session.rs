@@ -228,7 +228,7 @@ fn main() {
     // Five, because this bench builds its own graph with a uniform
     // degree and there is no skew here for a tail to come from. The
     // SF1 benches run on a real social graph and get ten.
-    let mut flat = |what: &str, p50: f64, p99: f64| {
+    let flat = |what: &str, p50: f64, p99: f64| {
         let Some(ceiling) = budget("uniform_flatness_x") else {
             return false;
         };

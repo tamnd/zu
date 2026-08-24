@@ -1080,24 +1080,63 @@ impl Log {
     /// an entry for does not exist. The cost is a crc over one record
     /// beside a read syscall that has already happened.
     pub fn load(&self, address: Address, into: &mut Vec<u64>) -> Result<()> {
-        let mut header = [0u8; record::HEADER];
-        file::read_exact_at(&self.file, &mut header, address)?;
-        let lengths = u64::from_le_bytes(header[16..24].try_into().expect("lengths word"));
-        let key_len = (lengths as u32 & !record::TOMBSTONE) as usize;
-        let value_len = (lengths >> 32) as usize;
-        let size = record::size_of(key_len, value_len);
+        // One read that usually gets the whole record, rather than a
+        // header read followed by a read of the same offset again. This
+        // is the trade #557 made for the cold tier and it is the same
+        // trade here for the same reason: the cost of a read off this
+        // path is in reaching the device and not in the bytes it hands
+        // back, so paying two of them for a record that nearly always
+        // fits in the first is wrong. The two paths share the size, so
+        // there is one number to argue about rather than two.
+        //
+        // Bounded by the end of the page, because a record never
+        // straddles one, and short answers are allowed: the file's length
+        // need not reach the end of the page being appended to, and a
+        // speculation over the last record in a page asks for bytes that
+        // may be padding or may not be there at all. What comes back is
+        // the record, which is what this is for.
+        let ceiling = (page_start(page_of(address) + 1) - address) as usize;
+        let ask = crate::cold::SPECULATE.min(ceiling).max(record::HEADER);
+        into.clear();
+        into.resize(ask.div_ceil(8), 0);
+        // SAFETY: the buffer is `ask` bytes and 8 byte aligned because it
+        // is a Vec<u64>.
+        let speculated =
+            unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), ask) };
+        let have = file::read_upto_at(&self.file, speculated, address)?;
+        if have < record::HEADER {
+            return Err(Error::Malformed {
+                address,
+                why: "the log ends inside a record header",
+            });
+        }
+        // SAFETY: as above, and the lengths are only used to size a
+        // second read.
+        let size = unsafe {
+            let r = record::RecordRef::new(into.as_ptr().cast());
+            record::size_of(r.key_len(), r.value_len())
+        };
         if size > PAGE_SIZE {
             return Err(Error::Malformed {
                 address,
                 why: "record longer than a page",
             });
         }
-        into.clear();
-        into.resize(size.div_ceil(8), 0);
-        // SAFETY: the buffer holds size bytes and is 8 byte aligned
-        // because it is a Vec<u64>.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast::<u8>(), size) };
-        file::read_exact_at(&self.file, bytes, address)?;
+        if size > have {
+            into.resize(size.div_ceil(8), 0);
+            // SAFETY: the buffer is size bytes and 8 byte aligned, and
+            // the first `have` of them are already the record's.
+            let rest = unsafe {
+                std::slice::from_raw_parts_mut(
+                    into.as_mut_ptr().cast::<u8>().add(have),
+                    size - have,
+                )
+            };
+            file::read_exact_at(&self.file, rest, address + have as u64)?;
+        }
+        // SAFETY: the buffer is at least `size` bytes and holds the
+        // record.
+        let bytes = unsafe { std::slice::from_raw_parts(into.as_ptr().cast::<u8>(), size) };
         // SAFETY: the buffer holds the whole record, sized from the
         // lengths in its own header and bounded against a page above.
         if !unsafe { record::RecordRef::new(bytes.as_ptr()).intact() } {

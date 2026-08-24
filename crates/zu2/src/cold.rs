@@ -74,7 +74,7 @@ pub const BASE: Address = 1 << 47;
 /// the largest thing this has to cover in one go, and the read is a
 /// syscall whose cost is in reaching the device rather than in the bytes
 /// it hands back, so this is generous on purpose.
-const SPECULATE: usize = 1152;
+pub(crate) const SPECULATE: usize = 1152;
 
 /// Whether an address names a record in the cold tier.
 #[inline]

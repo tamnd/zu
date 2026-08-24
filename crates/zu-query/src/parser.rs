@@ -7083,8 +7083,8 @@ impl Parser<'_> {
         // there being no third kind of duration for a number to pick.
         if let Some(kind) = self.parse_duration_qualifier(&name)? {
             let ty = LogicalType::Duration(kind);
-            if self.at_list_name() {
-                return self.parse_list_type(Some(ty));
+            if let Some(not_null) = self.at_postfix_list() {
+                return self.parse_postfix_list_type(ty, not_null);
             }
             return Ok(ty);
         }
@@ -7125,8 +7125,8 @@ impl Parser<'_> {
         // GV50 again, written after its element type. `INT LIST` and
         // `LIST<INT>` are one type asked for two ways, so the postfix
         // spelling is read here rather than given a branch of its own.
-        if self.at_list_name() {
-            return self.parse_list_type(Some(ty));
+        if let Some(not_null) = self.at_postfix_list() {
+            return self.parse_postfix_list_type(ty, not_null);
         }
         Ok(ty)
     }
@@ -7174,22 +7174,58 @@ impl Parser<'_> {
         Ok(Some(kind))
     }
 
-    /// Whether a list type name starts here.
+    /// Whether a list type name starts `offset` tokens on.
     ///
     /// `LIST` and `ARRAY` are the same type spelled twice, and `GROUP`
     /// in front of either is the spelling an aggregation uses, which
     /// names the same type as well.
+    fn list_name_at(&self, offset: usize) -> bool {
+        let named = |offset: usize| self.kw_at(offset, "LIST") || self.kw_at(offset, "ARRAY");
+        named(offset) || (self.kw_at(offset, "GROUP") && named(offset + 1))
+    }
+
+    /// Whether a list type name starts here.
     fn at_list_name(&self) -> bool {
-        let named = |offset: usize| {
-            matches!(
-                self.tokens.get(self.pos + offset),
-                Some(Token {
-                    kind: TokenKind::Ident(s),
-                    ..
-                }) if s.eq_ignore_ascii_case("LIST") || s.eq_ignore_ascii_case("ARRAY")
-            )
+        self.list_name_at(0)
+    }
+
+    /// Whether the element type just read is followed by a list type
+    /// name, and whether a `NOT NULL` stands between the two.
+    ///
+    /// ISO's postfix spelling holds a whole value type in front of the
+    /// name, `<value type> <list value type name>`, and a value type
+    /// carries its own `NOT NULL`. So the word between the element
+    /// type and the name is about the elements and the word after the
+    /// length is about the list, and `FLOAT32 NOT NULL ARRAY[768] NOT
+    /// NULL` says both: a list that is not null of floats none of
+    /// which is null. The prefix spelling puts the inner one inside
+    /// the angle brackets instead, `LIST<FLOAT32 NOT NULL>[768] NOT
+    /// NULL`, and the two are one type asked for two ways.
+    fn at_postfix_list(&self) -> Option<bool> {
+        if self.at_list_name() {
+            return Some(false);
+        }
+        if self.at_kw("NOT") && self.kw_at(1, "NULL") && self.list_name_at(2) {
+            return Some(true);
+        }
+        None
+    }
+
+    /// A list type written after its element type, the element type
+    /// already read and the cursor on either `NOT` or the list name.
+    fn parse_postfix_list_type(
+        &mut self,
+        elem: LogicalType,
+        elem_not_null: bool,
+    ) -> Result<LogicalType> {
+        let elem = match elem_not_null {
+            true => {
+                self.pos += 2;
+                elem
+            }
+            false => LogicalType::Nullable(Box::new(elem)),
         };
-        named(0) || (self.at_kw("GROUP") && named(1))
+        self.parse_list_type(Some(elem))
     }
 
     /// A list type, GV50, from either of its two spellings.
@@ -7205,7 +7241,7 @@ impl Parser<'_> {
         self.eat_kw("GROUP");
         self.pos += 1;
         let elem = match elem {
-            Some(ty) => LogicalType::Nullable(Box::new(ty)),
+            Some(ty) => ty,
             None if self.eat(&TokenKind::Lt) => {
                 let ty = self.parse_value_type()?;
                 self.expect(&TokenKind::Gt)?;
@@ -7217,17 +7253,17 @@ impl Parser<'_> {
         // and it is a count rather than an expression for the same
         // reason a string's length is.
         //
-        // ISO writes it in square brackets, `LIST<INT>[2]`, which is
-        // the only length in the grammar not written in parentheses.
-        // Both are read, since a query that spells it the way every
-        // other length is spelled meant the same thing.
+        // ISO writes it in square brackets, `LIST<INT>[2]`. It is the
+        // only length in the whole grammar not written in parentheses,
+        // and the parenthesised spelling used to be read here as well
+        // on the reasoning that somebody who wrote it the way every
+        // other length is written meant the same thing. That is a
+        // meaning of zu's own for a statement outside the standard's
+        // grammar, which is the one thing this parser does not do, so
+        // it is the bracket alone.
         let max = if self.eat(&TokenKind::LBracket) {
             let n = self.parse_type_argument()?;
             self.expect(&TokenKind::RBracket)?;
-            Some(n)
-        } else if self.eat(&TokenKind::LParen) {
-            let n = self.parse_type_argument()?;
-            self.expect(&TokenKind::RParen)?;
             Some(n)
         } else {
             None
@@ -9871,11 +9907,73 @@ mod tests {
             LogicalType::Node(Some("Person".into()))
         );
         assert_eq!(ty("EDGE :KNOWS"), LogicalType::Edge(Some("KNOWS".into())));
-        assert_eq!(
+        assert!(matches!(
             ty("LIST<INT>[2]"),
-            ty("LIST<INT>(2)"),
-            "the two spellings of a maximum are one type"
-        );
+            LogicalType::List { max: Some(2), .. }
+        ));
+    }
+
+    /// GV50's two spellings, and where each of its two NOT NULLs goes.
+    ///
+    /// ISO's postfix list type is `<value type> <list value type
+    /// name>`, and a value type ends with a NOT NULL of its own, so
+    /// the word in front of the name is about the elements and the
+    /// word behind the length is about the list. The prefix spelling
+    /// puts the inner one inside the angle brackets instead. Two words
+    /// in two places are four types, and both spellings reach all
+    /// four, which is what an embedding column needs: `FLOAT32 NOT
+    /// NULL ARRAY[768] NOT NULL` is 768 floats, all of them there.
+    ///
+    /// The maximum is in square brackets and only there. It is the one
+    /// length in the whole grammar not written in parentheses, and the
+    /// parenthesised spelling used to be read here too, which was a
+    /// meaning of zu's own for a statement the standard has no rule
+    /// for.
+    #[test]
+    fn a_list_type_says_which_half_of_it_admits_null() {
+        let ty = |text: &str| {
+            let q = parsed(&format!("RETURN CAST(x AS {text}) AS v"));
+            match &q.result().expect("RETURN").items[0].expr {
+                Expr::Cast { ty, .. } => ty.clone(),
+                other => panic!("{text}: {other:?}"),
+            }
+        };
+        for (postfix, prefix) in [
+            ("FLOAT32 ARRAY", "LIST<FLOAT32>"),
+            ("FLOAT32 ARRAY[768]", "LIST<FLOAT32>[768]"),
+            ("FLOAT32 NOT NULL ARRAY", "LIST<FLOAT32 NOT NULL>"),
+            ("FLOAT32 NOT NULL ARRAY[768]", "LIST<FLOAT32 NOT NULL>[768]"),
+            ("FLOAT32 ARRAY[768] NOT NULL", "LIST<FLOAT32>[768] NOT NULL"),
+            (
+                "FLOAT32 NOT NULL ARRAY[768] NOT NULL",
+                "LIST<FLOAT32 NOT NULL>[768] NOT NULL",
+            ),
+            // The duration types read their qualifier first and reach
+            // the same place by a branch of their own.
+            (
+                "DURATION(DAY TO SECOND) NOT NULL LIST",
+                "LIST<DURATION(DAY TO SECOND) NOT NULL>",
+            ),
+        ] {
+            assert_eq!(ty(postfix), ty(prefix), "{postfix}");
+        }
+        // Four spellings, four types, and no two of them the same.
+        let four = [
+            "LIST<FLOAT32>[768]",
+            "LIST<FLOAT32 NOT NULL>[768]",
+            "LIST<FLOAT32>[768] NOT NULL",
+            "LIST<FLOAT32 NOT NULL>[768] NOT NULL",
+        ];
+        for (i, a) in four.iter().enumerate() {
+            for b in &four[i + 1..] {
+                assert_ne!(ty(a), ty(b), "{a} and {b}");
+            }
+        }
+        // The maximum is in brackets, and a parenthesis where the
+        // bracket belongs is a statement outside the grammar.
+        for text in ["LIST<INT>(2)", "INT LIST(2)", "LIST(2)"] {
+            parse_err(&format!("RETURN CAST(x AS {text}) AS v"));
+        }
     }
 
     /// GV56, GV57 and GV60 closed, which is an element type written

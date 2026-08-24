@@ -92,7 +92,7 @@ fn probe() -> Vec<(&'static str, Answer)> {
         // Spelled and not stored. This is the list S2 works through.
         // The condition is 42000 for all of them, which is what S1
         // replaced the sentence about corruption with.
-        ("LIST<FLOAT32 NOT NULL>(768)", cannot_write(24)),
+        ("LIST<FLOAT32 NOT NULL>[768]", cannot_write(24)),
         ("LIST<LIST<STRING>>", cannot_write(25)),
         ("DECIMAL(12,2)", cannot_write(26)),
         ("INT128", cannot_write(27)),

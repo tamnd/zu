@@ -627,6 +627,46 @@ cases:
           - type: BOOL
             value: false
 
+  - name: a-list-type-written-after-its-element-type
+    doc: The postfix spelling of a list type, which ISO writes as a value type followed by the list name. It is the same type as the prefix spelling with the element inside the angle brackets, so a client that reads only one of the two answers a different question from the one the query asked.
+    query: RETURN [1, 2] IS TYPED INT ARRAY AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-postfix-list-type-whose-elements-are-not-null
+    doc: A value type carries its own NOT NULL, and the postfix spelling holds a whole value type in front of the list name, so the word between the two is about the elements. A null among them answers false where the same list without the word answers true.
+    query: RETURN [1, NULL] IS TYPED INT NOT NULL ARRAY AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-postfix-list-type-that-is-itself-not-null
+    doc: The NOT NULL behind the length is about the list rather than about the elements, so the two words in the two places are two different tests and a client collapsing them into one gets this case wrong. Here the list is present and holds a null, so the outer test passes.
+    query: RETURN [1, NULL] IS TYPED INT ARRAY[2] NOT NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-list-type-bounded-by-a-maximum-length
+    doc: The maximum length of a list type is written in square brackets, which is the one length in the grammar not written in parentheses. A list longer than the maximum is not of the type.
+    query: RETURN [1, 2, 3] IS TYPED LIST<INT>[2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
   - name: unwinding-twice-flattens
     doc: A second unwind over the rows of the first is how a nested list is flattened, since the first one does not do it, and the result is the whole of both lists in order.
     query: UNWIND [[1, 2], [3]] AS r UNWIND r AS n RETURN collect(n) AS n

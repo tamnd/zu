@@ -727,12 +727,23 @@ type_component  = "ANY" , [ "VALUE" | "RECORD" | "GRAPH"
                 | "RECORD" , [ record_fields ]
                 | list_type
                 | type_name , [ "(" , integer , { "," , integer } , ")" ] ,
-                  [ list_name , [ "(" , integer , ")" ] ] ;
+                  [ [ "NOT" , "NULL" ] , list_name ,
+                    [ "[" , integer , "]" ] ] ;
 (* A list type either names the element type inside angle brackets or
    follows it, and a list type with neither admits a list of anything.
-   The count in parentheses is the maximum length. *)
+   The count in brackets is the maximum length, and it is the one
+   length in this grammar not written in parentheses, which is ISO's
+   spelling and not a choice made here.
+
+   NOT NULL is written twice for a reason. ISO's postfix spelling holds
+   a whole value type in front of the list name, and a value type ends
+   with a NOT NULL of its own, so the word before the name is about the
+   elements and the word after the length is about the list. FLOAT32
+   NOT NULL ARRAY[768] NOT NULL is a list that is not null of floats
+   none of which is null, and the prefix spelling puts the inner one
+   inside the angle brackets to say the same thing. *)
 list_type       = list_name , [ "<" , value_type , ">" ] ,
-                  [ "(" , integer , ")" ] ;
+                  [ "[" , integer , "]" ] ;
 list_name       = [ "GROUP" ] , ( "LIST" | "ARRAY" ) ;
 record_fields   = "{" , [ name , "::" , value_type ,
                   { "," , name , "::" , value_type } ] , "}" ;

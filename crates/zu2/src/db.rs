@@ -2437,6 +2437,76 @@ impl<'a> Session<'a> {
         count: usize,
         mut each: impl FnMut(&[u8], &[u8]),
     ) -> Result<usize> {
+        self.scan_walk(start, count, false, |key, value, _| each(key, value))
+    }
+
+    /// Scans without dropping the epoch protection at the end, so slices
+    /// the callback was told were stable stay readable after this
+    /// returns.
+    ///
+    /// This exists for #738 and for one caller, the C API. `zu2_scan`
+    /// copied every key and every value into a session buffer so it
+    /// could promise its caller that the pairs were good until the next
+    /// call on the session, and #737 measured that copy at 34% of the
+    /// scan at one thread and 56% at thirty two. The bytes were already
+    /// in a readable place. The copy bought a lifetime, not a read.
+    ///
+    /// The callback's third argument says whether the **value** it was
+    /// handed will outlive the call. It says nothing about the key,
+    /// which comes out of the scan plane's own nodes rather than out of
+    /// the log and is not covered by this session's epoch, so a caller
+    /// copies every key. That is cheap where it matters: a YCSB key is
+    /// twenty three bytes against a thousand byte value, so copying
+    /// every key and no value is about two per cent of the traffic that
+    /// copying both was.
+    ///
+    /// It is true for a record below the
+    /// read-only boundary, which cannot change under a reader because an
+    /// update to one of those appends instead, and false for a record in
+    /// the mutable window or out in the cold tier, which was read into a
+    /// scratch buffer that dies with this call. A caller that copies
+    /// exactly the unstable ones gets the same guarantee `zu2_scan` gave
+    /// for a fraction of the memory traffic.
+    ///
+    /// Unlike [`Session::scan`] this holds one epoch protection for the
+    /// whole walk rather than retaking it every [`SCAN_EPOCH_RUN`]
+    /// records, because a protection that is dropped part way through
+    /// would leave the records handed out before the drop unprotected,
+    /// which is the entire thing being promised. So a borrowing scan is
+    /// a floor under reclamation for its whole length and until
+    /// [`Session::scan_release`] is called, and `count` is the caller's
+    /// number. A host that asks for a million rows and then goes away
+    /// stops compaction from freeing anything until it comes back.
+    ///
+    /// # Safety
+    /// The caller must call [`Session::scan_release`] before making any
+    /// other call on this session, and must not read a stable slice
+    /// after that. Nothing here checks it.
+    pub unsafe fn scan_borrowed(
+        &mut self,
+        start: &[u8],
+        count: usize,
+        each: impl FnMut(&[u8], &[u8], bool),
+    ) -> Result<usize> {
+        self.scan_walk(start, count, true, each)
+    }
+
+    /// Drops the protection [`Session::scan_borrowed`] held.
+    ///
+    /// Safe to call when no borrowing scan is outstanding, since the
+    /// slot counts, but every `scan_borrowed` needs exactly one of
+    /// these.
+    pub fn scan_release(&mut self) {
+        self.slot.unprotect();
+    }
+
+    fn scan_walk(
+        &mut self,
+        start: &[u8],
+        count: usize,
+        hold: bool,
+        mut each: impl FnMut(&[u8], &[u8], bool),
+    ) -> Result<usize> {
         let mut done = 0;
         let mut value = Vec::new();
         // The plane is on the core and the core outlives the session,
@@ -2511,7 +2581,11 @@ impl<'a> Session<'a> {
                 held -= 1;
                 hinted = hinted.saturating_sub(1);
                 walked += 1;
-                if walked.is_multiple_of(SCAN_EPOCH_RUN) {
+                // Not when the caller is borrowing. Dropping the
+                // protection here would unprotect every record already
+                // handed out, which is the whole of what a borrowing
+                // scan promises. See [`Session::scan_borrowed`].
+                if !hold && walked.is_multiple_of(SCAN_EPOCH_RUN) {
                     self.slot.unprotect();
                     self.slot.protect();
                 }
@@ -2551,10 +2625,10 @@ impl<'a> Session<'a> {
                         false
                     } else {
                         if !cold::is_cold(address) && address < self.core.log.read_only() {
-                            each(key, r.value_unchecked());
+                            each(key, r.value_unchecked(), true);
                         } else {
                             r.read_value(&mut value);
-                            each(key, &value);
+                            each(key, &value, false);
                         }
                         true
                     }
@@ -2565,7 +2639,21 @@ impl<'a> Session<'a> {
             }
             Ok(done)
         })();
-        self.slot.unprotect();
+        // Held only when the caller asked for it and the walk got
+        // through. On the error path there is nothing worth borrowing
+        // and the caller has no reason to expect a release to be owed,
+        // so it comes off here.
+        if !hold || outcome.is_err() {
+            self.slot.unprotect();
+        } else {
+            // The epoch stays up, which is what keeps the borrowed pages
+            // alive, and the park says nothing is running on this slot,
+            // which is what stops a compaction pass beside it from
+            // spinning in `wait_for_quiescence` until the host happens
+            // to come back (#738). Both halves are needed and they say
+            // different things. See [`crate::epoch::Slotted::park`].
+            self.slot.park();
+        }
         self.promoting = promoting;
         outcome
     }

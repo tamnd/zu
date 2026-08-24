@@ -25,6 +25,17 @@
 //! that a thread's participation is explicit and its cost is paid once
 //! rather than on every operation. That is FASTER's session model and
 //! it is why a benchmark thread holds one session for its whole run.
+//!
+//! Quiescence needed the same separation the flusher got, and for the
+//! same reason. A borrowing scan stands its epoch up, hands the host
+//! pointers into log pages, and returns, and the epoch stays announced
+//! for as long as the host is reading them: that is exactly right for
+//! reclamation, which is the question `safe_epoch` answers. It is wrong
+//! for [`Epochs::wait_for_quiescence`], whose four callers all want to
+//! know whether a session is *inside* an operation, because a session
+//! that is parked between calls is not, and a wait that counts it never
+//! returns at all. So a parked slot announces that too, and quiescence
+//! skips it while reclamation does not. See [`Slotted::park`].
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -62,6 +73,11 @@ const RESERVED: usize = 2;
 struct Slot {
     epoch: AtomicU64,
     writing: AtomicU64,
+    /// Whether this session announced its epoch and then left the
+    /// engine, which is what a borrowing scan does. See
+    /// [`Slotted::park`]. On the same line as the other two: it is read
+    /// by quiescence, which already reads the epoch beside it.
+    parked: AtomicBool,
 }
 
 type Action = Box<dyn FnOnce() + Send>;
@@ -106,6 +122,7 @@ impl Epochs {
                 .map(|_| Slot {
                     epoch: AtomicU64::new(FREE),
                     writing: AtomicU64::new(NOWHERE),
+                    parked: AtomicBool::new(false),
                 })
                 .collect(),
             claimed: AtomicUsize::new(0),
@@ -206,6 +223,42 @@ impl Epochs {
         safe
     }
 
+    /// The oldest epoch any session that is *inside an operation* is
+    /// still working in.
+    ///
+    /// The same scan as [`Epochs::safe_epoch`] with the parked slots
+    /// left out, and it answers a different question. Reclamation asks
+    /// who might still dereference an address, and a parked session
+    /// might, so it counts there. Quiescence asks who is still running,
+    /// and a parked session is not, so it does not count here.
+    ///
+    /// Nothing may free memory on the strength of this. It is only for
+    /// the four callers of [`Epochs::wait_for_quiescence`], every one of
+    /// which is waiting out an in-flight operation rather than a held
+    /// pointer: two of them a `pread` that could land in a punched hole
+    /// (#563), one an append the capture would otherwise miss, one a
+    /// walk of the index table that is about to be rewritten.
+    fn running_epoch(&self) -> u64 {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let mut safe = self.current();
+        let claimed = self.claimed.load(Ordering::Acquire);
+        for slot in &self.slots[..claimed] {
+            let announced = slot.epoch.load(Ordering::Acquire);
+            if announced == FREE || announced == IDLE || announced >= safe {
+                continue;
+            }
+            // The park is read after the epoch. A session parks after it
+            // has announced and unparks before it does anything, so a
+            // reader that saw the announcement and then sees the park
+            // flag set is looking at a session that has genuinely left.
+            if slot.parked.load(Ordering::Acquire) {
+                continue;
+            }
+            safe = announced;
+        }
+        safe
+    }
+
     /// The lowest address any session may still be writing, or `ceiling`
     /// when none of them is writing below it.
     ///
@@ -298,10 +351,16 @@ impl Epochs {
     /// bump puts new work in a later epoch, so waiting for the safe
     /// epoch to pass the bumped one waits for exactly the sessions that
     /// were already running.
+    ///
+    /// A session parked on a borrow is not one of them, and this used to
+    /// wait for it regardless, which is a wait with no bound: the park
+    /// ends when the host comes back and the host may be doing anything.
+    /// A compaction pass beside a borrowing scan spun here forever
+    /// (#738). It reads [`Epochs::running_epoch`] for that reason.
     pub fn wait_for_quiescence(&self) {
         let epoch = self.bump();
         let mut spins = 0u32;
-        while self.safe_epoch() <= epoch {
+        while self.running_epoch() <= epoch {
             spins += 1;
             if spins < 64 {
                 std::hint::spin_loop();
@@ -412,9 +471,19 @@ impl<'a> Slotted<'a> {
     /// operation the closer believes nobody is inside. Announcing first
     /// means the closer either sees the announcement, and waits for it,
     /// or has already shut the gate, and this sees that and stands down.
+    ///
+    /// The park flag is cleared first and unconditionally. An operation
+    /// that starts is by definition running, and clearing before the
+    /// announcement rather than after means there is no window in which
+    /// a slot is announced in the new epoch and still reads as parked,
+    /// which is the one interleaving that would let a quiescence wait
+    /// skip a session that is inside an operation.
     #[inline]
     pub fn protect(&self) {
         loop {
+            self.epochs.slots[self.slot]
+                .parked
+                .store(false, Ordering::Release);
             self.epochs.slots[self.slot]
                 .epoch
                 .swap(self.epochs.current(), Ordering::SeqCst);
@@ -430,8 +499,34 @@ impl<'a> Slotted<'a> {
     #[inline]
     pub fn unprotect(&self) {
         self.epochs.slots[self.slot]
+            .parked
+            .store(false, Ordering::Release);
+        self.epochs.slots[self.slot]
             .epoch
             .store(IDLE, Ordering::Release);
+    }
+
+    /// Keeps the epoch announced while this session leaves the engine.
+    ///
+    /// A borrowing scan is the caller: it hands the host pointers into
+    /// log pages and returns, and the announcement is the only thing
+    /// keeping those pages from being freed under it. What the park adds
+    /// is the other half of the truth, that nobody is running on this
+    /// slot, so [`Epochs::wait_for_quiescence`] does not sit waiting for
+    /// an operation that has already finished.
+    ///
+    /// The cost is real and it is paid in space, not in a stall:
+    /// reclamation genuinely is held at this epoch until the host comes
+    /// back, so deferred frees queue up behind a park the same way they
+    /// queue behind a long operation. A host that parks and never
+    /// returns pins the log. That is a lease and it is the host's to
+    /// end, which is what [`crate::Session::scan_release`] is for, and
+    /// every entry point calls it before it does anything else.
+    #[inline]
+    pub fn park(&self) {
+        self.epochs.slots[self.slot]
+            .parked
+            .store(true, Ordering::Release);
     }
 
     /// Announces that this session is about to claim tail space at or
@@ -476,6 +571,9 @@ impl Drop for Slotted<'_> {
         self.epochs.slots[self.slot]
             .writing
             .store(NOWHERE, Ordering::Release);
+        self.epochs.slots[self.slot]
+            .parked
+            .store(false, Ordering::Release);
         self.epochs.slots[self.slot]
             .epoch
             .store(FREE, Ordering::Release);
@@ -579,6 +677,71 @@ mod tests {
             writer.appending_at(40);
         }
         assert_eq!(epochs.write_floor(100), 100, "a gone session pinned it");
+    }
+
+    #[test]
+    fn a_parked_session_still_holds_reclamation_back() {
+        // The whole point of a park. The bytes the host is reading are
+        // in a page whose free is sitting on this queue, and it must not
+        // run until the park ends.
+        let epochs = Epochs::new(4);
+        let session = Slotted::claim(&epochs).expect("slot");
+        session.protect();
+        session.park();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&ran);
+        epochs.defer(Box::new(move || {
+            flag.fetch_add(1, Ordering::Release);
+        }));
+        for _ in 0..4 {
+            epochs.bump();
+            epochs.drain();
+        }
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            0,
+            "a page was freed under a parked borrow"
+        );
+        session.unprotect();
+        epochs.bump();
+        epochs.drain();
+        assert_eq!(ran.load(Ordering::Acquire), 1, "the park never ended");
+    }
+
+    #[test]
+    fn a_parked_session_does_not_hold_quiescence_up() {
+        // #738. This is the deadlock: without the park the wait below
+        // never returns, because the session it is waiting for is not
+        // running and will only stand down when the host says so.
+        let epochs = Epochs::new(4);
+        let session = Slotted::claim(&epochs).expect("slot");
+        session.protect();
+        session.park();
+        epochs.wait_for_quiescence();
+        // And it is not a one way door: the slot is still announced, so
+        // the session can pick up where it left off.
+        assert!(
+            epochs.safe_epoch() <= epochs.current(),
+            "the park gave up the epoch"
+        );
+        session.unprotect();
+    }
+
+    #[test]
+    fn starting_an_operation_ends_a_park() {
+        // A stale park would be the dangerous direction: a session
+        // inside a real operation that quiescence walks straight past.
+        let epochs = Epochs::new(4);
+        let session = Slotted::claim(&epochs).expect("slot");
+        session.protect();
+        session.park();
+        session.protect();
+        assert_eq!(
+            epochs.running_epoch(),
+            epochs.safe_epoch(),
+            "a running session was still counted as parked"
+        );
+        session.unprotect();
     }
 
     #[test]

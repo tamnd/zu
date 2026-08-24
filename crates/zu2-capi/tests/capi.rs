@@ -1312,3 +1312,217 @@ fn a_page_bound_reaches_the_engine_and_bounds_what_it_holds() {
     close(bounded, &[sb]);
     close(unbounded, &[su]);
 }
+
+/// Opens a database with the scan plane on and compaction at its
+/// default, so a pass can actually be asked for.
+///
+/// `open_ordered` sets `compact_below` to `u64::MAX` deliberately, so
+/// that nothing moves under the tests that use it. #738's whole
+/// question is what happens when something does move, so it needs the
+/// opposite.
+fn open_ordered_compacting(name: &str) -> (tempfile::TempDir, *mut Zu2Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let path = path.to_str().expect("utf8 path").to_owned();
+    let mut options = Zu2Options::default();
+    assert_eq!(
+        unsafe { zu2::zu2_options_init(&mut options) },
+        Zu2Status::Ok
+    );
+    options.durability = 0;
+    options.ordered = 1;
+    let mut db: *mut Zu2Db = ptr::null_mut();
+    let status = unsafe {
+        zu2::zu2_open(
+            path.as_ptr() as *const std::ffi::c_char,
+            path.len(),
+            &options,
+            &mut db,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Zu2Status::Ok);
+    (dir, db)
+}
+
+/// A borrowing scan hands out the engine's own bytes and they hold up.
+///
+/// #738. `zu2_scan` used to copy every key and every value into a
+/// session buffer, which bought a lifetime rather than a read, and
+/// #737 measured that copy at 34% of the scan at one thread and 56% at
+/// thirty two. It now copies the key and leaves the value where it
+/// lies whenever the record is below the read-only boundary.
+///
+/// This has to be big enough that the records being scanned are below
+/// that boundary, which means writing past the mutable window. A
+/// smaller store keeps everything in the window, every value takes the
+/// copy, and the test would pass without exercising the path it was
+/// written for. Twenty five thousand records of a kilobyte is about
+/// twenty five megabytes against a sixteen megabyte window.
+#[test]
+fn a_scan_borrows_the_engines_bytes_and_they_still_read_after_the_call() {
+    const ROWS: u32 = 25_000;
+    const VALUE: usize = 1000;
+    let (_dir, db) = open_ordered_compacting("borrow.zu2");
+    let s = session_on(db);
+    let mut value = vec![b'v'; VALUE];
+    for i in 0..ROWS {
+        let key = format!("user{i:019}");
+        // Something that identifies the record, so a value that came
+        // from the wrong place is a failure and not a coincidence.
+        value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        assert_eq!(
+            unsafe { zu2::zu2_upsert(s, key.as_ptr(), key.len(), value.as_ptr(), value.len(),) },
+            Zu2Status::Ok
+        );
+    }
+
+    // Read the pairs in place rather than through the `scan` helper,
+    // because the helper copies and copying is exactly what this is
+    // checking is no longer needed.
+    let start = format!("user{:019}", 100);
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 0usize;
+    assert_eq!(
+        unsafe {
+            zu2::zu2_scan(
+                s,
+                start.as_ptr(),
+                start.len(),
+                50,
+                &mut pairs,
+                &mut returned,
+            )
+        },
+        Zu2Status::Ok
+    );
+    assert_eq!(returned, 50);
+    let slice = unsafe { std::slice::from_raw_parts(pairs, returned) };
+    for (n, pair) in slice.iter().enumerate() {
+        let key = unsafe { std::slice::from_raw_parts(pair.key, pair.key_len) };
+        let got = unsafe { std::slice::from_raw_parts(pair.value, pair.value_len) };
+        let want = 100 + n as u64;
+        assert_eq!(key, format!("user{want:019}").as_bytes());
+        assert_eq!(got.len(), VALUE);
+        assert_eq!(
+            u64::from_le_bytes(got[..8].try_into().expect("eight bytes")),
+            want,
+            "row {n} came back with the wrong record's bytes"
+        );
+        assert!(got[8..].iter().all(|&b| b == b'v'), "row {n} is not intact");
+    }
+
+    unsafe { zu2::zu2_session_close(s) };
+    unsafe { zu2::zu2_close(db) };
+}
+
+/// The borrow holds while compaction runs beside it.
+///
+/// This is the test #738 lives or dies by. The pairs point into log
+/// pages rather than into a buffer the session owns, so the only thing
+/// keeping them readable is the epoch protection the scan left held.
+/// If that protection is not really held, or is dropped part way
+/// through the walk the way an ordinary scan drops it every
+/// `SCAN_EPOCH_RUN` records, then a compaction pass on another thread
+/// can reclaim the page and these reads are of freed memory.
+///
+/// Compaction runs on another thread on purpose. Calling it on this one
+/// would go through `zu2_compact` on the db handle rather than the
+/// session, so it would not trip the release in `Zu2Session::enter`,
+/// but it also would not overlap, and overlapping is the case.
+#[test]
+fn a_borrowed_scan_holds_while_a_compaction_runs_beside_it() {
+    const ROWS: u32 = 25_000;
+    const ROUNDS: u32 = 4;
+    const VALUE: usize = 1000;
+    let (_dir, db) = open_ordered_compacting("borrow-compact.zu2");
+    let s = session_on(db);
+    let mut value = vec![b'v'; VALUE];
+    // Rewritten several times over, so the log is mostly superseded
+    // versions and a pass has a great deal to reclaim. A pass that
+    // reclaims nothing frees no pages and proves nothing.
+    for _ in 0..ROUNDS {
+        for i in 0..ROWS {
+            let key = format!("user{i:019}");
+            value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(
+                unsafe { zu2::zu2_upsert(s, key.as_ptr(), key.len(), value.as_ptr(), value.len()) },
+                Zu2Status::Ok
+            );
+        }
+    }
+
+    // Compaction only moves what is already on the device, and the
+    // durability here is asynchronous, so without this the pass finds
+    // the whole log still above the read only boundary, has nothing it
+    // is allowed to touch, and reclaims nothing. The test then fails on
+    // its own non vacuity check rather than passing for a bad reason,
+    // which is the right way round but is still not the test running.
+    assert_eq!(unsafe { zu2::zu2_sync(db) }, Zu2Status::Ok);
+
+    let start = format!("user{:019}", 100);
+    let mut pairs: *const zu2::Zu2Pair = ptr::null();
+    let mut returned = 0usize;
+    assert_eq!(
+        unsafe {
+            zu2::zu2_scan(
+                s,
+                start.as_ptr(),
+                start.len(),
+                200,
+                &mut pairs,
+                &mut returned,
+            )
+        },
+        Zu2Status::Ok
+    );
+    assert_eq!(returned, 200);
+
+    // Now pull the ground out from under it, or try to.
+    let address = db as usize;
+    let compactor = std::thread::spawn(move || {
+        let db = address as *mut Zu2Db;
+        let mut total = 0u64;
+        for _ in 0..8 {
+            let mut reclaimed = 0u64;
+            if unsafe { zu2::zu2_compact(db, &mut reclaimed) } == Zu2Status::Ok {
+                total += reclaimed;
+            }
+        }
+        total
+    });
+
+    // Read the pairs over and over while that runs, rather than once
+    // after it, so the window the two overlap in is as wide as it can
+    // be made from here.
+    let slice = unsafe { std::slice::from_raw_parts(pairs, returned) };
+    let mut checked = 0u64;
+    while !compactor.is_finished() {
+        for (n, pair) in slice.iter().enumerate() {
+            let got = unsafe { std::slice::from_raw_parts(pair.value, pair.value_len) };
+            let want = 100 + n as u64;
+            assert_eq!(got.len(), VALUE);
+            assert_eq!(
+                u64::from_le_bytes(got[..8].try_into().expect("eight bytes")),
+                want,
+                "row {n} changed under a scan that had borrowed it"
+            );
+            assert!(got[8..].iter().all(|&b| b == b'v'), "row {n} is not intact");
+            checked += 1;
+        }
+    }
+    let reclaimed = compactor.join().expect("compactor");
+
+    // Both halves have to have happened or this proved nothing: a
+    // compaction that reclaimed no pages could not have freed one out
+    // from under us however broken the protection was.
+    assert!(
+        reclaimed > 0,
+        "compaction reclaimed nothing, so nothing was ever at risk"
+    );
+    assert!(checked > 0, "the compactor finished before a single read");
+
+    unsafe { zu2::zu2_session_close(s) };
+    unsafe { zu2::zu2_close(db) };
+}

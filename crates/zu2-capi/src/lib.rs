@@ -203,13 +203,26 @@ struct State {
     /// rather than one allocation per record, and the pairs point into
     /// it once it has stopped growing.
     scan_bytes: Vec<u8>,
-    /// Where each record starts and how long its two halves are, kept
-    /// as offsets while the buffer is still growing and turned into
-    /// pointers at the end. A pointer taken before the buffer stopped
-    /// growing would be into an allocation the next push freed.
-    scan_spans: Vec<(usize, usize, usize)>,
+    /// One entry a record: where its key starts in `scan_bytes`, how
+    /// long the key is, where its value starts, the borrowed value
+    /// pointer, and how long the value is. Offsets while the buffer is
+    /// still growing and turned into pointers at the end, because a
+    /// pointer taken before the buffer stopped growing would be into an
+    /// allocation the next push freed.
+    ///
+    /// The value is in one of two places and the offset says which: a
+    /// value offset of `usize::MAX` means the fourth field is a pointer
+    /// straight into a log page and the buffer holds only the key. See
+    /// `zu2_scan` and #738.
+    scan_spans: Vec<(usize, usize, usize, usize, usize)>,
     /// The array a scan is answered out of.
     scan_pairs: Vec<Zu2Pair>,
+    /// Whether the last scan left an epoch protection held, which it
+    /// does whenever it handed out a pointer into a log page rather
+    /// than into `scan_bytes`. Released by the next
+    /// [`Zu2Session::enter`] and by nothing else, so the pairs stay
+    /// readable for exactly as long as the header says they do.
+    scan_held: bool,
 }
 
 /// Held for the length of a call on a session. Dropping it lets the
@@ -233,6 +246,16 @@ impl Zu2Session {
         // SAFETY: the exchange above succeeded, so this thread is the
         // only one with a reference to the state until the guard drops.
         let state = unsafe { &mut *self.state.get() };
+        // The single funnel every call on a session goes through, which
+        // makes it the one place a borrowing scan's protection can be
+        // let go without every entry point having to remember. The
+        // pairs from the previous scan stop being readable exactly
+        // here, which is the contract the header has always stated:
+        // good until the next call on this session.
+        if state.scan_held {
+            state.scan_held = false;
+            state.session.scan_release();
+        }
         Some(Entered {
             busy: &self.busy,
             state,
@@ -618,6 +641,7 @@ pub unsafe extern "C" fn zu2_session_open(db: *mut Zu2Db, out: *mut *mut Zu2Sess
             scan_bytes: Vec::new(),
             scan_spans: Vec::new(),
             scan_pairs: Vec::new(),
+            scan_held: false,
         }),
         _owner: owner,
     });
@@ -634,7 +658,23 @@ pub unsafe extern "C" fn zu2_session_close(s: *mut Zu2Session) {
     if s.is_null() {
         return;
     }
-    drop(unsafe { Box::from_raw(s) });
+    let boxed = unsafe { Box::from_raw(s) };
+    // A scan that borrowed left an epoch protection held, and a slot
+    // that is never released is a floor under reclamation that nothing
+    // ever lifts, so closing a session in the middle of reading a scan
+    // would stop compaction from freeing anything for the life of the
+    // process. Nothing else needs the state here, so this reaches
+    // straight into it rather than going through `enter`, which would
+    // deadlock against a caller that closed from inside a callback.
+    //
+    // SAFETY: the caller is giving up the session, so this is the only
+    // reference to its state.
+    let state = unsafe { &mut *boxed.state.get() };
+    if state.scan_held {
+        state.scan_held = false;
+        state.session.scan_release();
+    }
+    drop(boxed);
 }
 
 /// What went wrong in the last fallible call on this session.
@@ -895,13 +935,66 @@ pub unsafe extern "C" fn zu2_scan(
     let mut spans = std::mem::take(&mut state.scan_spans);
     buffer.clear();
     spans.clear();
-    let outcome = state.session.scan(start, count, |key, value| {
-        spans.push((buffer.len(), key.len(), value.len()));
-        buffer.extend_from_slice(key);
-        buffer.extend_from_slice(value);
-    });
+    // #738. This used to copy every key and every value in here and
+    // hand out pointers into the copy, which bought a lifetime rather
+    // than a read: the bytes were already in a readable place. #737
+    // measured the copy at 34% of the scan at one thread and 56% at
+    // thirty two.
+    //
+    // Now the key is copied and the value usually is not. The key comes
+    // out of the scan plane's own nodes and is not covered by the
+    // session's epoch, so it has to be; at twenty three bytes against a
+    // thousand that is about two per cent of what was being moved. The
+    // value is copied only when `scan_borrowed` says it will not
+    // outlive the call, which means a record still in the mutable
+    // window or one out in the cold tier that was read into a scratch
+    // buffer. Everything below the read-only boundary is handed out
+    // where it lies.
+    //
+    // A value span is (offset, len) into the buffer and a borrowed one
+    // is a raw pointer, and the two are told apart by the offset being
+    // `usize::MAX`, so both fit the same array and the loop below does
+    // not need a second one.
+    const BORROWED: usize = usize::MAX;
+    let mut held = false;
+    // SAFETY: every path out of this function either releases the
+    // protection here or sets `scan_held`, and the only thing that
+    // clears `scan_held` is `Zu2Session::enter`, which releases it. A
+    // borrowed value is read by the caller before that next call and
+    // by contract not after it.
+    let outcome = unsafe {
+        state
+            .session
+            .scan_borrowed(start, count, |key, value, stable| {
+                let at = buffer.len();
+                buffer.extend_from_slice(key);
+                if stable {
+                    held = true;
+                    spans.push((
+                        at,
+                        key.len(),
+                        BORROWED,
+                        value.as_ptr() as usize,
+                        value.len(),
+                    ));
+                } else {
+                    let value_at = buffer.len();
+                    buffer.extend_from_slice(value);
+                    spans.push((at, key.len(), value_at, 0, value.len()));
+                }
+            })
+    };
     state.scan_bytes = buffer;
     state.scan_spans = spans;
+    // Whether anything was borrowed decides whether a release is owed.
+    // A scan that found every record in the mutable window borrowed
+    // nothing, and holding a floor under reclamation for that would be
+    // a cost with no reader behind it.
+    if held {
+        state.scan_held = true;
+    } else {
+        state.session.scan_release();
+    }
     if let Err(status) = note(&mut state.error, outcome) {
         return status;
     }
@@ -909,14 +1002,19 @@ pub unsafe extern "C" fn zu2_scan(
     // taken while it was still being pushed to would be into whatever
     // allocation the next push replaced.
     state.scan_pairs.clear();
-    for &(at, key_len, value_len) in &state.scan_spans {
+    for &(at, key_len, value_at, borrowed, value_len) in &state.scan_spans {
         let base = state.scan_bytes.as_ptr();
         state.scan_pairs.push(Zu2Pair {
             // SAFETY: the offsets came from the buffer as it was built
             // and the buffer has not been touched since.
             key: unsafe { base.add(at) },
             key_len,
-            value: unsafe { base.add(at + key_len) },
+            value: if value_at == BORROWED {
+                borrowed as *const u8
+            } else {
+                // SAFETY: as for the key.
+                unsafe { base.add(value_at) }
+            },
             value_len,
         });
     }

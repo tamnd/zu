@@ -1997,16 +1997,21 @@ fn main() {
     // disk, and a ratio divides the disk out: both halves carry the
     // same sync, so a slow volume moves neither.
     //
-    // What is gated is the middle shape rather than the widest one. A
-    // run is WRITES statements, so a p99 here is the second slowest of
-    // two hundred, and one scheduling stall on a shared machine owns
-    // it: three runs an hour apart put the widest shape at 12.9x, 5.2x
-    // and 4.7x, a different shape each time, off a set of shapes that
-    // otherwise sat between 1.1x and 1.9x. The maximum over fourteen
-    // such samples measures the box. The middle one does not move
-    // unless the write path itself grew a tail, which is the thing
-    // being asked about, and the widest is printed beside it so a run
-    // that stalled says so.
+    // Reported and not gated, for a reason the first cut of it missed.
+    // Both halves carry the same sync, so the ratio divides out how
+    // slow the volume is; what it does not divide out is how fast it
+    // is. These are durable statements, so the median is one fsync and
+    // the tail is one fsync plus whatever the scheduler did, and the
+    // quicker the fsync the larger the same stall reads. A CI runner
+    // syncing in 1.2 ms put the middle shape at 16x off a 19 ms stall
+    // while this laptop, syncing in 3 ms, read 1.6x on the same commit.
+    // That is the volume speaking, not the write path.
+    //
+    // write_p99_p50_x a few lines down asks the same question with the
+    // sync taken out, which is the form of it that is about the engine,
+    // and that one is gated. This stays because it names the shape and
+    // the run that stalled, which is what a reader wants when the other
+    // one moves.
     let shapes = [
         ("SET", &set_small),
         ("SET on an edge", &set_edge),
@@ -2032,15 +2037,14 @@ fn main() {
     let middle = ratios[ratios.len() / 2];
     println!(
         "stmt_p99_p50_x: {ratio:.2}x at the middle shape, {name} at p99 {p99:.0} us against \
-         p50 {p50:.0} us",
+         p50 {p50:.0} us (reported, not gated: see write_p99_p50_x)",
         name = middle.0,
         ratio = middle.1,
         p99 = middle.2,
         p50 = middle.3
     );
     println!(
-        "widest shape this run: {name} at {ratio:.2}x, p99 {p99:.0} us against p50 {p50:.0} us \
-         (reported, not gated)",
+        "widest shape this run: {name} at {ratio:.2}x, p99 {p99:.0} us against p50 {p50:.0} us",
         name = widest.0,
         ratio = widest.1,
         p99 = widest.2,
@@ -2049,7 +2053,6 @@ fn main() {
 
     let mut failed = false;
     let checks = [
-        ("stmt_p99_p50_x", middle.1),
         ("set_stmt_us", set_small.us),
         ("set_stmt_cpu_us", set_small.cpu),
         ("set_stmt_cpu_nosync_us", set_small.cpu_less_sync(sync)),

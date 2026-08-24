@@ -691,6 +691,28 @@ exec_scale_8x = 2.0
 # on every run. Raise this floor, never lower it.
 exec_group_mrows_s_core = 8.0
 
+# The same sink at one worker on a string key, M rows/s: the same ten
+# million rows grouped on a name over a thousand distinct values, so
+# the key is bytes rather than a word and the group table has to hash
+# and compare them.
+#
+# It reads 41 on gamingpc and the integer shape beside it reads 94, so
+# a string key costs a little over twice what a word key does rather
+# than the four times it cost before short keys started living in
+# their own two words. Medians of three paired runs at e907ab5:
+# 311.0 ms before and 242.9 after at one worker, 44.6 and 35.8 at
+# eight, with the integer shapes unmoved either side.
+#
+# The floor is derived rather than measured, which is the one thing
+# worth knowing about it. Both shared vCPU hosts were saturated by
+# other work when it was set, load 55 on server3's eight cores and 75
+# on server1's four, so neither could say what its worst quiet run
+# looks like. Two is what gamingpc's ratio against the integer shape
+# puts server3 near, given the same margin the floor above it carries.
+# Tighten it to a measured number the next time the fleet is idle.
+# Raise this floor, never lower it.
+exec_group_str_mrows_s_core = 2.0
+
 # What the ORDER BY costs on a query that already has one, percent
 # (perf/05 section 5). The bench runs the same ten thousand row fan
 # three ways, unordered, ordered with a LIMIT 10, and fully ordered,

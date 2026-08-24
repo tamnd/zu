@@ -1105,6 +1105,14 @@ pub(crate) fn finish_agg(
             Some(m) => m.merge_from(&t)?,
         }
     }
+    // Asked here rather than per row on the way in: the table holds one
+    // copy of each distinct key and every row that did not create a
+    // group has the bytes of the one that did.
+    if merged.as_ref().is_some_and(|t| !t.utf8()) {
+        return Err(zu_common::ZuError::InvalidArgument(
+            "string property is not UTF-8".to_string(),
+        ));
+    }
     let mut groups = merged.map(GroupTable::drain).unwrap_or_default();
     groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
     let mut rows = Vec::with_capacity(groups.len());

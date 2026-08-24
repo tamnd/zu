@@ -22,6 +22,14 @@
 //! fixed-width key, which is most group-bys, never reads them even on a
 //! hit: the inline word is the whole key.
 //!
+//! A string of at most [`INLINE_MAX`] bytes is carried in the two words
+//! its part occupies rather than in the heap, which is what a name or a
+//! country or a status is, and while nothing in the table has spilled
+//! past that the compare is a run down two word buffers: no walk over
+//! the parts, no second buffer to reach into, no `memcmp` call for seven
+//! bytes. That is worth about a third of the whole query on a ten
+//! million row scan grouped on a name.
+//!
 //! Probing is the memory-bound part, one dependent random access per
 //! row, so the probe loop warms the slot line eight rows ahead. That is
 //! what makes the vector unit of work pay: eight probes are in flight at
@@ -52,9 +60,124 @@ pub(crate) enum PartKind {
     Temporal(TemporalLane),
     /// A node: table id and row offset, two words.
     Node,
-    /// A string: byte offset and length into the batch's or the table's
-    /// byte buffer, two words.
+    /// A string: two words, holding the bytes themselves when there are
+    /// at most [`INLINE_MAX`] of them and an offset and a length into
+    /// the batch's or the table's byte buffer when there are more.
     Str,
+}
+
+/// Bytes a string key part carries in its own two words. Sixteen bytes
+/// are there and the length needs one of them, so fifteen fit, which
+/// covers a name, a country code, a status, a short label, most of what
+/// a GROUP BY on a string is actually grouping on.
+///
+/// The point is not the copy it saves on the way in, which is small. It
+/// is that an inline key hashes out of two registers and compares as two
+/// word compares, so a row never reaches the byte buffer at all: no
+/// second random line on the compare, and no `memcmp` call, which for
+/// seven bytes costs more than the compare it is doing.
+const INLINE_MAX: usize = 15;
+
+/// The length byte of the second word when the bytes did not fit, which
+/// is the one value a real inline length cannot take.
+const HEAP_TAG: u64 = 0xFF << 56;
+
+/// The other 56 bits of the second word, the length of a heap key.
+const LEN_MASK: u64 = !HEAP_TAG;
+
+/// Whether a string part's second word says its bytes are in the words.
+#[inline(always)]
+fn inline_str(w1: u64) -> bool {
+    w1 & HEAP_TAG != HEAP_TAG
+}
+
+/// A string part's length, whichever of the two forms it is in.
+#[inline(always)]
+fn str_len(w1: u64) -> usize {
+    (if inline_str(w1) {
+        w1 >> 56
+    } else {
+        w1 & LEN_MASK
+    }) as usize
+}
+
+/// The word holding `s`, which is at most eight bytes, little endian and
+/// zero above them.
+///
+/// Written as fixed-width loads that overlap rather than as a copy into
+/// a zeroed buffer, because a copy of a length the compiler cannot see
+/// is a `memcpy` call, and a call per row is more than the whole rest of
+/// the packing costs. Two loads cover four to eight bytes, three byte
+/// loads cover one to three, and both read only bytes `s` has.
+#[inline(always)]
+fn load_short(s: &[u8]) -> u64 {
+    let n = s.len();
+    debug_assert!(n <= 8, "one word holds eight bytes");
+    if n >= 4 {
+        let head = u32::from_le_bytes(s[..4].try_into().expect("four bytes")) as u64;
+        let tail = u32::from_le_bytes(s[n - 4..].try_into().expect("four bytes")) as u64;
+        // Bytes four and up are the top of the overlapping tail load,
+        // and at exactly four there are none of them.
+        let above = if n > 4 { tail >> ((8 - n) * 8) } else { 0 };
+        head | above << 32
+    } else if n > 0 {
+        // The first, the last, and the one in the middle, which for one
+        // and two bytes is one of those two again.
+        u64::from(s[0]) | u64::from(s[n / 2]) << (n / 2 * 8) | u64::from(s[n - 1]) << ((n - 1) * 8)
+    } else {
+        0
+    }
+}
+
+/// Packs up to [`INLINE_MAX`] bytes into the two words of a string part.
+#[inline(always)]
+fn pack_inline(s: &[u8]) -> (u64, u64) {
+    let n = s.len();
+    debug_assert!(n <= INLINE_MAX, "the caller checked the length");
+    let (lo, hi) = if n >= 8 {
+        let lo = u64::from_le_bytes(s[..8].try_into().expect("eight bytes"));
+        let tail = u64::from_le_bytes(s[n - 8..].try_into().expect("eight bytes"));
+        (lo, if n > 8 { tail >> ((16 - n) * 8) } else { 0 })
+    } else {
+        (load_short(s), 0)
+    };
+    // The top byte of the second word is the length, and it is free
+    // because seven bytes above the first eight are all an inline key
+    // can hold.
+    (lo, hi | (n as u64) << 56)
+}
+
+/// Unpacks an inline string part into a caller's scratch, which is
+/// where a key that has to be read as bytes again is read from.
+#[inline(always)]
+fn unpack_inline(w0: u64, w1: u64, out: &mut [u8; INLINE_MAX + 1]) -> usize {
+    out[..8].copy_from_slice(&w0.to_le_bytes());
+    out[8..].copy_from_slice(&(w1 & LEN_MASK).to_le_bytes());
+    (w1 >> 56) as usize
+}
+
+/// The bytes of a string part, out of the words when it is inline and
+/// out of `buf` when it is not.
+#[inline(always)]
+fn str_bytes<'a>(w0: u64, w1: u64, buf: &'a [u8], scratch: &'a mut [u8; 16]) -> &'a [u8] {
+    if inline_str(w1) {
+        let n = unpack_inline(w0, w1, scratch);
+        &scratch[..n]
+    } else {
+        let (off, len) = (w0 as usize, str_len(w1));
+        &buf[off..off + len]
+    }
+}
+
+/// The hash of one string part. An inline key is two words and never
+/// touches `buf`.
+#[inline(always)]
+fn hash_str(w0: u64, w1: u64, buf: &[u8]) -> u64 {
+    if inline_str(w1) {
+        hash64(hash64(w0) ^ w1)
+    } else {
+        hash_bytes(&buf[w0 as usize..w0 as usize + str_len(w1)])
+    }
 }
 
 impl PartKind {
@@ -76,6 +199,9 @@ pub(crate) struct KeyBatch {
     bytes: Vec<u8>,
     stride: usize,
     rows: usize,
+    /// Whether any string in the batch was too long for its words and
+    /// went to `bytes`. See [`GroupTable::spilled`].
+    spilled: bool,
 }
 
 impl KeyBatch {
@@ -86,6 +212,7 @@ impl KeyBatch {
         self.bytes.clear();
         self.stride = stride;
         self.rows = rows;
+        self.spilled = false;
     }
 
     /// The word buffer and its stride, for a caller writing one column
@@ -103,12 +230,19 @@ impl KeyBatch {
     }
 
     /// Writes one string cell. Strings are the one part a caller has to
-    /// fill row by row, since the bytes only pack in order.
+    /// fill row by row, since the long ones only pack in order.
     pub(crate) fn set_str(&mut self, row: usize, off: usize, s: &[u8]) {
         let at = row * self.stride + off;
-        self.words[at] = self.bytes.len() as u64;
-        self.words[at + 1] = s.len() as u64;
-        self.bytes.extend_from_slice(s);
+        let (w0, w1) = if s.len() <= INLINE_MAX {
+            pack_inline(s)
+        } else {
+            let head = (self.bytes.len() as u64, HEAP_TAG | s.len() as u64);
+            self.bytes.extend_from_slice(s);
+            self.spilled = true;
+            head
+        };
+        self.words[at] = w0;
+        self.words[at + 1] = w1;
     }
 
     /// Drops the string bytes of the batch, keeping the word buffer.
@@ -156,6 +290,24 @@ pub(crate) struct GroupTable {
     counting: bool,
     /// One hash per row of the batch in flight.
     hashes: Vec<u64>,
+    /// Whether any stored key has a string too long to live in its own
+    /// words.
+    ///
+    /// While nothing has spilled, two keys are equal exactly when their
+    /// words are, because a string's length decides its form and its
+    /// bytes are the words. That turns the compare into a run down two
+    /// word buffers, with no walk over the parts and no reach into a
+    /// byte buffer, which is the whole reason for packing short strings
+    /// inline in the first place.
+    spilled: bool,
+    /// Whether every string key stored so far was UTF-8.
+    ///
+    /// The check lives here rather than on the way in because a row that
+    /// lands on a group it did not create has bytes equal to that
+    /// group's, which were checked when it was created. So a scan of ten
+    /// million rows over a thousand names validates a thousand names,
+    /// not ten million. [`GroupTable::utf8`] is where it is answered.
+    utf8: bool,
 }
 
 /// Slots start here and double past three quarters full. Seven eighths
@@ -203,6 +355,8 @@ impl GroupTable {
             order: Vec::new(),
             counting: false,
             hashes: Vec::new(),
+            spilled: false,
+            utf8: true,
         }
     }
 
@@ -229,6 +383,12 @@ impl GroupTable {
     /// How many distinct keys the table holds.
     pub(crate) fn groups(&self) -> usize {
         self.groups
+    }
+
+    /// Whether every string key in the table is UTF-8, which the caller
+    /// asks once at the end rather than per row. See [`Self::utf8`].
+    pub(crate) fn utf8(&self) -> bool {
+        self.utf8
     }
 
     /// Every group's aggregate states, `n_aggs` per group, indexed by the
@@ -265,12 +425,15 @@ impl GroupTable {
         }
         out.clear();
         out.resize(batch.rows, 0);
+        // Asked once for the vector rather than once per row: while
+        // neither side has spilled a string, the words are the key.
+        let words_decide = !self.spilled && !batch.spilled;
         for row in 0..batch.rows {
             if row + AHEAD < batch.rows {
                 let i = hashes[row + AHEAD] as usize & self.mask;
                 warm(self.slots[i]);
             }
-            out[row] = self.find_or_insert(hashes[row], batch, row, specs) as u32;
+            out[row] = self.find_or_insert(hashes[row], batch, row, specs, words_decide) as u32;
         }
         self.hashes = hashes;
     }
@@ -336,7 +499,14 @@ impl GroupTable {
         }
     }
 
-    fn find_or_insert(&mut self, h: u64, batch: &KeyBatch, row: usize, specs: &[AggSpec]) -> usize {
+    fn find_or_insert(
+        &mut self,
+        h: u64,
+        batch: &KeyBatch,
+        row: usize,
+        specs: &[AggSpec],
+        words_decide: bool,
+    ) -> usize {
         let tag = (h >> 48).max(1);
         let inline = self.inline_word(h, batch.row_words(row));
         let mut i = h as usize & self.mask;
@@ -355,7 +525,14 @@ impl GroupTable {
             }
             if slot[0] >> 48 == tag && slot[1] == inline {
                 let g = ((slot[0] & IDX_MASK) - 1) as usize;
-                if self.simple || self.key_eq(g, batch, row) {
+                let same = if self.simple {
+                    true
+                } else if words_decide {
+                    self.words_eq(g, batch, row)
+                } else {
+                    self.key_eq(g, batch, row)
+                };
+                if same {
                     return g;
                 }
             }
@@ -388,14 +565,36 @@ impl GroupTable {
                     self.keys.push(words[w + 1]);
                 }
                 PartKind::Str => {
-                    let (off, len) = (words[w] as usize, words[w + 1] as usize);
-                    self.keys.push(self.heap.len() as u64);
-                    self.keys.push(len as u64);
-                    self.heap.extend_from_slice(&batch.bytes[off..off + len]);
+                    let (w0, w1) = (words[w], words[w + 1]);
+                    let mut scratch = [0u8; INLINE_MAX + 1];
+                    let bytes = str_bytes(w0, w1, &batch.bytes, &mut scratch);
+                    self.utf8 &= std::str::from_utf8(bytes).is_ok();
+                    if inline_str(w1) {
+                        // The bytes are the key, so the key is the copy.
+                        self.keys.push(w0);
+                    } else {
+                        let (off, len) = (w0 as usize, str_len(w1));
+                        self.keys.push(self.heap.len() as u64);
+                        self.heap.extend_from_slice(&batch.bytes[off..off + len]);
+                        self.spilled = true;
+                    }
+                    self.keys.push(w1);
                 }
             }
             w += part.words();
         }
+    }
+
+    /// Stored group `g` against a batch row, word for word, which is the
+    /// whole comparison while [`Self::spilled`] is false.
+    ///
+    /// Written as a loop rather than as a slice compare because the two
+    /// slices are `u64` and a slice compare on those is a `memcmp` call,
+    /// and a call is more than the two or three compares it makes.
+    fn words_eq(&self, g: usize, batch: &KeyBatch, row: usize) -> bool {
+        let base = g * self.stride;
+        let stored = &self.keys[base..base + self.stride];
+        stored.iter().zip(batch.row_words(row)).all(|(a, b)| a == b)
     }
 
     fn key_eq(&self, g: usize, batch: &KeyBatch, row: usize) -> bool {
@@ -414,14 +613,24 @@ impl GroupTable {
                     }
                 }
                 PartKind::Str => {
-                    let len = stored[w + 1] as usize;
-                    if len != words[w + 1] as usize {
+                    // The second word is the length and the form and,
+                    // for an inline key, the bytes above the eighth, so
+                    // two keys that differ in any of those are already
+                    // apart here.
+                    if stored[w + 1] != words[w + 1] {
                         return false;
                     }
-                    let a = stored[w] as usize;
-                    let b = words[w] as usize;
-                    if self.heap[a..a + len] != batch.bytes[b..b + len] {
-                        return false;
+                    if inline_str(words[w + 1]) {
+                        if stored[w] != words[w] {
+                            return false;
+                        }
+                    } else {
+                        let len = str_len(words[w + 1]);
+                        let a = stored[w] as usize;
+                        let b = words[w] as usize;
+                        if self.heap[a..a + len] != batch.bytes[b..b + len] {
+                            return false;
+                        }
                     }
                 }
             }
@@ -439,10 +648,7 @@ impl GroupTable {
             h = match part {
                 PartKind::Int | PartKind::Temporal(_) => hash64(h ^ words[w]),
                 PartKind::Node => hash64(hash64(h ^ words[w]) ^ words[w + 1]),
-                PartKind::Str => {
-                    let (off, len) = (words[w] as usize, words[w + 1] as usize);
-                    hash64(h ^ hash_bytes(&bytes[off..off + len]))
-                }
+                PartKind::Str => hash64(h ^ hash_str(words[w], words[w + 1], bytes)),
             };
             w += part.words();
         }
@@ -470,10 +676,7 @@ impl GroupTable {
             h = match part {
                 PartKind::Int | PartKind::Temporal(_) => hash64(h ^ words[w]),
                 PartKind::Node => hash64(hash64(h ^ words[w]) ^ words[w + 1]),
-                PartKind::Str => {
-                    let (off, len) = (words[w] as usize, words[w + 1] as usize);
-                    hash64(h ^ hash_bytes(&self.heap[off..off + len]))
-                }
+                PartKind::Str => hash64(h ^ hash_str(words[w], words[w + 1], &self.heap)),
             };
             w += part.words();
         }
@@ -533,7 +736,10 @@ impl GroupTable {
             other.read_into(g, &mut batch);
             // The hash reads key content, never the offsets, so the
             // other table's stored hash is this table's probe hash.
-            let target = self.find_or_insert(other.hash_stored(g), &batch, 0, &[]);
+            // Part by part rather than word by word: a merge is one call
+            // per group, not per row, so the general compare costs
+            // nothing worth saving here.
+            let target = self.find_or_insert(other.hash_stored(g), &batch, 0, &[], false);
             let src = &other.accs[g * other.n_aggs..(g + 1) * other.n_aggs];
             if self.accs.len() < (target + 1) * self.n_aggs {
                 self.accs.extend_from_slice(src);
@@ -560,11 +766,15 @@ impl GroupTable {
         // groups; the words above are overwritten either way.
         batch.clear_bytes();
         let mut w = 0;
+        let mut scratch = [0u8; INLINE_MAX + 1];
         for &part in &self.parts {
             if part == PartKind::Str {
-                let off = self.keys[base + w] as usize;
-                let len = self.keys[base + w + 1] as usize;
-                batch.set_str(0, w, &self.heap[off..off + len]);
+                let (w0, w1) = (self.keys[base + w], self.keys[base + w + 1]);
+                // Through the bytes rather than by copying the words,
+                // because an offset into this table's heap means nothing
+                // in the batch the caller is about to probe with. An
+                // inline key packs back to the words it came from.
+                batch.set_str(0, w, str_bytes(w0, w1, &self.heap, &mut scratch));
             }
             w += part.words();
         }
@@ -590,6 +800,7 @@ impl GroupTable {
             return out;
         }
         let mut accs = self.accs.into_iter();
+        let mut scratch = [0u8; INLINE_MAX + 1];
         for g in 0..self.groups {
             let base = g * self.stride;
             let mut vals = Vec::with_capacity(self.parts.len());
@@ -605,12 +816,12 @@ impl GroupTable {
                         offset: self.keys[base + w + 1],
                     },
                     PartKind::Str => {
-                        let off = self.keys[base + w] as usize;
-                        let len = self.keys[base + w + 1] as usize;
+                        let (w0, w1) = (self.keys[base + w], self.keys[base + w + 1]);
                         // The caller checked these bytes for UTF-8 on
                         // the way in, so the lossy read never replaces
                         // anything.
-                        Value::Str(String::from_utf8_lossy(&self.heap[off..off + len]).into_owned())
+                        let bytes = str_bytes(w0, w1, &self.heap, &mut scratch);
+                        Value::Str(String::from_utf8_lossy(bytes).into_owned())
                     }
                 });
                 w += part.words();
@@ -712,6 +923,55 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].0[0], Value::Str("a".into()));
         assert_eq!(count_of(&rows[0].1[0]), 2);
+    }
+
+    /// Every length from empty to past the inline limit, each a distinct
+    /// key, so a packing that drops or duplicates a byte at some length
+    /// shows up as two keys sharing a group or one key splitting.
+    #[test]
+    fn string_keys_of_every_length_stay_apart() {
+        let strs: Vec<String> = (0..40)
+            .map(|n| (0..n).map(|i| (b'a' + (i % 26) as u8) as char).collect())
+            .collect();
+        let mut t = GroupTable::new(vec![PartKind::Str], 1);
+        let specs = [AggSpec::CountStar];
+        let mut batch = KeyBatch::default();
+        // Twice over, so the second pass of each key has to find the
+        // group the first pass made rather than make one of its own.
+        batch.reset(t.stride(), strs.len() * 2);
+        for (row, s) in strs.iter().chain(&strs).enumerate() {
+            batch.set_str(row, 0, s.as_bytes());
+        }
+        let mut gids = Vec::new();
+        t.probe(&batch, &specs, &mut gids);
+        for &g in &gids {
+            t.accs_mut()[g as usize].add_star(1);
+        }
+        let rows = t.drain();
+        assert_eq!(rows.len(), strs.len(), "one group per distinct length");
+        for (row, s) in rows.iter().zip(&strs) {
+            assert_eq!(row.0[0], Value::Str(s.clone()), "the key read back whole");
+            assert_eq!(count_of(&row.1[0]), 2, "both passes landed on it");
+        }
+    }
+
+    /// The packing itself, against the copy it stands in for.
+    #[test]
+    fn short_strings_pack_into_their_words() {
+        for n in 0..=INLINE_MAX {
+            let s: Vec<u8> = (0..n as u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(1))
+                .collect();
+            let (w0, w1) = pack_inline(&s);
+            assert!(inline_str(w1), "{n} bytes fit in the words");
+            assert_eq!(str_len(w1), n, "the length rode along");
+            let mut scratch = [0u8; INLINE_MAX + 1];
+            assert_eq!(
+                str_bytes(w0, w1, &[], &mut scratch),
+                &s[..],
+                "{n} bytes back"
+            );
+        }
     }
 
     #[test]

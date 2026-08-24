@@ -156,6 +156,12 @@ impl Cold {
             file::create_new(&beside)?
         };
         file::make_sparse(&file);
+        // Every read of this tier is a point read at an address the hash
+        // index handed over, so readahead here fetches pages nobody asked
+        // for and charges them to the memory the process is allowed. See
+        // [`file::advise_random`] for why the sequential walkers do not
+        // mind. Advice, so nothing checks whether it was taken.
+        file::advise_random(&file);
         let cold = Self {
             file,
             path: beside,

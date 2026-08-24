@@ -399,6 +399,74 @@ pub fn preallocate(_file: &File, _offset: u64, _len: u64) -> bool {
     false
 }
 
+/// Tells the kernel this file is read at scattered offsets, so it should
+/// not read ahead.
+///
+/// The cold tier's steady state is a point read: one `pread` of about a
+/// kilobyte at an address the hash index handed over, with no
+/// relationship to the address before it. Linux defaults to
+/// 128 KiB of readahead on a file opened this way, so a 1152 byte ask can
+/// pull two orders of magnitude more than it needs, and every one of
+/// those pages is charged to whatever memory the process is allowed. That
+/// is not merely waste, it evicts the pages a later read wanted, which is
+/// the shape of #720: under a 512 MiB budget our cold reads fell 43x
+/// where pebble, which reads its own blocks and asks the kernel for
+/// nothing, fell 5.6x.
+///
+/// It costs the sequential readers almost nothing, which is why it can go
+/// on the file rather than on a call. Recovery and compaction walk this
+/// tier with [`read_exact_at`] a whole 4 MiB page at a time, and a
+/// request already thirty two times the readahead window does not need
+/// readahead.
+///
+/// Returns whether the kernel took the advice. A platform without it is
+/// slower and not wrong, the same reading [`punch`] and [`preallocate`]
+/// get.
+#[cfg(target_os = "linux")]
+pub fn advise_random(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    /// `POSIX_FADV_RANDOM` from `fcntl.h`.
+    const RANDOM: i32 = 1;
+
+    unsafe extern "C" {
+        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+    }
+    // Zero length means to the end of the file, and it keeps meaning that
+    // as the file grows, so this is said once at open and not again.
+    //
+    // SAFETY: the descriptor is owned by `file`.
+    // It returns the error rather than setting errno, so zero is success.
+    unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, RANDOM) == 0 }
+}
+
+/// Turns readahead off. See the Linux version for what this is for;
+/// macOS has no `posix_fadvise` and spells it as an `fcntl` whose
+/// argument is whether to read ahead at all.
+#[cfg(target_os = "macos")]
+pub fn advise_random(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    /// `F_RDAHEAD` from `sys/fcntl.h`. Argument zero turns it off.
+    const F_RDAHEAD: i32 = 45;
+
+    // Variadic for the same reason [`punch`] is: Apple's arm64 ABI puts a
+    // variadic argument on the stack and a fixed one in a register.
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    // SAFETY: the descriptor is owned by `file`.
+    unsafe { fcntl(file.as_raw_fd(), F_RDAHEAD, 0i32) != -1 }
+}
+
+/// Nowhere to say it after the file is open. Windows takes the same hint
+/// as `FILE_FLAG_RANDOM_ACCESS`, which is a flag on the open and not a
+/// call, so saying it here would mean reopening the file.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn advise_random(_file: &File) -> bool {
+    false
+}
+
 /// Drops the file's length back to `len`, giving up whatever was
 /// provisioned above it.
 ///
@@ -548,4 +616,28 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
         done += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The advice is a bare `extern "C"` declaration with a constant
+    /// copied out of a system header, which is the same shape [`punch`]
+    /// and [`preallocate`] have and the same way it can be silently
+    /// wrong: a bad command number fails and the caller carries on
+    /// slower, with nothing to say so. This is what says so.
+    ///
+    /// A regular file on a temp directory is the case both platforms
+    /// support, so on those two it has to be taken. Elsewhere there is
+    /// nothing to ask and the answer is allowed to be no.
+    #[test]
+    fn the_kernel_takes_the_random_access_advice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = create_new(&dir.path().join("advised")).expect("create");
+        let taken = advise_random(&file);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(taken, "the platform has the call and it was refused");
+        }
+    }
 }

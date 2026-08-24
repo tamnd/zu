@@ -21,6 +21,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use zu_common::{Epoch, Result, ZuError};
 
@@ -576,9 +577,9 @@ pub fn commit_counters() -> (u64, u64) {
 /// frames go, so the writers that staged behind it while it waited for
 /// the write side come along for free. A writer that finds a sync
 /// already running waits for it, and either it covered them or they
-/// lead the next one. So a burst of n commits costs two syncs rather
-/// than n: the one already in flight when the burst arrived, and the
-/// one that covers the rest.
+/// lead the next one. So a burst of n commits costs one sync rather
+/// than n, and the leader pauses before issuing it so that the writers
+/// who are still staging when it takes the lead are in that one too.
 ///
 /// The sync runs on a second handle on the log, because by then the
 /// writer that staged the frames has given the write side back and the
@@ -607,7 +608,30 @@ struct Marks {
     /// rather than left believing a sync happened. Cleared by the next
     /// sync that succeeds.
     failed: bool,
+    /// Commits inside [`Commits::sync_through`] that the log still owes
+    /// something to, the leader among them.
+    waiting: u64,
+    /// How many of those the last flush found, which is this log's
+    /// answer to whether anything is going on: one writer on its own
+    /// reads 1 every time.
+    group: u64,
+    /// What a sync on this file costs, in nanoseconds, smoothed over
+    /// the ones this process has issued. Zero until it has issued one.
+    cost: u64,
 }
+
+/// The share of a sync period a leader will spend gathering writers
+/// that have not staged yet, and the most it will spend whatever the
+/// share comes to.
+///
+/// The window is a fraction of the flush it saves, so it is right on a
+/// drive that syncs in a hundred microseconds and on one that takes
+/// fifty milliseconds, and the cap is there because the second of those
+/// should not put five milliseconds in front of a commit however much
+/// it might save. An eighth of three milliseconds is 375 us, against
+/// the staging it is waiting for, which is tens of microseconds.
+const GATHER_SHARE: u64 = 8;
+const GATHER_CAP: Duration = Duration::from_micros(500);
 
 impl Commits {
     fn new(file: Box<dyn VfsFile>, len: u64) -> Self {
@@ -620,6 +644,9 @@ impl Commits {
                 durable: len,
                 running: None,
                 failed: false,
+                waiting: 0,
+                group: 0,
+                cost: 0,
             }),
             done: Condvar::new(),
         }
@@ -650,16 +677,41 @@ impl Commits {
         !marks.failed && marks.durable >= marks.staged
     }
 
+    /// How long a leader should hold its flush back to let the writers
+    /// that are still staging catch it, which is nothing at all unless
+    /// there are any.
+    ///
+    /// A flush covers the bytes that were written before it started, so
+    /// a writer that staged into the middle of one waits it out and then
+    /// waits for the next: two sync periods, and a burst of n commits
+    /// costs two flushes rather than one. Pausing for a fraction of a
+    /// flush before issuing it is what turns those two into one, because
+    /// staging is tens of microseconds against a flush's thousands, so
+    /// nearly everyone in flight arrives inside the pause.
+    ///
+    /// The pause is only worth its own cost where there is a group to
+    /// gather, so it asks what the last flush found. One writer on its
+    /// own finds itself every time and waits for nobody, which is what
+    /// keeps this off the single connection path the write budget is
+    /// read on. It also stays off until the log has timed a sync, since
+    /// a fraction of an unknown is not a number.
+    fn gather(marks: &Marks) -> Duration {
+        if marks.group < 2 || marks.cost == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(marks.cost / GATHER_SHARE).min(GATHER_CAP)
+    }
+
     /// Returns once the log is durable through `need` bytes, syncing it
     /// here if nobody else is already doing it.
     ///
     /// This is the commit point. It runs with the write side let go of,
     /// so the writers behind this one are staging their own frames
-    /// while this sync is in the air, and the sync that covers them is
-    /// the next one rather than one each.
+    /// while this sync is in the air, and one sync covers all of them.
     pub fn sync_through(&self, need: u64) -> Result<()> {
         COMMITS.fetch_add(1, Ordering::Relaxed);
         let mut marks = self.marks.lock().expect("wal marks");
+        let mut counted = false;
         loop {
             // A log shorter than the byte asked for no longer holds the
             // frames this was waiting on, and the only two ways that
@@ -667,7 +719,14 @@ impl Commits {
             // sealed them into the base file and synced it before
             // cutting, or a rollback that took them away.
             if !marks.failed && (marks.durable >= need || marks.staged < need) {
+                if counted {
+                    marks.waiting -= 1;
+                }
                 return Ok(());
+            }
+            if !counted {
+                counted = true;
+                marks.waiting += 1;
             }
             if marks.running.is_some() {
                 // Somebody is syncing. Whether they reach far enough or
@@ -676,16 +735,29 @@ impl Commits {
                 marks = self.done.wait(marks).expect("wal marks");
                 continue;
             }
-            // Lead. Sync as far as the log has been staged, not only as
-            // far as this commit needs, because the bytes are already
-            // there and covering them costs the same syscall. Never
-            // past that: a mark above what the file holds would have
-            // the next commit believe a sync it never got.
+            // Lead. Claim the flush before pausing for the stragglers,
+            // so that a writer arriving during the pause waits for this
+            // one rather than starting a second: the whole point of the
+            // pause is that its flush is the one they all ride.
+            let gather = Self::gather(&marks);
+            if !gather.is_zero() {
+                marks.running = Some(marks.staged);
+                drop(marks);
+                std::thread::sleep(gather);
+                marks = self.marks.lock().expect("wal marks");
+            }
+            // Sync as far as the log has been staged, not only as far as
+            // this commit needs, because the bytes are already there and
+            // covering them costs the same syscall. Never past that: a
+            // mark above what the file holds would have the next commit
+            // believe a sync it never got.
             let target = marks.staged;
             marks.running = Some(target);
             drop(marks);
 
+            let began = Instant::now();
             let synced = self.file.lock().expect("wal sync handle").sync_data();
+            let took = began.elapsed().as_nanos() as u64;
 
             marks = self.marks.lock().expect("wal marks");
             marks.running = None;
@@ -693,10 +765,23 @@ impl Commits {
                 Ok(()) => {
                     marks.durable = marks.durable.max(target);
                     marks.failed = false;
+                    // Half the last answer and half this one, which
+                    // follows a drive that changes its mind without
+                    // letting one slow flush decide the window.
+                    marks.cost = match marks.cost {
+                        0 => took,
+                        was => (was + took) / 2,
+                    };
+                    // Everyone the flush found, this leader included.
+                    // Read after it landed rather than before, because
+                    // the writers that arrived while it ran are exactly
+                    // the ones the next pause is for.
+                    marks.group = marks.waiting;
                     SYNCS.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => marks.failed = true,
             }
+            marks.waiting -= 1;
             self.done.notify_all();
             return synced;
         }
@@ -1163,6 +1248,75 @@ mod tests {
             syncs.load(Ordering::Relaxed) - reserving,
             1,
             "the two behind it were already covered"
+        );
+    }
+
+    /// The pause in front of a flush is for gathering writers, so it
+    /// happens where there are writers to gather and nowhere else. One
+    /// connection committing on its own is the case that must not pay
+    /// it: it is the case the write budget is read on, and the pause
+    /// would be latency bought for nobody.
+    #[test]
+    fn a_leader_waits_only_where_the_last_flush_found_a_group() {
+        let alone = Marks {
+            cost: 3_200_000,
+            group: 1,
+            ..Marks::default()
+        };
+        assert_eq!(Commits::gather(&alone), Duration::ZERO);
+
+        let crowd = Marks { group: 4, ..alone };
+        assert_eq!(
+            Commits::gather(&crowd),
+            Duration::from_micros(400),
+            "an eighth of the flush it is worth waiting for"
+        );
+
+        let untimed = Marks { cost: 0, ..crowd };
+        assert_eq!(
+            Commits::gather(&untimed),
+            Duration::ZERO,
+            "a fraction of an unknown is not a number"
+        );
+
+        let slow = Marks {
+            cost: 4_000_000_000,
+            ..crowd
+        };
+        assert_eq!(
+            Commits::gather(&slow),
+            GATHER_CAP,
+            "a drive that takes four seconds does not get to put half of one in front of a commit"
+        );
+    }
+
+    /// And the pause is in front of the flush rather than after it,
+    /// which is the whole of it: the writers it is waiting for stage
+    /// while it waits, and the flush that follows reaches past them
+    /// because it reads how far the log is staged when it starts.
+    #[test]
+    fn the_pause_comes_before_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gather.wal");
+        let (file, _) = CountingFile::open(&path);
+        let mut wal = Wal::open_on(file).unwrap();
+        let commits = Arc::clone(wal.commits());
+        let need = staged(&mut wal, 1);
+
+        // What a burst leaves behind it, put here by hand because one
+        // thread cannot be a burst: a flush that found four writers and
+        // took four milliseconds.
+        {
+            let mut marks = commits.marks.lock().unwrap();
+            marks.group = 4;
+            marks.cost = 4_000_000;
+        }
+
+        let began = Instant::now();
+        commits.sync_through(need).unwrap();
+        assert!(
+            began.elapsed() >= Duration::from_micros(500),
+            "the commit waited out the window before it asked the disk for anything"
         );
     }
 

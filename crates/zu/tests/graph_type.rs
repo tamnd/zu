@@ -194,21 +194,27 @@ fn a_type_the_catalog_will_not_write_is_refused_with_a_condition() {
 }
 
 /// A type the parser refuses is refused as text, with a syntax
-/// condition, which is half of what every refusal above should look
-/// like once S1 is done.
+/// condition and with the place the text went wrong.
 ///
-/// The other half is missing here too. An unknown type name raises
-/// 42001 with no position and therefore no excerpt, so the user is told
-/// the statement has a bad type and not which token it is. In a
-/// declaration of thirty properties that is a search. S1 owes both
-/// halves of the message shape and this pins where it starts.
+/// S1 added the place. An unknown type name used to raise 42001 saying
+/// only that the statement had a bad type, which in a declaration of
+/// thirty properties is a search over the user's own statement. The
+/// offset is where the type began rather than where the parser stopped,
+/// because the word the reader has to change is the first one.
+///
+/// The excerpt comes with it, and is the whole line the position falls
+/// on, so a caller holding nothing but the error can still underline
+/// the token. `refusal_shape.rs` pins the rest of the envelope.
 #[test]
-fn a_type_with_no_spelling_is_a_syntax_error_that_does_not_say_where() {
+fn a_type_with_no_spelling_is_a_syntax_error_that_says_where() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
     let source = "CREATE GRAPH TYPE nope { (:Probe {v :: NOSUCHTYPE}) }";
     let err = run(source, &mut db, &[]).expect_err("there is no such type");
     assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42001".into()));
     assert!(err.to_string().contains("NOSUCHTYPE"), "{err}");
-    assert_eq!(err.position(), None, "S1 gives this one a position");
+    let at = err.position().expect("the type name is somewhere");
+    assert_eq!((at.line, at.column), (1, 40), "{err}");
+    assert_eq!(&source[at.offset as usize..], "NOSUCHTYPE}) }");
+    assert_eq!(err.excerpt(), Some(source), "one line, quoted whole");
 }

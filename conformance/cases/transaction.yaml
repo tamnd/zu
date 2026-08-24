@@ -198,6 +198,31 @@ cases:
           - type: INT64
             value: "2"
 
+  - name: a-call-body-that-is-only-a-catalog-statement
+    doc: ISO 12.8 calls this a call catalog-modifying procedure statement, which is a catalog statement written as a call rather than a call that happens to change the catalog. What a call does is add the rows its body answered to the row it ran for, a catalog statement answers none, so the call is the statements in it and the braces say nothing. The graph the second part names is one only the first part could have made, so a client that read the braces as a subquery and asked it for rows answers a condition here rather than a count.
+    query: "CALL { CREATE GRAPH side ANY } NEXT USE side MATCH (t:thing) RETURN count(t) AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-call-body-of-several-catalog-statements
+    doc: The braces may hold more than one, chained the way the parts of any block are, and what comes out is those parts in the order they were written. The third one here unmakes what the first one made, which is what tells a client that ran them in one go from one that ran the block as written.
+    query: "CALL { CREATE GRAPH one ANY NEXT CREATE GRAPH two ANY NEXT DROP GRAPH one } NEXT USE two MATCH (t:thing) RETURN count(t) AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-clause-behind-a-call-body-of-catalog-statements
+    doc: A clause written behind the call is reading a row the catalog statements did not answer, so it is a syntax condition and not an empty result. The NEXT of the case above is the way to write what follows, since that reads the unit row every statement starts from rather than a row the call handed on.
+    query: "CALL { CREATE GRAPH side ANY } RETURN 1 AS n"
+    raises: "42001"
+
   - name: a-transaction-word-is-not-a-part-of-a-block
     doc: A block runs as one transaction, so a word that begins or ends one has nothing to say among its parts and is a syntax condition rather than a block that quietly committed halfway.
     query: "CREATE GRAPH side ANY NEXT COMMIT"

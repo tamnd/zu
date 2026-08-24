@@ -255,7 +255,7 @@ fn run_load(
     // The file holds two CSRs, so density is quoted per direction: bwd
     // block bytes are carved out of the fwd number, keeping it comparable
     // with the single-direction figures the ceilings were set against.
-    // Blocks, not payloads: each segment pads to 256 KiB blocks and that
+    // Blocks, not payloads: each segment pads to whole blocks and that
     // padding is part of the direction's disk footprint. Headers and
     // directory overhead stay on the fwd side.
     let bwd_bytes: u64 = directory

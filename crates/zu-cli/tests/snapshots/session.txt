@@ -1,25 +1,25 @@
 $ zu copy <edges> <graph>
 copied 4 edges, 4 nodes, 1 groups
 parse <n>s, encode+write <n>s, total <n>s
-<n> M edges/s end to end, 1572864 bytes on disk, <n> bits/edge fwd, <n> bits/edge bwd
+<n> M edges/s end to end, 196608 bytes on disk, <n> bits/edge fwd, <n> bits/edge bwd
 
 $ zu copy --format json <edges> <second>
-{"file":"<second>","edges":4,"nodes":4,"groups":1,"bytes":1572864,"key_bytes":0,"edge_properties":[],"parse_secs":<n>,"encode_secs":<n>,"total_secs":<n>,"edges_per_sec":<n>,"fwd_bits_per_edge":<n>,"bwd_bits_per_edge":<n>}
+{"file":"<second>","edges":4,"nodes":4,"groups":1,"bytes":196608,"key_bytes":0,"edge_properties":[],"parse_secs":<n>,"encode_secs":<n>,"total_secs":<n>,"edges_per_sec":<n>,"fwd_bits_per_edge":<n>,"bwd_bits_per_edge":<n>}
 
 $ zu copy --reorder degree <edges> <keyed> --format json
-{"file":"<keyed>","edges":4,"nodes":4,"groups":1,"bytes":2883584,"key_bytes":524288,"edge_properties":[],"parse_secs":<n>,"encode_secs":<n>,"total_secs":<n>,"edges_per_sec":<n>,"fwd_bits_per_edge":<n>,"bwd_bits_per_edge":<n>}
+{"file":"<keyed>","edges":4,"nodes":4,"groups":1,"bytes":360448,"key_bytes":65536,"edge_properties":[],"parse_secs":<n>,"encode_secs":<n>,"total_secs":<n>,"edges_per_sec":<n>,"fwd_bits_per_edge":<n>,"bwd_bits_per_edge":<n>}
 
 $ zu stat <graph>
 file:            <graph>
 uuid:            <uuid>
 format:          zu1 v1, min reader v1
-block size:      256 KiB
+block size:      32 KiB
 epoch:           2
 high water:      block 5
 wal seq:         0
 roots:           catalog=3 tables=4 free=0 stats=5
-size:            <n> MiB (6 blocks of 256 KiB)
-  schema:        <n> MiB (4 blocks: header, catalog, table index, stats)
+size:            <n> KiB (6 blocks of 32 KiB)
+  schema:        <n> KiB (4 blocks: header, catalog, table index, stats)
   free:          0 B (0 blocks)
   data:          <n> KiB (2 blocks)
 directory:       /
@@ -29,7 +29,7 @@ rel table:       edge (4 edges, node to node)
   colors:        none, run zu analyze
 
 $ zu stat <graph> --format json
-{"file":"<graph>","format_version":1,"epoch":2,"block_size":262144,"blocks":6,"bytes":1572864,"schema_bytes":1048576,"free_bytes":0,"data_bytes":524288,"node_tables":[{"name":"node","nodes":4}],"rel_tables":[{"name":"edge","from":"node","to":"node","edges":4}]}
+{"file":"<graph>","format_version":1,"epoch":2,"block_size":32768,"blocks":6,"bytes":196608,"schema_bytes":131072,"free_bytes":0,"data_bytes":65536,"node_tables":[{"name":"node","nodes":4}],"rel_tables":[{"name":"edge","from":"node","to":"node","edges":4}]}
 
 $ zu verify <graph>
 <graph>: ok, 723 meta bytes verified

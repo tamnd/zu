@@ -1,17 +1,17 @@
 //! The block cache under every read path (perf/04 section 1).
 //!
-//! Before this module existed every block read heap-allocated 256 KiB
-//! and hit the file, so a warm scan paid malloc plus memcpy plus a
+//! Before this module existed every block read heap-allocated a whole
+//! block and hit the file, so a warm scan paid malloc plus memcpy plus a
 //! syscall per block per touch. Now [`Zu1File`](crate::file::Zu1File)
 //! pins blocks through a shared [`BlockCache`]: a hit is a shard lock,
 //! a map probe, and an `Arc` clone, no allocation and no copy; a miss
-//! reads the whole block once into a recycled frame. Frames are 256 KiB
-//! `Arc<Vec<u8>>`s, so a [`PinnedBlock`] guard keeps its frame alive
-//! even after eviction drops it from the map, which is what makes the
-//! guard safe to hold across other cache traffic with no invalidation
-//! protocol: committed blocks never change in place, and the one path
-//! that rewrites a block, [`Zu1File::write_block`], drops the cached
-//! frame so the next read sees the new bytes.
+//! reads the whole block once into a recycled frame. A frame is one
+//! block of `Arc<Vec<u8>>`, so a [`PinnedBlock`] guard keeps its frame
+//! alive even after eviction drops it from the map, which is what makes
+//! the guard safe to hold across other cache traffic with no
+//! invalidation protocol: committed blocks never change in place, and
+//! the one path that rewrites a block, [`Zu1File::write_block`], drops
+//! the cached frame so the next read sees the new bytes.
 //!
 //! Eviction keeps the SIEVE retention rule: every hit sets a visited
 //! bit, the hand clears visited slots and takes the first unvisited,
@@ -375,7 +375,7 @@ impl<T> DecodedPool<T> {
     }
 }
 
-/// A pinned 256 KiB block frame. Holding it keeps the frame alive; the
+/// A pinned block frame. Holding it keeps the frame alive; the
 /// cache may evict the block meanwhile, which only means the next
 /// reader refills. Dereferences to the full block's bytes.
 #[derive(Debug, Clone)]

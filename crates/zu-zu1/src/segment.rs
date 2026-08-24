@@ -1025,7 +1025,12 @@ mod tests {
         let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
         let values: Vec<u64> = (0..200_000u64).map(|i| i * 3).collect();
         let meta = write_segment(&mut db, &values).unwrap();
-        assert_eq!(meta.blocks.len(), 1, "delta packed ids fit one block");
+        let raw = (values.len() * 8) as u64;
+        assert!(
+            meta.payload_len < raw / 10,
+            "delta packed ids want {} of {raw} raw bytes",
+            meta.payload_len
+        );
         let mut out = Vec::new();
         read_segment(&mut db, &meta, &mut out).unwrap();
         assert_eq!(out, values);

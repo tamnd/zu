@@ -37,7 +37,23 @@ use crate::file::Zu1File;
 pub const MAGIC: [u8; 8] = [0xE5, 0x9B, 0xB3, b'Z', b'U', b'1', 0x00, 0x0A];
 
 /// Fixed block size in bytes.
-pub const BLOCK_SIZE: u32 = 262_144;
+///
+/// It was 256 KiB, from the research note that took DuckDB's block and
+/// did not ask what zu writes into one. What zu writes into one is a
+/// packing scope: a column directory, one table's adjacency, one key
+/// index, each of which has to be freeable on its own, so each starts a
+/// block of its own and the tail of that block is waste. A thousand
+/// node linkbench graph came to 3.75 MiB of file holding about 400 KiB
+/// of graph, and a fold, which takes a fresh scope for everything it
+/// rewrites, spent a megabyte a time on it.
+///
+/// The waste falls linearly with the block and what a smaller block
+/// costs is one more pointer in a segment meta and one more read per
+/// block of a big segment. At 32 KiB the same graph loads into 768 KiB
+/// and a 10k node one into 3.8 MiB rather than 6.5, and the reads came
+/// out faster rather than slower: a point read pulls a 32 KiB frame
+/// into the cache where it used to pull 256.
+pub const BLOCK_SIZE: u32 = 32_768;
 
 /// Current format version.
 pub const FORMAT_VERSION: u16 = 1;
@@ -304,8 +320,8 @@ pub fn verify(path: &Path) -> Result<u64> {
 /// This exists because a store's size on its own does not divide by a
 /// graph. Every engine writes something before it holds anything, and
 /// zu writes rather a lot of it: the header block, the catalog, the
-/// table index and the statistics are four blocks of 256 KiB before a
-/// single node exists. A tool dividing 1 MiB by three edges gets a
+/// table index and the statistics are four blocks before a single node
+/// exists. A tool dividing those four blocks by three edges gets a
 /// number in the millions of bits per edge and publishes it as an
 /// encoding, which happened, repeatedly, to a benchmark harness that
 /// had no way to ask this question.
@@ -408,7 +424,7 @@ mod tests {
     #[test]
     fn block_size_is_power_of_two() {
         assert!(BLOCK_SIZE.is_power_of_two());
-        assert_eq!(BLOCK_SIZE, 256 * 1024);
+        assert_eq!(BLOCK_SIZE, 32 * 1024);
     }
 
     /// A store of `edges` edges over `nodes` nodes, laid out the

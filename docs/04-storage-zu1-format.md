@@ -9,8 +9,8 @@ offset 0        ┌────────────────────�
                 │ FileHeader (4 KiB)          │  magic, version, block size
 offset 4096     │ DatabaseHeader A (4 KiB)    │  ┐ alternating; higher epoch
 offset 8192     │ DatabaseHeader B (4 KiB)    │  ┘ with valid CRC wins
-offset 12288    │ padding to 256 KiB          │
-offset 256 KiB  │ Block 1                     │  fixed 256 KiB blocks
+offset 12288    │ padding to 32 KiB           │
+offset 32 KiB   │ Block 1                     │  fixed 32 KiB blocks
                 │ Block 2 …                   │  (data, metadata, free)
                 └────────────────────────────┘
 sidecar         <db>.zu1.wal                    redo WAL (§08)
@@ -22,12 +22,14 @@ sidecar         <db>.zu1.wal                    redo WAL (§08)
 | 0 | 8 | magic: `0xE5 0x9B 0xB3 'Z' 'U' '1' 0x00 0x0A` (UTF-8 図 + `ZU1\0\n`) |
 | 8 | 2 | format_version = 1 |
 | 10 | 2 | min_reader_version |
-| 12 | 4 | block_size = 262144 |
+| 12 | 4 | block_size = 32768 |
 | 16 | 16 | database UUID |
 | 32 | 8 | flags (bit0: encrypted†, bit1: created-by-bulk) |
 | 40 | 24 | reserved |
 | 64 | 4 | crc32c of bytes 0..64 |
 † encryption reserved for v2; not in scope.
+
+`block_size` was 262144 and is 32768. It is a header field with a check of its own, so a store written by a build with the other value is refused by name on open rather than misread, and there is no upgrade path: rebuild the store.
 
 ### DatabaseHeader (one per checkpoint, alternating A/B, atomic root flip)
 | field | type | meaning |
@@ -41,7 +43,7 @@ sidecar         <db>.zu1.wal                    redo WAL (§08)
 | stats_root | BlockPtr | statistics blocks |
 | crc32c | u32 | over the header |
 
-Open procedure (T8: O(1) I/O): read 12 KiB, pick valid header with max epoch, lazily page everything else. `BlockPtr = u64` block index; meta-block chains are linked lists of 256 KiB blocks whose payload is a versioned, length-prefixed binary encoding (hand-rolled, spec'd in `format/meta.rs`; no serde on disk).
+Open procedure (T8: O(1) I/O): read 12 KiB, pick valid header with max epoch, lazily page everything else. `BlockPtr = u64` block index; meta-block chains are linked lists of blocks whose payload is a versioned, length-prefixed binary encoding (hand-rolled, spec'd in `format/meta.rs`; no serde on disk).
 
 ### Where the bytes come from
 
@@ -78,7 +80,7 @@ SegmentMeta {
 <!-- terms: allow row group -->
 
 ### Packing (directory version 10, props directory version 6)
-A block is 256 KiB and most segments are far smaller than one: a 50 row id column is 54 bytes. So a payload does not start a block of its own. Segments written inside one *packing scope* are laid end to end through as many blocks as they need, and `start` says how far into `blocks[0]` a payload begins; the decode rule is `(start + payload_len).div_ceil(BLOCK_SIZE) == blocks.len()`. A meta written before version 10 has no `start` word and every one of its payloads begins at its block, which is how an older store still reads.
+A block is 32 KiB and most segments are far smaller than one: a 50 row id column is 54 bytes. So a payload does not start a block of its own. Segments written inside one *packing scope* are laid end to end through as many blocks as they need, and `start` says how far into `blocks[0]` a payload begins; the decode rule is `(start + payload_len).div_ceil(BLOCK_SIZE) == blocks.len()`. A meta written before version 10 has no `start` word and every one of its payloads begins at its block, which is how an older store still reads.
 
 A scope is whatever the store frees as a unit, one props directory or one rel table's adjacency, and a scope always opens a block of its own, so no two things that are freed separately end up sharing bytes. Because a block can hold several payloads, the free path collects the blocks going and the blocks a kept segment still reads and hands back the difference, rather than walking one segment's block list at a time. A block a kept column sits in stays where it is, holding whatever the dropped ones left behind, until the rewrite that lets that column go too. The bound this keeps is one live block per live segment, which is what the format cost before any of this.
 

@@ -69,10 +69,10 @@ use crate::zu1::wal::{Commits, Wal};
 /// gives back nothing, because until a checkpoint publishes, the header
 /// a crash would find still reads what they replaced. So this is file
 /// growth, and it is growth that stays: the high-water mark is what the
-/// file is on disk and it never comes back down. 64 MiB at the 256 KiB
-/// block, which is the ceiling rather than the number, and it is here
-/// for the store big enough that one fold approaches it on its own.
-const CEILING_BLOCKS: u64 = 256;
+/// file is on disk and it never comes back down. This is the ceiling
+/// rather than the number, and it is here for the store big enough that
+/// one fold approaches it on its own.
+const CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The least it may take, for the store too small to have a quarter
 /// worth speaking of.
@@ -84,7 +84,14 @@ const CEILING_BLOCKS: u64 = 256;
 /// interesting end of the latency distribution, close enough that a
 /// four megabyte store stays an eight megabyte file rather than a
 /// seventy megabyte one.
-const FLOOR_BLOCKS: u64 = 16;
+///
+/// Both of these are bytes rather than blocks because that is what they
+/// are about. They were block counts when a block was 256 KiB, and a
+/// block that is now 32 would have taken the floor from four megabytes
+/// to half of one without anybody saying so: the same number of folds
+/// worth of slack is the same number of bytes, not the same number of
+/// blocks.
+const FLOOR_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What the file may grow by between checkpoints, as a fraction of what
 /// it already is.
@@ -100,10 +107,13 @@ const GROWTH_SHARE: u64 = 4;
 /// How many blocks a fold may take before the next commit checkpoints
 /// rather than staging.
 ///
-/// See [`CEILING_BLOCKS`], [`FLOOR_BLOCKS`] and [`GROWTH_SHARE`]: the
+/// See [`CEILING_BYTES`], [`FLOOR_BYTES`] and [`GROWTH_SHARE`]: the
 /// slack is a quarter of the file, held between the two of them.
 fn checkpoint_due(db: &Zu1File) -> bool {
-    let slack = (db.db_header().block_count / GROWTH_SHARE).clamp(FLOOR_BLOCKS, CEILING_BLOCKS);
+    let block = u64::from(crate::zu1::BLOCK_SIZE);
+    let floor = FLOOR_BYTES.div_ceil(block);
+    let ceiling = CEILING_BYTES.div_ceil(block);
+    let slack = (db.db_header().block_count / GROWTH_SHARE).clamp(floor, ceiling);
     db.unpublished_blocks() >= slack
 }
 
@@ -1581,10 +1591,14 @@ mod tests {
         let path = dir.path().join("threshold.zu1");
         let mut db = Zu1File::create(&path).expect("create");
 
+        let block = u64::from(crate::zu1::BLOCK_SIZE);
+        let floor_blocks = FLOOR_BYTES.div_ceil(block);
+        let ceiling_blocks = CEILING_BYTES.div_ceil(block);
+
         // A file of nothing. The floor is what answers, because a
         // quarter of nothing would checkpoint on the first block.
         db.db_header_mut().block_count = 0;
-        for _ in 0..FLOOR_BLOCKS - 1 {
+        for _ in 0..floor_blocks - 1 {
             db.allocate_block();
             assert!(!checkpoint_due(&db), "under the floor is not due");
         }
@@ -1594,7 +1608,7 @@ mod tests {
         // A file big enough that the share is what answers, and small
         // enough that it is still under the ceiling.
         let mut db = Zu1File::create(&dir.path().join("big.zu1")).expect("create");
-        db.db_header_mut().block_count = 400;
+        db.db_header_mut().block_count = floor_blocks * GROWTH_SHARE * 4;
         let mut taken = 0;
         while !checkpoint_due(&db) {
             db.allocate_block();
@@ -1607,7 +1621,7 @@ mod tests {
         // out of it.
         assert_eq!(taken, db.db_header().block_count / GROWTH_SHARE);
         assert!(
-            taken > FLOOR_BLOCKS && taken < CEILING_BLOCKS,
+            taken > floor_blocks && taken < ceiling_blocks,
             "neither end of the clamp answered this one: {taken}"
         );
 
@@ -1615,7 +1629,7 @@ mod tests {
         // anything wants to carry, where the ceiling answers instead.
         let mut db = Zu1File::create(&dir.path().join("huge.zu1")).expect("create");
         db.db_header_mut().block_count = 1_000_000;
-        for _ in 0..CEILING_BLOCKS - 1 {
+        for _ in 0..ceiling_blocks - 1 {
             db.allocate_block();
         }
         assert!(!checkpoint_due(&db), "under the ceiling is not due");

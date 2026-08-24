@@ -306,9 +306,8 @@ fn stat_command(args: &[String]) -> ExitCode {
 ///
 /// The schema line is the one with a use beyond curiosity. A store's
 /// size divided by the graph in it is only an encoding once the schema
-/// has come out of the numerator, and zu's schema is four blocks of
-/// 256 KiB, which is larger than most of the graphs a conformance
-/// suite loads.
+/// has come out of the numerator, and zu's schema is four blocks,
+/// which is larger than most of the graphs a conformance suite loads.
 fn print_layout(path: &std::path::Path) {
     match zu::zu1::layout(path) {
         Ok(l) => {
@@ -920,7 +919,7 @@ fn copy(
             let total = started.elapsed();
             let file_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
             // Adjacency density is quoted per direction: the file holds
-            // two CSRs, so bwd block bytes (payload plus 256 KiB block
+            // two CSRs, so bwd block bytes (payload plus block
             // padding, the direction's real disk footprint) are carved
             // out of the fwd number to stay comparable with
             // single-direction figures.

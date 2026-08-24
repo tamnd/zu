@@ -485,11 +485,31 @@ fn parts(dir: &Path) -> (u64, u64) {
     (store, log)
 }
 
+/// The median statement of a run and its tail, in microseconds, off
+/// the per statement times in `lat`. Sorts in place.
+fn tail(lat: &mut [std::time::Duration]) -> (f64, f64) {
+    lat.sort_unstable();
+    let us = |d: std::time::Duration| d.as_nanos() as f64 / 1e3;
+    (us(lat[lat.len() / 2]), us(lat[lat.len() * 99 / 100]))
+}
+
 /// What one run of a statement cost, per statement where that is the
 /// sensible unit and over the whole run where it is not.
 struct Cost {
-    /// Latency a caller waits, in microseconds.
+    /// Latency a caller waits, in microseconds, averaged over the run.
     us: f64,
+    /// The median statement of the run and its tail, in microseconds.
+    ///
+    /// The average above is what the run cost divided by the statements
+    /// in it, so one statement that stalled for a hundred milliseconds
+    /// moves it by half a millisecond and hides inside it. These two
+    /// come from timing each statement on its own. A run is [`WRITES`]
+    /// statements, so the p99 is the second slowest of them: coarse,
+    /// but a checkpoint or a fold landing on one caller is exactly the
+    /// thing it is there to show, and the ceilings on it are set with
+    /// that coarseness in mind.
+    p50: f64,
+    p99: f64,
     /// Processor time the statement burned, in microseconds. A commit
     /// is a log append and an fsync, and on this laptop that fsync is
     /// 3.9 ms on its own, so the latency column is mostly the storage
@@ -521,9 +541,11 @@ impl Cost {
 
     fn header() {
         println!(
-            "{:<26} {:>10} {:>9} {:>11} {:>12} {:>13} {:>12} {:>10} {:>12}",
+            "{:<26} {:>10} {:>9} {:>9} {:>9} {:>11} {:>12} {:>13} {:>12} {:>10} {:>12}",
             "statement",
             "latency",
+            "p50",
+            "p99",
             "cpu",
             "cpu-sync",
             "throughput",
@@ -536,8 +558,10 @@ impl Cost {
 
     fn report(&self, what: &str, sync: f64) {
         println!(
-            "{what:<26} {:>7.0} us {:>6.0} us {:>8.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
+            "{what:<26} {:>7.0} us {:>6.0} us {:>6.0} us {:>6.0} us {:>8.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
             self.us,
+            self.p50,
+            self.p99,
             self.cpu,
             self.cpu_less_sync(sync),
             1e6 / self.us.max(0.001),
@@ -707,17 +731,29 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
     // look like a store that grows a third as much if the same growth
     // were spread over three passes.
     let mut elapsed = std::time::Duration::MAX;
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let mut once: Option<(Usage, u64)> = None;
     for _ in 0..PASSES {
+        let mut pass = Vec::with_capacity(WRITES as usize);
         let start = Instant::now();
         for i in 0..WRITES {
             let age = i % rows;
+            let at = Instant::now();
             conn.query(&format!(
                 "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
             ))
             .expect("set");
+            pass.push(at.elapsed());
         }
-        elapsed = elapsed.min(start.elapsed());
+        // The median and the tail come off whichever pass was fastest
+        // end to end, the same pass the average above is taken from, so
+        // the three numbers on the line describe one run rather than
+        // three different ones.
+        let took = start.elapsed();
+        if took < elapsed {
+            elapsed = took;
+            lat = pass;
+        }
         if once.is_none() {
             once = Some((usage(), disk(dir)));
         }
@@ -738,8 +774,11 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
         1,
         "and the value written back is the value that was there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -769,13 +808,16 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         conn.query(&format!(
             "MATCH (p:person) WHERE p.age = {age} SET p = {{age: {age}, name: 'seed{age}'}}"
         ))
         .expect("set a record");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -794,8 +836,11 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
         1,
         "and both values written back are the values that were there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -829,8 +874,10 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         let verb = match i % 2 {
             0 => "SET",
@@ -840,6 +887,7 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
             "MATCH (p:person) WHERE p.age = {age} {verb} p:Bot"
         ))
         .expect("set a label");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -855,8 +903,11 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
         (WRITES / 2) as i64,
         "every other write put the label on and the one after took it off"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -891,13 +942,16 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         let age = i % rows;
         conn.query(&format!(
             "MATCH (p:person)-[f:follows]->(q:person) WHERE p.age = {age} SET f.since = {age}"
         ))
         .expect("set");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -919,8 +973,11 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
         1,
         "and the value written back is the value that was there"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -958,9 +1015,12 @@ fn run_merge(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&merge(i % rows, rows + 1 + i)).expect("merge");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -979,8 +1039,11 @@ fn run_merge(dir: &Path, rows: u64) -> Cost {
         WRITES.min(rows) as i64,
         "and the half that matched changed the rows it matched"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1004,13 +1067,16 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!(
             "INSERT (p:person {{age: {}, name: 'new'}})",
             rows + i
         ))
         .expect("insert");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1021,8 +1087,11 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
         (rows + WRITES + 1) as i64,
         "every element written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1072,9 +1141,12 @@ fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&insert(i + 1)).expect("insert");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1088,8 +1160,11 @@ fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
         (rows + WRITES + 1) as i64,
         "every edge written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1142,9 +1217,12 @@ fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         write(&mut session, i + 1);
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1161,8 +1239,11 @@ fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
         Some(&Value::Int((rows + WRITES + 1) as i64)),
         "every edge written is readable"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1198,10 +1279,13 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!("MATCH (p:person) WHERE p.age = {i} DELETE p"))
             .expect("delete");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1212,8 +1296,11 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
         (rows - WRITES - 1) as i64,
         "every element deleted is gone, and no other one is"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1255,12 +1342,15 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
+    let mut lat = Vec::with_capacity(WRITES as usize);
     let start = Instant::now();
     for i in 0..WRITES {
+        let at = Instant::now();
         conn.query(&format!(
             "MATCH (p:person) WHERE p.age = {i} DETACH DELETE p"
         ))
         .expect("detach delete");
+        lat.push(at.elapsed());
     }
     let elapsed = start.elapsed();
     let after = usage();
@@ -1279,8 +1369,11 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
         left < edges - WRITES as i64,
         "every deleted element took its edges with it: {left} left of {edges}"
     );
+    let (p50, p99) = tail(&mut lat);
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        p50,
+        p99,
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
@@ -1420,9 +1513,12 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
     let before = usage();
     let store_before = parts(dir).0;
     let mut peak = store_before;
+    let mut lat = Vec::with_capacity(window as usize);
     let start = Instant::now();
     for i in 0..window {
+        let at = Instant::now();
         set(&mut conn, age % rows);
+        lat.push(at.elapsed());
         age += 1;
         if (i + 1) % SAMPLE == 0 {
             peak = peak.max(parts(dir).0);
@@ -1437,9 +1533,12 @@ fn run_sustained(dir: &Path, rows: u64, ramp: u64, window: u64) -> Sustained {
         rows as i64,
         "no row was added or lost"
     );
+    let (p50, p99) = tail(&mut lat);
     Sustained {
         cost: Cost {
             us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+            p50,
+            p99,
             cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
             written: after.written.saturating_sub(before.written) as f64 / window as f64,
             growth: store_after.saturating_sub(store_before) as f64 / window as f64,
@@ -1534,6 +1633,8 @@ fn run_unsynced(rows: u64, ramp: u64, window: u64) -> Unsynced {
     let slow = slow_us(&sorted);
     let cost = Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / window as f64,
+        p50: sorted[sorted.len() / 2],
+        p99: sorted[sorted.len() * 99 / 100],
         cpu: after.cpu.saturating_sub(before.cpu) as f64 / window as f64,
         // A store with no file under it pushes nothing at a disk and
         // grows no file, so both columns are zero by construction

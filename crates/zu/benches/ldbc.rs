@@ -55,6 +55,97 @@ use zu::zu1::graph::{
 use zu::zu1::props::{PropValues, store_props};
 use zu_query::exec::Value;
 
+/// The tail of `struct rusage` this bench does not read, sized so the
+/// kernel writes inside the allocation rather than past it.
+const RUSAGE_TAIL: usize = 14;
+
+/// As much of `struct rusage` as the peak resident size needs. The two
+/// timevals in front of that field are two words each on both platforms
+/// this runs on, so it lands at the same offset on either.
+#[repr(C)]
+#[derive(Default)]
+struct Rusage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    maxrss: i64,
+    tail: [i64; RUSAGE_TAIL],
+}
+
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+}
+
+/// The high water mark of resident bytes for this process, which only
+/// ever rises. `ru_maxrss` is bytes on macOS and kilobytes on Linux,
+/// which is a difference in the kernels rather than in the call.
+fn peak_rss() -> u64 {
+    let mut usage = Rusage::default();
+    // RUSAGE_SELF is 0 on every platform that has the call.
+    if unsafe { getrusage(0, &mut usage) } != 0 {
+        return 0;
+    }
+    let maxrss = usage.maxrss.max(0) as u64;
+    if cfg!(target_os = "macos") {
+        maxrss
+    } else {
+        maxrss * 1024
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    /// `struct rusage_info_v0` read as the words it is: sixteen bytes
+    /// of uuid and then u64 fields, with room past the one this reads
+    /// so the kernel fills the buffer rather than the stack behind it.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Info {
+        uuid: [u8; 16],
+        words: [u64; 32],
+    }
+
+    /// Resident size is the seventh word.
+    const RESIDENT: usize = 6;
+    const FLAVOR: i32 = 0;
+
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buf: *mut Info) -> i32;
+    }
+
+    /// Resident bytes right now, or zero if the call refuses.
+    pub(super) fn rss() -> u64 {
+        let mut info = Info::default();
+        if unsafe { proc_pid_rusage(std::process::id() as i32, FLAVOR, &mut info) } != 0 {
+            return 0;
+        }
+        info.words[RESIDENT]
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    /// Resident bytes from `statm`, whose second field is resident
+    /// pages.
+    pub(super) fn rss() -> u64 {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|pages| pages * 4096)
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod platform {
+    pub(super) fn rss() -> u64 {
+        0
+    }
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
     for line in std::fs::read_to_string(path).ok()?.lines() {
@@ -1069,17 +1160,46 @@ fn main() {
     let (edges, by_row, profiles) = load(&data, &path);
     let node_count = by_row.len() as u64;
 
+    // Resident bytes once the load is done and its working buffers are
+    // gone, and the highest reading taken between phases after that.
+    // Sampling at the seams cannot see inside a phase, which is what
+    // the process high water mark below is for.
+    let resting = platform::rss();
+    let mut between = resting;
+    let mut sample = || between = between.max(platform::rss());
+
     let hop = only("hop").then(|| run_one_hop(&path, &edges, node_count));
+    sample();
     let key = only("key").then(|| run_key_lookups(&path, &by_row));
+    sample();
     let two_hop = only("two-hop").then(|| run_two_hop(&path, &edges, node_count));
+    sample();
     let triangle = only("triangle").then(|| run_triangle_count(&path, &edges, node_count));
+    sample();
     let ordered = only("ordered").then(|| run_ordered_triangle(&path, &edges, &by_row, node_count));
+    sample();
     let close = only("close").then(|| run_undirected_close(&path, &edges, node_count));
+    sample();
     let is_read = only("is").then(|| run_is_reads(&path, &by_row, &profiles));
+    sample();
     let ic = only("ic").then(|| run_ic_friends_of_friends(&path, &edges, &by_row, &profiles));
+    sample();
     let distinct = only("distinct").then(|| run_distinct_two_hop(&path, &edges, &by_row));
+    sample();
     let cardinality = only("cardinality").then(|| run_cardinality(&path, &by_row, &profiles));
+    sample();
     let kernels = only("call").then(|| run_table_functions(&path, &edges, &by_row, node_count));
+    sample();
+    let peak = peak_rss();
+    println!(
+        "sf1 memory: {:.1} MiB memory_limit, {:.1} MiB resident after the load, \
+         {:.1} MiB highest between phases, {:.1} MiB process peak \
+         (the peak includes the load and the crosscheck references)",
+        mib(zu::zu1::file::DEFAULT_MEMORY_LIMIT as u64),
+        mib(resting),
+        mib(between),
+        mib(peak)
+    );
 
     let (q50, q90, q99, qmax, violations) = cardinality.unwrap_or_default();
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = kernels.unwrap_or_default();
@@ -1129,6 +1249,19 @@ fn main() {
     // No budget line for this one. A ceiling the data walks straight
     // through is wrong, and there is no number of wrong ceilings worth
     // writing down as acceptable.
+    // The P9 resource gate. A phase filter leaves phases out, so the
+    // number a partial run reaches is not the sweep's and is not held
+    // against the ceiling.
+    if std::env::var("ZU_ONLY").is_err()
+        && let Some(ceiling) = budget("ldbc_sweep_rss_mb")
+        && mib(peak) > ceiling
+    {
+        println!(
+            "GATE FAIL sf1 sweep RSS: {:.1} MiB > ceiling {ceiling}",
+            mib(peak)
+        );
+        failed = true;
+    }
     if violations > 0 {
         println!("GATE FAIL cardinality: {violations} bound violations, ceilings must hold");
         failed = true;

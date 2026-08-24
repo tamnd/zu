@@ -150,7 +150,9 @@ Why a density is withheld, in the harness's words:
 
 ## What the numbers do not say
 
-The three engines are reached three different ways, and the difference between the routes is larger than the difference between some of the engines. zu answers in a process on a pipe, Neo4j answers over Bolt on a loopback socket, and Ladybug answers one process per exchange. The floor rule above exists because of that and it is the only reason any row on this page is excluded.
+The three engines are reached three different ways, and the difference between the routes is larger than the difference between some of the engines. zu answers in a process on a pipe, Neo4j answers over Bolt on a loopback socket into a container, and Ladybug answers one process per exchange. The floor rule above exists because of that and it is the only reason any row on this page is excluded.
+
+The container is worth naming rather than leaving in a footnote, because it is the largest single thing the Neo4j column carries that is not Neo4j. Its ingest reads about half what the same version read reached directly, and its resident memory does not read at all, since nothing outside a container can see a process inside one the way the harness measures. Neither changes a verdict here: the margins on this page are two and three orders of magnitude and the container is a factor of two. But a reader comparing this column against one taken without a container should expect it to be the slower of the two for that reason and not for a reason about the engine.
 
 A timing on a case that did not pass is the cost of the wrong answer, so the table prints the outcome instead of the number. A case an engine skipped never ran at all.
 

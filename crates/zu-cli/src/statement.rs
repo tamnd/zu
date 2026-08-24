@@ -289,8 +289,21 @@ pub fn render(t: &Tally) -> String {
         t.engine
     ));
     out.push_str("```\n\n");
+    // The one claim above that no engine run can check. Everything else
+    // on this page is a count out of a report; the registers are an
+    // argument about the standard's text, and an argument needs a command
+    // of its own or it is back to being somebody's word.
     out.push_str(
-        "The harness is [gql-compat](https://github.com/tamnd/gql-compat), which measures other engines the same way. `docs/gql-conformance.md` is the same corpus against zu, Neo4j and Ladybug side by side.\n",
+        "The registered items are the one part of this page that no engine run can check, since they are claims about the standard's own text rather than about zu. The command that checks them takes no engine at all:\n\n",
+    );
+    out.push_str("```\n");
+    out.push_str("gql-compat validate\n");
+    out.push_str("```\n\n");
+    out.push_str(
+        "It reads the corpus and the standard and re-derives the same four rows this page quotes, so the reasons behind every registered feature, rule and subclause are re-checked from the text rather than carried forward from whoever wrote them down. Its GQLSTATUS row reads 68 claimed rather than 63, because a corpus can claim a code that an engine with a given feature can never raise, and which of the two you want depends on whether you are asking about the corpus or about zu.\n\n",
+    );
+    out.push_str(
+        "The harness is [gql-compat](https://github.com/tamnd/gql-compat), which measures other engines the same way. `docs/gql-conformance.md` is the same corpus against zu, Neo4j and Ladybug side by side, and `docs/gql-performance.md` is what those same answers cost.\n",
     );
     out
 }

@@ -54,6 +54,6 @@ Config in §06 §4. Integration notes:
 ## 6. Resource discipline (T6/T7 enforcement)
 
 - 32 MiB floor CI job: full test suite under `memory_limit = 32 MiB`, `threads = 1` (spills exercised).
-- No allocation on the per-vector hot path: vectors, masks, and hash-table scratch come from a per-morsel bump arena reset between morsels.
+- No allocation on the per-vector hot path: vectors, masks, and hash-table scratch come from a per-morsel bump arena reset between morsels. The arena's blocks start at 8 KiB and double to a 256 KiB cap, because an arena is born per run and most runs are small: a warm point read used to take a 256 KiB block to hold a few vectors, which was the largest single thing it asked the allocator for and enough fresh pages to fault in that it cost about as much as the read. Growing instead put that read at 20 KiB of heap and took its p50 from 4.68 us to 2.58. A run that needs the room still gets it, one block allocation later.
 - Binary size: `opt-level = "s"` on parser/CLI crates, `panic = "abort"` on release CLI, no default `regex`/`chrono` heavy deps (own date code); measured in CI (T7 gate: 15 MiB).
 - CPU: workers park when idle (no spinning); background tasks (s3 flusher) tick at flush_interval only when dirty.

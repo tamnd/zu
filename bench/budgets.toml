@@ -2450,35 +2450,31 @@ write_p99_nosync_us = 100.0
 # it.
 write_p99_p50_x = 4.0
 
-# The same ratio over the durable statement shapes, gated on whichever
-# of them is widest that run.
+# stmt_p99_p50_x, the same ratio over the durable statement shapes, is
+# printed by the write bench and has no key here on purpose. It was
+# gated at four for one release and the gate was wrong.
 #
-# Every other ceiling in this bench is an average over the run, and an
-# average is exactly the statistic a growing tail hides in: one
-# statement in a hundred at ten times the median moves a mean by nine
-# percent and would clear all of them. This is the companion those
-# ceilings did not have. It is a ratio because a durable statement here
-# is mostly its sync, and both halves of a ratio carry the same sync,
-# so a slow volume moves neither: the wall clock version of the same
-# question would be a gate on the storage.
+# The argument for it was that a durable statement is mostly its sync
+# and both halves of a ratio carry the same sync, so a slow volume
+# moves neither. That much holds. What it misses is that a fast volume
+# does move it: the median is one fsync and the tail is one fsync plus
+# whatever else the box did, so the quicker the fsync the larger the
+# same stall reads. A CI runner syncing in 1.2 ms put the middle shape
+# at 16.4x off a 19 ms stall on a commit this laptop, syncing in 3 ms,
+# read at 1.61x. Two boxes, one write path, an order of magnitude
+# apart. That is the volume and not the engine.
 #
-# The middle shape is the one gated and the widest is printed beside
-# it. A run is two hundred statements, so a p99 here is the second
-# slowest of two hundred, and one scheduling stall owns it: five runs
-# on this laptop put the widest shape at 4.74, 5.24, 12.88, 123 and 182
-# times its median, a different shape each time, with the stall itself
-# reading 19 ms, 26 ms, 51 ms, 554 ms and 1.1 s. Those are the box,
-# not the write path, and a gate on the maximum of fourteen such
-# samples is a gate on whatever else the machine was doing. The middle
-# shape over the same five runs read 1.40, 2.00, 2.24 and 2.53, and it
-# only moves when the write path itself grew a tail.
+# It is also two hundred statements, so the p99 is the second slowest
+# of two hundred and one stall owns it: five runs on this laptop put
+# the widest shape at 4.74, 5.24, 12.88, 123 and 182 times its median,
+# a different shape each time, with the stall reading 19 ms, 26 ms,
+# 51 ms, 554 ms and 1.1 s.
 #
-# The ceiling is four, the same as write_p99_p50_x beside it, which is
-# roughly a doubling over the worst quiet reading. A fold landing
-# inside the tail of every shape rather than just above it is what
-# would cross it. Lower it as the write path gets flatter, never raise
-# it.
-stmt_p99_p50_x = 4.0
+# write_p99_p50_x just above is the form of the question that is about
+# the engine: the same tail over the same median with the sync taken
+# out of both, which is why it holds on every box. The per-shape number
+# stays in the output because it names the shape and the run that
+# stalled, which is what a reader wants when the gated one moves.
 
 # The flatness ratios, perf/13 section 3 and its exit gate: every class
 # that has a p50 ceiling gets a companion p99 over p50, because a p50

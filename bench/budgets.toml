@@ -589,6 +589,19 @@ vec_sum_gbs = 4.0
 # ceiling, never raise it.
 read_hop_p50_us = 2.0
 
+# The tail of the same hop, twice the median ceiling, which is the
+# companion every other latency pair in this file carries: ldbc_hop is
+# 10 and 20, ldbc_key is 2 and 4. It is not there to grade a machine's
+# scheduler. It is there because the median cannot see the thing this
+# path actually fails at, which is a group revisit that stops being
+# served from the decoded pool: a fresh decode is thousands of times a
+# pooled read, so a pool that misses even one hop in a hundred moves
+# this number and nothing else. Measured on a laptop M4 at 0.10 to 0.17
+# us against a median of 0.04 to 0.09, so the ratio is under four and
+# the ceiling is over twenty times the worst reading. Lower it, never
+# raise it.
+read_hop_p99_us = 4.0
+
 # The decoded-pool speedup on group revisits against decoding the
 # segment fresh, which is what a revisit cost before the pools. The
 # perf/04 exit asks for 20x; measured 9.8 K to 35 K across the fleet,
@@ -1304,6 +1317,21 @@ exec_semi_mprobes_s_core = 1.8
 # help from any of this.
 refuse_over_answer = 0.6
 refuse_p50_us = 4.0
+
+# The same two gates asked at the tail. A refusal has more ways to be
+# slow occasionally than to be slow always: a branch that allocates, a
+# plan cache that misses one send in a hundred, an error type that
+# formats its message on the way out. None of that moves a median, and
+# all of it reaches a client with a timeout, so a bench that reports
+# only the middle would call that run clean. The ratio is stated at 0.6
+# for the same reason the median one is, that refusing has to cost less
+# than answering, and it is measured at 0.27 to 0.37 on a quiet laptop
+# M4 with the widest refusal reading 0.88 us against an answer tail of
+# 2.38 to 3.25 us. The microsecond ceiling is twice the median one and
+# is held under the same condition, on a host that reads within a
+# quarter of the reference and reported everywhere else.
+refuse_p99_over_answer = 0.6
+refuse_p99_us = 8.0
 
 # Tail latency of a served read (perf/05, zu#76), benches/tail.rs: the
 # p99 of a point seeded one hop over the p50 of the same stream, on a
@@ -2421,6 +2449,36 @@ write_p99_nosync_us = 100.0
 # doubles this. Lower it as the write path gets flatter, never raise
 # it.
 write_p99_p50_x = 4.0
+
+# The same ratio over the durable statement shapes, gated on whichever
+# of them is widest that run.
+#
+# Every other ceiling in this bench is an average over the run, and an
+# average is exactly the statistic a growing tail hides in: one
+# statement in a hundred at ten times the median moves a mean by nine
+# percent and would clear all of them. This is the companion those
+# ceilings did not have. It is a ratio because a durable statement here
+# is mostly its sync, and both halves of a ratio carry the same sync,
+# so a slow volume moves neither: the wall clock version of the same
+# question would be a gate on the storage.
+#
+# The middle shape is the one gated and the widest is printed beside
+# it. A run is two hundred statements, so a p99 here is the second
+# slowest of two hundred, and one scheduling stall owns it: five runs
+# on this laptop put the widest shape at 4.74, 5.24, 12.88, 123 and 182
+# times its median, a different shape each time, with the stall itself
+# reading 19 ms, 26 ms, 51 ms, 554 ms and 1.1 s. Those are the box,
+# not the write path, and a gate on the maximum of fourteen such
+# samples is a gate on whatever else the machine was doing. The middle
+# shape over the same five runs read 1.40, 2.00, 2.24 and 2.53, and it
+# only moves when the write path itself grew a tail.
+#
+# The ceiling is four, the same as write_p99_p50_x beside it, which is
+# roughly a doubling over the worst quiet reading. A fold landing
+# inside the tail of every shape rather than just above it is what
+# would cross it. Lower it as the write path gets flatter, never raise
+# it.
+stmt_p99_p50_x = 4.0
 
 # The flatness ratios, perf/13 section 3 and its exit gate: every class
 # that has a p50 ceiling gets a companion p99 over p50, because a p50

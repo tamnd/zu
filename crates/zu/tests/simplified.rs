@@ -11,6 +11,12 @@
 //! exactly one type: the bar, the ampersand and the exclamation mark are
 //! a set of types and the complement of one, and what those two cannot
 //! hold is refused by name.
+//!
+//! The one operator in the contents that is not a question about a step
+//! is the multiset alternation, which answers a path once per term that
+//! found it, so its terms are walks that stay apart. That one is read
+//! as the pattern written as many ways as it has terms, which is what
+//! the bar between two whole path patterns is read as.
 
 use zu::Database;
 use zu::zu1::file::Zu1File;
@@ -163,6 +169,68 @@ fn a_bar_inside_the_slashes_is_either_label_on_one_step() {
     assert_eq!(fx.walks("-/ knows|knows /->"), fx.walks("-[:knows]->"));
 }
 
+/// The other bar answers a path once per term that found it, so the
+/// same label written on both sides of it is the walk twice where the
+/// plain bar made it the walk once. That count is the whole of the
+/// difference between the two operators, and the far end says the same
+/// thing in the other direction: every node the stretch reaches is
+/// reached once for each way that reached it.
+#[test]
+fn a_multiset_alternation_inside_the_slashes_answers_a_walk_once_per_term() {
+    let mut fx = Fixture::open("simplified-multiset.zu1");
+    assert_eq!(
+        fx.walks("-/ knows |+| knows /->"),
+        2 * fx.walks("-[:knows]->")
+    );
+    assert_eq!(fx.walks("-/ knows | knows /->"), fx.walks("-[:knows]->"));
+    assert_eq!(fx.reached("-/ knows |+| knows /->"), [1, 1, 2, 2]);
+}
+
+/// What the terms of a multiset alternation may be is walks, which is
+/// what a bar cannot hold: the terms stay apart rather than folding
+/// into one step, so two of different shapes are two stretches and the
+/// answer is the answers of both.
+#[test]
+fn the_terms_of_a_multiset_alternation_may_be_walks_of_different_shapes() {
+    let mut fx = Fixture::open("simplified-multiset-shapes.zu1");
+    assert_eq!(
+        fx.walks("-/ knows knows |+| knows /->"),
+        fx.walks("-[:knows]->()-[:knows]->") + fx.walks("-[:knows]->")
+    );
+    // From 0 the two hop walks end at 2 and 3 and the one hop walks end
+    // at 1 and 2, so 2 is reached twice and by two different shapes.
+    assert_eq!(fx.reached("-/ knows knows |+| knows /->"), [1, 2, 2, 3]);
+}
+
+/// A term that repeats a variable number of times is a walk per length
+/// the way a path pattern's term is, and the lengths of one term are
+/// nothing to do with the term beside it, so the alternation answers
+/// what its terms answer between them and not the product of them.
+#[test]
+fn a_term_of_a_multiset_alternation_that_repeats_is_a_walk_per_length() {
+    let mut fx = Fixture::open("simplified-multiset-lengths.zu1");
+    assert_eq!(
+        fx.walks("-/ (knows knows)? |+| knows /->"),
+        fx.walks("-/ (knows knows)? /->") + fx.walks("-/ knows /->")
+    );
+    assert_eq!(
+        fx.walks("-/ (knows knows){1,2} |+| knows /->"),
+        fx.walks("-/ (knows knows){1,2} /->") + fx.walks("-/ knows /->")
+    );
+}
+
+/// The two bars are not mixed in one alternation, for the reason they
+/// are not mixed between whole path patterns: one answers a path once
+/// however many terms matched it and the other answers it once per
+/// term, so a stretch written with both is asking for two answers at
+/// once.
+#[test]
+fn the_two_bars_are_not_mixed_inside_the_slashes() {
+    let mut fx = Fixture::open("simplified-mixed-bars.zu1");
+    let err = fx.refused("-/ knows |+| knows | knows /->");
+    assert!(err.contains("asking for two answers at once"), "{err}");
+}
+
 /// An ampersand asks the one label of the step to be several things at
 /// once. An edge is kept under exactly one type here, so the only
 /// conjunction with an answer is the one that names the same type
@@ -242,8 +310,6 @@ fn what_a_simplified_stretch_refuses() {
     // paths, which the bar between two whole patterns already says.
     let err = fx.refused("-/ knows knows | knows /->");
     assert!(err.contains("either label on the one step"), "{err}");
-    let err = fx.refused("-/ knows |+| knows /->");
-    assert!(err.contains("multiset alternation"), "{err}");
     // A count with no ceiling over more than one step is lengths with
     // no end to the list of them, the same refusal a quantifier behind
     // brackets gets.

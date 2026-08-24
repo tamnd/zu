@@ -1334,6 +1334,31 @@ cases:
           - type: INT64
             value: "0"
 
+  - name: a-multiset-alternation-in-a-simplified-stretch-answers-a-walk-per-term
+    doc: The other bar inside the slashes answers a path once per term that found it rather than once however many terms found it, which is ISO 16.12 with the multiset alternation of 16.7. The same label written on both sides of it is the three edges walked twice, where the plain bar above makes them the three edges walked once, and that count is the whole of the difference between the two operators.
+    query: MATCH (a:person)-/ knows |+| knows /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: the-terms-of-a-simplified-multiset-alternation-may-be-walks
+    doc: What the terms of this operator may be is walks, which is what the plain bar cannot hold, since the terms stay apart rather than folding into one step. Two terms of different shapes are two stretches and the answer is the answers of both, the two walks of two edges beside the three walks of one.
+    query: MATCH (a:person)-/ knows knows |+| knows /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: the-two-bars-are-not-mixed-inside-a-simplified-stretch
+    doc: One bar answers a path once however many terms matched it and the other answers it once per term, so a stretch written with both is asking for two answers at once. It is refused where the second one is written, which is the same rule the bars between whole path patterns are read under.
+    query: MATCH (a:person)-/ knows |+| knows | knows /->(b:person) RETURN count(*) AS a
+    raises: "42001"
+
   - name: a-label-expression-a-single-typed-edge-cannot-answer-is-refused
     doc: The label set of an edge stored under one type holds one label, so a step asked to wear two labels at once describes something no edge of it can be, which is the too many labels condition of ISO 24.5.2 seen while the statement is being read. It is refused by name where it is written rather than answered as though one of the two had been dropped.
     query: MATCH (a:person)-/ knows & likes /->(b:person) RETURN count(*) AS a

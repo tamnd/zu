@@ -9297,6 +9297,14 @@
       "doc": "An empty patch over a base holding `base` edges."
     },
     {
+      "id": "zu::zu1::graph::EdgePatch::ordinal",
+      "kind": "method",
+      "name": "ordinal",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn ordinal(&self, src: u64, dst: u64) -> Option<u64>",
+      "doc": "The ordinal the copy of `src -> dst` this patch added took, which\nis also the row of the rel table its property values sit in, so\na writer with a value to put on that edge knows where it goes."
+    },
+    {
       "id": "zu::zu1::graph::EdgePatch::remove",
       "kind": "method",
       "name": "remove",
@@ -10485,6 +10493,22 @@
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn row_with(&self, col: usize, word: u64) -> Option<u64>",
       "doc": "The last row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column.\n\nThe last rather than the first, because a run of deferred\ncommits can hold one key twice: a row takes a key, goes away,\nand a row after it takes the key the first one left free. Only\none of them is a row that is still there, and it is the last,\nbecause a key is only free to be taken again once the row\nholding it has gone and a row that has gone does not come back.\n\nThe sealed chunks answer out of the index each of them built as\nit was sealed, and the chunk being filled is walked, so what a\nlookup costs is a probe per sealed chunk and a walk of at most\n[`PATCH_CHUNK`] rows. Asked about any other column it walks the\nwhole run, which is what it used to do for every column and is\nwhat the fold's own index is for."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::set",
+      "kind": "method",
+      "name": "set",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn set(&mut self, col: usize, row: u64, value: Cell) -> bool",
+      "doc": "Writes `value` over what row `row` holds in `col`, and answers\nwhether it could.\n\nA row this patch appended is one no column holds yet, so a\nstatement writing onto it has nowhere else for the value to go:\nthe lane patch lays words over stored rows and there is no\nstored row under this one. The value goes over the one the\nappend carried and a read gets what the last write left, which\nis what the fold seals as well, because it asks the overlay for\neach appended row rather than taking the append at its word.\n\nThe key column is refused. Each sealed chunk carries an index of\nit, built as the chunk was sealed and shared with every reader\nholding an older copy of this patch, so moving a key here would\nmean rebuilding an index those readers are still reading out of.\nA key write onto an unfolded row folds instead."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::settable",
+      "kind": "method",
+      "name": "settable",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn settable(&self, col: usize, row: u64) -> bool",
+      "doc": "Whether [`Self::set`] would take a write of `col` on row `row`,\nwhich a writer asks before it takes the commit that would make\none. It has to be asked rather than tried, because a commit that\ncannot be patched has to fold whole and nothing of it may reach\nthe patch first."
     },
     {
       "id": "zu::zu1::props::list_elements",

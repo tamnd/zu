@@ -19,6 +19,7 @@
 //! column, and where a value the column cannot hold is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
 use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
@@ -99,9 +100,11 @@ pub(crate) struct Batch<'a> {
     write: &'a Insert,
     /// The catalog as the statement started, which is what says which
     /// graph a table is in and which two node tables a rel table runs
-    /// between. Owned for the reason [`crate::delete::Removals`] owns
-    /// one: the file it came out of is handed in a row at a time.
-    catalog: Catalog,
+    /// between. Held past the file it came out of for the reason
+    /// [`crate::delete::Removals`] holds one: the file is handed in a
+    /// row at a time. An insert only reads it, so this is the session's
+    /// catalog rather than a copy of it.
+    catalog: Arc<Catalog>,
     /// The rows the database has lost, which is what says an endpoint
     /// an earlier clause found is one a `DELETE` has since taken away.
     /// A statement's own delete is in here whichever way it was
@@ -130,7 +133,7 @@ impl<'a> Batch<'a> {
     pub(crate) fn open(
         db: &mut Zu1File,
         write: &'a Insert,
-        catalog: Catalog,
+        catalog: impl Into<Arc<Catalog>>,
         patches: &Patches,
         dirs: &'a mut Dirs,
     ) -> Result<Self> {
@@ -167,7 +170,7 @@ impl<'a> Batch<'a> {
         }
         Ok(Self {
             write,
-            catalog,
+            catalog: catalog.into(),
             gone,
             columns,
             rel_columns,

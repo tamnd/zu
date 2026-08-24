@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::sync::Arc;
 
 use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{Result, ZuError};
@@ -163,7 +164,11 @@ pub(crate) struct Changes<'a> {
     /// bit a label is and which labels a table has declared. A `SET` of
     /// a label a table has not declared declares it here, so this is
     /// also what the statement publishes when it is done.
-    catalog: Catalog,
+    ///
+    /// Held as a handle on the session's catalog and copied only where
+    /// a label is declared, because most of what a `SET` writes is a
+    /// property and reads the catalog without changing a word of it.
+    catalog: Arc<Catalog>,
     /// Whether any of that happened, which is what says the catalog
     /// above has to be stored before the changes are staged.
     widened: bool,
@@ -171,10 +176,10 @@ pub(crate) struct Changes<'a> {
 }
 
 impl<'a> Changes<'a> {
-    pub(crate) fn open(write: &'a Set, catalog: Catalog) -> Self {
+    pub(crate) fn open(write: &'a Set, catalog: impl Into<Arc<Catalog>>) -> Self {
         Self {
             write,
-            catalog,
+            catalog: catalog.into(),
             widened: false,
             updates: Vec::new(),
         }
@@ -342,7 +347,10 @@ impl<'a> Changes<'a> {
                 (None, false) => continue,
                 (None, true) => {
                     self.room_for(label)?;
-                    let id = self.catalog.declare_label(table, label)?;
+                    // The first label a statement declares is the point
+                    // the shared catalog stops being enough, so this is
+                    // where the copy happens rather than at open.
+                    let id = Arc::make_mut(&mut self.catalog).declare_label(table, label)?;
                     declared |= 1 << id;
                     self.widened = true;
                     id
@@ -407,7 +415,7 @@ impl<'a> Changes<'a> {
     /// not declared the bit, and the fold reads the catalog out of the
     /// file rather than out of the statement.
     pub(crate) fn staged(self) -> (Vec<Update>, Option<Catalog>) {
-        let widened = self.widened.then_some(self.catalog);
+        let widened = self.widened.then(|| Arc::unwrap_or_clone(self.catalog));
         (self.updates, widened)
     }
 }

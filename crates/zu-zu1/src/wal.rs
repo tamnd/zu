@@ -19,6 +19,7 @@
 //! after the last commit loses nothing that was promised durable.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use zu_common::{Epoch, Result, ZuError};
@@ -497,6 +498,40 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Syncs issued and commits that asked for one, since the process
+/// started.
+///
+/// The second divided by the first is commits a flush, which is the
+/// only statement about group commit that survives being measured on a
+/// busy machine or a slow disk: it counts syscalls, not microseconds.
+/// One writer reads one however fast the drive is, and eight writers
+/// that share properly read near eight however slow it is. A latency
+/// ratio answers the same question in units of whatever the drive was
+/// doing that minute.
+///
+/// A commit counts whether it waited or not. One that found its bytes
+/// already on the platter is the case the counter exists to see: it got
+/// its promise out of somebody else's flush, which is what sharing
+/// means.
+///
+/// Per process rather than per log, because a log object does not
+/// outlive the burst it is counting: a rollback drops the writer and a
+/// caller that wants the raw file folds it away, and either one puts a
+/// fresh [`Commits`] behind the same database with its counters back at
+/// zero. A pair of deltas around a measured window is what these are
+/// for, and one process writes one store at a time in the bench that
+/// takes them.
+static SYNCS: AtomicU64 = AtomicU64::new(0);
+static COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// The two counters above, as they stand.
+pub fn commit_counters() -> (u64, u64) {
+    (
+        SYNCS.load(Ordering::Relaxed),
+        COMMITS.load(Ordering::Relaxed),
+    )
+}
+
 /// The open sidecar log: an append position, a staging buffer and the
 /// frame codec around them. Commit durability is one `fdatasync` per
 /// commit; the 1 ms group-commit window from docs/08 arrives with the
@@ -623,6 +658,7 @@ impl Commits {
     /// while this sync is in the air, and the sync that covers them is
     /// the next one rather than one each.
     pub fn sync_through(&self, need: u64) -> Result<()> {
+        COMMITS.fetch_add(1, Ordering::Relaxed);
         let mut marks = self.marks.lock().expect("wal marks");
         loop {
             // A log shorter than the byte asked for no longer holds the
@@ -657,6 +693,7 @@ impl Commits {
                 Ok(()) => {
                     marks.durable = marks.durable.max(target);
                     marks.failed = false;
+                    SYNCS.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => marks.failed = true,
             }

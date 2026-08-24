@@ -500,6 +500,34 @@ hot_plan_hit_allocs = 0
 hot_point_allocs = 70
 hot_hop_allocs = 70
 
+# P9 resource gate (Px, zu#79), benches/ldbc.rs. The whole SF1 sweep
+# in one process under the default 128 MiB memory_limit, held to a
+# peak resident size of that same 128 MiB. Eleven phases, each opening
+# its own reader and dropping it, against a store of 10295 persons and
+# their nine props columns.
+#
+# The number gated is the process high water mark, not a sample,
+# because a sample taken between phases cannot see inside one. That
+# makes it the honest upper bound and also a loose one: it includes
+# the load, which reads three text files and builds the densified edge
+# list, and it includes the crosscheck references every phase holds
+# against, which are the bench and not the engine. The run prints the
+# resting size after the load next to it so the two can be told apart.
+# Where the getrusage mark and the between-phase samples disagree, and
+# on Linux they have by 1.5 MiB, the gate takes the larger.
+#
+# Local M series reads 28.5 to 31.0 MiB resting and 99.1 to 109.3 MiB
+# peak over two runs. gamingpc under WSL reads 22.1 and 55.9, half the
+# Mac's peak for the same work, which is the two kernels counting
+# resident pages differently and not the engine behaving differently.
+# The ceiling is the perf/09 target itself rather than a number off
+# either host, and the Mac is the one with something to lose against
+# it.
+#
+# A ZU_ONLY run leaves phases out, so it is not held against this at
+# all: a partial sweep reaching a lower number says nothing.
+ldbc_sweep_rss_mb = 128.0
+
 # P1 vector kernel gates (Spec/2064g/perf/02 and perf/11, zu#74),
 # benches/kernels.rs, single core, all inputs cache resident. The spec
 # targets print next to every measurement; floors sit under the worst

@@ -89,6 +89,28 @@ fn options(records: u64) -> Options {
         index_buckets: (records as usize / 4).next_power_of_two().max(1 << 12),
         max_pages: 1 << 17,
         ordered: true,
+        // Both default on and both are in the way of the question this
+        // bench asks, so both are knobs here.
+        //
+        // A load of a million distinct keys writes every one of them
+        // once and updates nothing, so nothing in the log is ever stale,
+        // and yet compaction runs anyway once the span passes
+        // `compact_below` and every record it finds is live and
+        // untouched, which is exactly its rule for cold. A gigabyte load
+        // ends up with 434 MiB of it in the cold tier. Scans then read
+        // two different paths for two arbitrary halves of the same
+        // record set, and which half a record is in is decided by when
+        // it was written rather than by anything the workload did.
+        //
+        // ZU2_COLD=0 and ZU2_COMPACT=0 take each of them out, so what
+        // the scan costs on a log alone can be measured against what it
+        // costs across the two tiers.
+        cold_tier: env("ZU2_COLD", 1) != 0,
+        compact_below: if env("ZU2_COMPACT", 1) != 0 {
+            Options::default().compact_below
+        } else {
+            0
+        },
         ..Options::default()
     }
 }
@@ -182,10 +204,13 @@ fn main() {
     let t = Instant::now();
     let db = load(&path, records);
     println!(
-        "# loaded in {:.1}s, {:.1} MiB on device, {:.1} MiB of file",
+        "# loaded in {:.1}s, {:.1} MiB on device, {:.1} MiB of it cold, \
+         cold tier {}, compaction {}",
         t.elapsed().as_secs_f64(),
         db.disk_bytes().expect("disk bytes") as f64 / (1 << 20) as f64,
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / (1 << 20) as f64
+        db.cold_disk_bytes().unwrap_or(0) as f64 / (1 << 20) as f64,
+        env("ZU2_COLD", 1),
+        env("ZU2_COMPACT", 1)
     );
     println!("variant\tthreads\trows\tseconds\tus a row\trows a second");
 

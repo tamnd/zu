@@ -379,10 +379,17 @@ impl GraphType {
     fn validate(&self, labels: usize, origin: Origin) -> Result<()> {
         let mut names: Vec<&str> = self.elements.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        if names.windows(2).any(|w| w[0] == w[1]) {
+        // The duplicate is named rather than counted. These refusals
+        // carry no position, because the defs they are about have no
+        // spans, so the name is the whole of what a reader has to find
+        // the two declarations by.
+        if let Some(pair) = names.windows(2).find(|w| w[0] == w[1]) {
             return Err(origin.refuse(
                 codes::C42000,
-                format!("graph type '{}' declares an element type twice", self.name),
+                format!(
+                    "graph type '{}' declares an element type twice, both named '{}'",
+                    self.name, pair[0]
+                ),
             ));
         }
         for element in &self.elements {
@@ -405,10 +412,14 @@ impl GraphType {
             }
             let mut props: Vec<&str> = element.properties.iter().map(|p| p.name.as_str()).collect();
             props.sort_unstable();
-            if props.windows(2).any(|w| w[0] == w[1]) {
+            if let Some(pair) = props.windows(2).find(|w| w[0] == w[1]) {
                 return Err(origin.refuse(
                     codes::C42000,
-                    format!("{} declares a property twice", where_()),
+                    format!(
+                        "{} declares a property twice, both named '{}'",
+                        where_(),
+                        pair[0]
+                    ),
                 ));
             }
             // The catalog writes a declared type with the codes a

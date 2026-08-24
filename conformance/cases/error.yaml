@@ -211,6 +211,11 @@ cases:
     query: RETURN cast([1, 2] AS LIST<INT8>(2)) AS a
     raises: "42001"
 
+  - name: a-sign-word-in-front-of-a-type-that-has-no-sign
+    doc: SIGNED and UNSIGNED say which of the two integer towers a verbose width belongs to, so the word means nothing in front of a type that is not an integer at all and the statement is refused rather than read as the type with the word ignored.
+    query: RETURN cast('x' AS UNSIGNED STRING) AS a
+    raises: "42001"
+
   - name: a-string-added-to-a-number
     doc: Addition is arithmetic here and not concatenation, so a string on either side of it is a value of the wrong type and not a coercion.
     query: RETURN 'a' + 1 AS a

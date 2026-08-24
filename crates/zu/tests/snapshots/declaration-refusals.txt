@@ -1,0 +1,84 @@
+# a type name nothing spells
+  statement CREATE GRAPH TYPE t1 { (:Probe {v :: NOSUCHTYPE}) }
+  gqlstatus 42001
+  condition syntax error or access rule violation / invalid syntax
+  severity  X
+  message   line 1, column 38: unknown value type 'NOSUCHTYPE'
+  at        line 1 column 38 offset 37
+  excerpt   CREATE GRAPH TYPE t1 { (:Probe {v :: NOSUCHTYPE}) }
+                                                 ^
+
+# a type name nothing spells, late in a long declaration
+  statement CREATE GRAPH TYPE t2 { (:Probe {a :: INT32, b :: STRING, c :: DATE, d :: NOSUCHTYPE}) }
+  gqlstatus 42001
+  condition syntax error or access rule violation / invalid syntax
+  severity  X
+  message   line 1, column 74: unknown value type 'NOSUCHTYPE'
+  at        line 1 column 74 offset 73
+  excerpt   CREATE GRAPH TYPE t2 { (:Probe {a :: INT32, b :: STRING, c :: DATE, d :: NOSUCHTYPE}) }
+                                                                                     ^
+
+# a signed word in front of a type that has no sign
+  statement CREATE GRAPH TYPE t3 { (:Probe {v :: UNSIGNED STRING}) }
+  gqlstatus 42001
+  condition syntax error or access rule violation / invalid syntax
+  severity  X
+  message   line 1, column 38: UNSIGNED says which integer type, and 'STRING' is not one
+  at        line 1 column 38 offset 37
+  excerpt   CREATE GRAPH TYPE t3 { (:Probe {v :: UNSIGNED STRING}) }
+                                                 ^
+
+# arguments a type does not take
+  statement CREATE GRAPH TYPE t4 { (:Probe {v :: DATE(3)}) }
+  gqlstatus 42001
+  condition syntax error or access rule violation / invalid syntax
+  severity  X
+  message   line 1, column 38: 'DATE' does not take (3), or the numbers in it are out of range
+  at        line 1 column 38 offset 37
+  excerpt   CREATE GRAPH TYPE t4 { (:Probe {v :: DATE(3)}) }
+                                                 ^
+
+# a list maximum written in parentheses
+  statement CREATE GRAPH TYPE t5 { (:Probe {v :: LIST<INT32>(2)}) }
+  gqlstatus 42001
+  condition syntax error or access rule violation / invalid syntax
+  severity  X
+  message   line 1, column 49: expected '}', found '('
+  at        line 1 column 49 offset 48
+  excerpt   CREATE GRAPH TYPE t5 { (:Probe {v :: LIST<INT32>(2)}) }
+                                                            ^
+
+# a type this file cannot write
+  statement CREATE GRAPH TYPE t6 { (:Probe {total :: DECIMAL(12,2)}) }
+  gqlstatus 42000
+  condition syntax error or access rule violation
+  severity  X
+  message   element type 't6.Probe' declares 'total' with a type this file cannot write
+  at        nowhere: the raise site has no span
+
+# one property declared twice
+  statement CREATE GRAPH TYPE t7 { (:Probe {v :: INT32, v :: STRING}) }
+  gqlstatus 42000
+  condition syntax error or access rule violation
+  severity  X
+  message   element type 't7.Probe' declares a property twice, both named 'v'
+  at        nowhere: the raise site has no span
+
+# one element type declared twice
+  statement CREATE GRAPH TYPE t8 { (a :Probe {v :: INT32}), (a :Other {w :: INT32}) }
+  gqlstatus 42000
+  condition syntax error or access rule violation
+  severity  X
+  message   graph type 't8' declares an element type twice, both named 'a'
+  at        nowhere: the raise site has no span
+
+# a key label set written and left empty
+  statement CREATE GRAPH TYPE t9 { ( => :Probe {v :: INT32}) }
+  gqlstatus 42012
+  condition syntax error or access rule violation / number of node type key labels below supported minimum
+  severity  X
+  message   line 1, column 26: a key label set that was written has to name a label
+  at        line 1 column 26 offset 25
+  excerpt   CREATE GRAPH TYPE t9 { ( => :Probe {v :: INT32}) }
+                                     ^
+

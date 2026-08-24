@@ -469,8 +469,18 @@ fn conjunction_name(how: Conjunction) -> &'static str {
 }
 
 /// A name written where a value type belongs and spelling none.
-fn unknown_type(name: &str) -> ZuError {
-    ZuError::gql(codes::C42001, format!("unknown value type '{name}'"))
+///
+/// The offset is where the type began, which is the word the user has
+/// to change. A graph type declaring thirty properties raises this the
+/// same way whichever of them is wrong, so a message without a place is
+/// a message that hands the reader a search.
+fn unknown_type(source: &str, at: usize, name: &str) -> ZuError {
+    ZuError::gql_in(
+        codes::C42001,
+        source,
+        at,
+        format!("unknown value type '{name}'"),
+    )
 }
 
 /// Whether a type is one a temporal literal can be written for.
@@ -1879,6 +1889,11 @@ impl Parser<'_> {
     /// name is read by the caller, since a phrase and a pattern write
     /// it in different places and the rest the same way.
     fn parse_type_filler(&mut self, node: bool, name: Option<String>) -> Result<ElementTypeDef> {
+        // Where the labels begin, which is where a key label set the
+        // file will not take is written. A graph type declares many
+        // element types and they all refuse alike, so the offset is the
+        // only part of the message that tells them apart.
+        let at = self.here();
         let first = self.parse_label_phrase()?.unwrap_or_default();
         let mut key_labels = Vec::new();
         let mut labels = first;
@@ -1891,7 +1906,7 @@ impl Parser<'_> {
         {
             self.pos += 2;
             key_labels = std::mem::take(&mut labels);
-            self.check_key_labels(&key_labels, node)?;
+            self.check_key_labels(&key_labels, node, at)?;
             let Some(rest) = self.parse_label_phrase()? else {
                 return Err(self.error("the rest of the labels after the key label set"));
             };
@@ -1922,18 +1937,22 @@ impl Parser<'_> {
     /// asking for a type nothing selects, and a set of 64 is one label
     /// short of the label set that has to contain it plus whatever the
     /// arrow adds, which does not fit the 64 bit mask a label set is.
-    fn check_key_labels(&self, labels: &[String], node: bool) -> Result<()> {
+    fn check_key_labels(&self, labels: &[String], node: bool, at: usize) -> Result<()> {
         if labels.is_empty() {
             let code = if node { codes::C42012 } else { codes::C42014 };
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_in(
                 code,
-                "a key label set that was written has to name a label".to_string(),
+                self.source,
+                at,
+                "a key label set that was written has to name a label",
             ));
         }
         if labels.len() > MAX_KEY_LABELS {
             let code = if node { codes::C42013 } else { codes::C42015 };
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_in(
                 code,
+                self.source,
+                at,
                 format!(
                     "{} key labels, and this file holds {MAX_KEY_LABELS}",
                     labels.len()
@@ -7027,6 +7046,11 @@ impl Parser<'_> {
         if self.at_list_name() {
             return self.parse_list_type(None);
         }
+        // Where the named type starts, kept because every refusal below
+        // is about the name and by then the parser has walked past it.
+        // The sign word counts as part of it: `UNSIGNED INTEGER32` is
+        // one type and the reader who has to fix it starts at UNSIGNED.
+        let at = self.here();
         // ISO 18.7 lets a verbose integer name carry SIGNED or UNSIGNED
         // in front of it, and that word is the whole of what tells the
         // two towers apart: `UNSIGNED INTEGER32` is `UINT32`. It is
@@ -7076,7 +7100,7 @@ impl Parser<'_> {
             }
         }
         if !value_type::is_type_name(&name) {
-            return Err(unknown_type(&name));
+            return Err(unknown_type(self.source, at, &name));
         }
         // GV42, ISO 18.7. A duration type says which fields it spans
         // and the parenthesis holds a qualifier rather than a length,
@@ -7100,8 +7124,10 @@ impl Parser<'_> {
         }
         let ty = value_type::spelled(&name, &args).ok_or_else(|| {
             let written: Vec<String> = args.iter().map(u32::to_string).collect();
-            ZuError::gql(
+            ZuError::gql_in(
                 codes::C42001,
+                self.source,
+                at,
                 format!(
                     "'{name}' does not take ({}), or the numbers in it are out of range",
                     written.join(", ")
@@ -7119,7 +7145,20 @@ impl Parser<'_> {
                 bits,
                 precision,
             },
-            (Some(_), _) => return Err(unknown_type(&name)),
+            // The sign word is only a word about the integer tower, and
+            // a reader who wrote it in front of something else has a
+            // type that spells fine and a word that does not belong to
+            // it. Saying the type is unknown would send them to look at
+            // the wrong half of what they wrote.
+            (Some(signed), _) => {
+                let word = if signed { "SIGNED" } else { "UNSIGNED" };
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format!("{word} says which integer type, and '{name}' is not one"),
+                ));
+            }
             (None, ty) => ty,
         };
         // GV50 again, written after its element type. `INT LIST` and

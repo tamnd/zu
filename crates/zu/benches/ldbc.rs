@@ -1190,10 +1190,15 @@ fn main() {
     sample();
     let kernels = only("call").then(|| run_table_functions(&path, &edges, &by_row, node_count));
     sample();
-    let peak = peak_rss();
+    // The two readings come from different kernel counters and they do
+    // not always agree: on Linux a between-phase sample off statm has
+    // read 55.9 where the same run's getrusage mark read 54.4. The gate
+    // takes whichever is larger, so a disagreement can only ever make
+    // it stricter.
+    let peak = peak_rss().max(between);
     println!(
         "sf1 memory: {:.1} MiB memory_limit, {:.1} MiB resident after the load, \
-         {:.1} MiB highest between phases, {:.1} MiB process peak \
+         {:.1} MiB highest between phases, {:.1} MiB peak \
          (the peak includes the load and the crosscheck references)",
         mib(zu::zu1::file::DEFAULT_MEMORY_LIMIT as u64),
         mib(resting),

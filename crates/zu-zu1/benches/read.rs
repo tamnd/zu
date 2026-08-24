@@ -331,6 +331,12 @@ fn main() {
         println!("GATE FAIL hop: {hop_p50_us:.3} us > ceiling {ceiling}");
         failed = true;
     }
+    if let Some(ceiling) = budget("read_hop_p99_us")
+        && hop_p99_us > ceiling
+    {
+        println!("GATE FAIL hop tail: p99 {hop_p99_us:.3} us > ceiling {ceiling}");
+        failed = true;
+    }
     if let Some(floor) = budget("read_thrash_speedup")
         && thrash_speedup < floor
     {

@@ -1988,8 +1988,68 @@ fn main() {
         "insert_edge_write_x: {write_edge_x:.2}x in processor time from {SMALL} to {LARGE} edges"
     );
 
+    // The same flatness question asked of every durable shape at once,
+    // which is the companion the microsecond ceilings below do not
+    // have. Each of those is an average over the run, so a shape that
+    // grew a tail without moving its mean walks past all of them; this
+    // is the one number that cannot miss that. It is a ratio and not a
+    // ceiling in microseconds because these statements are mostly the
+    // disk, and a ratio divides the disk out: both halves carry the
+    // same sync, so a slow volume moves neither.
+    //
+    // What is gated is the middle shape rather than the widest one. A
+    // run is WRITES statements, so a p99 here is the second slowest of
+    // two hundred, and one scheduling stall on a shared machine owns
+    // it: three runs an hour apart put the widest shape at 12.9x, 5.2x
+    // and 4.7x, a different shape each time, off a set of shapes that
+    // otherwise sat between 1.1x and 1.9x. The maximum over fourteen
+    // such samples measures the box. The middle one does not move
+    // unless the write path itself grew a tail, which is the thing
+    // being asked about, and the widest is printed beside it so a run
+    // that stalled says so.
+    let shapes = [
+        ("SET", &set_small),
+        ("SET on an edge", &set_edge),
+        ("SET a record", &set_record),
+        ("SET a label", &set_label),
+        ("INSERT", &insert),
+        ("INSERT, large", &insert_large),
+        ("MERGE", &merge),
+        ("INSERT an edge", &edge_small),
+        ("INSERT an edge, large", &edge_large),
+        ("INSERT an edge with a payload", &edge_str),
+        ("edge on a txn", &txn_small),
+        ("DELETE", &delete),
+        ("DETACH DELETE", &detach),
+        ("SET sustained", &sustained.cost),
+    ];
+    let mut ratios: Vec<(&str, f64, f64, f64)> = shapes
+        .iter()
+        .map(|(name, cost)| (*name, cost.p99 / cost.p50.max(0.001), cost.p99, cost.p50))
+        .collect();
+    ratios.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+    let widest = *ratios.last().expect("shapes");
+    let middle = ratios[ratios.len() / 2];
+    println!(
+        "stmt_p99_p50_x: {ratio:.2}x at the middle shape, {name} at p99 {p99:.0} us against \
+         p50 {p50:.0} us",
+        name = middle.0,
+        ratio = middle.1,
+        p99 = middle.2,
+        p50 = middle.3
+    );
+    println!(
+        "widest shape this run: {name} at {ratio:.2}x, p99 {p99:.0} us against p50 {p50:.0} us \
+         (reported, not gated)",
+        name = widest.0,
+        ratio = widest.1,
+        p99 = widest.2,
+        p50 = widest.3
+    );
+
     let mut failed = false;
     let checks = [
+        ("stmt_p99_p50_x", middle.1),
         ("set_stmt_us", set_small.us),
         ("set_stmt_cpu_us", set_small.cpu),
         ("set_stmt_cpu_nosync_us", set_small.cpu_less_sync(sync)),

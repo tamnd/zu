@@ -146,14 +146,36 @@ fn count_of(r: &zu::query::QueryResult) -> i64 {
     }
 }
 
-fn p50(mut lat: Vec<u64>) -> f64 {
-    lat.sort_unstable();
-    lat[lat.len() / 2] as f64 / 1e3
+/// One latency sample said twice: the middle of it and the tail.
+///
+/// The tail is here because the two paths do not have to grow their
+/// medians together to have gone wrong. A refusal that allocates on a
+/// slow branch, or one that misses the plan cache once in a hundred
+/// sends, moves nothing a median can see and everything a client with a
+/// timeout can, and a bench that only reports the middle would call that
+/// run clean.
+#[derive(Clone, Copy)]
+struct Lat {
+    p50: f64,
+    p99: f64,
 }
 
-/// Median latency of the warm point read, every answer checked against
-/// the degree table. This is the number the refusals are held against.
-fn run_answer(path: &std::path::Path, degree: &[i64]) -> f64 {
+/// A zero sample, the starting point for a running worst-of.
+fn answer_zero() -> Lat {
+    Lat { p50: 0.0, p99: 0.0 }
+}
+
+fn quantiles(mut lat: Vec<u64>) -> Lat {
+    lat.sort_unstable();
+    Lat {
+        p50: lat[lat.len() / 2] as f64 / 1e3,
+        p99: lat[lat.len() * 99 / 100] as f64 / 1e3,
+    }
+}
+
+/// Latency of the warm point read, every answer checked against the
+/// degree table. This is the number the refusals are held against.
+fn run_answer(path: &std::path::Path, degree: &[i64]) -> Lat {
     let mut session = Session::open(path).expect("open");
     let mut rng = 0xbeefu64;
     for _ in 0..100 {
@@ -172,10 +194,10 @@ fn run_answer(path: &std::path::Path, degree: &[i64]) -> f64 {
         lat.push(start.elapsed().as_nanos() as u64);
         assert_eq!(count_of(&r), degree[src as usize], "src {src}");
     }
-    p50(lat)
+    quantiles(lat)
 }
 
-/// Median latency of one refusal, asserting the condition every time.
+/// Latency of one refusal, asserting the condition every time.
 ///
 /// The session is warmed the way a client that keeps sending the same
 /// bad statement would warm it, which is the shape that matters: if
@@ -186,7 +208,7 @@ fn run_refusal(
     source: &str,
     params: &[(&str, Value)],
     want: GqlStatus,
-) -> f64 {
+) -> Lat {
     let mut session = Session::open(path).expect("open");
     for _ in 0..100 {
         refuse(&mut session, source, params, want);
@@ -198,7 +220,7 @@ fn run_refusal(
         lat.push(start.elapsed().as_nanos() as u64);
         check(err, want, source);
     }
-    p50(lat)
+    quantiles(lat)
 }
 
 fn refuse(session: &mut Session, source: &str, params: &[(&str, Value)], want: GqlStatus) {
@@ -224,24 +246,36 @@ fn main() {
     let edge_count: i64 = degree.iter().sum();
     println!("refuse bench graph: {NODES} nodes, {edge_count} edges");
 
-    let answer_us = run_answer(&path, &degree);
-    println!("answer path (warm point read): p50 {answer_us:.2} us over 10000 reads");
+    let answer = run_answer(&path, &degree);
+    println!(
+        "answer path (warm point read): p50 {p50:.2} us, p99 {p99:.2} us over 10000 reads",
+        p50 = answer.p50,
+        p99 = answer.p99
+    );
 
-    let mut worst = ("", 0.0f64);
+    let mut worst = ("", answer_zero());
+    let mut worst_tail = ("", answer_zero());
     for (name, source, want) in REFUSALS {
         let params: &[(&str, Value)] = if *name == "missing parameter" {
             &[]
         } else {
             &[("src", Value::Int(1))]
         };
-        let us = run_refusal(&path, source, params, *want);
+        let lat = run_refusal(&path, source, params, *want);
         println!(
-            "refusal, {name} ({code}): p50 {us:.2} us, {ratio:.2}x the answer path",
+            "refusal, {name} ({code}): p50 {p50:.2} us, {ratio:.2}x the answer path, \
+             p99 {p99:.2} us, {tail:.2}x its p99",
             code = want,
-            ratio = us / answer_us.max(0.001)
+            p50 = lat.p50,
+            p99 = lat.p99,
+            ratio = lat.p50 / answer.p50.max(0.001),
+            tail = lat.p99 / answer.p99.max(0.001)
         );
-        if us > worst.1 {
-            worst = (name, us);
+        if lat.p50 > worst.1.p50 {
+            worst = (name, lat);
+        }
+        if lat.p99 > worst_tail.1.p99 {
+            worst_tail = (name, lat);
         }
     }
 
@@ -251,23 +285,30 @@ fn main() {
     // against the same kind of work rather than against a scan, and it
     // is here because a runtime refusal costing many times an answer
     // would mean the check itself is expensive.
-    let divide_us = run_refusal(
+    let divide = run_refusal(
         &path,
         "MATCH (a:person {id: $src}) RETURN a.id / 0 AS n",
         &[("src", Value::Int(1))],
         codes::C22012,
     );
     println!(
-        "runtime refusal, divide by zero (22012): p50 {divide_us:.2} us, \
+        "runtime refusal, divide by zero (22012): p50 {p50:.2} us, \
          {ratio:.2}x the answer path (information, not gated)",
-        ratio = divide_us / answer_us.max(0.001)
+        p50 = divide.p50,
+        ratio = divide.p50 / answer.p50.max(0.001)
     );
 
-    let ratio = worst.1 / answer_us.max(0.001);
+    let ratio = worst.1.p50 / answer.p50.max(0.001);
+    let tail_ratio = worst_tail.1.p99 / answer.p99.max(0.001);
     println!(
         "slowest gated refusal: {name} at p50 {us:.2} us, {ratio:.2}x the answer path",
         name = worst.0,
-        us = worst.1
+        us = worst.1.p50
+    );
+    println!(
+        "widest gated tail: {name} at p99 {us:.2} us, {tail_ratio:.2}x the answer path p99",
+        name = worst_tail.0,
+        us = worst_tail.1.p99
     );
 
     // Which class of machine this is, on zu's own work rather than on a
@@ -280,10 +321,11 @@ fn main() {
     // is zu, is timed the same way on every host, and moves with the
     // machine: the two runners that read 1.15x and 1.61x on the loop
     // read 1.94x and 2.33x here. See #648.
-    let host = answer_us / REFERENCE_ANSWER_US;
+    let host = answer.p50 / REFERENCE_ANSWER_US;
     println!(
         "host: answer path {answer_us:.2} us, {host:.2}x the reference \
-         {REFERENCE_ANSWER_US:.2} us"
+         {REFERENCE_ANSWER_US:.2} us",
+        answer_us = answer.p50
     );
 
     let mut failed = false;
@@ -296,7 +338,26 @@ fn main() {
         );
         failed = true;
     }
-    if let Some(ceiling) = budget("refuse_p50_us") {
+    if let Some(ceiling) = budget("refuse_p99_over_answer")
+        && tail_ratio > ceiling
+    {
+        println!(
+            "GATE FAIL refusal tail against answer: {name} at {tail_ratio:.2}x > ceiling {ceiling}",
+            name = worst_tail.0
+        );
+        failed = true;
+    }
+    // The two microsecond ceilings answer the run where both paths got
+    // slower together and both ratios held, and they are held under the
+    // one condition that makes a microsecond mean anything, which is
+    // that this host is the class of host they were written for.
+    for (key, name, us) in [
+        ("refuse_p50_us", worst.0, worst.1.p50),
+        ("refuse_p99_us", worst_tail.0, worst_tail.1.p99),
+    ] {
+        let Some(ceiling) = budget(key) else {
+            continue;
+        };
         if host > ENFORCE_WITHIN {
             // A microsecond ceiling is a statement about a machine, and
             // this one is not that machine. Scaling the ceiling by how
@@ -307,21 +368,18 @@ fn main() {
             // with a looser constant. So it is reported here and held
             // where it means something.
             println!(
-                "latency ceiling: {ceiling:.2} us written, not held on this host at {host:.2}x \
-                 the reference. The slowest refusal read p50 {us:.2} us. The ratio gate above \
-                 runs everywhere and is the one this host enforces.",
-                us = worst.1
+                "latency ceiling {key}: {ceiling:.2} us written, not held on this host at \
+                 {host:.2}x the reference. {name} read {us:.2} us. The ratio gates above run \
+                 everywhere and are the ones this host enforces."
             );
-        } else {
-            println!("latency ceiling: {ceiling:.2} us written, held on this host at {host:.2}x");
-            if worst.1 > ceiling {
-                println!(
-                    "GATE FAIL refusal latency: {name} at p50 {us:.2} us > ceiling {ceiling:.2}",
-                    name = worst.0,
-                    us = worst.1
-                );
-                failed = true;
-            }
+            continue;
+        }
+        println!("latency ceiling {key}: {ceiling:.2} us written, held on this host at {host:.2}x");
+        if us > ceiling {
+            println!(
+                "GATE FAIL refusal latency {key}: {name} at {us:.2} us > ceiling {ceiling:.2}"
+            );
+            failed = true;
         }
     }
     if gate && failed {

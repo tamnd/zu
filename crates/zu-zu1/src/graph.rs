@@ -1815,42 +1815,27 @@ impl EdgePatch {
 
     /// Takes one edge and answers with the ordinal it was given.
     ///
-    /// A pair the dead set holds comes out of it, so that a pair is
-    /// ever only in one of the two. The file holds no copy of one that
-    /// gets this far, because a pair it does hold is refused before it
-    /// is added, so there is nothing in the dead set for a reader still
-    /// to want.
+    /// A pair the dead set holds stays in it. The two sets say different
+    /// things about different copies: the dead set covers whatever the
+    /// file holds under that pair, and the lists here hold the one copy
+    /// this patch has added. A pair that was taken away and put back is
+    /// exactly that shape, and it has to be, because the copy going in
+    /// carries the values this statement wrote and the file's copies
+    /// carry the ones the last fold sealed. Reviving the file's copies
+    /// instead would put the old values back and leave two edges where
+    /// the statement asked for one.
+    ///
+    /// What this does rest on is that the patch holds at most one copy
+    /// of a pair, which is what [`Self::holds`] is asked before a
+    /// deferred add is taken.
     pub fn add(&mut self, src: u64, dst: u64) -> u64 {
         let ord = self.base + self.added;
         put(&mut self.recent.fwd, src, dst, ord);
         put(&mut self.recent.bwd, dst, src, ord);
         self.fresh += 1;
-        self.revive(src, dst);
         self.added += 1;
         self.seal();
         ord
-    }
-
-    /// Takes a pair back out of whichever dead set holds it.
-    ///
-    /// The recent one nearly always, because a pair is taken away and
-    /// put back by statements that run near each other or not at all,
-    /// and only that one is free: reaching into the run copies it, and
-    /// this is the one write that has to.
-    fn revive(&mut self, src: u64, dst: u64) {
-        if self.recent.dead.remove(&(src, dst)) {
-            self.recent.dead_bwd.remove(&(dst, src));
-            self.dropped -= 1;
-            self.fresh -= 1;
-            return;
-        }
-        if !self.run.dead.contains(&(src, dst)) {
-            return;
-        }
-        let run = Arc::make_mut(&mut self.run);
-        run.dead.remove(&(src, dst));
-        run.dead_bwd.remove(&(dst, src));
-        self.dropped -= 1;
     }
 
     /// The first ordinal this patch handed out, so a caller holding one
@@ -1862,21 +1847,23 @@ impl EdgePatch {
     /// Takes one edge away, by the pair it runs between, which is every
     /// copy of it the file holds.
     ///
-    /// A pair this patch added itself comes out of the lists instead of
-    /// going into the dead set, because the file holds no copy of it to
-    /// be told about: a pair the file already runs through is refused
-    /// before it is ever added here. The ordinal it took stays spent,
-    /// and so does the row of edge properties that went with it. Both
-    /// are only ever reached through the lists this drops it from, and
-    /// the next edge takes the next ordinal either way, so what is left
-    /// behind is a row nothing reads rather than a hole in a run
-    /// something counts on.
+    /// A pair this patch added itself comes out of the lists first. The
+    /// dead set is left alone either way, because what it says is what
+    /// the file holds under the pair, and taking the patch's own copy
+    /// away does not change that: a pair the file holds and the patch
+    /// has added is already marked, and one the file does not hold has
+    /// nothing to mark. The ordinal the copy took stays spent, and so
+    /// does the row of edge properties that went with it. Both are only
+    /// ever reached through the lists this drops it from, and the next
+    /// edge takes the next ordinal either way, so what is left behind is
+    /// a row nothing reads rather than a hole in a run something counts
+    /// on.
     ///
     /// A pair added before the last seal is in the run, and taking it
     /// out of there copies the run. That is the same write the recent
-    /// side answers for free, and it is rare for the same reason
-    /// [`Self::revive`] is: an edge and the delete that takes it back
-    /// arrive together or not at all.
+    /// side answers for free, and it is rare for the same reason: an
+    /// edge and the delete that takes it back arrive together or not at
+    /// all.
     pub fn remove(&mut self, src: u64, dst: u64) {
         let took = take(&mut self.recent.fwd, src, dst);
         if took > 0 {
@@ -2746,9 +2733,10 @@ impl GraphReader {
     pub fn edge_run(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
         if let Some(patch) = self.edges.clone() {
             if let Some(ord) = patch.of(src, Direction::Fwd).first(dst) {
-                // An unfolded edge is only ever deferred over a pair the
-                // graph does not hold, so the run it names is itself
-                // and there is nothing of the file's to count in.
+                // The patch holds one copy of a pair at most, and
+                // whatever the file holds under a pair the patch has
+                // added is in the dead set, so the run this names is
+                // itself and there is nothing of the file's to count in.
                 return Ok(Some((ord, 1)));
             }
             if patch.drops(src, dst, Direction::Fwd) {
@@ -3268,13 +3256,24 @@ mod tests {
         assert!(patch.drops(7, 8, Direction::Fwd), "a seal lost a dead pair");
         assert!(patch.drops(8, 7, Direction::Bwd));
         assert!(patch.drops_any(7, Direction::Fwd));
-        // And putting it back takes it out of the dead set, from the
-        // run as readily as from the recent side.
+        // And putting it back leaves the mark where it is, because what
+        // it says is that the file's copies of the pair are gone and
+        // they are. The copy going back in is this patch's own, and a
+        // reader takes the file's off the list before it merges this one
+        // into it, so the pair runs once and runs with the values the
+        // add carried.
         patch.add(7, 8);
-        assert!(!patch.drops(7, 8, Direction::Fwd));
-        assert!(!patch.drops(8, 7, Direction::Bwd));
+        assert!(patch.drops(7, 8, Direction::Fwd));
+        assert!(patch.drops(8, 7, Direction::Bwd));
         assert!(patch.holds(7, 8));
-        assert_eq!(patch.removed(), 0);
+        assert_eq!(patch.removed(), 1);
+        // And taking it away again leaves the file's copies dead and
+        // the patch's own copy gone, which is one delete's worth of
+        // effect and not two.
+        patch.remove(7, 8);
+        assert!(!patch.holds(7, 8));
+        assert!(patch.drops(7, 8, Direction::Fwd));
+        assert_eq!(patch.removed(), 1);
     }
 
     #[test]

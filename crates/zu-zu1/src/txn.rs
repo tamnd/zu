@@ -66,19 +66,38 @@ struct TableOverlay {
 #[derive(Debug, Default)]
 struct RelOverlay {
     edges: Vec<OverlayEdge>,
-    /// The rows a removed edge ran between, stamped with the removing
-    /// epoch. An edge has no offset of its own, so the pair is its name,
-    /// which means an entry here takes away every edge over that pair.
-    /// Nothing that has a name of its own is lost by that: a table that
-    /// stores edge properties holds a pair once, and one that stores
-    /// none has nothing to tell two edges over a pair apart with.
-    dead: BTreeMap<(u64, u64), Epoch>,
+    /// The rows a removed edge ran between, stamped with every epoch
+    /// that removed it, ascending. An edge has no offset of its own, so
+    /// the pair is its name, which means an entry here takes away every
+    /// edge over that pair. Nothing that has a name of its own is lost
+    /// by that: a table that stores edge properties holds a pair once,
+    /// and one that stores none has nothing to tell two edges over a
+    /// pair apart with.
+    ///
+    /// Every epoch and not just the first, because a pair can be taken
+    /// away and put back inside one run of unfolded commits, and which
+    /// of the two the pair ends on is the order of the stamps and not
+    /// the fact that there is one. One epoch could say the pair had
+    /// gone or say when, and an overlay edge needs both: it stands if
+    /// nothing removed the pair between the epoch that added it and the
+    /// epoch being read.
+    dead: BTreeMap<(u64, u64), Vec<Epoch>>,
     /// What a statement wrote onto an edge that was already there,
     /// keyed by the rows it runs between and the column, newest last.
     /// The pair names the edge here for the same reason it does in
     /// `dead`, and the column has to be part of the key because two
     /// statements can change two properties of one edge.
     updates: BTreeMap<(u64, u64, u32), Vec<(Epoch, Cell)>>,
+}
+
+/// Puts `epoch` on the end of a pair's delete stamps, unless it is
+/// already the last one there. Commits apply in order, so the list
+/// stays ascending, and one commit that names a pair twice leaves one
+/// stamp rather than two.
+fn stamp(stamps: &mut Vec<Epoch>, epoch: Epoch) {
+    if stamps.last() != Some(&epoch) {
+        stamps.push(epoch);
+    }
 }
 
 /// One committed edge the base does not hold yet: the rows it runs
@@ -470,7 +489,7 @@ impl Mvcc {
                 WalRecord::RelDelete { rel, src, dst } => {
                     let overlay = mvcc.rels.entry(*rel).or_default();
                     for (s, d) in src.iter().zip(dst) {
-                        overlay.dead.entry((*s, *d)).or_insert(epoch);
+                        stamp(overlay.dead.entry((*s, *d)).or_default(), epoch);
                     }
                     Ok(())
                 }
@@ -592,7 +611,8 @@ impl Mvcc {
     pub fn neighbors(&self, rel: u32, node: u64, reversed: bool, epoch: Epoch, out: &mut Vec<u64>) {
         if let Some(overlay) = self.rels.get(&rel) {
             for edge in &overlay.edges {
-                if edge.epoch > epoch || self.edge_gone(rel, edge.src, edge.dst, epoch) {
+                if edge.epoch > epoch || self.edge_gone(rel, edge.src, edge.dst, edge.epoch, epoch)
+                {
                     continue;
                 }
                 if !reversed && edge.src == node {
@@ -604,24 +624,31 @@ impl Mvcc {
         }
     }
 
-    /// Whether the edges between two rows are gone for a reader at
-    /// `epoch`. The base holds edges the overlay never saw, so this is
-    /// asked about a pair rather than about an overlay entry, and the
-    /// facade asks it of every base edge it reads.
-    pub fn edge_gone(&self, rel: u32, src: u64, dst: u64, epoch: Epoch) -> bool {
+    /// Whether an edge over two rows that has stood since `since` is
+    /// gone for a reader at `epoch`.
+    ///
+    /// The pair is the name of the edge, so what this asks is whether
+    /// anything took the pair away in the window the edge has been
+    /// there for. An edge the base holds has stood since the file was
+    /// sealed, which is epoch zero as far as the overlay is concerned,
+    /// and an overlay edge has stood since the commit that added it: a
+    /// delete before that one is about the copies that were there then
+    /// and says nothing about this one.
+    pub fn edge_gone(&self, rel: u32, src: u64, dst: u64, since: Epoch, epoch: Epoch) -> bool {
         self.rels
             .get(&rel)
             .and_then(|o| o.dead.get(&(src, dst)))
-            .is_some_and(|&e| e <= epoch)
+            .is_some_and(|stamps| stamps.iter().any(|&e| since <= e && e <= epoch))
     }
 
     /// The pairs `rel` has lost by `epoch`, ascending, which is what a
-    /// fold drops out of the CSR it rebuilds.
+    /// fold drops out of the CSR it rebuilds. The base copies of a pair
+    /// go on the first delete of it, so that is the stamp this reads.
     pub fn dead_edges(&self, rel: u32, epoch: Epoch) -> Vec<(u64, u64)> {
         self.rels.get(&rel).map_or_else(Vec::new, |o| {
             o.dead
                 .iter()
-                .filter(|&(_, &e)| e <= epoch)
+                .filter(|(_, stamps)| stamps.first().is_some_and(|&e| e <= epoch))
                 .map(|(&pair, _)| pair)
                 .collect()
         })
@@ -676,7 +703,7 @@ impl Mvcc {
             .into_iter()
             .flat_map(|o| &o.edges)
             .filter(move |edge| {
-                edge.epoch <= epoch && !self.edge_gone(rel, edge.src, edge.dst, epoch)
+                edge.epoch <= epoch && !self.edge_gone(rel, edge.src, edge.dst, edge.epoch, epoch)
             })
             .map(|edge| (edge.src, edge.dst, edge.cols.as_slice()))
     }
@@ -986,12 +1013,15 @@ impl Mvcc {
                         .or_insert(epoch);
                 }
                 Op::DeleteRel { rel, src, dst } => {
-                    self.rels
-                        .entry(rel)
-                        .or_default()
-                        .dead
-                        .entry((src, dst))
-                        .or_insert(epoch);
+                    stamp(
+                        self.rels
+                            .entry(rel)
+                            .or_default()
+                            .dead
+                            .entry((src, dst))
+                            .or_default(),
+                        epoch,
+                    );
                 }
                 Op::UpdateRel {
                     rel,
@@ -1458,6 +1488,59 @@ mod tests {
         }
     }
 
+    /// A pair taken away and put back inside one run of unfolded
+    /// commits ends where the last statement left it.
+    ///
+    /// This is what a bracketed write does: the delete is the teardown
+    /// of the round before and the insert is the round after it, and the
+    /// two sit in one overlay until a fold seals them. The delete used
+    /// to carry one stamp, and every overlay edge over that pair was
+    /// read as gone whether it arrived before the delete or after, so a
+    /// fold of the two together wrote no edge at all.
+    #[test]
+    fn an_edge_added_after_the_pair_died_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.delete_rel(9, 0, 1);
+        let e1 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.insert_rel(9, 0, 1);
+        let e2 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.delete_rel(9, 0, 1);
+        let e3 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.insert_rel(9, 0, 1);
+        let e4 = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            let edges = |epoch| m.edges(9, epoch).collect::<Vec<_>>();
+            assert!(edges(e1).is_empty(), "the delete is all there is yet");
+            assert_eq!(edges(e2), vec![(0, 1)], "the add after the delete stands");
+            assert!(edges(e3).is_empty(), "the delete after the add takes it");
+            assert_eq!(edges(e4), vec![(0, 1)], "and the add after that stands");
+            // The base copies go on the first delete and stay gone: an
+            // add puts a copy of its own in the overlay rather than
+            // bringing back the ones the file holds.
+            for epoch in [e1, e2, e3, e4] {
+                assert_eq!(
+                    m.dead_edges(9, epoch),
+                    vec![(0, 1)],
+                    "the file's copies came back at epoch {epoch}"
+                );
+            }
+            let mut nbrs = Vec::new();
+            m.neighbors(9, 0, false, e4, &mut nbrs);
+            assert_eq!(nbrs, vec![1], "the reader lost the re-added edge");
+            nbrs.clear();
+            m.neighbors(9, 1, true, e3, &mut nbrs);
+            assert!(nbrs.is_empty(), "the end it arrived at keeps a dead edge");
+        }
+    }
+
     /// An edge the overlay took away stops being a neighbor at the
     /// epoch that took it, and recovery reads the same thing back out
     /// of the log.
@@ -1485,8 +1568,8 @@ mod tests {
             nbrs.clear();
             m.neighbors(9, 1, true, e2, &mut nbrs);
             assert!(nbrs.is_empty(), "the end it arrived at loses it too");
-            assert!(m.edge_gone(9, 0, 1, e2));
-            assert!(!m.edge_gone(9, 0, 1, e1));
+            assert!(m.edge_gone(9, 0, 1, e1, e2));
+            assert!(!m.edge_gone(9, 0, 1, e1, e1));
             assert_eq!(m.dead_edges(9, e2), vec![(0, 1)]);
             assert!(m.dead_edges(9, e1).is_empty());
             // What a fold would seal: the edge that was taken away is

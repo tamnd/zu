@@ -716,6 +716,16 @@ impl Writer {
     /// table that stores properties refuses the second copy at write
     /// time anyway; this is what keeps the other kind honest.
     ///
+    /// A pair the same run of deferred commits already took away is not
+    /// one the graph runs through, whatever the file still holds under
+    /// it. The patch says the file's copies are gone and every reader
+    /// takes them off the list before it merges the patch's own in, so
+    /// the added edge is the only one there is and its run is itself.
+    /// This is the whole of an add and a delete over one pair going
+    /// round without a fold, which is what a bracketed write does: the
+    /// delete leaves the mark, the add goes on top of it, and neither
+    /// of them rebuilds a CSR.
+    ///
     /// Either end may be a row the CSR was never built over, one an
     /// earlier commit of this run appended or one this same commit is
     /// appending, which is what `appending` counts. The CSR holds no
@@ -739,14 +749,11 @@ impl Writer {
         cols: &[(u32, Cell)],
         appending: &IdMap<u32, u64>,
     ) -> Result<bool> {
-        if self
-            .patches
-            .edges
-            .get(&rel)
-            .is_some_and(|p| p.holds(src, dst))
-        {
+        let patch = self.patches.edges.get(&rel);
+        if patch.is_some_and(|p| p.holds(src, dst)) {
             return Ok(false);
         }
+        let dropped = patch.is_some_and(|p| p.drops(src, dst, Direction::Fwd));
         self.load_reader(db, rel)?;
         if self.catalog.is_none() {
             self.catalog = Some(Catalog::load(db)?);
@@ -770,7 +777,7 @@ impl Writer {
         if src >= room(from_count, from_grown, from) || dst >= room(to_count, to_grown, to) {
             return Ok(false);
         }
-        if src < from_count && reader.has_edge(db, src, dst)? {
+        if !dropped && src < from_count && reader.has_edge(db, src, dst)? {
             return Ok(false);
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(rel) {
@@ -3157,6 +3164,70 @@ mod tests {
             )
             .expect("count");
         assert_eq!(r.rows[0][0], Value::Int(added as i64 + 2));
+    }
+
+    /// An edge taken away and put back over and over does not fold,
+    /// even over a pair the file itself holds.
+    ///
+    /// This is the shape a bracketed write has: a benchmark that
+    /// measures an insert deletes what it inserted before it measures
+    /// the next one, so the same pair goes round for the length of the
+    /// run. The delete leaves a mark saying the file's copies of the
+    /// pair are gone, and the add that follows used to be refused
+    /// because the file still held them, which folded, which sealed the
+    /// new edge into the file, which made the next one fold as well. The
+    /// mark is what the add reads now.
+    #[test]
+    fn an_edge_taken_away_and_put_back_does_not_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cycle.zu1");
+        {
+            let mut db = Zu1File::create(&path).expect("create");
+            bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1)]).expect("load");
+            let ages: Vec<u64> = (0..4).collect();
+            store_props(&mut db, "person", &[("age", PropValues::Int(&ages))]).expect("props");
+        }
+
+        let mut session = Session::open(&path).expect("open");
+        let drop_it = "MATCH (a:person)-[k:knows]->(b:person) \
+                       WHERE a.age = 0 AND b.age = 1 DELETE k";
+        let add_it = "MATCH (a:person), (b:person) WHERE a.age = 0 AND b.age = 1 \
+                      INSERT (a)-[:knows]->(b)";
+        let count = |session: &mut Session| {
+            let r = session
+                .run(
+                    "MATCH (a:person)-[:knows]->(b:person) WHERE a.age = 0 \
+                     RETURN count(b) AS n",
+                    &[],
+                )
+                .expect("count");
+            r.rows[0][0].clone()
+        };
+
+        // The first write opens the writer, which recovers and folds, so
+        // the epoch to hold against is the one after it.
+        session.run(drop_it, &[]).expect("first delete");
+        let before = session.epoch();
+        assert_eq!(count(&mut session), Value::Int(0));
+
+        let rounds = 200;
+        for _ in 0..rounds {
+            session.run(add_it, &[]).expect("add");
+            assert_eq!(count(&mut session), Value::Int(1), "the edge is not back");
+            session.run(drop_it, &[]).expect("drop");
+            assert_eq!(count(&mut session), Value::Int(0), "the edge is not gone");
+        }
+        assert_eq!(
+            session.epoch(),
+            before,
+            "{rounds} rounds of one edge going away and coming back folded"
+        );
+
+        // And the pair ends where the last statement left it rather than
+        // where the file has it, which is what says the mark outlived
+        // the adds that went on top of it.
+        session.run(add_it, &[]).expect("add");
+        assert_eq!(count(&mut session), Value::Int(1));
     }
 
     /// A run of point writes longer than a writer will defer folds

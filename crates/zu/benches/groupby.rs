@@ -16,9 +16,10 @@
 //! a group fails here rather than showing up as a fast number.
 //!
 //! exec_group_mrows_s_core gates the hundred thousand group query at
-//! one worker. It is a whole-query number, decode and scan and sink and
-//! the final sort of the groups together, because that is what a user
-//! waits for.
+//! one worker and exec_group_str_mrows_s_core gates the string key
+//! beside it. Both are whole-query numbers, decode and scan and sink
+//! and the final sort of the groups together, because that is what a
+//! user waits for.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench groupby
 
@@ -144,7 +145,7 @@ fn main() {
         FEW as usize,
         "int key",
     );
-    run(
+    let strkey = run(
         &mut db,
         "MATCH (p:person) RETURN p.name AS g, count(p) AS n",
         NAMES as usize,
@@ -163,13 +164,19 @@ fn main() {
         wide / old
     );
 
-    if std::env::var("ZU_GATE").as_deref() == Ok("1")
-        && let Some(floor) = budget("exec_group_mrows_s_core")
-    {
-        assert!(
-            wide >= floor,
-            "group by at {wide:.0} M rows/s/core under the {floor} M floor"
-        );
-        println!("gate: grouping floor met");
+    if std::env::var("ZU_GATE").as_deref() == Ok("1") {
+        if let Some(floor) = budget("exec_group_mrows_s_core") {
+            assert!(
+                wide >= floor,
+                "group by at {wide:.0} M rows/s/core under the {floor} M floor"
+            );
+        }
+        if let Some(floor) = budget("exec_group_str_mrows_s_core") {
+            assert!(
+                strkey >= floor,
+                "group by on a string key at {strkey:.0} M rows/s/core under the {floor} M floor"
+            );
+        }
+        println!("gate: grouping floors met");
     }
 }

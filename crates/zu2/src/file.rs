@@ -453,6 +453,21 @@ pub fn disk_bytes(file: &File, path: &Path) -> io::Result<u64> {
     Ok(u64::from(high) << 32 | u64::from(low))
 }
 
+/// Bytes a file at this path occupies, and zero when it is not there.
+///
+/// For the sidecars, which are named rather than held open: a store
+/// costs what all of its files cost, and a checkpoint that is not on
+/// disk yet costs nothing. Anything other than a missing file is still
+/// an error, because a store whose checkpoint cannot be read is not a
+/// store with a small checkpoint.
+pub fn disk_bytes_at(path: &Path) -> io::Result<u64> {
+    match File::open(path) {
+        Ok(file) => disk_bytes(&file, path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(unix)]
 pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)

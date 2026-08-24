@@ -83,16 +83,25 @@ fn breakdown(path: &Path) -> String {
     parts.join(", ")
 }
 
-/// What the engine said, at the two moments the harness could ask.
+/// What the engine said, at the two moments the harness could ask, and
+/// what the filesystem had at each of them.
 struct Said {
     /// With the database still open, which is when the adapter's
     /// `printStorage` asks.
     open: u64,
+    /// What the filesystem had at that same instant. Held separately
+    /// from `closed_device` because the two answer different questions:
+    /// this one against `open` says whether the engine is counting its
+    /// files correctly, and `closed_device` against `open` says whether
+    /// the close writes more after the engine has answered. Before they
+    /// were separated those two were one number and the second was
+    /// being read as the first.
+    open_device: u64,
     /// After the close, which is when the harness's `du` runs.
     closed_device: u64,
 }
 
-fn write(path: &Path, rows: u32) -> u64 {
+fn write(path: &Path, rows: u32) -> (u64, u64) {
     let db = Db::create(
         path,
         Options {
@@ -115,16 +124,18 @@ fn write(path: &Path, rows: u32) -> u64 {
     // counted the bytes against a filesystem that has not received them.
     db.sync().expect("sync");
     let said = db.disk_bytes().expect("disk_bytes");
+    let device = device_bytes(path);
     drop(db);
-    said
+    (said, device)
 }
 
 /// The harness's comparison exactly: ask the engine while it is open,
 /// then ask the filesystem after the process would have exited.
 fn write_and_watch(path: &Path, rows: u32) -> Said {
-    let open = write(path, rows);
+    let (open, open_device) = write(path, rows);
     Said {
         open,
+        open_device,
         closed_device: device_bytes(path),
     }
 }
@@ -137,14 +148,32 @@ fn the_engine_and_the_filesystem_agree_about_the_log_after_a_close() {
 
     let Said {
         open: said,
+        open_device: saw_open,
         closed_device: saw,
     } = write_and_watch(&path, ROWS);
 
+    // Asked at the same instant, the engine and the filesystem now count
+    // the same set of files, so they should give the same answer. Until
+    // #733 the engine counted the log and the cold tier and left out the
+    // checkpoint and the relink journal, which is 1.1 per cent of a
+    // gigabyte store and a much larger share of one holding many small
+    // records, because the checkpoint is sized by the index and not by
+    // the records.
+    //
+    // Four pages of slack rather than none: a block can land between the
+    // two calls and neither is atomic against the other.
+    assert!(
+        said.abs_diff(saw_open) <= 4 * 4096,
+        "asked at the same moment the engine says {said} and the \
+         filesystem says {saw_open}. Files: {}",
+        breakdown(&path)
+    );
+
     // Two allowances, and both are one sided.
     //
-    // The filesystem is allowed to be larger, because it counts files
-    // the engine does not answer for: the checkpoint and, if a compaction
-    // ran, the relink journal. That is a superset and it is expected.
+    // The filesystem is allowed to be larger after the close, because a
+    // close trims and checkpoints and whatever it writes lands after the
+    // engine has already answered.
     //
     // It is not allowed to be meaningfully smaller. Blocks the engine
     // claims and the device does not have are the #631 gap, and one page
@@ -180,10 +209,13 @@ fn the_gap_does_not_grow_with_the_database() {
         let path = dir.path().join(format!("grow{rows}.zu2"));
         let Said {
             open: said,
+            open_device: saw_open,
             closed_device: saw,
         } = write_and_watch(&path, rows);
         eprintln!(
-            "rows {rows}: engine {said}, device {saw}, gap {}",
+            "rows {rows}: engine {said}, device {saw_open} open and {saw} \
+             closed, gap {} open and {} closed",
+            saw_open as i64 - said as i64,
             saw as i64 - said as i64
         );
         gaps.push((rows, saw as i64 - said as i64, said));
@@ -224,10 +256,12 @@ fn the_two_numbers_agree_at_the_size_the_gap_was_found_at() {
     let path = dir.path().join("million.zu2");
     let Said {
         open: said,
+        open_device: saw_open,
         closed_device: saw,
     } = write_and_watch(&path, ROWS);
     eprintln!(
-        "rows {ROWS}: engine {said}, device {saw}, gap {} ({:.2} per cent). Files: {}",
+        "rows {ROWS}: engine {said}, device {saw_open} open, {saw} closed, \
+         gap {} ({:.2} per cent). Files: {}",
         saw as i64 - said as i64,
         (saw as f64 - said as f64) / said as f64 * 100.0,
         breakdown(&path)

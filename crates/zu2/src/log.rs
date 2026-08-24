@@ -31,13 +31,13 @@
 //! difference between a commit that costs what the device charges and
 //! one that costs whatever the other threads happen to be doing.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use crate::addr::{Address, FIRST, MAX_PAGES, PAGE_SIZE, page_of, page_start};
+use crate::addr::{page_of, page_start, Address, FIRST, MAX_PAGES, PAGE_SIZE};
 use crate::epoch::{Epochs, Slotted};
 use crate::error::{Error, Result};
 use crate::{file, record};
@@ -452,9 +452,19 @@ impl Log {
         self.tail().saturating_sub(self.begin())
     }
 
-    /// Bytes the file occupies, holes excluded.
+    /// Bytes the log and its sidecars occupy, holes excluded.
+    ///
+    /// The checkpoint and the relink journal are part of what the store
+    /// costs and they were not counted here until #733. The checkpoint
+    /// is sized by the index rather than by the records, so on a store
+    /// of many small records it is a much larger share of the total
+    /// than the 1.1% it was on the load that found this.
     pub fn disk_bytes(&self) -> Result<u64> {
-        Ok(file::disk_bytes(&self.file, &self.path)?)
+        let mut bytes = file::disk_bytes(&self.file, &self.path)?;
+        let (checkpoint, _) = self.checkpoint_path();
+        bytes += file::disk_bytes_at(&checkpoint)?;
+        bytes += file::disk_bytes_at(&self.journal_path())?;
+        Ok(bytes)
     }
 
     /// Adopts a begin address read off a file that is being reopened.

@@ -1282,6 +1282,20 @@ fn main() {
                 bad = true;
             }
         }
+        // perf/13 flatness: every class gate gets a companion ratio, so
+        // a p50 that improved while the tail doubled cannot pass. Ten
+        // rather than five because SF1 is a real social graph and the
+        // knows degree is power-law: the seeded phases draw a person
+        // at random and some of them are hubs, and that skew is in the
+        // data rather than in the engine.
+        if let Some(ceiling) = budget("powerlaw_flatness_x") {
+            let ratio = p99 / p50.max(1e-6);
+            println!("{label} flatness: p99 is {ratio:.2}x the p50");
+            if ratio > ceiling {
+                println!("GATE FAIL {label} flatness: {ratio:.2}x > ceiling {ceiling}");
+                bad = true;
+            }
+        }
         if bad {
             missed.push(label);
         }

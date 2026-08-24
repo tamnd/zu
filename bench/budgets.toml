@@ -2389,6 +2389,28 @@ write_p99_nosync_us = 100.0
 # it.
 write_p99_p50_x = 4.0
 
+# The flatness ratios, perf/13 section 3 and its exit gate: every class
+# that has a p50 ceiling gets a companion p99 over p50, because a p50
+# that improved while the tail doubled is not an improvement and a
+# ceiling on each of the two separately does not say so.
+#
+# Two numbers because skew is real and unbounded is not. Five is for a
+# graph with a uniform degree, which is what the session bench builds
+# for itself: nothing in the data can make one read slower than
+# another, so a tail there is the engine. Ten is for SF1, where the
+# knows degree is power-law and a seeded phase drawing a person at
+# random draws a hub some of the time.
+#
+# Measured on an M series laptop. Session: plan cache hit 1.29, point
+# read 1.32, held 1.32, one-shot 1.99. SF1: 1-hop 1.60, key lookup
+# 3.00, 2-hop 2.64, triangle 1.13, ordered triangle 1.23, undirected
+# close 1.07, IS read 3.63, IC friends-of-friends 4.48, distinct
+# two-hop 2.37. The IC read is the closest to its ceiling and it is the
+# one that walks two hops out of a randomly drawn person, which is the
+# shape the power-law allowance is for. Lower these, never raise them.
+uniform_flatness_x = 5.0
+powerlaw_flatness_x = 10.0
+
 # The P5 point write gate: processor time a statement excluding fsync,
 # under 30 us (docs/12, zu#78).
 #

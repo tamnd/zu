@@ -2288,7 +2288,49 @@ impl Parser<'_> {
             let stmt = self.parse_catalog_stmt()?;
             return Ok((Statement::Catalog(stmt), Ending::Write));
         }
+        // ISO 9.1 and 13.1. A whole statement may be written in braces
+        // with nothing around it, a `USE` clause in front of it or
+        // both, which the standard calls a nested query specification
+        // and a nested data-modifying procedure specification. It is
+        // not a subquery: the braces are the statement, so what is
+        // inside them is read as one and the clause in front focuses
+        // it. The clause is read first because only the brace behind
+        // it says which of the two shapes this is, and the tokens go
+        // back where they were when it is neither.
+        let at = self.pos;
+        let focus = self.parse_use_graph()?;
+        if self.at(&TokenKind::LBrace) {
+            return self.parse_braced_statement(focus);
+        }
+        self.pos = at;
         let (query, ending) = self.parse_query_body()?;
+        Ok((Statement::Query(query), ending))
+    }
+
+    /// A statement written in braces, with the graph a clause in front
+    /// of the brace named, if one was written there.
+    ///
+    /// The clause outside the braces and a clause inside them name the
+    /// one graph the statement runs against, so writing both is writing
+    /// it twice: the same graph twice is what it says once, and two
+    /// graphs is 25G04, which is the answer every other place a
+    /// statement names two graphs gives.
+    fn parse_braced_statement(&mut self, focus: Option<GraphRef>) -> Result<(Statement, Ending)> {
+        self.expect(&TokenKind::LBrace)?;
+        let (mut query, ending) = self.parse_query_body()?;
+        self.expect(&TokenKind::RBrace)?;
+        if let Some(focus) = focus {
+            match &query.use_graph {
+                None => query.use_graph = Some(focus),
+                Some(inner) if *inner == focus => {}
+                Some(_) => {
+                    return Err(ZuError::gql(
+                        codes::C25G04,
+                        "a statement runs against the one graph it names, and the USE in front of the braces and the one inside them name two different ones".to_string(),
+                    ));
+                }
+            }
+        }
         Ok((Statement::Query(query), ending))
     }
 
@@ -2664,7 +2706,7 @@ impl Parser<'_> {
                 ));
             }
         };
-        let (linear, ending) = self.parse_linear()?;
+        let (linear, ending) = self.parse_linear(use_graph.as_ref())?;
         // The graph a select statement body named, which is where that
         // form writes what a `USE` clause writes in front. A statement
         // that wrote both says one graph twice or two graphs once, and
@@ -2732,7 +2774,7 @@ impl Parser<'_> {
                     ),
                 ));
             }
-            let (right, next) = self.parse_linear()?;
+            let (right, next) = self.parse_linear(use_graph.as_ref())?;
             ending = next;
             body = Composite::Conjoined {
                 left: Box::new(body),
@@ -2779,7 +2821,7 @@ impl Parser<'_> {
 
     /// A linear query statement: simple statements chained by `NEXT`,
     /// and how the last of them ended.
-    fn parse_linear(&mut self) -> Result<(Linear, Ending)> {
+    fn parse_linear(&mut self, focus: Option<&GraphRef>) -> Result<(Linear, Ending)> {
         let mut statements = Vec::new();
         loop {
             let (simple, ending) = self.parse_simple()?;
@@ -2802,6 +2844,28 @@ impl Parser<'_> {
                 }
             };
             statements.push(simple);
+            // ISO 16.2 builds a focused linear query statement out of
+            // parts, each one a `USE` clause and the statements under
+            // it, and only the last part carries the result statement.
+            // So a second clause may stand in front of a later
+            // statement of the one query, and where it names the graph
+            // the query already named it says what has already been
+            // said and the next part carries on.
+            if self.at_kw("USE") && ending != Ending::Result && ending != Ending::Finish {
+                let at = self.peek().expect("peeked").start;
+                let again = self.parse_use_graph()?.expect("a USE stands here");
+                if focus != Some(&again) {
+                    return Err(ZuError::gql_in(
+                        codes::C25G04,
+                        self.source,
+                        at,
+                        format_args!(
+                            "a statement runs against the one graph it names, and this USE names a second one for the rest of the statement; write the two as two statements"
+                        ),
+                    ));
+                }
+                continue;
+            }
             if self.at_kw("NEXT") && ending == Ending::Finish {
                 return Err(ZuError::gql_in(
                     codes::C42001,
@@ -3132,6 +3196,19 @@ impl Parser<'_> {
                 // its answer is that it worked. A read query is not
                 // allowed to, because a query nobody returns anything
                 // from asked a question and threw the answer away.
+                return Ok((
+                    Simple {
+                        clauses,
+                        result: None,
+                    },
+                    Ending::Write,
+                ));
+            } else if self.at_kw("USE") && !clauses.is_empty() {
+                // ISO 16.2. A `USE` here opens another part of the one
+                // focused linear query statement, so this part is over
+                // where the word stands and the chain around this reads
+                // the clause. A part holds at least one statement, so a
+                // `USE` with no clauses in front of it is not this.
                 return Ok((
                     Simple {
                         clauses,
@@ -3628,6 +3705,15 @@ impl Parser<'_> {
         }
         if self.eat_kw("HOME_PROPERTY_GRAPH") || self.eat_kw("HOME_GRAPH") {
             return Ok(GraphRef::Home);
+        }
+        // GP11. A name here could be a variable or a catalog object,
+        // and ISO 11.1 lets the query say which before the engine
+        // looks: `VARIABLE g` is the variable and nothing else. A name
+        // written plainly is read as a variable first here and as a
+        // catalog object where nothing bound it, so the word settles
+        // what was already settled and the two answer alike.
+        if self.eat_kw("VARIABLE") {
+            return Ok(GraphRef::Named(self.parse_graph_name()?));
         }
         // `PROPERTY GRAPH` before the name is the long spelling and
         // says nothing the name does not.

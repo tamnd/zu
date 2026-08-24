@@ -280,3 +280,57 @@ cases:
     doc: The other half of GP17. What a block defines goes out of scope with the block, so the statement around it cannot read the name, and the refusal is the same one any undefined name gets.
     query: "MATCH (p:person) CALL (p) { VALUE cut = 35 MATCH (q:person) WHERE q.age > cut RETURN q.name AS f } RETURN cut AS x"
     raises: "42002"
+  - name: a-statement-written-in-braces
+    doc: ISO 9.1. A statement may be written in braces with nothing around them. The braces say where the statement ends and nothing else, so the braced text and the bare text answer alike, and the case is here because the braces are read before the first clause says whether this statement reads or writes.
+    query: "{ MATCH (p:person) RETURN count(p) AS a }"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-use-in-front-of-the-braces
+    doc: ISO 13.1. The clause in front of the braces names the graph the statement inside them runs against, which is the same graph the clause names when it is written inside them instead. Only the brace behind the clause says which of the two shapes the text is, so the clause has to be read before the shape is known.
+    query: "USE CURRENT_PROPERTY_GRAPH { MATCH (p:person) RETURN count(p) AS a }"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-use-in-front-of-the-braces-and-the-same-graph-inside-them
+    doc: Both places may be written at once when they name the one graph, because then there is nothing to choose between and the statement runs against what both of them said.
+    query: "USE CURRENT_PROPERTY_GRAPH { USE CURRENT_PROPERTY_GRAPH MATCH (p:person) RETURN count(p) AS a }"
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-use-written-again-in-front-of-a-later-part
+    doc: ISO 16.2 builds a focused statement out of parts, each one a graph clause and the clauses under it, and only the last part carries the result. A query with one clause in it derives the last part alone, so a clause written again is the only way the earlier parts appear at all. Both name the one graph, because what this asks is whether the clause may be repeated and not what happens when the graph moves under a bound variable.
+    query: USE CURRENT_PROPERTY_GRAPH MATCH (p:person) USE CURRENT_PROPERTY_GRAPH MATCH (p)-[:knows]->(q:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-second-graph-in-front-of-a-later-part
+    doc: The line the case above draws, from the other side. A statement runs against the one graph it names, so a second clause naming a second graph is not the graph changing partway through, it is a statement with nothing to compile against.
+    query: USE CURRENT_PROPERTY_GRAPH GRAPH g = HOME_PROPERTY_GRAPH MATCH (p:person) USE g MATCH (p)-[:knows]->(q:person) RETURN count(*) AS a
+    raises: "25G04"
+
+  - name: the-word-variable-in-front-of-a-graph-name
+    doc: GP11. A name standing where a graph goes could be a variable or a catalog object, and ISO 11.1 lets the query say which before the engine looks. A name written plainly is read as a variable first and as a catalog object where nothing bound it, so the word settles what was already settled and the two answer alike.
+    query: GRAPH g = CURRENT_PROPERTY_GRAPH USE VARIABLE g MATCH (p:person) RETURN count(p) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"

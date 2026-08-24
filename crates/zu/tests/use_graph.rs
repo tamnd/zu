@@ -11,6 +11,14 @@
 //! The half that is easy to get wrong is the plan cache. A plan is
 //! against one graph's tables, and two calls of one text can name two
 //! graphs, so both orders are run below on the same session.
+//!
+//! The other half is where the clause may stand. ISO 16.2 builds a
+//! focused statement out of parts, each one a `USE` and the clauses
+//! under it, so the clause may be written again in front of a later
+//! part; ISO 9.1 lets a whole statement be written in braces, with the
+//! clause in front of them or inside them. All of those name the graph
+//! for one statement, so naming two is refused rather than read as the
+//! graph changing partway through.
 
 use zu::query::Value;
 use zu::session::Session;
@@ -63,13 +71,22 @@ fn count(session: &mut Session, source: &str, params: &[(&str, Value)]) -> i64 {
     }
 }
 
-fn refused(session: &mut Session, source: &str, params: &[(&str, Value)]) -> String {
+fn refused_with(
+    session: &mut Session,
+    source: &str,
+    params: &[(&str, Value)],
+    code: &str,
+) -> String {
     let err = session
         .run(source, params)
         .expect_err("this one does not run");
     let record = err.diagnostic().expect("a condition");
-    assert_eq!(record.status.code(), "42002", "{}", record.detail);
+    assert_eq!(record.status.code(), code, "{}", record.detail);
     record.detail.clone()
+}
+
+fn refused(session: &mut Session, source: &str, params: &[(&str, Value)]) -> String {
+    refused_with(session, source, params, "42002")
 }
 
 const COUNT: &str = "USE $g MATCH (p:person) RETURN count(*) AS n";
@@ -175,4 +192,115 @@ fn a_copy_starts_from_the_graph_a_parameter_names() {
         .expect("a copy of the copy");
     let third = session.graph_ref("/", "third").expect("the second copy");
     assert_eq!(count(&mut session, COUNT, &[("g", third)]), 6);
+}
+
+/// ISO 9.1 lets a statement be written in braces with nothing around
+/// them, which says where the statement ends and nothing else, so the
+/// braced text and the bare text answer alike.
+#[test]
+fn a_statement_may_be_written_in_braces_with_nothing_around_it() {
+    let (_dir, mut session) = opened("use-braces.zu1");
+    let bare = "MATCH (p:person) RETURN count(*) AS n";
+    assert_eq!(count(&mut session, bare, &[]), 5);
+    assert_eq!(count(&mut session, &format!("{{ {bare} }}"), &[]), 5);
+    // A write in braces reaches the graph the same way, which is worth
+    // its own line because the braces are read before the first clause
+    // says whether this statement reads or writes.
+    session
+        .run("{ INSERT (x:person {id: 7}) }", &[])
+        .expect("the braced write");
+    assert_eq!(count(&mut session, bare, &[]), 6);
+}
+
+/// The clause in front of the braces focuses what is inside them, and
+/// the same clause inside the braces focuses the same statement, so all
+/// three placings of the one graph answer alike.
+#[test]
+fn a_use_in_front_of_the_braces_focuses_what_is_inside_them() {
+    let (_dir, mut session) = opened("use-braced-focus.zu1");
+    let all = [
+        "USE twin { MATCH (p:person) RETURN count(*) AS n }",
+        "{ USE twin MATCH (p:person) RETURN count(*) AS n }",
+        "USE twin { USE twin MATCH (p:person) RETURN count(*) AS n }",
+    ];
+    for source in all {
+        assert_eq!(count(&mut session, source, &[]), 6, "{source}");
+    }
+    session
+        .run("USE twin { INSERT (x:person {id: 8}) }", &[])
+        .expect("the braced write");
+    assert_eq!(count(&mut session, all[0], &[]), 7);
+    assert_eq!(
+        count(&mut session, "MATCH (p:person) RETURN count(*) AS n", &[]),
+        5,
+        "the graph the session is working in is untouched"
+    );
+}
+
+/// ISO 16.2 builds a focused statement out of parts, each one a `USE`
+/// and the clauses under it, and only the last part carries the result.
+/// A query with one clause in it is the last part alone, so the clause
+/// written again is the only way the earlier parts appear at all.
+#[test]
+fn a_use_may_be_written_again_in_front_of_a_later_part() {
+    let (_dir, mut session) = opened("use-again.zu1");
+    let source = "USE HOME_PROPERTY_GRAPH MATCH (p:person) \
+                  USE HOME_PROPERTY_GRAPH MATCH (p)-[:knows]->(q:person) \
+                  RETURN count(*) AS n";
+    assert_eq!(count(&mut session, source, &[]), 5);
+    // And in the copy, where the person the copy has and the ring does
+    // not walks nowhere, so the second part answers for five of six.
+    let twice = "USE twin MATCH (p:person) USE twin MATCH (p)-[:knows]->(q:person) \
+                 RETURN count(*) AS n";
+    assert_eq!(count(&mut session, twice, &[]), 5);
+    assert_eq!(
+        count(
+            &mut session,
+            "USE twin MATCH (p:person) RETURN count(*) AS n",
+            &[]
+        ),
+        6
+    );
+}
+
+/// A name here could be a variable or a catalog object, and ISO 11.1
+/// lets the query say which before the engine looks. Nothing binds
+/// `twin` as a variable, so the word settles what the bare name settles
+/// anyway and the two answer alike.
+#[test]
+fn the_word_variable_says_the_name_is_a_variable() {
+    let (_dir, mut session) = opened("use-variable.zu1");
+    let both = [
+        "USE twin MATCH (p:person) RETURN count(*) AS n",
+        "USE VARIABLE twin MATCH (p:person) RETURN count(*) AS n",
+    ];
+    for source in both {
+        assert_eq!(count(&mut session, source, &[]), 6, "{source}");
+    }
+}
+
+/// A statement runs against the one graph it names. Two clauses naming
+/// two graphs is not the graph changing partway through, it is a
+/// statement with nothing to run against, and the message says to write
+/// the two as two statements.
+#[test]
+fn two_graphs_for_the_one_statement_are_refused() {
+    let (_dir, mut session) = opened("use-two-graphs.zu1");
+
+    let braces = "USE twin { USE HOME_PROPERTY_GRAPH MATCH (p:person) RETURN count(*) AS n }";
+    let detail = refused_with(&mut session, braces, &[], "25G04");
+    assert!(
+        detail.contains("in front of the braces and the one inside them"),
+        "{detail}"
+    );
+
+    let parts = "USE twin MATCH (p:person) \
+                 USE HOME_PROPERTY_GRAPH MATCH (p)-[:knows]->(q:person) \
+                 RETURN count(*) AS n";
+    let detail = refused_with(&mut session, parts, &[], "25G04");
+    assert!(
+        detail.contains("for the rest of the statement"),
+        "{detail}, want which half the second clause reaches"
+    );
+    assert!(detail.contains("two as two statements"), "{detail}");
 }

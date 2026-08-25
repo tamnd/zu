@@ -5076,6 +5076,7 @@ mod tests {
             columns: columns.iter().map(|s| s.to_string()).collect(),
             func: None,
             consts: Vec::new(),
+            reuse: None,
         }
     }
 

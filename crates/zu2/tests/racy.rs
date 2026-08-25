@@ -247,6 +247,19 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
             .load(std::sync::atomic::Ordering::Relaxed)
     };
     if migrated() == 0 {
+        // The sync is the part that makes this deterministic and the
+        // compaction on its own was not. A pass may only touch pages
+        // below `compact::ceiling`, which is the flushed frontier and
+        // the read-only boundary, whichever is lower, and the durability
+        // here is async. On a loaded machine the flusher is behind at
+        // the moment the threads stop, so the ceiling sits below the
+        // page the log starts in, the pass has nothing it is allowed to
+        // read, and the counter stays at zero on a run where every other
+        // thing worked. That is #763, seen once in about eight full
+        // suite runs and never in isolation. Flushing first gives the
+        // pass the whole log up to the mutable window, which is the same
+        // thing a quiet machine was handing it by luck.
+        db.sync().expect("sync");
         db.compact().expect("compact");
     }
     assert!(migrated() > 0, "nothing ever reached the cold tier");

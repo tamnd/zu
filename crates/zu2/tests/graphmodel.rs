@@ -294,8 +294,17 @@ fn an_edge_write_on_a_full_log_makes_room_rather_than_failing() {
                 .unwrap_or_else(|e| panic!("remove at op {op}: {e}"));
         }
     }
+    // Says what it saw rather than only that it was unhappy. This test
+    // failed once in a loaded full suite run and could not be reproduced
+    // afterwards, and what was kept of the output did not include the
+    // assertion text, so it is not known whether this is the line that
+    // fired or one of the unwraps above it. The counters cost nothing to
+    // print and the next failure will not be a guess. #763.
+    let passes = db.compaction().passes.load(Ordering::Relaxed);
     assert!(
-        db.compaction().passes.load(Ordering::Relaxed) > 0,
-        "the log never filled, so nothing here was tested against a full one"
+        passes > 0,
+        "the log never filled, so nothing here was tested against a full one: \
+         span {} after the padding filled it to {filled}",
+        db.log_span(),
     );
 }

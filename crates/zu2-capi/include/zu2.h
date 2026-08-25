@@ -235,7 +235,9 @@ zu2_status zu2_session_open(zu2_db *db, zu2_session **out);
 /* Closes a session. A no-op on NULL. */
 void zu2_session_close(zu2_session *s);
 
-/* What went wrong in the last fallible call on this session. */
+/* What went wrong in the last fallible call on this session,
+ * NUL-terminated and empty when that call succeeded. Valid until the
+ * next fallible call on this session. */
 const char *zu2_session_error(const zu2_session *s, size_t *len);
 
 /* Changes how far this session waits before acknowledging a write.
@@ -276,14 +278,40 @@ zu2_status zu2_upsert_many(zu2_session *s, const zu2_pair *pairs,
                            size_t count, size_t *written);
 
 /* Reads the newest value for key. *found says whether there was one.
- * The buffer is the session's and is valid until the next call on it. */
+ *
+ * *value is valid until the next call on this session and it is not
+ * always the same kind of memory. A record below the read only boundary
+ * whose page is in memory is handed over where it lies, so *value points
+ * into the log; anything else is read into the session's buffer first.
+ * The caller cannot tell which and does not need to, because the bound
+ * is the same either way.
+ *
+ * What the caller does need to know is that the first case is not free
+ * to hold. The session keeps its epoch announced so the page cannot be
+ * freed underneath the pointer, which means reclamation stops at that
+ * epoch until the next call on this session ends the lease. Reading the
+ * value and moving on costs nothing; holding it while doing something
+ * slow holds the log. */
 zu2_status zu2_read(zu2_session *s, const uint8_t *key, size_t key_len,
                     const uint8_t **value, size_t *value_len, int *found);
 
 /* Reads up to count records in key order from the first key at or
  * after start, and points *pairs at the session's own array of them.
  * The array and the bytes it points into are good until the next call
- * on this session.
+ * on this session. The keys are always in the session's own buffer. A
+ * value is handed over where it lies when its record is below the read
+ * only boundary and its page is in memory, and copied into that buffer
+ * when it is not, which the caller cannot tell apart and does not need
+ * to.
+ *
+ * A scan that handed over even one value where it lies leaves the
+ * session's epoch announced until the next call on it, so the pages
+ * under those pointers cannot be freed. That is a lease and it is the
+ * caller's to end: reclamation stops at that epoch while it is out, and
+ * deferred frees queue behind it the same way they queue behind a long
+ * operation. Walking the array and carrying on costs nothing. Walking
+ * it slowly, or leaving it and going away, holds the log at the size it
+ * was.
  *
  * *returned is how many were filled, which is fewer than count at the
  * end of the key set and is the whole answer: a key whose newest

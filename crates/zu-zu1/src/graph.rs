@@ -4141,6 +4141,7 @@ mod tests {
         for col in &directory.columns {
             out.extend(&col.meta.blocks);
             out.extend(col.validity.iter().flat_map(|m| &m.blocks));
+            out.extend(col.zones.iter().flat_map(|m| &m.blocks));
         }
     }
 

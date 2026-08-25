@@ -66,8 +66,10 @@ use crate::txn::Cell;
 /// form, so a column may hold a type no single code names: `BINARY(16)`
 /// and `STRING(1,5)` were declarable and unstorable before it. Version 9
 /// adds the element count a list column's rows are written at, which is
-/// what lets the rows stop carrying one each.
-const PROPS_VERSION: u16 = 9;
+/// what lets the rows stop carrying one each. Version 10 gives a column
+/// entry a second segment, for the zone plane of a zoned column, which
+/// is the first column here that is not one segment of values.
+const PROPS_VERSION: u16 = 10;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -220,18 +222,37 @@ fn type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
 /// graph type names and a type a column holds stay one encoding.
 ///
 /// A length bound is the declaration a column takes this way, on a
-/// string, a byte string or a list. What is left unstorable is a zoned
-/// temporal, which has no lane yet, and a list of anything but a fixed
-/// width element, whose row has to carry lengths of its own; saying so
-/// here is what keeps the writer from making a file the reader below
-/// would refuse.
+/// string, a byte string or a list, and a zoned temporal takes it with
+/// nothing beside it, since the type is the whole of what it says. What
+/// is left unstorable is a list of anything but a fixed width element,
+/// whose row has to carry lengths of its own; saying so here is what
+/// keeps the writer from making a file the reader below would refuse.
 fn column_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
     match ty {
         _ if bounded_list(ty).is_some() => extended_bytes(&column_type(ty.clone())),
         _ if type_bytes(ty).is_some() => type_bytes(ty),
-        LogicalType::Str { .. } | LogicalType::Bytes { .. } => extended_bytes(ty),
+        LogicalType::Str { .. }
+        | LogicalType::Bytes { .. }
+        | LogicalType::ZonedTime
+        | LogicalType::ZonedDatetime => extended_bytes(ty),
         _ => None,
     }
+}
+
+/// Whether this is one of the two zoned temporal types, which are the
+/// column shape that is two planes rather than one.
+///
+/// A zoned value is an instant and the offset from UTC it was written
+/// with, which is two numbers, and everything else here is one. The two
+/// are stored as two segments over the same rows: the instants in the
+/// scalar lane, where they get the integer cascade and where a
+/// comparison, a sort and a range estimate all read them, and the
+/// offsets in a plane of their own that only materialising a value
+/// touches. A column of one zone, which is what a column of timestamps
+/// almost always is, pays a handful of bytes for the whole of the
+/// second plane.
+pub fn zoned(ty: &LogicalType) -> bool {
+    matches!(ty, LogicalType::ZonedTime | LogicalType::ZonedDatetime)
 }
 
 /// Whether a column may be declared this type at all.
@@ -490,6 +511,16 @@ pub struct PropColumn {
     /// `LIST<INT32>(768)` column of 767 counted elements a row is the
     /// same 3072 bytes a row as one of 768 uncounted ones.
     pub fixed_len: Option<u32>,
+    /// The zone plane of a zoned column: one word a row, the offset
+    /// from UTC in minutes that the row's value was written with.
+    /// `None` is every other column, which has no second plane.
+    ///
+    /// It is a segment beside `meta` rather than a second column
+    /// because it is not a property: no query names it, nothing
+    /// declares it, and it means nothing without the instant it sits
+    /// beside. Physically it is a lane segment like any other, which is
+    /// why a column of one zone costs almost nothing for it.
+    pub zones: Option<SegmentMeta>,
 }
 
 impl PropColumn {
@@ -530,8 +561,15 @@ impl PropColumn {
 }
 
 /// Whether values of this type ride the fixed width lane.
+///
+/// A zoned column rides it and is not in [`lane_width`], and the two
+/// answers are not in conflict. The lane holds a zoned column's
+/// instants, which is what a comparison, a sort and a range read, and
+/// the offsets ride a plane beside it. A list element gets no plane of
+/// its own, so eight bytes there would be an instant and no zone, which
+/// is not the value; that is `lane_width`'s question and it answers no.
 fn lane_type(ty: &LogicalType) -> bool {
-    lane_width(ty).is_some()
+    lane_width(ty).is_some() || zoned(ty)
 }
 
 /// How wide one value of this type is where it is written out at its
@@ -702,6 +740,23 @@ pub enum PropValues<'a> {
     LocalTime(&'a [i64]),
     /// Nanoseconds since the epoch.
     LocalDatetime(&'a [i64]),
+    /// Nanoseconds since midnight in the offset's own day, and the
+    /// offset from UTC in minutes, one of each per row.
+    ZonedTime {
+        nanos: &'a [i64],
+        zones: &'a [i16],
+    },
+    /// Nanoseconds since the epoch in UTC, and the offset from UTC in
+    /// minutes the value was written with, one of each per row.
+    ///
+    /// The instant is UTC and the offset is beside it rather than
+    /// folded into it, which is what lets two rows written in two zones
+    /// for one instant be one number in the lane and still each print
+    /// where they were written.
+    ZonedDatetime {
+        nanos: &'a [i64],
+        zones: &'a [i16],
+    },
     /// Months for a year-month duration, nanoseconds for a day-time one.
     Duration(DurationKind, &'a [i64]),
     /// One list per row, every list holding elements of `elem`.
@@ -884,8 +939,24 @@ impl PropValues<'_> {
             PropValues::Float(v) => v.len(),
             PropValues::Date(v) => v.len(),
             PropValues::LocalTime(v) | PropValues::LocalDatetime(v) => v.len(),
+            PropValues::ZonedTime { nanos, .. } | PropValues::ZonedDatetime { nanos, .. } => {
+                nanos.len()
+            }
             PropValues::Duration(_, v) => v.len(),
             PropValues::List { rows, .. } => rows.len(),
+        }
+    }
+
+    /// The zone plane, `None` for every column that has no second
+    /// plane. A row count that disagrees with `len` is refused at store
+    /// time, so the two planes describe the same rows or nothing is
+    /// written.
+    pub(crate) fn zone_plane(&self) -> Option<&[i16]> {
+        match self {
+            PropValues::ZonedTime { zones, .. } | PropValues::ZonedDatetime { zones, .. } => {
+                Some(zones)
+            }
+            _ => None,
         }
     }
 
@@ -916,6 +987,14 @@ impl PropValues<'_> {
             LogicalType::Date => PropValues::Date(&[]),
             LogicalType::LocalTime => PropValues::LocalTime(&[]),
             LogicalType::LocalDatetime => PropValues::LocalDatetime(&[]),
+            LogicalType::ZonedTime => PropValues::ZonedTime {
+                nanos: &[],
+                zones: &[],
+            },
+            LogicalType::ZonedDatetime => PropValues::ZonedDatetime {
+                nanos: &[],
+                zones: &[],
+            },
             LogicalType::Duration(kind) => PropValues::Duration(*kind, &[]),
             LogicalType::List { elem, .. } => PropValues::List {
                 elem: list_elem(elem)?,
@@ -951,6 +1030,8 @@ impl PropValues<'_> {
             PropValues::Date(_) => LogicalType::Date,
             PropValues::LocalTime(_) => LogicalType::LocalTime,
             PropValues::LocalDatetime(_) => LogicalType::LocalDatetime,
+            PropValues::ZonedTime { .. } => LogicalType::ZonedTime,
+            PropValues::ZonedDatetime { .. } => LogicalType::ZonedDatetime,
             PropValues::Duration(kind, _) => LogicalType::Duration(*kind),
             PropValues::List { elem, .. } => list_of((*elem).clone()),
         }
@@ -974,6 +1055,14 @@ impl PropValues<'_> {
             PropValues::Date(v) => v.iter().map(|&d| i64::from(d) as u64).collect(),
             PropValues::LocalTime(v) | PropValues::LocalDatetime(v) => {
                 v.iter().map(|&n| n as u64).collect()
+            }
+            // The lane of a zoned column is its instants. That is the
+            // half of the value every comparison reads, so the sort
+            // key, the histogram and every range predicate come out of
+            // the lane unchanged, and the zones ride the plane beside
+            // it where only materialising a value looks.
+            PropValues::ZonedTime { nanos, .. } | PropValues::ZonedDatetime { nanos, .. } => {
+                nanos.iter().map(|&n| n as u64).collect()
             }
             PropValues::Duration(_, v) => v.iter().map(|&n| n as u64).collect(),
         })
@@ -1078,6 +1167,17 @@ impl PropsDirectory {
                 }
                 None => out.push(0),
             }
+            // The zone plane needs no flag byte, unlike the validity
+            // mask beside it: every zoned column has one and no other
+            // column has one, so the type already said whether it is
+            // here, and a byte on every column of every table would be
+            // paid for a question the type answers.
+            if zoned(&col.ty) {
+                col.zones
+                    .as_ref()
+                    .expect("a zoned column is written with its zone plane")
+                    .encode(&mut out);
+            }
         }
         match &self.labels {
             Some(meta) => {
@@ -1170,6 +1270,14 @@ impl PropsDirectory {
                             "column type {ty} in a version {version} directory"
                         )));
                     }
+                    // And a zoned column was unstorable before version
+                    // 10, for the same reason read the same way: the
+                    // second plane it takes had nowhere to be written.
+                    if version < 10 && zoned(&ty) {
+                        return Err(corrupt(format!(
+                            "column type {ty} in a version {version} directory"
+                        )));
+                    }
                     ty
                 }
                 Some(&code) => {
@@ -1240,12 +1348,31 @@ impl PropsDirectory {
                     )));
                 }
             }
+            // The type says whether a second plane follows, and a plane
+            // over a different set of rows than the instants beside it
+            // is one a read would pair the wrong zone with, so the two
+            // counts are agreed here rather than at the first read.
+            let zones = match zoned(&ty) {
+                true => {
+                    let (plane, next) = seg(bytes, pos, version)?;
+                    pos = next;
+                    if plane.value_count != meta.value_count {
+                        return Err(corrupt(format!(
+                            "column '{name}' holds {} instants and {} zones",
+                            meta.value_count, plane.value_count
+                        )));
+                    }
+                    Some(plane)
+                }
+                false => None,
+            };
             columns.push(PropColumn {
                 name,
                 ty,
                 meta,
                 validity,
                 fixed_len,
+                zones,
             });
         }
         // A directory older than version 5 has no label bitset, which
@@ -1344,7 +1471,7 @@ fn free_props_parts(
         going.keep_all(directory.labels.iter());
     }
     for (ci, col) in directory.columns.iter().enumerate() {
-        let segs = [Some(&col.meta), col.validity.as_ref()];
+        let segs = [Some(&col.meta), col.validity.as_ref(), col.zones.as_ref()];
         match keep_cols.get(ci) == Some(&true) {
             true => going.keep_all(segs.into_iter().flatten()),
             false => going.drop_all(segs.into_iter().flatten()),
@@ -1580,6 +1707,18 @@ fn check_columns(rows: u64, columns: &[PropInput]) -> Result<()> {
                 mask.len()
             )));
         }
+        // A zoned column is two planes over one set of rows, and they
+        // are paired by row number and by nothing else, so a plane of
+        // another length would pair every row past the difference with
+        // the wrong zone rather than fail to pair it.
+        if let Some(offsets) = values.zone_plane()
+            && offsets.len() as u64 != rows
+        {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' holds {} zones over {rows} rows",
+                offsets.len()
+            )));
+        }
     }
     Ok(())
 }
@@ -1709,6 +1848,27 @@ fn check_declared(
         (LogicalType::Float { bits, .. }, PropValues::Float(v))
             if *bits != FloatBits::B64 && v.is_empty() =>
         {
+            return Ok(());
+        }
+        // A zoned column's declaration says nothing a value could fall
+        // outside of, so what is checked is the zone plane rather than
+        // the declaration: an offset past eighteen hours names no zone
+        // on earth, and a row holding one would print an hour the
+        // calendar does not have. It is the same bound `Temporal`
+        // enforces when it parses one, said here for the values that
+        // arrive already taken apart.
+        (
+            LogicalType::ZonedTime | LogicalType::ZonedDatetime,
+            PropValues::ZonedTime { zones, .. } | PropValues::ZonedDatetime { zones, .. },
+        ) if *ty == values.ty() => {
+            for (row, &offset) in zones.iter().enumerate() {
+                if !column.holds(row) || (-1080..=1080).contains(&offset) {
+                    continue;
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "column '{name}' is declared {ty} and row {row} is offset {offset} minutes"
+                )));
+            }
             return Ok(());
         }
         (LogicalType::Str { min, max, .. }, PropValues::Str(_)) => (*min, *max, true),
@@ -1896,12 +2056,24 @@ fn write_columns(
             Some(mask) if !all_set(mask, node_count as usize) => Some(write_segment(db, mask)?),
             _ => None,
         };
+        // The zone plane is written whole, placeholders and all. A null
+        // row's offset is a zone nothing reads, the way a null row's
+        // instant is, and leaving a hole in one plane of two would cost
+        // both of them the row numbering they are paired by.
+        let zones = match values.zone_plane() {
+            Some(offsets) => {
+                let words: Vec<u64> = offsets.iter().map(|&z| i64::from(z) as u64).collect();
+                Some(write_segment(db, &words)?)
+            }
+            None => None,
+        };
         cols.push(PropColumn {
             name: name.to_string(),
             ty,
             meta,
             validity,
             fixed_len,
+            zones,
         });
     }
     let directory = PropsDirectory {
@@ -2747,6 +2919,12 @@ pub struct PropsReader {
     /// first because most columns have no validity segment and the ones
     /// that do are read through a different index, a word per 64 rows.
     valid_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
+    /// And again for the zone plane of the zoned columns. A third map
+    /// for the same reason the second one is one: almost no column has
+    /// a plane here, and the read that wants it is materialising a
+    /// value rather than scanning, so it does not share the cache the
+    /// scan is using.
+    zone_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
     /// The same again for the label bitset, which is one word per row
     /// rather than one per 64 and belongs to no column.
     label_state: Option<(Arc<ChunkDirectory>, ChunkCache)>,
@@ -2769,6 +2947,7 @@ impl PropsReader {
             int_state: BTreeMap::new(),
             str_state: BTreeMap::new(),
             valid_state: BTreeMap::new(),
+            zone_state: BTreeMap::new(),
             label_state: None,
             order_scratch: Vec::new(),
             patch: None,
@@ -3121,6 +3300,51 @@ impl PropsReader {
             Some(patch) => patch.get(col, row).unwrap_or(value),
             None => value,
         })
+    }
+
+    /// The whole of row `row` of a zoned column: the instant in the
+    /// lane, and the offset from UTC in minutes the value was written
+    /// with, from the plane beside it.
+    ///
+    /// Every other read of a zoned column answers the instant, which is
+    /// what a comparison, a sort and a range all want and is what the
+    /// lane holds. This is the read that materialises a value, and it
+    /// is the only one that touches the second plane, so a scan that
+    /// filters on a timestamp and returns no timestamp never pays for
+    /// the zones at all.
+    pub fn read_zoned(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<(i64, i16)> {
+        let nanos = self.read_int(db, col, row)? as i64;
+        let column = &self.directory.columns[col];
+        let Some(meta) = column.zones.clone() else {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{}' holds {} and is not a zoned column",
+                column.name, column.ty
+            )));
+        };
+        // A row a commit left behind carries its instant in the patch
+        // and has no zone there to carry, because a patch cell is one
+        // word. Such a row is UTC, which is the offset a value written
+        // without one already has, and the statement path that would
+        // write another is not here yet.
+        if self
+            .added
+            .as_ref()
+            .is_some_and(|p| p.word(col, row).is_some())
+            || self
+                .patch
+                .as_ref()
+                .is_some_and(|p| p.get(col, row).is_some())
+        {
+            return Ok((nanos, 0));
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.zone_state.entry(col) {
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, &meta)?;
+            slot.insert((dir, ChunkCache::default()));
+        }
+        let (dir, cache) = self.zone_state.get_mut(&col).expect("just inserted");
+        let word = read_one_cached(db, &meta, dir, cache, row)?;
+        Ok((nanos, word as i64 as i16))
     }
 
     /// Gathers `col` for arbitrary `rows`, writing `out[i]` for
@@ -4739,6 +4963,136 @@ mod tests {
         }
     }
 
+    /// A zoned column is two planes over one set of rows, and both come
+    /// back. The instants ride the lane, where a comparison and a sort
+    /// already read them, and the offsets ride the plane beside it, so
+    /// two rows written in two zones for one instant are one word in
+    /// the lane and still each print where they were written.
+    #[test]
+    fn a_zoned_column_keeps_the_instant_and_the_zone_it_was_written_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        // 2024-01-15T10:00:00+07:00 and the same instant written in
+        // UTC, then one before the epoch and one east of Greenwich.
+        let nanos = [
+            1_705_285_200_000_000_000i64,
+            1_705_285_200_000_000_000,
+            -1,
+            0,
+        ];
+        let zones = [420i16, 0, -480, 1080];
+        let directory = store_props(
+            &mut db,
+            "person",
+            &[(
+                "at",
+                PropValues::ZonedDatetime {
+                    nanos: &nanos,
+                    zones: &zones,
+                },
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(directory.columns[0].ty, LogicalType::ZonedDatetime);
+        assert!(directory.columns[0].zones.is_some());
+        assert!(directory.columns[0].is_lane());
+        let mut reader = PropsReader::new(directory);
+        for row in 0..nanos.len() {
+            assert_eq!(
+                reader.read_zoned(&mut db, 0, row as u64).unwrap(),
+                (nanos[row], zones[row]),
+                "row {row}"
+            );
+            // And the lane on its own still answers the instant, which
+            // is what every read that is not materialising a value
+            // wants and what the two rows of one instant agree on.
+            assert_eq!(
+                reader.read_int(&mut db, 0, row as u64).unwrap() as i64,
+                nanos[row],
+                "row {row}"
+            );
+        }
+        drop(db);
+        crate::verify(&dir.path().join("props.zu1")).unwrap();
+    }
+
+    /// The two planes are paired by row number and by nothing else, so
+    /// a plane of another length would pair rows rather than fail to.
+    #[test]
+    fn a_zone_plane_that_is_not_as_long_as_the_rows_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let nanos = [1i64, 2, 3, 4];
+        let zones = [0i16, 60];
+        let err = store_props(
+            &mut db,
+            "person",
+            &[(
+                "at",
+                PropValues::ZonedDatetime {
+                    nanos: &nanos,
+                    zones: &zones,
+                },
+            )],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("2 zones"), "{err}");
+    }
+
+    /// An offset past eighteen hours names no zone on earth, and a row
+    /// holding one would print an hour the calendar does not have.
+    #[test]
+    fn an_offset_no_zone_has_is_refused_by_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let nanos = [1i64, 2, 3, 4];
+        let zones = [0i16, 60, 1440, -60];
+        let err = store_props(
+            &mut db,
+            "person",
+            &[(
+                "at",
+                PropValues::ZonedTime {
+                    nanos: &nanos,
+                    zones: &zones,
+                },
+            )],
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("row 2"), "{text}");
+        assert!(text.contains("1440"), "{text}");
+    }
+
+    /// A zoned column had nowhere to put its second plane before
+    /// version 10, so one in an older directory is a file that has been
+    /// edited rather than an older column.
+    #[test]
+    fn a_zoned_column_in_an_older_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let nanos = [1i64, 2, 3, 4];
+        let zones = [0i16, 60, -60, 120];
+        let directory = store_props(
+            &mut db,
+            "person",
+            &[(
+                "at",
+                PropValues::ZonedTime {
+                    nanos: &nanos,
+                    zones: &zones,
+                },
+            )],
+        )
+        .unwrap();
+        let mut bytes = directory.encode();
+        assert_eq!(u16::from_le_bytes(bytes[..2].try_into().unwrap()), 10);
+        bytes[..2].copy_from_slice(&9u16.to_le_bytes());
+        let err = PropsDirectory::decode(&bytes).unwrap_err();
+        assert!(err.to_string().contains("version 9 directory"), "{err}");
+    }
+
     /// Every integer type rides the one lane, so a column declared
     /// narrower than the words arrive in is the same words read at
     /// another width. The declaration lands in the column entry and
@@ -5182,14 +5536,19 @@ mod tests {
         assert_eq!(dir.columns[0].ty, binary16);
     }
 
-    /// A column entry may carry a length bound and nothing else of the
-    /// extended form. A zoned temporal has no lane, and a bounded list
-    /// of a variable width element has no layout the bound buys
-    /// anything in, since its rows carry lengths of their own whatever
-    /// the bound says; both stay declarable and unstorable.
+    /// A column entry may carry a length bound, a zoned temporal, and
+    /// nothing else of the extended form. A bounded list of a variable
+    /// width element has no layout the bound buys anything in, since
+    /// its rows carry lengths of their own whatever the bound says, so
+    /// it stays declarable and unstorable.
     #[test]
     fn an_extended_column_type_a_column_cannot_hold_is_refused() {
-        assert!(column_type_bytes(&LogicalType::ZonedDatetime).is_none());
+        // A zoned temporal is the one this change made storable, and it
+        // is the same bytes the catalog writes, so a type a graph type
+        // names and a type a column holds stay one encoding.
+        for ty in [LogicalType::ZonedTime, LogicalType::ZonedDatetime] {
+            assert_eq!(column_type_bytes(&ty), declared_type_bytes(&ty));
+        }
         let bounded = LogicalType::List {
             elem: Box::new(LogicalType::string()),
             max: Some(3),

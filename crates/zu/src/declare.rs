@@ -1174,6 +1174,38 @@ mod tests {
         assert!(catalog.node_in(graph, "doc").is_none());
     }
 
+    /// A zoned column is a column the store holds and a statement
+    /// cannot fill, for the reason a list column is: the cell between
+    /// the two is one word, and a zoned value is an instant and the
+    /// offset it was written with, so a word would keep the first and
+    /// drop the second. That is a wrong answer rather than a missing
+    /// one, which is why the refusal is here and not a zero offset.
+    #[test]
+    fn a_declared_zoned_column_is_not_yet_something_a_statement_can_fill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zoned.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:event {at :: ZONED DATETIME}) }",
+            "CREATE GRAPH g TYPED t",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        let err = session
+            .run(
+                "USE g INSERT (e:event {at: ZONED_DATETIME('2024-01-15T10:00:00+07:00')})",
+                &[],
+            )
+            .expect_err("the write path carries no zone yet");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G03"));
+        assert!(err.to_string().contains("zone"), "{err}");
+        let catalog = session.catalog();
+        let graph = catalog.graph(ROOT_SCHEMA, "g").expect("the graph").id;
+        assert!(catalog.node_in(graph, "event").is_none());
+    }
+
     /// A refusal is asked once whether this module can do anything for
     /// it, and the answer is held with it, so the second send of the
     /// same bad statement does not parse it again to find out. What

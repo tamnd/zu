@@ -631,6 +631,28 @@ fn fold_props(
             }
             rewrite_rows(db, &col.meta, &updates, &appended)?
         };
+        // A zoned column's second plane grows with the rows the way the
+        // first one does, and it is dirty in the same chunks. What a
+        // commit left carries no zone, because a cell is one word, so a
+        // row a statement wrote is UTC, which is the offset a value
+        // written without one already has.
+        let zones = match col.zones.as_ref() {
+            None => None,
+            Some(plane) => {
+                let mut offsets = Vec::with_capacity(new_count as usize);
+                read_segment(db, plane, &mut offsets)?;
+                let mut dirty = BTreeSet::new();
+                for (offset, _) in mvcc.col_updates(table, ci as u32, base, epoch) {
+                    offsets[offset as usize] = 0;
+                    dirty.insert(offset as usize / CHUNK_ROWS);
+                }
+                for offset in base..new_count {
+                    offsets.push(0);
+                    dirty.insert(offset as usize / CHUNK_ROWS);
+                }
+                Some(rewrite_segment(db, plane, &offsets, &dirty)?)
+            }
+        };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),
             ty: col.ty.clone(),
@@ -640,6 +662,7 @@ fn fold_props(
             // column was already written at, so the count the rows do
             // not carry is the count they still do not carry.
             fixed_len: col.fixed_len,
+            zones,
         });
     }
     // The label bitset grows with the row domain, and an appended row
@@ -1197,12 +1220,35 @@ fn fold_rel_props(
             }
             rewrite_rows_reordered(db, &col.meta, &values)?
         };
+        // The zone plane follows its edges the way the values above do.
+        // A plane left in the old order would pair every edge the sort
+        // moved with somebody else's zone, which is a wrong answer and
+        // not a missing one, so it is permuted here and not later.
+        let zones = match col.zones.as_ref() {
+            None => None,
+            Some(plane) => {
+                let mut old = Vec::with_capacity(order.len());
+                read_segment(db, plane, &mut old)?;
+                let moved: Vec<u64> = order
+                    .iter()
+                    .map(|came| match came {
+                        Came::Base(at) => old[*at],
+                        // An added edge has no zone to bring, for the
+                        // reason a written one has none: a cell is one
+                        // word and the zone is not in it.
+                        Came::Overlay(_) => 0,
+                    })
+                    .collect();
+                Some(write_segment(db, &moved)?)
+            }
+        };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),
             ty: col.ty.clone(),
             meta,
             validity: valid.write(db)?,
             fixed_len: col.fixed_len,
+            zones,
         });
     }
     free_props_keeping_labels(db, props)?;

@@ -130,7 +130,7 @@ impl Acc {
         Ok(())
     }
 
-    fn finalize(self) -> Value {
+    pub(crate) fn finalize(self) -> Value {
         match self {
             Acc::Count(n) => Value::Int(n),
             Acc::Sum(acc) => Value::Int(acc.unwrap_or(0)),
@@ -373,17 +373,6 @@ fn val_cmp(x: &Value, y: &Value) -> Ordering {
         ) => (t1, o1).cmp(&(t2, o2)),
         _ => OrdValue(x.clone()).cmp(&OrdValue(y.clone())),
     }
-}
-
-/// Group order: the key columns compared left to right.
-fn key_cmp(a: &[Value], b: &[Value]) -> Ordering {
-    for (x, y) in a.iter().zip(b) {
-        let ord = val_cmp(x, y);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
 }
 
 /// How many of the sorted rows the steps above the sort can still use.
@@ -1075,9 +1064,9 @@ fn distinct(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
 }
 
 /// Merges keyed aggregation partials into the final result: fold the
-/// group tables, produce the empty-input row for a bare aggregate,
-/// order groups by key ascending like the old BTreeMap sink, and
-/// interleave keys and aggregates back into clause order.
+/// group tables, produce the empty-input row for a bare aggregate, and
+/// hand the folded table the clause order so that it can put the rows
+/// out by key ascending, the way the old BTreeMap sink did.
 pub(crate) fn finish_agg(
     columns: Vec<String>,
     item_agg: &[bool],
@@ -1118,22 +1107,7 @@ pub(crate) fn finish_agg(
             "string property is not UTF-8".to_string(),
         ));
     }
-    let mut groups = merged.map(GroupTable::drain).unwrap_or_default();
-    groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
-    let mut rows = Vec::with_capacity(groups.len());
-    for (keyvals, states) in groups {
-        let mut kit = keyvals.into_iter();
-        let mut sit = states.into_iter();
-        let mut row = Vec::with_capacity(item_agg.len());
-        for &is_agg in item_agg {
-            row.push(if is_agg {
-                sit.next().expect("one state per aggregate item").finalize()
-            } else {
-                kit.next().expect("one value per key item")
-            });
-        }
-        rows.push(row);
-    }
+    let rows = merged.map(|t| t.rows(item_agg)).unwrap_or_default();
     Ok(QueryResult::new(columns, apply_post(post, rows)))
 }
 

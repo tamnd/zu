@@ -50,6 +50,28 @@ impl IntBits {
         }
     }
 
+    /// Whether a 64 bit lane word is a value of an integer type this
+    /// wide.
+    ///
+    /// The word is two's complement for a signed type and plain for an
+    /// unsigned one, which is the reading the lane gives it, so this
+    /// asks about the value rather than about the bits. A type 64 bits
+    /// or wider holds every word there is, since a word is all a lane
+    /// carries and the wide towers have no lane of their own.
+    pub fn holds(self, word: u64, signed: bool) -> bool {
+        let width = u32::from(self.bits());
+        if width >= 64 {
+            return true;
+        }
+        match signed {
+            true => {
+                let bound = 1i64 << (width - 1);
+                (-bound..bound).contains(&(word as i64))
+            }
+            false => word < 1u64 << width,
+        }
+    }
+
     /// The narrowest width that holds `digits` decimal digits, which is
     /// what `INT(p)` (GV09) asks for. `None` when no width in the tower
     /// is wide enough.

@@ -234,6 +234,17 @@ fn column_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether a column may be declared this type at all.
+///
+/// A graph type may name a type no column holds, because naming one is
+/// a promise about values and holding one is a layout. So the caller
+/// that turns a declaration into a table asks this first, and refuses
+/// the statement naming the property, rather than letting the store
+/// refuse a column halfway through making the table.
+pub fn storable(ty: &LogicalType) -> bool {
+    column_type_bytes(&column_type(ty.clone())).is_some()
+}
+
 /// The bound and the element width of a list column whose declaration
 /// fixes both, or `None` for a column whose rows have to say their own
 /// length.
@@ -880,6 +891,38 @@ impl PropValues<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// No values at all, in the arm a column declared `ty` holds them
+    /// in, and `None` for a type no column holds.
+    ///
+    /// This is [`PropValues::ty`] read the other way, and it is not its
+    /// inverse. The other direction widens: a run of bytes says only
+    /// that it is a run of bytes, so `BINARY(16)` and `BYTES` both
+    /// answer the blob arm here and only the second of them comes back
+    /// out of `ty`. What a caller wants from this is the arm, since the
+    /// arm is which side of the store the column is on, and the
+    /// declaration it passes beside it is the rest of the answer.
+    ///
+    /// A table being made has no rows in it yet, which is why what
+    /// comes back holds none.
+    pub fn none_of(ty: &LogicalType) -> Option<PropValues<'_>> {
+        Some(match ty {
+            LogicalType::Bool => PropValues::Bool(&[]),
+            LogicalType::Int { .. } => PropValues::Int(&[]),
+            LogicalType::Float { .. } => PropValues::Float(&[]),
+            LogicalType::Str { .. } => PropValues::Str(&[]),
+            LogicalType::Bytes { .. } => PropValues::Bytes(&[]),
+            LogicalType::Date => PropValues::Date(&[]),
+            LogicalType::LocalTime => PropValues::LocalTime(&[]),
+            LogicalType::LocalDatetime => PropValues::LocalDatetime(&[]),
+            LogicalType::Duration(kind) => PropValues::Duration(*kind, &[]),
+            LogicalType::List { elem, .. } => PropValues::List {
+                elem: list_elem(elem)?,
+                rows: &[],
+            },
+            _ => return None,
+        })
     }
 
     /// The type a column holding these values is declared as.
@@ -1632,6 +1675,40 @@ fn check_declared(
                     )));
                 }
             }
+            return Ok(());
+        }
+        // Every integer type rides the one lane, and a word is the same
+        // word whatever width the declaration reads it at, so a
+        // narrower declaration is a promise about the values rather
+        // than a different encoding. What is left to check is the
+        // promise: a word outside the declared range is a row the
+        // column's own type says is not there.
+        (LogicalType::Int { signed, bits, .. }, PropValues::Int(words)) => {
+            for (row, &word) in words.iter().enumerate() {
+                if !column.holds(row) || bits.holds(word, *signed) {
+                    continue;
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "column '{name}' is declared {ty} and row {row} holds {}",
+                    match signed {
+                        true => (word as i64).to_string(),
+                        false => word.to_string(),
+                    }
+                )));
+            }
+            return Ok(());
+        }
+        // A float is the other way round: the lane holds IEEE bits, and
+        // an `f32`'s are not a half of an `f64`'s, so a narrower
+        // declaration is a different word and not a promise about the
+        // same one. The values would have to arrive already narrowed,
+        // and this arm is the wide ones, so the only column it admits
+        // is one with no row in it yet. That is the column a table
+        // being made has, and every row written into it afterwards goes
+        // through the statement path, which narrows.
+        (LogicalType::Float { bits, .. }, PropValues::Float(v))
+            if *bits != FloatBits::B64 && v.is_empty() =>
+        {
             return Ok(());
         }
         (LogicalType::Str { min, max, .. }, PropValues::Str(_)) => (*min, *max, true),
@@ -4660,6 +4737,65 @@ mod tests {
                 "row {row}"
             );
         }
+    }
+
+    /// Every integer type rides the one lane, so a column declared
+    /// narrower than the words arrive in is the same words read at
+    /// another width. The declaration lands in the column entry and
+    /// nothing about the payload changes, which is the promote edge of
+    /// schema/06 §2: the catalog holds the declaration and the block
+    /// holds the narrowest encoding that carries it.
+    #[test]
+    fn a_narrower_integer_declaration_is_a_promise_about_the_same_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let declared = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        };
+        let words: Vec<u64> = vec![7, -9i64 as u64, i32::MAX as u64, i32::MIN as i64 as u64];
+        let directory = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed("n", PropValues::Int(&words), &declared)],
+        )
+        .unwrap();
+
+        assert_eq!(directory.columns[0].ty, declared);
+        let mut reader = PropsReader::new(directory);
+        for (row, want) in words.iter().enumerate() {
+            assert_eq!(
+                reader.read_int(&mut db, 0, row as u64).unwrap(),
+                *want,
+                "row {row}"
+            );
+        }
+    }
+
+    /// And the promise is kept before anything is written. A word
+    /// outside the declared width is a row the column's own type says
+    /// is not there, and no reader would ever notice it, because the
+    /// lane holds the word whole whatever width reads it.
+    #[test]
+    fn a_word_the_declared_integer_width_does_not_hold_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let declared = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        };
+        let words: Vec<u64> = vec![1, 2, i32::MAX as u64 + 1, 4];
+        let err = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed("n", PropValues::Int(&words), &declared)],
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("row 2"), "{text}");
+        assert!(text.contains("2147483648"), "{text}");
     }
 
     /// A row past the bound is refused, the way a row past an octet

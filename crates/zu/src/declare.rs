@@ -14,42 +14,53 @@
 //! answer to make a table out of and the statement is refused with the
 //! ends it could not settle named.
 //!
-//! What the table holds comes from the pattern, because there is
-//! nowhere else for it to come from: a column has a type, and the
-//! statement is the only thing here that says anything about one. A
-//! value written out says its own type, and a value that has to be
-//! worked out first says nothing, since the plan that would work it out
-//! is the plan this stands in front of. That is the refusal in this
-//! module, and it names the property rather than the statement.
+//! What the table holds comes from whichever of two things says it. A
+//! graph whose type is closed has declared what an element of this
+//! label holds, and that declaration is the better answer: it says
+//! `BINARY(16)` where a written value can only say that a run of bytes
+//! was written, it says it for the properties whose values the plan has
+//! yet to work out, and it says it in the order the type wrote them.
+//!
+//! A graph that promised nothing leaves the pattern as the only thing
+//! here that says anything about a type, and then a value written out
+//! says its own and a value that has to be worked out first says
+//! nothing, since the plan that would work it out is the plan this
+//! stands in front of. That is the refusal in this module, and it names
+//! the property rather than the statement.
 //!
 //! This runs before the statement compiles and under the savepoint the
 //! statement holds, so a table made for a statement that then raises is
 //! a table that was never made.
 
 use zu_common::gqlstatus::{Subject, codes};
-use zu_common::{Result, Temporal, ZuError};
+use zu_common::{FloatBits, IntBits, LogicalType, Result, Temporal, ZuError};
 use zu_query::ast::{
     Clause, Expr, LabelExpr, Literal, NodePattern, PathPattern, Query, RelDirection, RelPattern,
 };
 
-use crate::zu1::catalog::{Catalog, ElementKind};
+use crate::zu1::catalog::{Catalog, ElementKind, ElementType};
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::create_empty_rel;
-use crate::zu1::props::{PropInput, PropValues, store_props_for, store_rel_props_for};
+use crate::zu1::props::{PropInput, PropValues, storable, store_props_for, store_rel_props_for};
 
 /// A table one statement wants and the graph has not got: the label the
-/// pattern wrote, and a column per property it wrote, in written order.
+/// pattern wrote, and a column per property, in the order whatever said
+/// what the table holds wrote them.
 ///
-/// A column is carried as the values it would hold, none of them, which
-/// is what a column of a table with no rows is and what says its type.
+/// A column is carried as its name and its type, which is the whole of
+/// what a column of a table with no rows is.
 pub(crate) struct NewTable {
     pub(crate) name: String,
-    pub(crate) columns: Vec<(String, PropValues<'static>)>,
+    pub(crate) columns: Vec<(String, LogicalType)>,
+    /// Whether the columns came out of a graph type rather than out of
+    /// the pattern, which is what says a second pattern naming this
+    /// table has nothing to agree with the first one about.
+    pub(crate) declared: bool,
 }
 
 /// A rel table one statement wants: the type the step wrote, the node
 /// tables its ends are in, whether its edges point, and a column per
-/// property the step wrote.
+/// property.
 ///
 /// The ends are names rather than ids because one of them may be a node
 /// table this same statement is making, which has no id until it is
@@ -59,7 +70,8 @@ pub(crate) struct NewRel {
     pub(crate) from: String,
     pub(crate) to: String,
     pub(crate) undirected: bool,
-    pub(crate) columns: Vec<(String, PropValues<'static>)>,
+    pub(crate) columns: Vec<(String, LogicalType)>,
+    pub(crate) declared: bool,
 }
 
 /// Everything one statement names that the graph has not got, in the
@@ -109,10 +121,11 @@ pub(crate) fn wanted(catalog: &Catalog, graph: u32, parsed: &Query) -> Result<Wa
                     agree(first, node)?;
                     continue;
                 }
-                promised(catalog, graph, name)?;
+                let shape = promised(catalog, graph, ElementKind::Node, name, "node")?;
                 wanted.nodes.push(NewTable {
                     name: name.clone(),
-                    columns: columns_of(name, node)?,
+                    columns: columns_of(name, node, &shape)?,
+                    declared: matches!(shape, Shape::Declared(_)),
                 });
             }
             wanted_rels(catalog, graph, parsed, pattern, &mut wanted)?;
@@ -166,13 +179,14 @@ fn wanted_rels(
         if let Some(first) = wanted.rels.iter().find(|t| t.name == *name) {
             agree_rel(first, &from, &to, undirected, rel)?;
         } else {
-            promised_rel(catalog, graph, name)?;
+            let shape = promised(catalog, graph, ElementKind::Edge, name, "edge")?;
             wanted.rels.push(NewRel {
                 name: name.clone(),
                 from,
                 to,
                 undirected,
-                columns: rel_columns_of(name, rel)?,
+                columns: rel_columns_of(name, rel, &shape)?,
+                declared: matches!(shape, Shape::Declared(_)),
             });
         }
         left = right;
@@ -277,80 +291,134 @@ pub(crate) fn create(db: &mut Zu1File, graph: u32, wanted: &Wanted) -> Result<()
 
 /// The columns of a table being made, as the store wants them: a dense
 /// column of no values, which is what a column of a table with no rows
-/// is.
-fn inputs<'a>(columns: &'a [(String, PropValues<'static>)]) -> Vec<PropInput<'a>> {
+/// is, and beside it the type the column is declared.
+///
+/// The type is passed even where it is exactly what the values imply,
+/// because saying it twice costs nothing and leaving it out would make
+/// this the one caller whose columns mean something different from
+/// what they say. Where it is narrower than the values imply, which is
+/// every column a graph type declared, it is the only thing that says
+/// the column is `BINARY(16)` and not `BYTES`.
+fn inputs<'a>(columns: &'a [(String, LogicalType)]) -> Vec<PropInput<'a>> {
     columns
         .iter()
-        .map(|(name, values)| PropInput::dense(name, *values))
+        .map(|(name, ty)| {
+            let values = PropValues::none_of(ty).expect("the column type was checked as storable");
+            PropInput::typed(name, values, ty)
+        })
         .collect()
 }
 
-/// Whether the graph's type leaves room for a table of this name.
+/// What a table being made is made out of.
+enum Shape<'c> {
+    /// Nothing promised anything about this label, so the pattern is
+    /// the only thing that says what the table holds.
+    Written,
+    /// The graph's type describes an element of this label and says
+    /// what one holds, so the table is that declaration.
+    Declared(&'c ElementType),
+}
+
+/// What the graph's type says about a table of this name, or the
+/// refusal that it says the graph is not for this.
 ///
 /// A graph created with a closed type has said what its elements look
-/// like, and a table made out of a pattern is a shape nobody promised:
-/// its rows would carry a label the type either never mentions, which
-/// no element of the graph may carry, or mentions with properties of
-/// its own that the pattern knows nothing about. Both are refused, and
-/// the message says which one it is, because the answer to the second
-/// is to make the table the type describes and the answer to the first
-/// is that the graph is not for this.
+/// like. A label the type never mentions is one no element of the graph
+/// may carry, so a table for it is refused: widening the graph behind
+/// the type's back is not an answer to give quietly. A label it does
+/// mention is the opposite case, and the table is made out of what the
+/// type declared, which is where a column gets a type no written value
+/// could have given it.
+///
+/// Two element types over one label are GG24, and which of them a table
+/// would hold is not a question the pattern answers, so that is refused
+/// too and the message says how many there were.
 ///
 /// A graph with no type or an open one promises nothing, which is every
-/// graph a zu1 file has held until now, so this answers yes.
-fn promised(catalog: &Catalog, graph: u32, name: &str) -> Result<()> {
+/// graph a zu1 file has held until now, and then the pattern is the
+/// whole of it.
+fn promised<'c>(
+    catalog: &'c Catalog,
+    graph: u32,
+    kind: ElementKind,
+    name: &str,
+    noun: &str,
+) -> Result<Shape<'c>> {
     let Some(ty) = catalog.closed_type_of(graph) else {
-        return Ok(());
+        return Ok(Shape::Written);
     };
-    let described = catalog.label_id(name).is_some_and(|id| {
-        ty.types_for(ElementKind::Node, 1 << id)
-            .iter()
-            .any(|e| e.labels.contains(&id))
-    });
-    let why = if described {
-        format!(
-            "graph type '{}' describes a node labelled '{name}' and says what it holds, which is not what this pattern says",
-            ty.name
-        )
-    } else {
-        format!(
-            "no element type of graph type '{}' describes a node labelled '{name}'",
-            ty.name
-        )
+    let described: Vec<&ElementType> = catalog
+        .label_id(name)
+        .map(|id| {
+            ty.types_for(kind, 1 << id)
+                .into_iter()
+                .filter(|e| e.labels.contains(&id))
+                .collect()
+        })
+        .unwrap_or_default();
+    let why = match described.as_slice() {
+        [one] => return Ok(Shape::Declared(one)),
+        [] => format!(
+            "no element type of graph type '{}' describes {} {noun} labelled '{name}'",
+            ty.name,
+            match noun {
+                "edge" => "an",
+                _ => "a",
+            }
+        ),
+        many => format!(
+            "graph type '{}' describes {} {noun} types labelled '{name}', and nothing here says which of them a table would hold",
+            ty.name,
+            many.len()
+        ),
     };
     Err(ZuError::gql(
         codes::CG2000,
-        format!("no node table is named '{name}' in this graph, and {why}"),
+        format!("no {noun} table is named '{name}' in this graph, and {why}"),
     ))
 }
 
-/// Whether the graph's type leaves room for a rel table of this name,
-/// which is [`promised`] on the edge side and refuses for the same two
-/// reasons.
-fn promised_rel(catalog: &Catalog, graph: u32, name: &str) -> Result<()> {
-    let Some(ty) = catalog.closed_type_of(graph) else {
-        return Ok(());
-    };
-    let described = catalog.label_id(name).is_some_and(|id| {
-        ty.types_for(ElementKind::Edge, 1 << id)
-            .iter()
-            .any(|e| e.labels.contains(&id))
-    });
-    let why = if described {
-        format!(
-            "graph type '{}' describes an edge labelled '{name}' and says what it holds, which is not what this pattern says",
-            ty.name
-        )
-    } else {
-        format!(
-            "no element type of graph type '{}' describes an edge labelled '{name}'",
-            ty.name
-        )
-    };
-    Err(ZuError::gql(
-        codes::CG2000,
-        format!("no edge table is named '{name}' in this graph, and {why}"),
-    ))
+/// The columns a graph type's element type says a table holds: one per
+/// declared property, in declared order, typed by the declaration.
+///
+/// An element type that is open permits properties it never declared,
+/// so what the pattern wrote and the type did not say is a column too,
+/// typed by what was written and standing behind the declared ones. A
+/// closed element type declares the whole of what an element holds, and
+/// a pattern that writes more than that is refused by the insert with
+/// the property named, ISO 24.5.2 item IL002, once the table it is
+/// being measured against exists.
+fn declared_columns(
+    what: &str,
+    element: &ElementType,
+    props: &[(String, Expr)],
+) -> Result<Vec<(String, LogicalType)>> {
+    let mut columns = Vec::with_capacity(element.properties.len());
+    for prop in &element.properties {
+        // A graph type may name a type no column holds, since naming
+        // one is a promise about values and holding one is a layout.
+        // Refused here, with the property named, rather than left for
+        // the store to refuse halfway through making the table.
+        if !storable(&prop.ty) {
+            return Err(ZuError::gql(
+                codes::C42002,
+                format!(
+                    "{what}, and the graph type declares '{}' as {}, which is not a type a column holds",
+                    prop.name, prop.ty
+                ),
+            )
+            .about(Subject::Property(prop.name.clone())));
+        }
+        columns.push((prop.name.clone(), prop.ty.clone()));
+    }
+    if element.open {
+        for (key, value) in props {
+            if element.property(key).is_none() {
+                columns.push((key.clone(), written(what, key, value)?));
+            }
+        }
+    }
+    Ok(columns)
 }
 
 /// The columns of a rel table made for one step, on the same terms as a
@@ -362,20 +430,34 @@ fn promised_rel(catalog: &Catalog, graph: u32, name: &str) -> Result<()> {
 /// has nowhere to put one, while an edge is a pair of ends the CSR
 /// holds whether or not anything hangs off it, so a bare `-[:KNOWS]->`
 /// makes a table that stores the edge and nothing about it.
-fn rel_columns_of(name: &str, rel: &RelPattern) -> Result<Vec<(String, PropValues<'static>)>> {
-    let mut columns: Vec<(String, PropValues<'static>)> = Vec::with_capacity(rel.props.len());
-    for (key, value) in &rel.props {
-        if columns.iter().any(|(had, _)| had == key) {
+fn rel_columns_of(
+    name: &str,
+    rel: &RelPattern,
+    shape: &Shape<'_>,
+) -> Result<Vec<(String, LogicalType)>> {
+    let what = format!("no edge table is named '{name}'");
+    twice("edge", &rel.props)?;
+    if let Shape::Declared(element) = shape {
+        return declared_columns(&what, element, &rel.props);
+    }
+    rel.props
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), written(&what, key, value)?)))
+        .collect()
+}
+
+/// Refuses a pattern that writes one property twice, whatever the table
+/// is going to be made out of, since a table holds one column of a
+/// name and the second write has nowhere to go.
+fn twice(noun: &str, props: &[(String, Expr)]) -> Result<()> {
+    for (i, (key, _)) in props.iter().enumerate() {
+        if props[..i].iter().any(|(had, _)| had == key) {
             return Err(ZuError::InvalidArgument(format!(
-                "the edge carries '{key}' twice, and a table holds one column of that name"
+                "the {noun} carries '{key}' twice, and a table holds one column of that name"
             )));
         }
-        columns.push((
-            key.clone(),
-            written(&format!("no edge table is named '{name}'"), key, value)?,
-        ));
     }
-    Ok(columns)
+    Ok(())
 }
 
 /// Whether a second step naming a rel table the first one is making
@@ -394,6 +476,11 @@ fn agree_rel(
         ))
     } else if first.undirected != undirected {
         Some("one step writes it with a direction and another without one".to_string())
+    } else if first.declared {
+        // A table the graph type declared is not made out of the steps
+        // that write it, so two steps writing different properties onto
+        // it are two edges of one table and not two tables.
+        None
     } else {
         let missing = first
             .columns
@@ -418,40 +505,47 @@ fn agree_rel(
 }
 
 /// The columns of a table made for one pattern: one per property, in
-/// the order the pattern wrote them, typed by what it wrote.
-fn columns_of(name: &str, node: &NodePattern) -> Result<Vec<(String, PropValues<'static>)>> {
+/// the order the pattern wrote them, typed by what it wrote, or the
+/// columns the graph type declared where one did.
+fn columns_of(
+    name: &str,
+    node: &NodePattern,
+    shape: &Shape<'_>,
+) -> Result<Vec<(String, LogicalType)>> {
+    let what = format!("no node table is named '{name}'");
+    twice("element", &node.props)?;
+    if let Shape::Declared(element) = shape {
+        return declared_columns(&what, element, &node.props);
+    }
     if node.props.is_empty() {
         return Err(ZuError::gql(
             codes::C42002,
             format!(
-                "no node table is named '{name}', and the pattern that would make one carries no property, so the table would have no column for a row to grow"
+                "{what}, and the pattern that would make one carries no property, so the table would have no column for a row to grow"
             ),
         )
         .about(Subject::Label(name.to_string())));
     }
-    let mut columns: Vec<(String, PropValues<'static>)> = Vec::with_capacity(node.props.len());
-    for (key, value) in &node.props {
-        if columns.iter().any(|(had, _)| had == key) {
-            return Err(ZuError::InvalidArgument(format!(
-                "the element carries '{key}' twice, and a table holds one column of that name"
-            )));
-        }
-        columns.push((
-            key.clone(),
-            written(&format!("no node table is named '{name}'"), key, value)?,
-        ));
-    }
-    Ok(columns)
+    node.props
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), written(&what, key, value)?)))
+        .collect()
 }
 
-/// The column one written property makes, as the values it would hold.
+/// The type of the column one written property makes.
 ///
 /// A literal says its own type. Anything else is worked out by the plan
 /// that runs the statement, and this runs before there is one, so the
 /// column would have to be guessed. A guessed column is worse than a
 /// refusal: it is written down, and the next statement is typed against
 /// it.
-fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
+///
+/// What comes back is the widest type of the value's family, because a
+/// value is one value and a column is every row a table will ever hold:
+/// a written `71` says the column holds whole numbers and not that it
+/// holds numbers under a hundred. A declaration is where a narrower
+/// column comes from, and that is [`declared_columns`].
+fn written(what: &str, key: &str, value: &Expr) -> Result<LogicalType> {
     let Expr::Literal(literal) = value else {
         return Err(ZuError::gql(
             codes::C42002,
@@ -462,15 +556,22 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
         .about(Subject::Property(key.to_string())));
     };
     Ok(match literal {
-        Literal::Bool(_) => PropValues::Bool(&[]),
-        Literal::Int(_) => PropValues::Int(&[]),
-        Literal::Float(_) => PropValues::Float(&[]),
-        Literal::Str(_) => PropValues::Str(&[]),
-        Literal::Bytes(_) => PropValues::Bytes(&[]),
-        Literal::Temporal(Temporal::Date(_)) => PropValues::Date(&[]),
-        Literal::Temporal(Temporal::LocalTime(_)) => PropValues::LocalTime(&[]),
-        Literal::Temporal(Temporal::LocalDatetime(_)) => PropValues::LocalDatetime(&[]),
-        Literal::Temporal(Temporal::Duration(kind, _)) => PropValues::Duration(*kind, &[]),
+        Literal::Bool(_) => LogicalType::Bool,
+        Literal::Int(_) => LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            precision: None,
+        },
+        Literal::Float(_) => LogicalType::Float {
+            bits: FloatBits::B64,
+            precision: None,
+        },
+        Literal::Str(_) => LogicalType::string(),
+        Literal::Bytes(_) => LogicalType::bytes(),
+        Literal::Temporal(Temporal::Date(_)) => LogicalType::Date,
+        Literal::Temporal(Temporal::LocalTime(_)) => LogicalType::LocalTime,
+        Literal::Temporal(Temporal::LocalDatetime(_)) => LogicalType::LocalDatetime,
+        Literal::Temporal(Temporal::Duration(kind, _)) => LogicalType::Duration(*kind),
         // A null says the row holds nothing, which is a fact about the
         // row and not about the column, and a column of nulls is one
         // no INSERT can append to anyway.
@@ -504,7 +605,14 @@ fn written(what: &str, key: &str, value: &Expr) -> Result<PropValues<'static>> {
 /// Two patterns that disagree are one statement asking for two tables
 /// of one name, and the one that would be made is whichever was written
 /// first. That is not an answer to give quietly.
+///
+/// A table the graph type declared is not made out of the patterns at
+/// all, so there is nothing for them to disagree about: both are
+/// measured against the declaration by the insert instead.
 fn agree(first: &NewTable, node: &NodePattern) -> Result<()> {
+    if first.declared {
+        return Ok(());
+    }
     let missing = first
         .columns
         .iter()
@@ -531,6 +639,7 @@ mod tests {
 
     use crate::query::Value;
     use crate::session::Session;
+    use crate::zu1::catalog::ROOT_SCHEMA;
     use crate::zu1::file::Zu1File;
     use crate::zu1::graph::bulk_load_as;
     use crate::zu1::props::{PropValues, store_props};
@@ -556,6 +665,23 @@ mod tests {
             ],
         )
         .expect("props");
+    }
+
+    /// Every column of a table of graph `g`, as its name and the type
+    /// the store holds it under, which is what says whether a
+    /// declaration reached the file or stopped at the catalog.
+    fn declared_columns_of(path: &Path, table: &str) -> Vec<(String, String)> {
+        let mut db = Zu1File::open(path).expect("open");
+        let catalog = crate::zu1::catalog::Catalog::load(&mut db).expect("catalog");
+        let graph = catalog.graph(ROOT_SCHEMA, "g").expect("the graph").id;
+        let id = catalog.node_in(graph, table).expect("the table").id;
+        let dir = crate::zu1::props::load_props(&mut db, id)
+            .expect("props")
+            .expect("the table stores columns");
+        dir.columns
+            .iter()
+            .map(|col| (col.name.clone(), col.ty.to_string()))
+            .collect()
     }
 
     fn strings(result: &crate::query::QueryResult, col: usize) -> Vec<String> {
@@ -885,6 +1011,167 @@ mod tests {
         session
             .run("INSERT (c:city {name: 'york'})", &[])
             .expect("the home graph promises nothing");
+    }
+
+    /// The other half of the same rule. A graph type that does
+    /// describe the label says what an element of it holds, and that
+    /// is what the table is made out of: `id` is the declared
+    /// `BINARY(16)` and not the `BYTES` a written value can say for
+    /// itself, which is a column type no statement could reach before.
+    #[test]
+    fn a_table_the_graph_type_describes_is_made_out_of_the_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("declared.zu1");
+        seeded(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            for stmt in [
+                "CREATE PROPERTY GRAPH TYPE t { (:doc {id :: BINARY(16), title :: STRING}) }",
+                "CREATE GRAPH g TYPED t",
+            ] {
+                session.run(stmt, &[]).expect("the graph and its type");
+            }
+            session
+                .run(
+                    "USE g INSERT (d:doc {id: X'000102030405060708090A0B0C0D0E0F', title: 'ada'})",
+                    &[],
+                )
+                .expect("insert");
+
+            let back = session
+                .run("USE g MATCH (d:doc) RETURN d.title AS title", &[])
+                .expect("read");
+            assert_eq!(strings(&back, 0), ["ada"]);
+        }
+
+        assert_eq!(
+            declared_columns_of(&path, "doc"),
+            [
+                ("id".to_string(), "BYTES(16) FIXED".to_string()),
+                ("title".to_string(), "STRING".to_string()),
+            ],
+            "the column carries the type the graph type declared"
+        );
+    }
+
+    /// And the declaration is a check rather than a label on the
+    /// column: an id of the wrong octet count is refused, because a
+    /// column declared `BINARY(16)` whose rows are not all sixteen
+    /// octets is a column whose own type is a lie.
+    #[test]
+    fn a_value_the_declared_type_does_not_admit_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("narrow.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:doc {id :: BINARY(16), title :: STRING}) }",
+            "CREATE GRAPH g TYPED t",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        let err = session
+            .run("USE g INSERT (d:doc {id: X'0001', title: 'ada'})", &[])
+            .expect_err("two octets are not sixteen");
+        assert!(
+            err.to_string().contains("octets"),
+            "the refusal says what was wrong with it: {err}"
+        );
+
+        // And the table the refused statement would have made is not
+        // there, so the next statement is the first one again.
+        session
+            .run(
+                "USE g INSERT (d:doc {id: X'000102030405060708090A0B0C0D0E0F', title: 'ada'})",
+                &[],
+            )
+            .expect("the right width goes in");
+    }
+
+    /// A property whose value the plan has yet to work out says
+    /// nothing about a column, and where a graph type declared the
+    /// table nothing needs it to: the column has a type already.
+    #[test]
+    fn a_declared_table_takes_a_value_that_is_worked_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("computed.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:city {name :: STRING, founded :: INT}) }",
+            "CREATE GRAPH g TYPED t",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        session
+            .run("USE g INSERT (c:city {name: 'york', founded: 70 + 1})", &[])
+            .expect("the type says what the column holds");
+
+        let back = session
+            .run("USE g MATCH (c:city) RETURN c.founded AS n", &[])
+            .expect("read");
+        assert_eq!(back.rows[0][0], Value::Int(71));
+    }
+
+    /// A graph type may name a type no column holds, since naming one
+    /// is a promise about values and holding one is a layout. The
+    /// statement that would need the column is where that is refused,
+    /// and the refusal names the property.
+    #[test]
+    fn a_declared_type_no_column_holds_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("unstorable.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:doc {tags :: LIST<STRING>[4], title :: STRING}) }",
+            "CREATE GRAPH g TYPED t",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        let err = session
+            .run("USE g INSERT (d:doc {tags: 'a', title: 'ada'})", &[])
+            .expect_err("no column holds a bounded list of strings");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("42002"));
+        assert!(
+            err.to_string().contains("'tags'"),
+            "the refusal names the property: {err}"
+        );
+    }
+
+    /// A type a column holds is not yet a type a statement can write
+    /// into one. A bounded list of a fixed width element is the column
+    /// the embedding work of #747, #749 and #754 was for, and the store
+    /// holds it; what `INSERT` has no way to say is the value. So the
+    /// statement is refused and the table it would have made goes with
+    /// it, which is where this stops until the write path carries a
+    /// list.
+    #[test]
+    fn a_declared_list_column_is_not_yet_something_a_statement_can_fill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("embedding.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:doc {v :: LIST<FLOAT32 NOT NULL>[3]}) }",
+            "CREATE GRAPH g TYPED t",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        let err = session
+            .run("USE g INSERT (d:doc {v: [1.0, 2.0, 3.0]})", &[])
+            .expect_err("the write path carries no list yet");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G03"));
+        // The label is in the dictionary because the graph type named
+        // it, and the table is not, because the statement that would
+        // have made it raised and took it with it.
+        let catalog = session.catalog();
+        let graph = catalog.graph(ROOT_SCHEMA, "g").expect("the graph").id;
+        assert!(catalog.node_in(graph, "doc").is_none());
     }
 
     /// A refusal is asked once whether this module can do anything for

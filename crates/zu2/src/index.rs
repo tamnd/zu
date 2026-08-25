@@ -82,6 +82,7 @@
 //! holding a reference into the old table, and nothing migrates until
 //! that wait returns.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
@@ -219,6 +220,15 @@ impl Table {
     #[inline]
     pub fn len(&self) -> usize {
         self.buckets.len()
+    }
+
+    /// What the table costs in memory. A bucket is `SLOTS` eight byte
+    /// entries in a `repr(align(64))` struct, so this is exact rather
+    /// than an estimate, and it is the same whether the table is empty
+    /// or full: the slots are allocated with it.
+    #[inline]
+    fn bytes(&self) -> usize {
+        self.buckets.len() * std::mem::size_of::<Bucket>()
     }
 
     /// How many slots are in use.
@@ -382,6 +392,21 @@ pub struct Index {
     /// Set when the caller sized the table itself and wants it left
     /// that way, which is what a test that is about crowding needs.
     fixed: bool,
+    /// What the tables cost in memory, maintained rather than counted.
+    ///
+    /// Counting means reading the live pointer and the migration
+    /// pointer, and the migration is only a valid reference inside an
+    /// epoch, so a metric that counted would either take an epoch to
+    /// answer or would read a pointer it is not allowed to. This moves
+    /// where the memory does instead.
+    ///
+    /// An `Arc` because the one place the memory goes away is the
+    /// closure a retirement defers, which runs after the epoch has
+    /// passed and cannot borrow the index. Decrementing at the
+    /// retirement instead would report the old table gone while it is
+    /// still held, which for a memory figure is the wrong direction to
+    /// be wrong in. #767.
+    bytes: Arc<AtomicUsize>,
 }
 
 impl Index {
@@ -389,13 +414,16 @@ impl Index {
     /// two. `fixed` leaves it at that size whatever the load factor
     /// does.
     pub fn new(buckets: usize, fixed: bool) -> Self {
+        let table = Table::new(buckets);
+        let bytes = table.bytes();
         Self {
-            live: AtomicPtr::new(Box::into_raw(Box::new(Table::new(buckets)))),
+            live: AtomicPtr::new(Box::into_raw(Box::new(table))),
             migrating: AtomicPtr::new(std::ptr::null_mut()),
             keys: AtomicUsize::new(0),
             grows: AtomicU64::new(0),
             growing: Mutex::new(()),
             fixed,
+            bytes: Arc::new(AtomicUsize::new(bytes)),
         }
     }
 
@@ -417,11 +445,15 @@ impl Index {
         if self.fixed || buckets <= self.buckets() {
             return;
         }
-        let fresh = Box::into_raw(Box::new(Table::new(buckets)));
+        let table = Table::new(buckets);
+        self.bytes.fetch_add(table.bytes(), Ordering::Relaxed);
+        let fresh = Box::into_raw(Box::new(table));
         let old = self.live.swap(fresh, Ordering::Release);
         // SAFETY: nothing else is running, so nothing holds a reference
         // to the table being replaced.
-        drop(unsafe { Box::from_raw(old) });
+        let old = unsafe { Box::from_raw(old) };
+        self.bytes.fetch_sub(old.bytes(), Ordering::Relaxed);
+        drop(old);
     }
 
     /// Replaces the table with one of exactly `buckets`, before there is
@@ -444,11 +476,15 @@ impl Index {
         if self.fixed {
             return false;
         }
-        let fresh = Box::into_raw(Box::new(Table::new(buckets)));
+        let table = Table::new(buckets);
+        self.bytes.fetch_add(table.bytes(), Ordering::Relaxed);
+        let fresh = Box::into_raw(Box::new(table));
         let old = self.live.swap(fresh, Ordering::Release);
         // SAFETY: nothing else is running, so nothing holds a reference
         // to the table being replaced.
-        drop(unsafe { Box::from_raw(old) });
+        let old = unsafe { Box::from_raw(old) };
+        self.bytes.fetch_sub(old.bytes(), Ordering::Relaxed);
+        drop(old);
         true
     }
 
@@ -520,6 +556,16 @@ impl Index {
         self.live().len()
     }
 
+    /// What the index costs in memory: the live table, and during a
+    /// doubling the table being drained and its state array as well.
+    ///
+    /// One of the four anonymous planes of #767, and the only one that
+    /// was not already reported. A load, not a walk, so a benchmark can
+    /// ask for it as often as it likes.
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
     /// Doublings since the database was opened.
     pub fn grows(&self) -> u64 {
         self.grows.load(Ordering::Relaxed)
@@ -562,7 +608,14 @@ impl Index {
         let old = self.live.load(Ordering::Acquire);
         // SAFETY: the live pointer is never null.
         let count = unsafe { &*old }.len();
-        let fresh = Box::into_raw(Box::new(Table::new(count * 2)));
+        let table = Table::new(count * 2);
+        // The doubling holds both tables at once until the drain
+        // finishes, plus a byte of state a bucket, and that peak is the
+        // figure a memory budget has to survive rather than the resting
+        // one. Both go in here and come out together at the retirement.
+        self.bytes
+            .fetch_add(table.bytes() + count, Ordering::Relaxed);
+        let fresh = Box::into_raw(Box::new(table));
         let migration = Box::into_raw(Box::new(Migration {
             old,
             state: (0..count).map(|_| AtomicU8::new(TODO)).collect(),
@@ -608,13 +661,18 @@ impl Index {
             return;
         }
         let retired = pointer as usize;
+        let bytes = Arc::clone(&self.bytes);
         epochs.defer(Box::new(move || {
             // SAFETY: the epoch has passed, so no operation still holds
             // a reference into either the migration or the table it
             // drained, and both were leaked from a Box.
             unsafe {
                 let migration = Box::from_raw(retired as *mut Migration);
-                drop(Box::from_raw(migration.old));
+                let old = Box::from_raw(migration.old);
+                // Here and not at the unlink above, because here is
+                // where the memory actually goes back.
+                bytes.fetch_sub(old.bytes() + migration.state.len(), Ordering::Relaxed);
+                drop(old);
             }
         }));
         epochs.bump();

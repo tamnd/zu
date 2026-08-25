@@ -2208,6 +2208,24 @@ pub unsafe extern "C" fn zu2_anonymous_pages(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// What the hash index is holding, in bytes: the live table, and during
+/// a doubling the table being drained and its state array too.
+///
+/// One of the four anonymous planes of #767, next to the log pages
+/// `zu2_anonymous_pages` counts and the scan plane `zu2_ordered_bytes`
+/// reports. A bucket is a cacheline whether there is anything in it or
+/// not, so this rises at a doubling and never at a key.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_index_bytes(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.index_bytes() as u64,
+        None => 0,
+    }
+}
+
 /// Records a read moved out of the cold tier and back into the log.
 ///
 /// The cost side of `promote_reads`: it says how much writing the reads

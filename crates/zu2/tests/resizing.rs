@@ -224,3 +224,66 @@ fn a_load_that_never_flushes_still_doubles() {
          maintainer caught up, so the doubling is behind the writer"
     );
 }
+
+/// What the index costs in memory, which is one of the four anonymous
+/// planes #767 has to account for and the only one that was not
+/// reported anywhere.
+///
+/// Two things are asserted and they are different claims. At rest the
+/// figure is exact, buckets times the cacheline they each are, because
+/// a bucket is allocated whole and its slots come with it. Under a
+/// doubling it is larger than that, because the table being drained is
+/// still held and so is a byte of state for each of its buckets, and
+/// that peak is what a memory budget has to survive rather than the
+/// resting figure.
+#[test]
+fn the_index_reports_what_its_tables_cost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = Options {
+        durability: Durability::Async,
+        index_buckets: 1,
+        max_pages: 1 << 12,
+        max_nodes: 1 << 16,
+        compact_below: 0,
+        ..Options::default()
+    };
+    let db = Db::create(&dir.path().join("b.zu2"), options).expect("create");
+    // A bucket is eight 8 byte entries on its own cacheline.
+    const BUCKET: usize = 64;
+    assert_eq!(db.index_bytes(), db.index_buckets() * BUCKET);
+
+    let keys = 60000u32;
+    let mut peak = 0usize;
+    {
+        let mut s = db.session();
+        for i in 0..keys {
+            s.upsert(&key(i), &value(i)).expect("upsert");
+            if i % 64 == 0 && db.index_resizing() {
+                // Sampled rather than watched, since a drain under a
+                // single writer finishes in the writes that follow it
+                // and a loop that waited for it here would wait for
+                // itself. Over sixteen doublings this lands inside one
+                // of them many times over.
+                peak = peak.max(db.index_bytes().saturating_sub(db.index_buckets() * BUCKET));
+            }
+        }
+    }
+    assert!(
+        peak > 0,
+        "never sampled a doubling in flight, so the second half of this says nothing"
+    );
+
+    for _ in 0..200 {
+        if !db.index_resizing() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!db.index_resizing(), "the doubling never drained");
+    assert_eq!(
+        db.index_bytes(),
+        db.index_buckets() * BUCKET,
+        "the drained table's memory was never given back, {} buckets",
+        db.index_buckets(),
+    );
+}

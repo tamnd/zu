@@ -562,6 +562,12 @@ uint64_t zu2_mapped_pages(const zu2_db *db);
  * the trillions. */
 uint64_t zu2_anonymous_pages(const zu2_db *db);
 
+/* What the hash index is holding, in bytes: the live table, plus the
+ * table being drained and its state array while a doubling is in
+ * flight. A bucket is a cacheline whether anything is in it or not, so
+ * this rises at a doubling and never at a key. */
+uint64_t zu2_index_bytes(const zu2_db *db);
+
 /* Records a read moved out of the cold tier and back into the log,
  * which is the cost side of promote_reads. */
 uint64_t zu2_promoted(const zu2_db *db);

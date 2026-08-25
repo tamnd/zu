@@ -1154,6 +1154,19 @@ impl Db {
         self.core.log.anonymous_pages()
     }
 
+    /// What the hash index is holding, in bytes: the live table, plus
+    /// the table being drained and its state array while a doubling is
+    /// in flight.
+    ///
+    /// The third of the four anonymous planes #767 lists, next to the
+    /// log pages [`Db::anonymous_pages`] counts and the scan plane
+    /// [`Db::ordered_bytes`] reports. A bucket is a cacheline whether
+    /// anything is in it or not, so this rises at a doubling and never
+    /// with a key.
+    pub fn index_bytes(&self) -> usize {
+        self.core.index.bytes()
+    }
+
     /// Bytes the file occupies on the device, holes excluded. This is
     /// the honest storage number: a compacted log keeps its addresses
     /// but not its blocks.

@@ -46,6 +46,7 @@
 //! them and decodes each group once, straight into its finished row.
 
 use std::cmp::Ordering;
+use std::sync::Mutex;
 
 use zu_query::exec::Value;
 use zu_query::snapshot::TemporalLane;
@@ -324,6 +325,13 @@ pub(crate) struct GroupTable {
 /// the smaller footprint pays back. Sixty-four costs a kilobyte and
 /// covers the many-groups-of-one queries that never grow past a handful.
 const INIT_SLOTS: usize = 64;
+
+/// Groups a hand needs before the finished rows are worth building on
+/// more than one thread. Four thousand of them is a few hundred
+/// microseconds of decoding, which is well clear of what a latch and a
+/// lock per hand cost, and it keeps every query that groups into tens
+/// or hundreds on the one thread it was already answered on.
+const SPLIT_ROWS: usize = 4096;
 
 const IDX_MASK: u64 = (1 << 48) - 1;
 
@@ -828,11 +836,7 @@ impl GroupTable {
     /// thrown away a moment later. The order is settled over an index
     /// vector against the stored words, so nothing is decoded until the
     /// row is built and each row is built once, in its final place.
-    pub(crate) fn rows(mut self, item_agg: &[bool]) -> Vec<Vec<Value>> {
-        // Out of the table first, while it is still whole, so that the
-        // sort below can borrow the rest of it.
-        let states = std::mem::take(&mut self.accs);
-        let mut done: Vec<Value> = states.into_iter().map(Acc::finalize).collect();
+    pub(crate) fn rows(mut self, item_agg: &[bool], hands: usize) -> Vec<Vec<Value>> {
         let mut order: Vec<u32> = if self.counting {
             std::mem::take(&mut self.order)
         } else {
@@ -846,9 +850,62 @@ impl GroupTable {
         } else {
             order.sort_unstable_by(|&a, &b| self.cmp_keys(a as usize, b as usize));
         }
+        // Decoding is per group and the groups are settled by now, so
+        // the slices of the order are independent and the pool the scan
+        // has just finished with is sitting there. `hands` is the run's
+        // worker count and not the machine's, because a query asked to
+        // run on one worker is answered on one worker, tail included.
+        // Under the split it is not worth a latch and two locks.
+        let hands = hands.min(order.len() / SPLIT_ROWS);
+        if hands < 2 {
+            return self.build(&order, item_agg);
+        }
+        let slices: Vec<&[u32]> = order.chunks(order.len().div_ceil(hands)).collect();
+        let slots: Vec<Mutex<Option<Vec<Vec<Value>>>>> =
+            slices[1..].iter().map(|_| Mutex::new(None)).collect();
+        let mine = {
+            let me = &self;
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = slices[1..]
+                .iter()
+                .zip(&slots)
+                .map(|(slice, slot)| {
+                    Box::new(move || {
+                        *slot.lock().unwrap() = Some(me.build(slice, item_agg));
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            let pending = crate::pool::submit(jobs);
+            let mine = self.build(slices[0], item_agg);
+            pending.wait();
+            mine
+        };
+        let mut out = mine;
+        out.reserve(order.len() - out.len());
+        for (slot, slice) in slots.into_iter().zip(&slices[1..]) {
+            // A slot still empty after the latch means that hand
+            // panicked, and the rows it was building are gone. Building
+            // them here keeps the answer whole and costs the panic
+            // handler's path only.
+            match slot.into_inner().unwrap() {
+                Some(rows) => out.extend(rows),
+                None => out.extend(self.build(slice, item_agg)),
+            }
+        }
+        out
+    }
+
+    /// The rows for one slice of the settled order.
+    ///
+    /// Takes the table by reference and reads each state out of it
+    /// rather than moving the states away first, so that slices of the
+    /// order can be built beside each other. An accumulator is a word or
+    /// two and is `Copy`, so reading one is cheaper than the bookkeeping
+    /// it would take to hand each thread the states it needs out of a
+    /// buffer indexed by group rather than by place in the order.
+    fn build(&self, order: &[u32], item_agg: &[bool]) -> Vec<Vec<Value>> {
         let mut out = Vec::with_capacity(order.len());
         let mut keys = Vec::new();
-        for &g in &order {
+        for &g in order {
             if self.counting {
                 keys.push(self.counted_key(g));
             } else {
@@ -861,7 +918,7 @@ impl GroupTable {
                     let v = if self.counting {
                         Value::Int(self.slots[g as usize][1] as i64)
                     } else {
-                        std::mem::replace(&mut done[agg_at], Value::Null)
+                        self.accs[agg_at].finalize()
                     };
                     agg_at += 1;
                     v
@@ -1277,7 +1334,7 @@ mod tests {
         // count(*) first and the key second, which is what
         // `RETURN count(*), n.k` asks for, so a row that just
         // concatenated the two halves would come out backwards.
-        let rows = t.rows(&[true, false]);
+        let rows = t.rows(&[true, false], 1);
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows,
@@ -1296,7 +1353,7 @@ mod tests {
         // order nor the answer.
         let mut t = GroupTable::counting(vec![PartKind::Int], 1);
         t.count_ints(&[7, 1, 4, 7, 7]);
-        let rows = t.rows(&[false, true]);
+        let rows = t.rows(&[false, true], 1);
         assert_eq!(
             rows,
             vec![
@@ -1356,7 +1413,24 @@ mod tests {
                 vals
             })
             .collect();
-        assert_eq!(t.rows(&[false, false, false, true]), want);
+        assert_eq!(t.rows(&[false, false, false, true], 1), want);
+    }
+
+    /// The split is a split of the work and not of the answer, so a
+    /// table wide enough to go to the pool has to put out exactly what
+    /// it puts out on one hand, in the same order.
+    #[test]
+    fn many_hands_answer_what_one_hand_answers() {
+        let vals: Vec<i64> = (0..200_000).map(|i| (i * 7919) % 20_000).collect();
+        let mut t = GroupTable::new(vec![PartKind::Int], 1);
+        count_ints(&mut t, &vals);
+        let mut same = GroupTable::new(vec![PartKind::Int], 1);
+        same.merge_from(&t).unwrap();
+        assert!(
+            t.groups() > SPLIT_ROWS * 2,
+            "wide enough that the split is taken"
+        );
+        assert_eq!(t.rows(&[false, true], 8), same.rows(&[false, true], 1));
     }
 
     /// A date is the one lane stored narrower than the word it rides in,
@@ -1367,7 +1441,7 @@ mod tests {
         let lane = TemporalLane::Date;
         let mut t = GroupTable::new(vec![PartKind::Temporal(lane)], 1);
         count_ints(&mut t, &[10, -5, 0, -400]);
-        let rows = t.rows(&[false, true]);
+        let rows = t.rows(&[false, true], 1);
         let days: Vec<i64> = rows
             .iter()
             .map(|r| match r[0] {

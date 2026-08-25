@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
@@ -1075,6 +1076,9 @@ pub(crate) fn finish_agg(
     partials: Vec<SinkState>,
     keys_empty: bool,
 ) -> Result<QueryResult> {
+    // One hand per worker that ran, so a query asked for on one thread
+    // is finished on one thread too.
+    let hands = partials.len();
     // A bare aggregate has one group whichever way the input went, so
     // it never needs the table: fold the per-worker state vectors and
     // emit the row even when no worker saw a row at all.
@@ -1091,14 +1095,7 @@ pub(crate) fn finish_agg(
     // Fold every other worker into the first non-empty table rather
     // than into a fresh one, so the biggest partial is usually the one
     // nobody has to rehash.
-    let mut merged: Option<GroupTable> = None;
-    for p in partials {
-        let Some(t) = p.groups else { continue };
-        match &mut merged {
-            None => merged = Some(t),
-            Some(m) => m.merge_from(&t)?,
-        }
-    }
+    let merged = fold_tables(partials)?;
     // Asked here rather than per row on the way in: the table holds one
     // copy of each distinct key and every row that did not create a
     // group has the bytes of the one that did.
@@ -1107,7 +1104,7 @@ pub(crate) fn finish_agg(
             "string property is not UTF-8".to_string(),
         ));
     }
-    let rows = merged.map(|t| t.rows(item_agg)).unwrap_or_default();
+    let rows = merged.map(|t| t.rows(item_agg, hands)).unwrap_or_default();
     Ok(QueryResult::new(columns, apply_post(post, rows)))
 }
 
@@ -1118,15 +1115,74 @@ pub(crate) fn finish_agg(
 /// merge only has to find the keys one table holds that another one
 /// does not.
 pub(crate) fn finish_distinct(partials: Vec<SinkState>) -> Result<i64> {
-    let mut merged: Option<GroupTable> = None;
-    for p in partials {
-        let Some(t) = p.groups else { continue };
-        match &mut merged {
-            None => merged = Some(t),
-            Some(m) => m.merge_from(&t)?,
+    Ok(fold_tables(partials)?.map_or(0, |m| m.groups() as i64))
+}
+
+/// Folds the workers' group tables into one.
+///
+/// Pairwise up a tree rather than one after another into the first,
+/// because the scheduler hands every worker morsels from all over the
+/// scan, so each partial ends up about as wide as the answer and every
+/// fold is a full width merge. Eight of them in a row is seven of those
+/// at the one point in the query where nothing else is running, which
+/// on the hundred thousand group bench is as much wall clock as the
+/// eight worker scan that produced them. The tree does the same seven
+/// merges in three rounds and runs each round on the pool the scan just
+/// finished with, so what was seven merges deep is three.
+///
+/// An odd table carries to the next round rather than being merged into
+/// a pair, which keeps every merge in a round the same size.
+fn fold_tables(partials: Vec<SinkState>) -> Result<Option<GroupTable>> {
+    let mut tables: Vec<GroupTable> = partials.into_iter().filter_map(|p| p.groups).collect();
+    while tables.len() > 1 {
+        let carry = (tables.len() % 2 == 1).then(|| tables.pop().expect("an odd count has a last"));
+        let mut pairs: Vec<(GroupTable, GroupTable)> = Vec::with_capacity(tables.len() / 2);
+        let mut it = tables.into_iter();
+        while let (Some(a), Some(b)) = (it.next(), it.next()) {
+            pairs.push((a, b));
         }
+        // One pair for this thread, the same way the scan keeps worker
+        // zero, so a round of one pair never goes near the pool.
+        let mine = pairs.pop().expect("a round starts with two tables");
+        let slots: Vec<Mutex<Option<Result<GroupTable>>>> =
+            pairs.iter().map(|_| Mutex::new(None)).collect();
+        let here = {
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = pairs
+                .into_iter()
+                .zip(&slots)
+                .map(|((mut a, b), slot)| {
+                    Box::new(move || {
+                        *slot.lock().unwrap() = Some(a.merge_from(&b).map(|()| a));
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            let pending = crate::pool::submit(jobs);
+            let (mut a, b) = mine;
+            let here = a.merge_from(&b).map(|()| a);
+            pending.wait();
+            here
+        };
+        let mut next = Vec::with_capacity(slots.len() + 2);
+        let mut first_err = None;
+        for res in std::iter::once(here).chain(slots.into_iter().map(|slot| {
+            slot.into_inner().unwrap().unwrap_or_else(|| {
+                Err(ZuError::InvalidArgument(
+                    "aggregation merge panicked".into(),
+                ))
+            })
+        })) {
+            match res {
+                Ok(t) => next.push(t),
+                Err(e) => first_err = first_err.or(Some(e)),
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        next.extend(carry);
+        tables = next;
     }
-    Ok(merged.map_or(0, |m| m.groups() as i64))
+    Ok(tables.pop())
 }
 
 /// Stitches row batches back into scan order and applies the posts.

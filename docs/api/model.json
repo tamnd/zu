@@ -10035,6 +10035,28 @@
       "signature": "Word(u64)"
     },
     {
+      "id": "zu::zu1::props::ListRows",
+      "kind": "enum",
+      "name": "ListRows",
+      "doc": "How a row of a list column says how many elements it holds.\n\nThe two are not tellable apart from the bytes, which is why this is\ncarried rather than worked out: a bounded `LIST<INT32>(768)` row of\n767 counted elements is the same length as one of 768 uncounted\nones. The column entry says, and a reader takes the answer."
+    },
+    {
+      "id": "zu::zu1::props::ListRows::Counted",
+      "kind": "variant",
+      "name": "Counted",
+      "of": "zu::zu1::props::ListRows",
+      "signature": "Counted(usize)",
+      "doc": "Every row says its own count, in this many bytes."
+    },
+    {
+      "id": "zu::zu1::props::ListRows::Fixed",
+      "kind": "variant",
+      "name": "Fixed",
+      "of": "zu::zu1::props::ListRows",
+      "signature": "Fixed(usize)",
+      "doc": "The directory says the count and no row carries one, which is a\ncolumn every row of which was written at its declared bound."
+    },
+    {
       "id": "zu::zu1::props::NodesWithProps",
       "kind": "type-alias",
       "name": "NodesWithProps",
@@ -10125,6 +10147,14 @@
       "name": "PropColumn"
     },
     {
+      "id": "zu::zu1::props::PropColumn::count_width",
+      "kind": "field",
+      "name": "count_width",
+      "of": "zu::zu1::props::PropColumn",
+      "signature": "u8",
+      "doc": "How many bytes each row of this list column spends saying its own\nelement count, where it says one at all. Four is what every\nversion before 12 wrote and what an unbounded list still writes.\n\nIt is carried rather than worked out from the declared bound\nbecause a column is read at the width its rows were written at,\nand those are two different questions once the rule has changed\nonce. A version 11 column of `LIST<INT8>(4)` rows holds four byte\ncounts, and a fold that leaves those rows alone has to leave the\nfour with them, whatever a column written today would have used."
+    },
+    {
       "id": "zu::zu1::props::PropColumn::fixed_len",
       "kind": "field",
       "name": "fixed_len",
@@ -10133,20 +10163,20 @@
       "doc": "The element count every row of this list column holds, where the\nrows do not carry one themselves. `None` is every other column,\nand a list column whose rows say their own count.\n\nThis is the encoding half of schema/06 §2 written down: the type\nabove is the declaration, `LIST<FLOAT32>(768)`, and this says\nthat this column was written whole at exactly the bound, so the\nblock may drop what the declaration already gives. It cannot be\nworked out from the bytes, which is why it is a field: a bounded\n`LIST<INT32>(768)` column of 767 counted elements a row is the\nsame 3072 bytes a row as one of 768 uncounted ones."
     },
     {
-      "id": "zu::zu1::props::PropColumn::fixed_list",
-      "kind": "method",
-      "name": "fixed_list",
-      "of": "zu::zu1::props::PropColumn",
-      "signature": "fn fixed_list(&self) -> Option<usize>",
-      "doc": "The count to read a row of this column at, which is what\n[`list_elements`] wants and `None` for every row that says its\nown."
-    },
-    {
       "id": "zu::zu1::props::PropColumn::is_lane",
       "kind": "method",
       "name": "is_lane",
       "of": "zu::zu1::props::PropColumn",
       "signature": "fn is_lane(&self) -> bool",
       "doc": "Whether this column stores in the fixed width lane, which is one\n64 bit word per row through the integer cascade, as against the\nblob segments a string or a byte string uses.\n\nEvery fixed stride type of eight bytes or less rides the lane:\nthe cascade encodes words and does not care what the bits mean,\nand the column's type is what says whether a word is a count, a\ntruth value, a float, a day or a nanosecond."
+    },
+    {
+      "id": "zu::zu1::props::PropColumn::list_rows",
+      "kind": "method",
+      "name": "list_rows",
+      "of": "zu::zu1::props::PropColumn",
+      "signature": "fn list_rows(&self) -> ListRows",
+      "doc": "How to read a row of this list column, which is what\n[`list_elements`] wants beside the bytes: the count the directory\nholds, or the width the row says its own in."
     },
     {
       "id": "zu::zu1::props::PropColumn::meta",
@@ -10429,14 +10459,6 @@
       "signature": "fn columns(&self) -> &[PropColumn]"
     },
     {
-      "id": "zu::zu1::props::PropsReader::fixed_list",
-      "kind": "method",
-      "name": "fixed_list",
-      "of": "zu::zu1::props::PropsReader",
-      "signature": "fn fixed_list(&self, col: usize) -> Option<usize>",
-      "doc": "The element count to read a row of `col` at, which is what\n[`list_elements`] wants beside the bytes."
-    },
-    {
       "id": "zu::zu1::props::PropsReader::gather_int",
       "kind": "method",
       "name": "gather_int",
@@ -10483,6 +10505,14 @@
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn label_word(&mut self, db: &mut Zu1File, row: u64) -> Result<Option<u64>>",
       "doc": "The label bitset of row `row`, `None` when the table stores\nnone, which is a table whose rows carry its name and nothing\nelse. The bits are dictionary positions, so a caller tests a\npattern's mask against the word with one AND."
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::list_rows",
+      "kind": "method",
+      "name": "list_rows",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn list_rows(&self, col: usize) -> ListRows",
+      "doc": "How to read a row of list column `col`, which is what\n[`list_elements`] wants beside the bytes."
     },
     {
       "id": "zu::zu1::props::PropsReader::meta",
@@ -10665,8 +10695,8 @@
       "id": "zu::zu1::props::list_elements",
       "kind": "function",
       "name": "list_elements",
-      "signature": "fn list_elements(elem: &zu_common::LogicalType, bytes: &[u8], fixed: Option<usize>) -> zu_common::Result<Vec<ListElement>>",
-      "doc": "Reads back a row written by `encode_list_row`.\n\n`fixed` is the element count a column whose rows do not carry one\nholds, which is [`PropColumn::fixed_list`], and `None` is every row\nthat says its own count. Which of the two a row is cannot be settled\nfrom the bytes the way the element width can: a bounded\n`LIST<INT32>(768)` row of 767 counted elements is the same length as\none of 768 uncounted ones. So the directory says, and this takes the\nanswer rather than guessing at it.\n\nThe elements borrow the buffer they came out of, so a read of a list\ncolumn is the blob read and a walk over it, with no allocation per\nelement."
+      "signature": "fn list_elements(elem: &zu_common::LogicalType, bytes: &[u8], rows: ListRows) -> zu_common::Result<Vec<ListElement>>",
+      "doc": "Reads back a row written by `encode_list_row`.\n\n`rows` is [`PropColumn::list_rows`], which says whether the count is\nin the directory or at the head of the row and how wide the head is.\nNeither can be settled from the bytes the way the element width can:\na bounded `LIST<INT32>(768)` row of 767 counted elements is the same\nlength as one of 768 uncounted ones, and the head that says 767 is\none, two or four bytes according to what the column was written at.\nSo the directory says, and this takes the answer rather than guessing\nat it.\n\nThe elements borrow the buffer they came out of, so a read of a list\ncolumn is the blob read and a walk over it, with no allocation per\nelement."
     },
     {
       "id": "zu::zu1::props::load_props",

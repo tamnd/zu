@@ -10,6 +10,43 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Mappings still to be refused, which is how a test reaches the one
+/// behaviour a kernel decides.
+static REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the next `count` mapping attempts fail the way a kernel at
+/// `vm.max_map_count` fails them, and any later one succeed.
+///
+/// Process wide and not per database, because the thing it stands in for
+/// is a per process limit. A test that calls this wants a test binary of
+/// its own, since a mapping any other test in the same process asks for
+/// while it is armed is refused too.
+///
+/// Deliberately not behind a cargo feature. The cost when it is not
+/// armed is one relaxed compare on a path that runs once per 4 MiB page
+/// on the flusher thread, which is nothing next to the `mmap` beside it,
+/// and a fault hook that is only compiled under a feature is a fault
+/// hook that stops compiling without anybody finding out. #769.
+pub fn refuse_mappings(count: u64) {
+    REFUSALS.store(count, Ordering::Relaxed);
+}
+
+/// Whether this mapping attempt is one of the refused ones, taking it
+/// off the count if it is.
+///
+/// Only where there is a mapping call to refuse. On a platform without
+/// one every attempt is refused already, so arming this changes nothing
+/// there and the count is simply never read.
+#[cfg(unix)]
+fn refusing() -> bool {
+    REFUSALS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+}
 
 /// Creates the log file, failing if it is already there.
 pub fn create_new(path: &Path) -> io::Result<File> {
@@ -520,6 +557,10 @@ pub unsafe fn map_read_at(file: &File, offset: u64, len: usize, at: *mut u8) -> 
 #[cfg(unix)]
 fn map_read_inner(file: &File, offset: u64, len: usize, at: *mut u8) -> Option<*mut u8> {
     use std::os::fd::AsRawFd;
+
+    if refusing() {
+        return None;
+    }
 
     /// `PROT_READ` from `sys/mman.h`, the same value on Linux and macOS.
     const PROT_READ: i32 = 1;

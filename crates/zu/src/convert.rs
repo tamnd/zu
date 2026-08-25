@@ -64,6 +64,19 @@ fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
         LogicalType::Bytes { .. } => ColumnType::Blob,
         LogicalType::Float { .. } => ColumnType::Real,
         LogicalType::Bool => ColumnType::Boolean,
+        // sqlite's INTEGER is sixty four bits wide, so the hundred and
+        // twenty eight bit integer has no storage class here either. It
+        // is refused rather than narrowed, because a staging form that
+        // silently drops the top half of a value is worse than one that
+        // says it cannot carry it.
+        LogicalType::Int {
+            bits: IntBits::B128,
+            ..
+        } => {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' holds {ty}, which has no sqlite storage class"
+            )));
+        }
         LogicalType::Int { .. } => ColumnType::Integer,
         // The temporal columns keep their declaration on the way out,
         // so a file that round trips through sqlite comes back holding

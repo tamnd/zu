@@ -76,8 +76,11 @@ use crate::txn::Cell;
 /// lives in the type. Version 12 lets a list column's rows say their
 /// count in fewer than four bytes, and writes the width they said it in
 /// into the column entry, which is the second field there that is about
-/// the encoding rather than about the declaration.
-const PROPS_VERSION: u16 = 12;
+/// the encoding rather than about the declaration. Version 13 adds the
+/// hundred and twenty eight bit integer, which is the first column type
+/// that is a number and does not ride the lane: sixteen bytes at a fixed
+/// stride, on the side of the store a `BINARY(16)` already uses.
+const PROPS_VERSION: u16 = 13;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -234,7 +237,10 @@ fn type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
 /// nothing beside it, since the type is the whole of what it says. A
 /// decimal takes its precision and its scale, and `extended_bytes` is
 /// where the precisions a lane word holds are told from the ones it does
-/// not, because that answer has to be the same for the catalog.
+/// not, because that answer has to be the same for the catalog. An
+/// integer wider than the lane takes the same road for the same reason:
+/// `INT128` has no code, and which of the wide integers has an encoding
+/// at all is a question `extended_bytes` answers once for both callers.
 ///
 /// What is left unstorable is a list of anything but a fixed width
 /// element, whose row has to carry lengths of its own; saying so here is
@@ -248,7 +254,8 @@ fn column_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
         | LogicalType::Bytes { .. }
         | LogicalType::ZonedTime
         | LogicalType::ZonedDatetime
-        | LogicalType::Decimal { .. } => extended_bytes(ty),
+        | LogicalType::Decimal { .. }
+        | LogicalType::Int { .. } => extended_bytes(ty),
         _ => None,
     }
 }
@@ -423,6 +430,12 @@ const EXT_LIST: u8 = 4;
 /// read a row: the lane holds unscaled units and the scale is what says
 /// a unit is a hundredth.
 const EXT_DECIMAL: u8 = 5;
+/// A signed hundred and twenty eight bit integer. It takes nothing
+/// beside the code, because the type is the whole of what it says, and
+/// it is in the extended form rather than in [`TYPE_CODES`] because that
+/// table doubles as the list element table and no list element is
+/// sixteen bytes wide.
+const EXT_INT128: u8 = 6;
 
 /// The count that stands for a bound nobody wrote, since a length is a
 /// `u32` and every one of them is a length somebody could write.
@@ -458,6 +471,19 @@ fn extended_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
     Some(match ty {
         LogicalType::ZonedTime => vec![EXTENDED_CODE, EXT_ZONED_TIME],
         LogicalType::ZonedDatetime => vec![EXTENDED_CODE, EXT_ZONED_DATETIME],
+        // The signed hundred and twenty eight bit integer, and that one
+        // alone of the wide integers. `UINT128` is not here because the
+        // engine's exact numeric carries an `i128`, so the top half of a
+        // `u128` is a range no value could name, and `INT256` is not
+        // here because the engine has no carrier for one at all. A
+        // column whose declared range no value can reach would take a
+        // row in and refuse to give it back, so the refusal lands at the
+        // declaration instead, the way the wide decimal's does.
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B128,
+            precision: None,
+        } => vec![EXTENDED_CODE, EXT_INT128],
         // A decimal is written where its unscaled units fit the lane,
         // and refused where they do not. The bound belongs here rather
         // than one caller up because the declared form and the column
@@ -529,6 +555,13 @@ fn decode_extended_type(bytes: &[u8], pos: &mut usize) -> Result<LogicalType> {
     }
     if kind == EXT_ZONED_DATETIME {
         return Ok(LogicalType::ZonedDatetime);
+    }
+    if kind == EXT_INT128 {
+        return Ok(LogicalType::Int {
+            signed: true,
+            bits: IntBits::B128,
+            precision: None,
+        });
     }
     if kind == EXT_DECIMAL {
         let mut digits = || -> Result<u16> {
@@ -1117,6 +1150,15 @@ impl PropValues<'_> {
             // them a number is in the declared type beside them, which
             // is why this can be the same empty lane an integer column
             // gets without the two columns being the same column.
+            // And a hundred and twenty eight bit integer holds none of
+            // sixteen byte runs, because it is on the blob side. The two
+            // integer arms are two arms for the same reason a `BINARY`
+            // column and an `INT64` one are: what an empty column holds
+            // none of is whatever its rows would have been.
+            LogicalType::Int {
+                bits: IntBits::B128,
+                ..
+            } => PropValues::Bytes(&[]),
             LogicalType::Int { .. } | LogicalType::Decimal { .. } => PropValues::Int(&[]),
             LogicalType::Float { .. } => PropValues::Float(&[]),
             LogicalType::Str { .. } => PropValues::Str(&[]),
@@ -1919,6 +1961,14 @@ fn write_props(
 /// characters and a character is one to four octets, so the width it
 /// fixes is a width in a unit the storage does not count in. A bound on
 /// characters is a check; a bound on octets is a layout.
+///
+/// A hundred and twenty eight bit integer is one of these, and it is the
+/// only one that is not a byte string. The lane is sixty four bits and
+/// this is twice that, so the number goes on the blob side of the store
+/// as sixteen little endian bytes, which is where a `BINARY(16)` already
+/// goes and by the same layout: one width, no offsets. What tells the
+/// two apart afterwards is the column's own type, the way it tells a
+/// byte string from a character string.
 pub(crate) fn fixed_octets(ty: &LogicalType) -> Option<u32> {
     match ty {
         LogicalType::Bytes {
@@ -1926,6 +1976,10 @@ pub(crate) fn fixed_octets(ty: &LogicalType) -> Option<u32> {
             max: Some(max),
             ..
         } if min == max && *min > 0 => Some(*min),
+        LogicalType::Int {
+            bits: IntBits::B128,
+            ..
+        } => Some(16),
         _ => None,
     }
 }
@@ -1986,7 +2040,33 @@ fn check_declared(
         // than a different encoding. What is left to check is the
         // promise: a word outside the declared range is a row the
         // column's own type says is not there.
-        (LogicalType::Int { signed, bits, .. }, PropValues::Int(words)) => {
+        // A hundred and twenty eight bit integer is the exception, and
+        // it is one because it is not on the lane: sixteen bytes a row
+        // at a fixed stride, so what is checked is the width and not a
+        // range. The type is the whole of what a value of it may be, and
+        // a row of another length is one the reader would walk into the
+        // next row for.
+        (
+            LogicalType::Int {
+                bits: IntBits::B128,
+                ..
+            },
+            PropValues::Bytes(rows),
+        ) => {
+            for (row, bytes) in rows.iter().enumerate() {
+                if !column.holds(row) || bytes.len() == 16 {
+                    continue;
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "column '{name}' is declared {ty} and row {row} holds {} octets",
+                    bytes.len()
+                )));
+            }
+            return Ok(());
+        }
+        (LogicalType::Int { signed, bits, .. }, PropValues::Int(words))
+            if *bits != IntBits::B128 =>
+        {
             for (row, &word) in words.iter().enumerate() {
                 if !column.holds(row) || bits.holds(word, *signed) {
                     continue;
@@ -5947,6 +6027,27 @@ mod tests {
             assert!(column_type_bytes(&ty).is_none(), "{ty}");
             assert!(!storable(&ty), "{ty}");
         }
+        // The wide integers split the same way and for the same reason.
+        // A signed hundred and twenty eight bit column is storable,
+        // because the engine's exact numeric carries an `i128` and so
+        // every value the declaration admits is a value that can be
+        // handed back. The unsigned one and the two hundred and fifty
+        // six bit one are not, because half of one range and all of the
+        // other have no carrier, and a column that took a row in and
+        // could not give it back would be worse than a refusal at the
+        // declaration.
+        let wide = LogicalType::int(IntBits::B128);
+        assert_eq!(column_type_bytes(&wide), declared_type_bytes(&wide));
+        assert!(storable(&wide), "{wide}");
+        for ty in [
+            LogicalType::uint(IntBits::B128),
+            LogicalType::int(IntBits::B256),
+            LogicalType::uint(IntBits::B256),
+        ] {
+            assert!(declared_type_bytes(&ty).is_none(), "{ty}");
+            assert!(column_type_bytes(&ty).is_none(), "{ty}");
+            assert!(!storable(&ty), "{ty}");
+        }
     }
 
     #[test]
@@ -6139,6 +6240,7 @@ mod tests {
                 },
                 true,
             ),
+            (LogicalType::int(IntBits::B128), true),
             // Declarable and not storable. Each of these is an entry in
             // schema/06 section 6, and S2 turns them true one at a time.
             (
@@ -6148,7 +6250,6 @@ mod tests {
                 },
                 false,
             ),
-            (LogicalType::int(IntBits::B128), false),
             (LogicalType::int(IntBits::B256), false),
             (LogicalType::uint(IntBits::B128), false),
             (LogicalType::float(FloatBits::B16), false),
@@ -6212,7 +6313,7 @@ mod tests {
         // encoding S2 owes, and taking one off is a deliberate diff.
         assert_eq!(
             unstorable.len(),
-            19,
+            18,
             "the unstorable set changed: {unstorable:?}"
         );
     }

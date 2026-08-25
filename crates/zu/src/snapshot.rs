@@ -502,17 +502,27 @@ fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
             reader.columns().len()
         )));
     }
-    // Two column types ride the lane and are not lanes the vector layer
-    // has. A zoned column's words are instants, and the offsets that
-    // make them zoned are a plane a vector has no room for. A decimal
-    // column's words are unscaled units, and the scale that makes them
-    // a number is in the declared type, which a vector does not carry.
-    // `vector_col` already keeps both out of a plan, and this is the
-    // same rule said where the read happens, so a caller that reached
-    // here another way is refused rather than handed words dressed as
-    // integers.
+    // Three column types are stored in a shape the vector layer has no
+    // lane for. A zoned column's words are instants, and the offsets
+    // that make them zoned are a plane a vector has no room for. A
+    // decimal column's words are unscaled units, and the scale that
+    // makes them a number is in the declared type, which a vector does
+    // not carry. A hundred and twenty eight bit integer is sixteen
+    // bytes at a fixed stride, so the gather below would hand it back
+    // as a string vector, which is a number dressed as text.
+    // `vector_col` already keeps all three out of a plan, and this is
+    // the same rule said where the read happens, so a caller that
+    // reached here another way is refused rather than handed words
+    // dressed as something else.
     let column = &reader.columns()[ix];
-    if zoned(&column.ty) || matches!(column.ty, LogicalType::Decimal { .. }) {
+    let wide_int = matches!(
+        column.ty,
+        LogicalType::Int {
+            bits: IntBits::B128,
+            ..
+        }
+    );
+    if zoned(&column.ty) || matches!(column.ty, LogicalType::Decimal { .. }) || wide_int {
         return Err(ZuError::InvalidArgument(format!(
             "column '{}' holds {}, which the vector layer has no lane for",
             column.name, column.ty

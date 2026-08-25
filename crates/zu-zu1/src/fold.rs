@@ -662,6 +662,14 @@ fn fold_props(
             // column was already written at, so the count the rows do
             // not carry is the count they still do not carry.
             fixed_len: col.fixed_len,
+            // And the same sentence for the width the rows that do carry
+            // a count carried it in. This directory is being written at
+            // the current version over row blobs that were written at
+            // whatever version they were written at, so the width has to
+            // come off the old entry rather than off the declared bound:
+            // a version 11 column said four, and its rows still say four
+            // however narrow the bound would let a fresh write be.
+            count_width: col.count_width,
             zones,
         });
     }
@@ -1248,6 +1256,7 @@ fn fold_rel_props(
             meta,
             validity: valid.write(db)?,
             fixed_len: col.fixed_len,
+            count_width: col.count_width,
             zones,
         });
     }
@@ -1264,7 +1273,7 @@ fn fold_rel_props(
 mod tests {
     use super::*;
     use crate::graph::{bulk_load_as, bulk_load_keyed};
-    use crate::props::{PropValues, PropsReader, load_props, store_props};
+    use crate::props::{ListRows, PropValues, PropsReader, load_props, store_props};
     use zu_common::LogicalType;
 
     struct Fixture {
@@ -1498,7 +1507,7 @@ mod tests {
         let mut out = Vec::new();
         reader.read_str(&mut f.db, 0, 1, &mut out).unwrap();
         assert_eq!(
-            crate::props::list_elements(&elem, &out, Some(2)).unwrap(),
+            crate::props::list_elements(&elem, &out, ListRows::Fixed(2)).unwrap(),
             vec![
                 crate::props::ListElement::Word(9),
                 crate::props::ListElement::Word(8)

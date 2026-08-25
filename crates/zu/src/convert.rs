@@ -25,8 +25,8 @@ use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, Ends, GraphReader, bulk_load_between};
 use zu_zu1::props::{
-    ListElement, PropInput, PropValues, PropsReader, list_elements, load_props, load_rel_props,
-    store_labels, store_props_nullable, store_rel_props_nullable,
+    ListElement, ListRows, PropInput, PropValues, PropsReader, list_elements, load_props,
+    load_rel_props, store_labels, store_props_nullable, store_rel_props_nullable,
 };
 
 /// The staged element kind a stored list's element type names, `None`
@@ -141,7 +141,7 @@ fn staged_value(
                 elem,
                 buf,
                 name,
-                reader.fixed_list(ci),
+                reader.list_rows(ci),
             )?))
         }
         LogicalType::Float { bits, .. } => {
@@ -286,14 +286,14 @@ fn staged_items(
     elem: &LogicalType,
     bytes: &[u8],
     name: &str,
-    fixed: Option<usize>,
+    rows: ListRows,
 ) -> Result<Vec<list_text::Item>> {
     let kind = list_kind(elem).ok_or_else(|| {
         ZuError::InvalidArgument(format!(
             "column '{name}' holds a list of {elem}, which has no sqlite staging form"
         ))
     })?;
-    list_elements(elem, bytes, fixed)?
+    list_elements(elem, bytes, rows)?
         .into_iter()
         .map(|item| match (item, kind) {
             (ListElement::Word(w), Kind::Int) => Ok(list_text::Item::Int(w as i64)),

@@ -298,6 +298,47 @@ fn the_plane_costs_what_it_says_it_costs() {
 }
 
 #[test]
+fn a_node_pays_for_its_key_and_its_links_and_four_bytes_of_header() {
+    // The layout of #772, measured rather than read off the source.
+    //
+    // A node is four bytes of header, then the key, then padding up to
+    // eight, then eight bytes a level. Heights are geometric at one
+    // over four, so the mean height is 4/3 and the height one node is
+    // three quarters of them.
+    //
+    // At a thirty three byte key that is 4 + 33 = 37 rounding to 40,
+    // plus 8, so 48 bytes at height one, 56 at two, 64 at three. Weight
+    // those and the mean node is 50.6 bytes, so sixty thousand of them
+    // is 3.04 MB, which is 2.90 MiB, which the arena holds in three of
+    // its one megabyte chunks.
+    //
+    // The layout this replaced had two `u32` in the header and the
+    // links in front of the key, so the same node was 8 + 8 + 33 = 49
+    // rounding to 56, the mean node was 57.8 bytes, and the same sixty
+    // thousand keys needed four chunks. That is what the ceiling below
+    // is set to catch: it is not a round number picked to pass, it sits
+    // between the two layouts.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("layout.zu2"), options()).unwrap();
+    {
+        let mut s = db.session();
+        for i in 0..60_000usize {
+            let key = format!("user{i:029}").into_bytes();
+            assert_eq!(key.len(), 33);
+            s.upsert(&key, b"v").unwrap();
+        }
+    }
+    let bytes = db.ordered_bytes().unwrap();
+    assert_eq!(db.ordered_keys(), Some(60_000));
+    assert!(
+        bytes <= 3 << 20,
+        "the plane holds {bytes} bytes for sixty thousand thirty three byte keys, \
+         which is more than the layout says it should"
+    );
+    assert!(bytes > 2 << 20, "the plane holds {bytes} bytes, too few");
+}
+
+#[test]
 fn threads_scanning_while_others_write_see_an_order_and_never_a_gap() {
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();

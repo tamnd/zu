@@ -73,7 +73,7 @@ const CHUNKS: usize = 1 << 16;
 ///
 /// Nodes are variable length and are never freed one at a time, which
 /// is the whole reason this is not a `Box` per node: a node is its
-/// header, its forward pointers and its key bytes contiguous, so a walk
+/// header, its key bytes and its forward pointers contiguous, so a walk
 /// touches one allocation per step instead of two, and the arena is
 /// dropped whole when the database closes.
 struct Arena {
@@ -180,34 +180,78 @@ impl Arena {
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
-/// A node, as bytes. Key length, then height, then one forward pointer
-/// per level, then the key.
+/// A node, as bytes. A four byte header, then the key, then enough
+/// padding to get back to eight, then one forward pointer per level.
 ///
 /// Laid out by hand rather than as a struct because the tail is two
 /// variable length arrays, and a `Box<Node>` with the key beside it
 /// would put a second dereference on the walk this whole plane exists
 /// to make cheap.
-const KEY_LEN: usize = 0;
-const HEIGHT: usize = 4;
-const LINKS: usize = 8;
+///
+/// The header holds both the height and the key length, height in the
+/// low [`HEIGHT_BITS`] because it never exceeds [`MAX_HEIGHT`] and the
+/// length in the rest. Two `u32` fields was four bytes more than the
+/// facts need, and on the key lengths a real workload has it was eight
+/// more than that once the arena rounded the node up to eight: 8 + 8 +
+/// 33 is 49 and rounds to 56, where 4 + 33 rounds to 40 and takes the
+/// links at 48. See #772.
+///
+/// The links go last rather than first for a reason that is easy to
+/// miss. Putting them first would be the natural way to keep them eight
+/// aligned without a header in front of them, but then the header sits
+/// at `8 * height` and there is no way to read the height without
+/// already knowing it. Last works because the header is at a fixed
+/// offset, and the key length it holds is what says where the padding
+/// ends.
+const HEADER: usize = 0;
+const HEADER_LEN: usize = 4;
+
+/// How much of the header the height gets. Twenty fits in five, and the
+/// key length gets the other twenty seven, which is 128 MiB and far
+/// past anything [`crate::Options`] will accept.
+const HEIGHT_BITS: u32 = 5;
+const HEIGHT_MASK: u32 = (1 << HEIGHT_BITS) - 1;
+
+/// The most key bytes a node can name.
+pub(crate) const MAX_KEY: usize = (1 << (32 - HEIGHT_BITS)) - 1;
+
+/// Where the forward pointers start, given a key length. Rounded up to
+/// eight because they are `AtomicU64` and the node's own base is eight
+/// aligned, so this is what keeps them aligned.
+#[inline]
+const fn links_at(key_len: usize) -> usize {
+    (HEADER_LEN + key_len).next_multiple_of(8)
+}
 
 /// SAFETY for all of these: `at` came from [`Ordered::node`] or from a
 /// forward pointer of one, so it points at a whole node in a chunk that
 /// outlives the list.
+unsafe fn header_of(at: *const u8) -> u32 {
+    unsafe { at.add(HEADER).cast::<u32>().read() }
+}
+
 unsafe fn height_of(at: *const u8) -> usize {
-    unsafe { at.add(HEIGHT).cast::<u32>().read() as usize }
+    unsafe { (header_of(at) & HEIGHT_MASK) as usize }
 }
 
 unsafe fn key_of<'a>(at: *const u8) -> &'a [u8] {
     unsafe {
-        let len = at.add(KEY_LEN).cast::<u32>().read() as usize;
-        let start = LINKS + 8 * height_of(at);
-        slice::from_raw_parts(at.add(start), len)
+        let len = (header_of(at) >> HEIGHT_BITS) as usize;
+        slice::from_raw_parts(at.add(HEADER_LEN), len)
     }
 }
 
 unsafe fn link(at: *const u8, level: usize) -> &'static AtomicU64 {
-    unsafe { &*at.add(LINKS + 8 * level).cast::<AtomicU64>() }
+    unsafe {
+        // Nothing on the walk asks a node its height, because a node
+        // reached at a level has more levels than that by construction
+        // and the walk descends rather than counts. The height is in
+        // the header anyway, since the length had bits to spare, so
+        // this is the one place it earns them back.
+        debug_assert!(level < height_of(at), "link above a node's height");
+        let len = (header_of(at) >> HEIGHT_BITS) as usize;
+        &*at.add(links_at(len) + 8 * level).cast::<AtomicU64>()
+    }
 }
 
 unsafe fn next_of(at: *const u8, level: usize) -> *const u8 {
@@ -455,14 +499,25 @@ impl Builder<'_> {
 /// Space for a node and its key, with the header filled in and the
 /// links left null.
 fn node(arena: &Arena, key: &[u8], height: usize) -> Result<*const u8> {
-    let size = LINKS + 8 * height + key.len();
-    let at = arena.alloc(size)?;
-    // SAFETY: the arena just handed back `size` zeroed and aligned
+    // Both of these are the caller's business and neither can happen
+    // from inside this crate, but the header packs them together and a
+    // silent truncation there would be a wrong answer rather than a
+    // failure, so they are checked rather than assumed.
+    if key.len() > MAX_KEY {
+        return Err(Error::KeyTooLong {
+            len: key.len(),
+            max: MAX_KEY,
+        });
+    }
+    debug_assert!((1..=MAX_HEIGHT).contains(&height));
+    let links = links_at(key.len());
+    let at = arena.alloc(links + 8 * height)?;
+    // SAFETY: the arena just handed back that many zeroed and aligned
     // bytes that nobody else has, which is exactly this layout.
     unsafe {
-        at.add(KEY_LEN).cast::<u32>().write(key.len() as u32);
-        at.add(HEIGHT).cast::<u32>().write(height as u32);
-        std::ptr::copy_nonoverlapping(key.as_ptr(), at.add(LINKS + 8 * height), key.len());
+        let header = ((key.len() as u32) << HEIGHT_BITS) | height as u32;
+        at.add(HEADER).cast::<u32>().write(header);
+        std::ptr::copy_nonoverlapping(key.as_ptr(), at.add(HEADER_LEN), key.len());
     }
     Ok(at)
 }

@@ -105,6 +105,15 @@ pub enum Error {
     #[error("the scan plane's arena reached its ceiling of {max} chunks")]
     ArenaFull { max: usize },
 
+    /// A key longer than the scan plane's node header can name. The
+    /// header packs the length beside the height, so twenty seven bits
+    /// of it are the length and this is 128 MiB. A record has to fit in
+    /// a page to be written at all, so a key that reaches this cannot
+    /// have come from a commit, and the check is here because packing
+    /// the two together would otherwise truncate rather than fail.
+    #[error("key of {len} bytes is longer than the scan plane's limit of {max}")]
+    KeyTooLong { len: usize, max: usize },
+
     /// A transaction committed on the log and then could not finish
     /// putting its records into the index, so what is in memory is part
     /// of a transaction and what is on the log is all of it. Nothing

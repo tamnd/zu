@@ -96,11 +96,15 @@ fn probe() -> Vec<(&'static str, Answer)> {
         // so a declaration is still all they are.
         ("LIST<FLOAT32 NOT NULL>[768]", Answer::Declared),
         ("LIST<LIST<STRING>>", Answer::Declared),
-        // A decimal a 64 bit lane holds. The column stores unscaled
-        // units and the declared scale is what makes them a number, so
-        // twelve digits of them fit a word and this is a column a
-        // statement can fill.
+        // The two decimals, which are one declared type stored two ways.
+        // The column stores unscaled units and the declared scale is
+        // what makes them a number; twelve digits of them fit a lane
+        // word and thirty eight want the sixteen byte plane INT128
+        // below opened. Both are columns a statement can fill, and
+        // thirty eight is the widest an i128 holds, so it is the widest
+        // a value of one can be.
         ("DECIMAL(12,2)", Answer::Declared),
+        ("DECIMAL(38,2)", Answer::Declared),
         // The signed hundred and twenty eight bit integer is the first
         // number here that does not ride the lane. It is sixteen bytes
         // at a fixed stride, the layout BINARY(16) above already uses,
@@ -111,13 +115,11 @@ fn probe() -> Vec<(&'static str, Answer)> {
         // The condition is 42000 for all of them, which is what S1
         // replaced the sentence about corruption with.
         //
-        // The wide decimal's unscaled units want more than a lane word
-        // and the lane is sixty four bits. The two wide integers below
-        // it are refused for a different reason: the top half of a
-        // `UINT128` and the whole of an `INT256` are ranges no value
-        // the engine carries can name, so a column of one would take a
-        // row in and be unable to give it back.
-        ("DECIMAL(38,2)", cannot_write(28)),
+        // The two wide integers are refused on the value side rather
+        // than the storage side: sixteen bytes would hold either, but
+        // the top half of a `UINT128` and the whole of an `INT256` are
+        // ranges no value the engine carries can name, so a column of
+        // one would take a row in and be unable to give it back.
         ("INT256", cannot_write(29)),
         ("UINT128", cannot_write(30)),
         ("FLOAT16", cannot_write(31)),
@@ -152,7 +154,7 @@ fn a_graph_type_declares_the_types_the_frontier_says_it_can() {
             declared += 1;
         }
     }
-    assert_eq!(declared, 27, "the declarable set changed");
+    assert_eq!(declared, 28, "the declarable set changed");
 }
 
 /// The frontier has a far side, and one type is on it.
@@ -193,28 +195,29 @@ fn the_year_month_duration_is_stored_and_cannot_be_declared() {
 /// Every refusal above carries a condition and none of them says
 /// corrupt, which is what S1 changed.
 ///
-/// A user who writes `DECIMAL(38,2)` has written a legal GQL statement
-/// that this engine will not perform. Before S1 they were told their
-/// file was damaged, with no condition to catch on. Now it is 42000,
-/// syntax error or access rule violation, which is the class the
-/// standard keeps for a statement the engine will not carry out. The
-/// two data exception codes that say invalid value type, 22G03 and
-/// 22G12, are class 22 and are about a value at run time; a type in a
-/// declaration is not a value.
+/// A user who writes `INT256` has written a legal GQL statement that
+/// this engine will not perform. Before S1 they were told their file was
+/// damaged, with no condition to catch on. Now it is 42000, syntax error
+/// or access rule violation, which is the class the standard keeps for a
+/// statement the engine will not carry out. The two data exception codes
+/// that say invalid value type, 22G03 and 22G12, are class 22 and are
+/// about a value at run time; a type in a declaration is not a value.
 ///
-/// The example is the wide decimal rather than the narrow one because
-/// the narrow one now stores. Thirty eight digits of unscaled units do
-/// not fit a lane word, so this is where the same sentence still holds.
+/// The example used to be the wide decimal and is now the wide integer,
+/// because the decimal stores at every precision a statement can spell.
+/// What is left on this side of the line is the types nothing here
+/// carries a value of, and a two hundred and fifty six bit integer is
+/// one: a column of them could take a row in and not give it back.
 #[test]
 fn a_type_the_catalog_will_not_write_is_refused_with_a_condition() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    let source = "CREATE GRAPH TYPE money { (:Purchase {total :: DECIMAL(38,2)}) }";
-    let err = run(source, &mut db, &[]).expect_err("a wide decimal is not storable");
+    let source = "CREATE GRAPH TYPE money { (:Purchase {total :: INT256}) }";
+    let err = run(source, &mut db, &[]).expect_err("a wide integer is not storable");
     assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42000".into()));
     assert!(!err.to_string().contains("corrupt"), "{err}");
     assert!(
-        err.to_string().contains("DECIMAL") || err.to_string().contains("total"),
+        err.to_string().contains("INT256") || err.to_string().contains("total"),
         "{err}"
     );
 }

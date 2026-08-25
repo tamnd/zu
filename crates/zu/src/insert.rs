@@ -24,6 +24,7 @@ use std::sync::Arc;
 use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{Decimal, FloatBits, GqlStatus, IntBits, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
+use zu_zu1::props::fixed_octets;
 
 use crate::deleted::Deleted;
 use crate::query::Value;
@@ -760,18 +761,32 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
         //
         // An integer is an exact number of scale nought, so it goes in
         // the same way a whole number goes into a float column.
+        //
+        // Where the units go is the precision's answer. To eighteen
+        // digits they are a lane word; above that they are sixteen
+        // bytes on the blob side, the plane the hundred and twenty
+        // eight bit integer opened, and `fixed_octets` is the one place
+        // that says which so the writer and the reader cannot disagree.
+        // The check either way is the declared precision, which is the
+        // promise, and not the width, which is the consequence.
         (LogicalType::Decimal { precision, scale }, Value::Decimal(_) | Value::Int(_)) => {
             let given = match value {
                 Value::Decimal(d) => *d,
                 Value::Int(n) => Decimal::new(i128::from(*n), 0),
                 _ => unreachable!("matched just above"),
             };
+            let wide = fixed_octets(ty).is_some();
             let at = given
                 .rescale(*scale)
                 .filter(|at| at.digits() <= *precision)
-                .and_then(|at| i64::try_from(at.unscaled()).ok());
+                .and_then(|at| match wide {
+                    true => Some(Cell::Str(at.unscaled().to_le_bytes().to_vec())),
+                    false => i64::try_from(at.unscaled())
+                        .ok()
+                        .map(|n| Cell::Int(n as u64)),
+                });
             match at {
-                Some(units) => Cell::Int(units as u64),
+                Some(cell) => cell,
                 None => {
                     return Err(ZuError::gql(
                         codes::C22003,

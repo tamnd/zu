@@ -197,21 +197,21 @@ cases:
     raises: "42000"
 
   - name: a-property-type-no-column-can-hold
-    doc: A declared type is written into the catalog with the codes a column stores, so a type no column has is a type no element type can name. A decimal column holds unscaled units in a 64 bit word and the declared scale is what makes them a number, so thirty eight digits of them are more than a column here has room for. The refusal is about the statement rather than about the file, which is why it is 42000 and not a report of damage.
-    query: "CREATE GRAPH TYPE t { (:P {v :: DECIMAL(38,2)}) }"
+    doc: A declared type is written into the catalog with the codes a column stores, so a type no column has is a type no element type can name. A two hundred and fifty six bit integer is one of those, and the reason is the value side rather than the storage side: nothing here carries a number that wide, so a column of them could take a row in and be unable to give it back. The refusal is about the statement rather than about the file, which is why it is 42000 and not a report of damage.
+    query: "CREATE GRAPH TYPE t { (:P {v :: INT256}) }"
     raises: "42000"
 
   - name: a-decimal-column-is-a-declaration-a-graph-type-takes
-    doc: The other side of the line above. A decimal whose unscaled units fit a 64 bit word is a column, so the declaration stands, and eighteen digits is the widest that does. The declaration is the setup because a catalog statement returns no rows, so what the case asserts is that it did not raise.
+    doc: A decimal is a column at every precision a statement can spell. To eighteen digits its unscaled units ride a 64 bit lane word and above that they are sixteen bytes a row, which is one declared type stored two ways and is the declaration and encoding split at its plainest. A bare DECIMAL is DECIMAL(38,0), the widest of them, so this case is the far end of the range as well as the ordinary spelling of it. The declaration is the setup because a catalog statement returns no rows, so what the case asserts is that it did not raise.
     setup:
-      - "CREATE GRAPH TYPE ledger { (:Purchase {total :: DECIMAL(18,2)}) }"
-    query: RETURN 18 AS digits
+      - "CREATE GRAPH TYPE ledger { (:Purchase {total :: DECIMAL(18,2), paid :: DECIMAL(29,4), owed :: DECIMAL}) }"
+    query: RETURN 38 AS digits
     columns:
       - digits
     rows:
       - values:
           - type: INT64
-            value: "18"
+            value: "38"
 
   - name: an-int128-column-is-a-declaration-a-graph-type-takes
     doc: A signed hundred and twenty eight bit integer is a column, stored as sixteen bytes a row at a fixed stride rather than in the sixty four bit lane every other number rides. It reads back as an exact numeric of scale nought, which is a carrier the engine has for the whole of that range. The declaration is the setup because a catalog statement returns no rows, so what the case asserts is that it did not raise.

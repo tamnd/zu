@@ -662,27 +662,41 @@ fn column_value(
             reader.read_str(db, col, row, &mut bytes)?;
             Ok(Value::Bytes(bytes))
         }
-        // A hundred and twenty eight bit integer is the same blob read
-        // as a number: sixteen little endian bytes, because the lane is
-        // sixty four bits and this is twice that.
+        // The two numbers the lane has no room for are the same blob
+        // read as a number: sixteen little endian bytes, because the
+        // lane is sixty four bits and these are twice that.
         //
-        // It comes back as an exact numeric of scale nought rather than
-        // as `Value::Int`, which holds sixty four bits and would lose
-        // the half of the column that the type is for. An exact numeric
-        // at scale nought is an integer, prints as one and compares
-        // equal to one, so `p.id = 5` is true of a row holding five;
-        // what it also is, is a hundred and twenty eight bit one.
+        // A hundred and twenty eight bit integer comes back as an exact
+        // numeric of scale nought rather than as `Value::Int`, which
+        // holds sixty four bits and would lose the half of the column
+        // that the type is for. An exact numeric at scale nought is an
+        // integer, prints as one and compares equal to one, so `p.id =
+        // 5` is true of a row holding five; what it also is, is a
+        // hundred and twenty eight bit one.
+        //
+        // A decimal reaching here is a wide one, since a narrow one is
+        // on the lane and returned above. The bytes are its unscaled
+        // units and the declared scale is what makes them a number,
+        // which is the same reading the lane arm does over a word.
         LogicalType::Int {
             bits: IntBits::B128,
             ..
-        } => {
+        }
+        | LogicalType::Decimal { .. } => {
+            let scale = match ty {
+                LogicalType::Decimal { scale, .. } => scale,
+                _ => 0,
+            };
             let mut bytes = Vec::new();
             reader.read_str(db, col, row, &mut bytes)?;
             let word: [u8; 16] = bytes.as_slice().try_into().map_err(|_| ZuError::Corrupt {
                 what: "props column",
                 detail: format!("'{key}' row {row} is {} octets and not 16", bytes.len()),
             })?;
-            Ok(Value::Decimal(Decimal::new(i128::from_le_bytes(word), 0)))
+            Ok(Value::Decimal(Decimal::new(
+                i128::from_le_bytes(word),
+                scale,
+            )))
         }
         // A stored list comes back as the list value the rest of the
         // engine already has, element by element through the same

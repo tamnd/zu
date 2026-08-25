@@ -494,8 +494,31 @@ pub fn advise_random(_file: &File) -> bool {
 /// while it lives. Nothing here does: the only truncation is `trim_tail`,
 /// which never goes below the write frontier, and a mapped page is always
 /// below it.
+/// Where `at` is `Some`, the mapping is placed there and replaces
+/// whatever was in that range, which is how a run of log pages becomes
+/// one region of address space instead of one a page. See
+/// [`reserve`] and #768.
 #[cfg(unix)]
 pub fn map_read(file: &File, offset: u64, len: usize) -> Option<*mut u8> {
+    map_read_inner(file, offset, len, std::ptr::null_mut())
+}
+
+/// [`map_read`] into a range [`reserve`] handed out.
+///
+/// # Safety
+///
+/// `at` is inside a live reservation, `len` bytes fit inside it, and no
+/// live mapping of this log occupies the range: `MAP_FIXED` replaces
+/// whatever is there without asking, so a caller that gets this wrong
+/// unmaps a page a reader is inside. The caller checks that; see
+/// `Log::remap_settled`.
+#[cfg(unix)]
+pub unsafe fn map_read_at(file: &File, offset: u64, len: usize, at: *mut u8) -> Option<*mut u8> {
+    map_read_inner(file, offset, len, at)
+}
+
+#[cfg(unix)]
+fn map_read_inner(file: &File, offset: u64, len: usize, at: *mut u8) -> Option<*mut u8> {
     use std::os::fd::AsRawFd;
 
     /// `PROT_READ` from `sys/mman.h`, the same value on Linux and macOS.
@@ -513,14 +536,24 @@ pub fn map_read(file: &File, offset: u64, len: usize) -> Option<*mut u8> {
             offset: i64,
         ) -> *mut core::ffi::c_void;
     }
-    // SAFETY: the descriptor is owned by `file` and open for reading, and
-    // a null hint asks the kernel to choose the address.
+    /// `MAP_FIXED`, the same value on Linux and macOS.
+    const MAP_FIXED: i32 = 0x10;
+
+    let flags = if at.is_null() {
+        MAP_SHARED
+    } else {
+        MAP_SHARED | MAP_FIXED
+    };
+    // SAFETY: the descriptor is owned by `file` and open for reading. A
+    // null hint asks the kernel to choose the address; a non-null one is
+    // a range inside a reservation this process made and the caller has
+    // checked nothing live is in it.
     let at = unsafe {
         mmap(
-            std::ptr::null_mut(),
+            at.cast::<core::ffi::c_void>(),
             len,
             PROT_READ,
-            MAP_SHARED,
+            flags,
             file.as_raw_fd(),
             offset as i64,
         )
@@ -544,6 +577,155 @@ pub fn map_read(file: &File, offset: u64, len: usize) -> Option<*mut u8> {
 pub fn map_read(_file: &File, _offset: u64, _len: usize) -> Option<*mut u8> {
     None
 }
+
+/// # Safety
+///
+/// Never called, because the reservation it maps into is never made.
+#[cfg(not(unix))]
+pub unsafe fn map_read_at(
+    _file: &File,
+    _offset: u64,
+    _len: usize,
+    _at: *mut u8,
+) -> Option<*mut u8> {
+    None
+}
+
+/// Takes `len` bytes of address space and nothing else.
+///
+/// `PROT_NONE`, anonymous and `MAP_NORESERVE`, so this is a promise from
+/// the kernel that nothing else will be put in the range rather than a
+/// request for memory. Nothing is charged for it, nothing is resident in
+/// it, and touching it is a fault.
+///
+/// What it is for is #768. A settled log page mapped with a null hint
+/// gets an address the kernel chose, and the kernel hands them out in
+/// the opposite order to the file offsets the log maps in, so two pages
+/// that are neighbours in the file are never neighbours in memory and
+/// the kernel cannot merge their mappings. That is one region of address
+/// space per 4 MiB page: measured on server1, 512 pages mapped a page at
+/// a time added 512 lines to `/proc/self/maps`, and the same 512 mapped
+/// into a reservation added one. The cost of the first is a longer walk
+/// on every fault, which is the fault `map_settled` traded a `pread`
+/// for, and a ceiling at `vm.max_map_count`, which is 65530 by default
+/// and is 256 GiB of log.
+///
+/// A refusal is not an error. The log maps with a null hint instead and
+/// gets what it had before this existed.
+#[cfg(unix)]
+pub fn reserve(len: usize) -> Option<*mut u8> {
+    /// `PROT_NONE`.
+    const PROT_NONE: i32 = 0;
+    /// `MAP_PRIVATE`, the same value on Linux and macOS.
+    const MAP_PRIVATE: i32 = 0x02;
+    /// `MAP_ANONYMOUS`, which is 0x20 on Linux and 0x1000 on macOS.
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    #[cfg(not(target_os = "linux"))]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    /// `MAP_NORESERVE`, which macOS does not have and does not need:
+    /// it does not do strict overcommit accounting.
+    #[cfg(target_os = "linux")]
+    const MAP_NORESERVE: i32 = 0x4000;
+    #[cfg(not(target_os = "linux"))]
+    const MAP_NORESERVE: i32 = 0;
+
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut core::ffi::c_void;
+    }
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: an anonymous mapping with a null hint, which takes no
+    // descriptor and reads nothing.
+    let at = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if at as isize == -1 {
+        return None;
+    }
+    Some(at.cast::<u8>())
+}
+
+/// Nowhere to ask, so there is no reservation and the log maps the way
+/// it did before #768.
+#[cfg(not(unix))]
+pub fn reserve(_len: usize) -> Option<*mut u8> {
+    None
+}
+
+/// Puts `len` bytes of a reservation back the way [`reserve`] left them.
+///
+/// Not a `munmap`: that would take the range out of the reservation and
+/// let the next unrelated `mmap` in the process land in the middle of
+/// it. This puts `PROT_NONE` anonymous memory back over the range, which
+/// is what was there before the page was mapped into it, so the
+/// reservation stays whole.
+///
+/// # Safety
+///
+/// `at` is a range inside a live reservation, `len` matches what was
+/// mapped there, and nothing is reading through it any more.
+#[cfg(unix)]
+pub unsafe fn unmap_within_reservation(at: *mut u8, len: usize) {
+    /// `PROT_NONE`.
+    const PROT_NONE: i32 = 0;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_FIXED: i32 = 0x10;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    #[cfg(not(target_os = "linux"))]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_NORESERVE: i32 = 0x4000;
+    #[cfg(not(target_os = "linux"))]
+    const MAP_NORESERVE: i32 = 0;
+
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut core::ffi::c_void;
+    }
+    // SAFETY: the caller promises the range is inside a reservation this
+    // process holds and that nothing is inside it.
+    unsafe {
+        mmap(
+            at.cast::<core::ffi::c_void>(),
+            len,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+            -1,
+            0,
+        );
+    }
+}
+
+/// Never called, because the reservation is never made.
+///
+/// # Safety
+///
+/// Unreachable.
+#[cfg(not(unix))]
+pub unsafe fn unmap_within_reservation(_at: *mut u8, _len: usize) {}
 
 /// Gives back a mapping [`map_read`] handed out.
 ///

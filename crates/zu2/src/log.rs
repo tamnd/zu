@@ -359,6 +359,29 @@ pub struct Log {
     /// Mappings the kernel refused, which is what says a run stopped
     /// mapping rather than ran out of pages to map.
     remap_refused: AtomicU64,
+    /// Address space held for the mapped pages to live in, null when
+    /// there is none.
+    ///
+    /// One `PROT_NONE` region of `reserved_pages` pages, taken at open
+    /// and given back at drop. Pages go into it with `MAP_FIXED` and
+    /// come out of it as `PROT_NONE` again, so the region stays whole
+    /// and the kernel sees one mapping where it used to see one a page.
+    /// #768.
+    ///
+    /// Null on a platform with no `mmap`, on a database with
+    /// `map_settled` off, and on one where the reservation was refused.
+    /// All three mean the same thing here: map with a null hint and
+    /// `munmap` on the way out, which is what happened before this
+    /// existed.
+    reservation: AtomicPtr<u8>,
+    /// Pages the reservation covers.
+    ///
+    /// A page goes at `page % reserved_pages`, which is only unambiguous
+    /// while the live pages span fewer than this many, and the log's own
+    /// cap is what makes that true. It is not relied on: `remap_settled`
+    /// checks the page this one would land on top of before it maps
+    /// anything.
+    reserved_pages: usize,
     /// How far past the write frontier the blocks are reserved. Zero
     /// never reserves.
     provision_bytes: u64,
@@ -390,11 +413,28 @@ impl Log {
         provision_bytes: u64,
         map_settled: bool,
     ) -> Self {
+        let capped = max_pages.clamp(1, MAX_PAGES);
+        // Two pages of slack over the span cap. The cap is what the log
+        // holds and a page can be opened a moment before the pass that
+        // takes the one at the bottom, which the tests around
+        // `max_pages` already allow for, so the ring has to be wider
+        // than the widest span or two live pages would want the same
+        // address. `remap_settled` checks as well; this is what makes
+        // the check something that never fires rather than something
+        // load bearing.
+        let reserved_pages = capped + 2;
+        let reservation = if map_settled {
+            file::reserve(reserved_pages * PAGE_SIZE).unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        };
         Self {
+            reservation: AtomicPtr::new(reservation),
+            reserved_pages,
             chunks: (0..MAX_PAGES / CHUNK)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
-            max_pages: max_pages.clamp(1, MAX_PAGES),
+            max_pages: capped,
             format: AtomicU32::new(u32::from(FORMAT)),
             allocating: Mutex::new(()),
             tail: AtomicU64::new(FIRST),
@@ -823,12 +863,19 @@ impl Log {
             self.anonymous.fetch_sub(1, Ordering::AcqRel);
         }
         let retired = page_base(stale) as usize;
+        // Worked out here rather than in the closure, because the
+        // closure cannot borrow the log and the answer cannot change:
+        // the reservation is taken at open and given back at drop, and
+        // a page inside it now was inside it when it was mapped. #768.
+        let reserved = mapped && self.within_reservation(page_base(stale));
         self.epochs.defer(Box::new(move || {
             // SAFETY: the epoch has passed, so no session that could
             // have loaded this pointer is still running, and the tag
             // says which of the two ways it was made.
             unsafe {
-                if mapped {
+                if reserved {
+                    crate::file::unmap_within_reservation(retired as *mut u8, PAGE_SIZE);
+                } else if mapped {
                     crate::file::unmap(retired as *mut u8, PAGE_SIZE);
                 } else {
                     dealloc(retired as *mut u8, page_layout());
@@ -1143,7 +1190,7 @@ impl Log {
             // On a platform with no mapping call at all this retries
             // from the same page every flush, which is a call into a
             // function that returns `None` without a syscall.
-            let Some(at) = crate::file::map_read(&self.file, page_start(page), PAGE_SIZE) else {
+            let Some(at) = self.map_page(page) else {
                 refused = refused.min(page);
                 self.remap_refused.fetch_add(1, Ordering::Relaxed);
                 page += 1;
@@ -1178,6 +1225,54 @@ impl Log {
         if mapped {
             self.retire_pages();
         }
+    }
+
+    /// Maps a log page, into the reservation when there is one.
+    ///
+    /// Without a reservation this is the old behaviour, a null hint and
+    /// an address the kernel chose, and it is what a platform with no
+    /// `mmap`, a database with `map_settled` off and a refused
+    /// reservation all get.
+    ///
+    /// With one, the page goes at `page % reserved_pages`. That is
+    /// unambiguous only while the live pages span fewer than that many,
+    /// which the log's own span cap makes true with two pages to spare,
+    /// and the check below is what makes it a fact rather than an
+    /// argument: the page `reserved_pages` below this one is the only
+    /// one that could want the same address, so if it is still a live
+    /// mapping this refuses. A refusal costs a page that stays on the
+    /// heap. Getting it wrong would cost a `MAP_FIXED` over a mapping
+    /// somebody is reading, which is not a trade worth taking on an
+    /// invariant that lives in another function. #768.
+    fn map_page(&self, page: usize) -> Option<*mut u8> {
+        let base = self.reservation.load(Ordering::Acquire);
+        if base.is_null() {
+            return crate::file::map_read(&self.file, page_start(page), PAGE_SIZE);
+        }
+        if let Some(below) = page.checked_sub(self.reserved_pages)
+            && let Some(slot) = self.page_slot(below)
+            && is_mapped(slot.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        // SAFETY: the address is inside the reservation this log holds,
+        // a page fits in it because the reservation is a whole number of
+        // pages, and the check above says no live mapping is there.
+        unsafe {
+            let at = base.add((page % self.reserved_pages) * PAGE_SIZE);
+            crate::file::map_read_at(&self.file, page_start(page), PAGE_SIZE, at)
+        }
+    }
+
+    /// Whether an address is inside the reservation, which is what says
+    /// how a mapping has to be given back.
+    fn within_reservation(&self, at: *mut u8) -> bool {
+        let base = self.reservation.load(Ordering::Acquire);
+        if base.is_null() {
+            return false;
+        }
+        let offset = (at as usize).wrapping_sub(base as usize);
+        offset < self.reserved_pages * PAGE_SIZE
     }
 
     /// Pages held as a mapping of the file rather than as heap.
@@ -1969,7 +2064,14 @@ impl Drop for Log {
                     // drop time.
                     unsafe {
                         if is_mapped(page) {
-                            crate::file::unmap(page_base(page), PAGE_SIZE);
+                            // A page inside the reservation is left
+                            // where it is: the whole region goes back in
+                            // one call below, and a `munmap` of a piece
+                            // of it here would only split the region up
+                            // on the way out.
+                            if !self.within_reservation(page_base(page)) {
+                                crate::file::unmap(page_base(page), PAGE_SIZE);
+                            }
                         } else {
                             dealloc(page, page_layout());
                         }
@@ -1978,6 +2080,16 @@ impl Drop for Log {
             }
             // SAFETY: allocated by ensure_slot with this layout.
             unsafe { dealloc(base.cast::<u8>(), chunk_layout()) };
+        }
+        // Last, and in one call. Everything that was inside it has been
+        // taken out of its slot above, and nothing is running.
+        let reservation = self
+            .reservation
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !reservation.is_null() {
+            // SAFETY: made by `file::reserve` at open with this length,
+            // and no session exists at drop time.
+            unsafe { crate::file::unmap(reservation, self.reserved_pages * PAGE_SIZE) };
         }
     }
 }

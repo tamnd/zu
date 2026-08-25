@@ -1804,7 +1804,18 @@ impl<'a> Session<'a> {
     ///
     /// The returned pointer is good until the next call on this session
     /// or the end of the epoch, whichever comes first.
-    fn locate(&mut self, address: Address) -> Result<*const u8> {
+    ///
+    /// The flag says which of the two it is: true for bytes in a log
+    /// page the epoch protection is holding down, false for bytes in
+    /// this session's scratch. It is not a detail a caller may work out
+    /// for itself from the address, because a page can be evicted or
+    /// read back at any moment and the answer is only true of the moment
+    /// the load happened. A caller that hands the bytes out past the end
+    /// of its own call has to have it: an address below the read only
+    /// boundary says the record will not be rewritten where it lies, and
+    /// says nothing at all about whether where it lies is a log page or
+    /// a buffer the next record overwrites (#751).
+    fn locate(&mut self, address: Address) -> Result<(*const u8, bool)> {
         if cold::is_cold(address) {
             let Some(cold) = &self.core.cold else {
                 return Err(Error::Malformed {
@@ -1813,14 +1824,14 @@ impl<'a> Session<'a> {
                 });
             };
             cold.load(address, &mut self.scratch)?;
-            return Ok(self.scratch.as_ptr().cast());
+            return Ok((self.scratch.as_ptr().cast(), false));
         }
         let resident = self.core.log.resident(address);
         if !resident.is_null() {
-            return Ok(resident);
+            return Ok((resident, true));
         }
         self.core.log.load(address, &mut self.scratch)?;
-        Ok(self.scratch.as_ptr().cast())
+        Ok((self.scratch.as_ptr().cast(), false))
     }
 
     /// What an entry has to say about `key`: the address of its newest
@@ -1874,7 +1885,7 @@ impl<'a> Session<'a> {
                 self.truncated = true;
                 return Ok(None);
             }
-            let base = self.locate(address)?;
+            let (base, _) = self.locate(address)?;
             // SAFETY: locate returns a whole record, 8 byte aligned,
             // valid until the next call, and nothing below moves on
             // before it is done with this one.
@@ -2099,7 +2110,7 @@ impl<'a> Session<'a> {
                     whole = false;
                     break;
                 }
-                let base = self.locate(at)?;
+                let (base, _) = self.locate(at)?;
                 // SAFETY: locate returns a whole record, valid until the
                 // next call on this session, which is why the key is
                 // copied rather than borrowed.
@@ -2300,14 +2311,14 @@ impl<'a> Session<'a> {
         bucket: &Bucket,
         tag: u64,
         key: &[u8],
-    ) -> Result<Option<(Address, *const u8)>> {
+    ) -> Result<Option<(Address, *const u8, bool)>> {
         loop {
             let floors = self.core.floors();
             let Some((_, address)) = self.lookup(bucket, tag, key)? else {
                 return Ok(None);
             };
             match self.locate(address) {
-                Ok(base) => return Ok(Some((address, base))),
+                Ok((base, resident)) => return Ok(Some((address, base, resident))),
                 Err(error) => {
                     if floors == self.core.floors() {
                         return Err(error);
@@ -2362,9 +2373,11 @@ impl<'a> Session<'a> {
     /// points into a log page that the held protection covers. When the
     /// flag is false the bytes are in `out` and are only good until the
     /// next use of it, which is the same contract [`Session::read`] has
-    /// always had. A record that is cold or still above the read only
-    /// boundary is the false case: the first has no resident bytes to
-    /// point at and the second may still be rewritten where it lies.
+    /// always had. A record that is cold, still above the read only
+    /// boundary, or in a log page that has been evicted is the false
+    /// case: the first has no resident bytes to point at, the second may
+    /// still be rewritten where it lies, and the third was read into the
+    /// scratch the next call reuses (#751).
     ///
     /// Promotion is not a case this has to handle, which is worth
     /// stating because it looks like it should be. A read promotes only
@@ -2447,7 +2460,7 @@ impl<'a> Session<'a> {
         each: &mut dyn FnMut(&[u8], bool),
         borrowed: &mut bool,
     ) -> Result<bool> {
-        let Some((address, base)) = self.newest_record(bucket, tag, key)? else {
+        let Some((address, base, resident)) = self.newest_record(bucket, tag, key)? else {
             return Ok(false);
         };
         // SAFETY: as in chain_find.
@@ -2456,11 +2469,14 @@ impl<'a> Session<'a> {
             if r.tombstone() {
                 false
             } else {
-                // The same test `scan_walk` makes, and for the same two
+                // The same test `scan_walk` makes, and for the same three
                 // reasons: a cold record has no resident bytes to point
-                // at, and one still above the read only boundary may be
-                // rewritten where it lies.
-                let stable = !cold::is_cold(address) && address < self.core.log.read_only();
+                // at, one still above the read only boundary may be
+                // rewritten where it lies, and one whose page has been
+                // evicted was read into this session's scratch, which the
+                // next record overwrites (#751).
+                let stable =
+                    resident && !cold::is_cold(address) && address < self.core.log.read_only();
                 if hold && stable {
                     *borrowed = true;
                     each(r.value_unchecked(), true);
@@ -2530,13 +2546,20 @@ impl<'a> Session<'a> {
     /// every key and no value is about two per cent of the traffic that
     /// copying both was.
     ///
-    /// It is true for a record below the
-    /// read-only boundary, which cannot change under a reader because an
-    /// update to one of those appends instead, and false for a record in
-    /// the mutable window or out in the cold tier, which was read into a
-    /// scratch buffer that dies with this call. A caller that copies
-    /// exactly the unstable ones gets the same guarantee `zu2_scan` gave
-    /// for a fraction of the memory traffic.
+    /// It is true for a resident record below the read-only boundary,
+    /// which cannot change under a reader because an update to one of
+    /// those appends instead, and false for a record in the mutable
+    /// window, one out in the cold tier, or one whose log page has been
+    /// evicted, all of which were read into a scratch buffer that the
+    /// next record overwrites. A caller that copies exactly the unstable
+    /// ones gets the same guarantee `zu2_scan` gave for a fraction of the
+    /// memory traffic.
+    ///
+    /// The residency half is not something the boundary implies and
+    /// leaving it out is #751: a reopened database serves its first scans
+    /// out of pages the warmer has not read back yet, every one of those
+    /// records came out of the one scratch buffer, and a caller that was
+    /// told they were stable held fifty pointers to the same bytes.
     ///
     /// Unlike [`Session::scan`] this holds one epoch protection for the
     /// whole walk rather than retaking it every [`SCAN_EPOCH_RUN`]
@@ -2661,7 +2684,7 @@ impl<'a> Session<'a> {
                 }
                 let tag = Index::tag(hash);
                 let bucket = self.bucket_of(hash)?;
-                let Some((address, base)) = self.newest_record(bucket, tag, key)? else {
+                let Some((address, base, resident)) = self.newest_record(bucket, tag, key)? else {
                     continue;
                 };
                 // Below the read-only boundary a record cannot change
@@ -2694,7 +2717,10 @@ impl<'a> Session<'a> {
                     if r.tombstone() {
                         false
                     } else {
-                        if !cold::is_cold(address) && address < self.core.log.read_only() {
+                        if resident
+                            && !cold::is_cold(address)
+                            && address < self.core.log.read_only()
+                        {
                             each(key, r.value_unchecked(), true);
                         } else {
                             r.read_value(&mut value);
@@ -2818,7 +2844,7 @@ impl<'a> Session<'a> {
     /// Whether `key` has a record that is not a tombstone. The caller
     /// holds the epoch, as [`lookup`](Self::lookup) requires.
     fn live(&mut self, bucket: &Bucket, tag: u64, key: &[u8]) -> Result<bool> {
-        let Some((_, base)) = self.newest_record(bucket, tag, key)? else {
+        let Some((_, base, _)) = self.newest_record(bucket, tag, key)? else {
             return Ok(false);
         };
         // SAFETY: as in chain_find.
@@ -2866,7 +2892,7 @@ impl<'a> Session<'a> {
                 let found = self.lookup(bucket, tag, key)?;
                 let present = match found {
                     Some((_, address)) => {
-                        let base = self.locate(address)?;
+                        let (base, _) = self.locate(address)?;
                         // SAFETY: as in chain_find.
                         unsafe {
                             let r = RecordRef::new(base);
@@ -3207,7 +3233,7 @@ impl<'a> Session<'a> {
     /// to reclaim and is not an error: the caller looks at the slot
     /// again either way.
     fn unsettle(&mut self, bucket: &Bucket, i: usize, entry: u64) -> Result<()> {
-        let base = self.locate(index::address_of(entry))?;
+        let (base, _) = self.locate(index::address_of(entry))?;
         // SAFETY: locate returns a whole record, valid until the next
         // call on this session, which is why both halves are copied out
         // before the append rather than borrowed across it.

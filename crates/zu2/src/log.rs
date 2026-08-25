@@ -5,10 +5,18 @@
 //! increasing:
 //!
 //! ```text
-//! [0 .. head)                stable, on disk only
+//! [0 .. head)                stable, on disk
 //! [head .. read_only)        immutable, in memory
 //! [read_only .. tail)        mutable, in memory, updates happen here
 //! ```
+//!
+//! On disk and not on disk only, since #759. A page below the floor is
+//! one the log has stopped keeping in anonymous memory, and if it was
+//! settled it may still be there as a read only mapping of the file it
+//! is identical to. So the floor says who is responsible for a page and
+//! not whether it is resident. What is resident is what has a page
+//! pointer, which is the only test the read path makes and the only one
+//! that is safe to make while the boundaries are moving.
 //!
 //! The read-only boundary is what makes an in-place update safe. Above
 //! it a record is young enough that no reader is entitled to treat it
@@ -301,8 +309,28 @@ pub struct Log {
     dirty_lock: Mutex<bool>,
     /// Pages kept in memory above the read-only boundary.
     mutable_pages: usize,
-    /// Pages kept in memory at all. `usize::MAX` means never evict.
+    /// Pages of anonymous memory the log is allowed to hold.
+    /// `usize::MAX` means never evict.
+    ///
+    /// Anonymous and not resident, which is the whole of #759. A page
+    /// that [`Log::remap_settled`] has turned into a mapping of the file
+    /// is resident, and it costs the process no memory it owns: the
+    /// kernel has a clean file backed copy it can drop the moment
+    /// anything else wants the frame, and take back with a fault. So
+    /// counting it against the bound would evict a page that is free to
+    /// keep and leave a page that is not. That is the shape lmdb has and
+    /// the reason its anonymous figure was 17.6 MiB against zu2's 1152.6
+    /// on the same million records.
     memory_pages: usize,
+    /// Pages of anonymous memory resident right now.
+    ///
+    /// Maintained rather than counted, because the eviction loop asks on
+    /// every page it considers and the count is a walk of the whole page
+    /// table. It moves in exactly three places: a page published by
+    /// [`Log::ensure_page`] or [`Log::warm_page`] comes in, and a page
+    /// that leaves a slot goes out through [`Log::release_page`], which
+    /// is the one door out.
+    anonymous: AtomicUsize,
     /// Whether a page that has settled becomes a mapping of the file
     /// instead of staying on the heap. See [`Log::remap_settled`], #757.
     map_settled: bool,
@@ -392,6 +420,7 @@ impl Log {
             memory_pages: memory_pages
                 .max(mutable_pages.min(max_pages.saturating_sub(2)).max(1) + 1),
             map_settled,
+            anonymous: AtomicUsize::new(0),
             remap_from: AtomicUsize::new(0),
             epochs: Epochs::new(sessions),
         }
@@ -764,6 +793,15 @@ impl Log {
             return;
         }
         let mapped = is_mapped(stale);
+        // The one door out of a slot, which is why the counter is
+        // decremented here and not at each of the three call sites. The
+        // memory is not given back until the epoch passes, and the
+        // counter still moves now: what it answers is how much anonymous
+        // memory the log is holding on to on purpose, and a page waiting
+        // on an epoch is on its way out rather than being kept.
+        if !mapped {
+            self.anonymous.fetch_sub(1, Ordering::AcqRel);
+        }
         let retired = page_base(stale) as usize;
         self.epochs.defer(Box::new(move || {
             // SAFETY: the epoch has passed, so no session that could
@@ -823,6 +861,7 @@ impl Log {
             std::alloc::handle_alloc_error(page_layout());
         }
         slot.store(fresh, Ordering::Release);
+        self.anonymous.fetch_add(1, Ordering::AcqRel);
         Ok(fresh)
     }
 
@@ -969,23 +1008,32 @@ impl Log {
     ///
     /// [`opened_page`]: Log::opened_page
     pub fn evict_settled(&self) {
-        // Eviction first, and the order is load bearing rather than
-        // arbitrary. `remap_settled` starts at the floor, so with a
-        // bound set and the remap running ahead of it every settled
-        // page was mapped by one half of this call and unmapped by the
-        // other half of the same call: two syscalls a page, a mapping
-        // that never served a read, and page cache warmed only to be
-        // dropped. Moving the floor first means the remap never looks
-        // below it. With no bound `evict_behind` returns at its first
-        // line, so this costs the common case nothing.
+        // Mapping first and eviction second, and the order is load
+        // bearing rather than arbitrary. A settled page has two ways out
+        // of anonymous memory and they are not equally good: mapped, it
+        // still answers a read as a load and the kernel drops it only if
+        // something else wants the frame; evicted, the next read of it is
+        // a pread and a checksum. Both take it off the bound, since #759
+        // made the bound a count of anonymous pages. So the page is
+        // offered the better of the two first, and eviction gets what is
+        // left, which under a mapping database is the pages that have
+        // not settled yet.
+        //
+        // The other order was what this said before #759, for a reason
+        // that has now gone: while a mapped page still counted against
+        // the bound, running the remap first meant every settled page
+        // was mapped by one half of this call and unmapped by the other
+        // half of the same call. Two syscalls a page and a mapping that
+        // never served a read. It cannot happen now, because eviction
+        // steps over a mapped page rather than taking it.
         let bounded = self.memory_pages != usize::MAX;
+        self.remap_settled();
         if bounded {
             self.evict_behind(page_of(self.tail()));
         }
-        // Retires its own pages if it maps any, so a database with no
-        // bound still does no epoch work on a flush that changed
-        // nothing.
-        self.remap_settled();
+        // `remap_settled` retires its own pages if it mapped any, so a
+        // database with no bound still does no epoch work on a flush
+        // that changed nothing.
         if bounded {
             self.retire_pages();
         }
@@ -1115,20 +1163,71 @@ impl Log {
         total
     }
 
+    /// Pages of anonymous memory the log is holding, which is what
+    /// `memory_pages` is a promise about.
+    ///
+    /// A counter and not a walk, and worth having as its own call rather
+    /// than as [`Log::resident_pages`] minus [`Log::mapped_pages`]: those
+    /// two are read one after the other while the maintainer is running,
+    /// so their difference can come back negative, and in the ycsb
+    /// driver it did. Unsigned, that printed as 1.8e13 MiB. #757.
+    pub fn anonymous_pages(&self) -> usize {
+        self.anonymous.load(Ordering::Acquire)
+    }
+
     /// Drops the pages that have fallen out of memory, given the page
     /// the log now ends in.
+    ///
+    /// The bound is on anonymous pages and the cursor walks every page,
+    /// which are two different things and #759 is the difference. A
+    /// settled page that [`Log::remap_settled`] has turned into a
+    /// mapping is skipped: the cursor steps over it and the floor moves
+    /// past it while the page stays where it is, so it goes on serving
+    /// reads as a load rather than a pread and the kernel drops it if
+    /// anything else needs the frame. That leaves pages below the floor
+    /// that are still resident, which used to be impossible, and the
+    /// read path was already written for it. [`Log::resident`] says so
+    /// itself: the head boundary is deliberately not consulted, the slot
+    /// pointer is the test. Nothing outside this file reads `head` at
+    /// all, and the two other writers of it, `reclaim_to` and
+    /// `resume_at`, only push it up to a compaction floor that has made
+    /// the addresses unreachable rather than merely cold.
+    ///
+    /// The old rule, evict once the tail is `memory_pages` past the
+    /// floor, was a distance and this is a count. With no mapping the
+    /// two agree, since every page between the floor and the tail is
+    /// anonymous. With mapping they must not: the distance grows with
+    /// every page that gets mapped and the count is what the process
+    /// actually owns.
     fn evict_behind(&self, page: usize) {
         if self.memory_pages == usize::MAX {
             return;
         }
-        let keep_from = page.saturating_sub(self.memory_pages);
-        while page_of(self.head()) < keep_from {
+        // The cursor stops at the page being written to whatever the
+        // count says, so a bound smaller than the log can hold cannot
+        // evict its way into the mutable window. The durability test
+        // below does the same job for the flusher's frontier, and this
+        // one is what stops a run of mapped pages from walking the floor
+        // up to the tail when there is no anonymous page left to give.
+        while self.anonymous.load(Ordering::Acquire) > self.memory_pages
+            && page_of(self.head()) < page
+        {
             let victim = page_of(self.head());
             // A page can only leave memory once its bytes are durable,
             // otherwise a reader that misses in memory would pread a
             // hole.
             if page_start(victim + 1) > self.flushed() {
                 break;
+            }
+            // Mapped, so it is not what the bound is about. The floor
+            // goes past it and the page stays. See the note above.
+            if is_mapped(match self.page_slot(victim) {
+                Some(slot) => slot.load(Ordering::Acquire),
+                None => std::ptr::null_mut(),
+            }) {
+                self.head
+                    .fetch_max(page_start(victim + 1), Ordering::AcqRel);
+                continue;
             }
             // fetch_max rather than a store, because a writer opening
             // a page and the maintainer finishing the job behind it can
@@ -1467,6 +1566,7 @@ impl Log {
             return Ok(false);
         }
         slot.store(fresh, Ordering::Release);
+        self.anonymous.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
 

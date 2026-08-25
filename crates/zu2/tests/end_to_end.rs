@@ -457,6 +457,88 @@ fn a_settled_page_becomes_a_mapping_of_the_file() {
     }
 }
 
+/// The memory bound counts anonymous pages, so a mapped page is free to
+/// keep and the resident set goes well past the bound while the memory
+/// the process owns does not.
+///
+/// This is #759 and it is the shape lmdb has: a million records of lmdb
+/// on server2 held 17.6 MiB of anonymous memory against 1090 MiB of
+/// data, because everything but its own structures was a mapping the
+/// kernel could drop. Before this the bound was a distance from the
+/// eviction floor to the tail, so a mapped page counted the same as a
+/// heap page and got thrown out of memory to make room for a heap page
+/// that cost strictly more. The assertions are on both halves: the
+/// anonymous count stays inside the bound, the resident count leaves it
+/// far behind, and every key reads back.
+#[test]
+fn a_mapped_page_is_outside_the_memory_bound() {
+    if !cfg!(unix) {
+        // No mapping call on this platform, so every page is anonymous
+        // and the bound is the old one. See `file::map_read`.
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bound = 4;
+    let db = Db::create(
+        &dir.path().join("b.zu2"),
+        Options {
+            durability: Durability::Async,
+            mutable_pages: 1,
+            map_settled: true,
+            max_pages: 256,
+            index_buckets: 1 << 12,
+            memory_pages: bound,
+            compact_below: 0,
+            ..Options::default()
+        },
+    )
+    .expect("create");
+
+    let mut s = db.session();
+    let big = vec![b'b'; 8192];
+    for i in 0..20_000u32 {
+        s.upsert(&key(i), &big).expect("upsert");
+    }
+    drop(s);
+    db.sync().expect("sync");
+
+    // The maintainer does the conversion after the flush that settles a
+    // page, so this waits for a thread to get to it rather than for any
+    // work to happen.
+    let mut resident = db.resident_pages();
+    let mut anonymous = db.anonymous_pages();
+    for _ in 0..200 {
+        if resident > bound * 4 && anonymous <= bound + 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resident = db.resident_pages();
+        anonymous = db.anonymous_pages();
+    }
+    let mapped = db.mapped_pages();
+    assert!(
+        resident > bound * 4,
+        "{resident} pages resident against a bound of {bound}, so the mapped \
+         pages are still being evicted along with the rest"
+    );
+    assert!(
+        anonymous <= bound + 1,
+        "{anonymous} anonymous pages against a bound of {bound}, {mapped} \
+         mapped, {resident} resident"
+    );
+
+    // A page below the eviction floor that is still resident is the new
+    // thing here, and the read path was never written for the floor in
+    // the first place, so read every key rather than a sample.
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in 0..20_000u32 {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost key {i}");
+        assert_eq!(out.len(), big.len(), "key {i} came back short");
+        assert_eq!(out[0], b'b', "key {i} came back as something else");
+    }
+}
+
 #[test]
 fn an_overflowing_bucket_keeps_every_key_through_updates() {
     // Sixteen buckets, eight entries each, so 128 slots hold 4000 keys.

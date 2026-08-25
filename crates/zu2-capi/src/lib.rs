@@ -2190,6 +2190,24 @@ pub unsafe extern "C" fn zu2_mapped_pages(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// The other side of that split: pages of anonymous memory, which is
+/// what `memory_pages` bounds.
+///
+/// Read this rather than subtracting the mapped count from the resident
+/// one. Those two walk the page table one after the other while the
+/// database keeps working, so the difference can come back negative, and
+/// in an unsigned caller that is not a small error, it is 1.8e13. #757.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_anonymous_pages(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.anonymous_pages() as u64,
+        None => 0,
+    }
+}
+
 /// Records a read moved out of the cold tier and back into the log.
 ///
 /// The cost side of `promote_reads`: it says how much writing the reads

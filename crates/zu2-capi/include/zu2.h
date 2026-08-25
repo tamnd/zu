@@ -555,6 +555,13 @@ uint64_t zu2_resident_pages(const zu2_db *db);
  * and the split is what a memory column actually turns on. */
 uint64_t zu2_mapped_pages(const zu2_db *db);
 
+/* The other side of that split, and what memory_pages bounds. Read this
+ * rather than subtracting the mapped count from the resident one: the
+ * two are taken a moment apart while the database keeps working, so the
+ * difference can go negative and an unsigned caller prints a number in
+ * the trillions. */
+uint64_t zu2_anonymous_pages(const zu2_db *db);
+
 /* Records a read moved out of the cold tier and back into the log,
  * which is the cost side of promote_reads. */
 uint64_t zu2_promoted(const zu2_db *db);

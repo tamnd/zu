@@ -142,7 +142,19 @@ pub struct Options {
     /// Pages above the read-only boundary, which is the window an
     /// update can happen in place in.
     pub mutable_pages: usize,
-    /// Pages kept in memory. `usize::MAX` never evicts.
+    /// Pages of anonymous memory the log may hold. `usize::MAX` never
+    /// evicts.
+    ///
+    /// Anonymous and not resident, since #759. With [`Options::map_settled`]
+    /// on, a settled page is held as a read only mapping of the file it
+    /// is byte for byte identical to, and that page is outside this
+    /// bound: it costs the process nothing it owns, the kernel drops it
+    /// whenever the memory is wanted elsewhere and faults it back if it
+    /// is wanted again. So the two options together say what lmdb says,
+    /// which is that the cache is the kernel's job and the bound is on
+    /// the memory the database is keeping for itself. With mapping off
+    /// there is nothing but anonymous memory and the bound reads exactly
+    /// as it did before.
     pub memory_pages: usize,
     /// Whether a page that has settled is held as a mapping of the file
     /// rather than as heap.
@@ -1129,6 +1141,17 @@ impl Db {
     /// on.
     pub fn mapped_pages(&self) -> usize {
         self.core.log.mapped_pages()
+    }
+
+    /// The other side of that split: pages of anonymous memory, which is
+    /// what [`Options::memory_pages`] bounds.
+    ///
+    /// Read this rather than subtracting [`Db::mapped_pages`] from
+    /// [`Db::resident_pages`]. The two walk the page table one after the
+    /// other while the maintainer keeps working, so the subtraction can
+    /// go negative. This is one counter and one load.
+    pub fn anonymous_pages(&self) -> usize {
+        self.core.log.anonymous_pages()
     }
 
     /// Bytes the file occupies on the device, holes excluded. This is

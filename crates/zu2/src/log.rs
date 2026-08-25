@@ -369,6 +369,13 @@ pub struct Log {
     /// Mappings the kernel refused, which is what says a run stopped
     /// mapping rather than ran out of pages to map.
     remap_refused: AtomicU64,
+    /// Mappings that were made and then thrown away because the slot
+    /// changed underneath them, which is the path that gives a mapping
+    /// back without ever having published it. Counted because it is the
+    /// only way a test can say a run went down it: the giveback has to
+    /// be the reservation's and not a plain `munmap`, and a run that
+    /// never raced would pass that test by not testing it. #776.
+    remap_lost: AtomicU64,
     /// Address space held for the mapped pages to live in, null when
     /// there is none.
     ///
@@ -492,6 +499,7 @@ impl Log {
             remap_from: AtomicUsize::new(0),
             remap_retry: AtomicUsize::new(usize::MAX),
             remap_refused: AtomicU64::new(0),
+            remap_lost: AtomicU64::new(0),
             epochs: Epochs::new(sessions),
         }
     }
@@ -1296,7 +1304,23 @@ impl Log {
                 // slot nobody owns and no reader has ever seen the
                 // pointer. It goes back now rather than through the
                 // epoch, which is for pointers that were published.
-                unsafe { crate::file::unmap(at, PAGE_SIZE) };
+                //
+                // The same two ways back as `release_page`, and for the
+                // same reason. A `munmap` of a page inside the
+                // reservation does not leave a hole that only this log
+                // can fill, it leaves address space the next unrelated
+                // `mmap` in the process is free to take, and the next
+                // time this page is mapped it goes in with `MAP_FIXED`
+                // and takes that mapping out from under whoever made
+                // it. #776.
+                self.remap_lost.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    if self.within_reservation(at) {
+                        crate::file::unmap_within_reservation(at, PAGE_SIZE);
+                    } else {
+                        crate::file::unmap(at, PAGE_SIZE);
+                    }
+                }
             }
             page += 1;
         }
@@ -1374,6 +1398,16 @@ impl Log {
     /// gave up. #769.
     pub fn remap_refused(&self) -> u64 {
         self.remap_refused.load(Ordering::Relaxed)
+    }
+
+    /// Mappings that were made and then given back unpublished, because
+    /// the slot they were for changed while they were being made.
+    ///
+    /// Not a fault and not pressure. It is a race a concurrent evictor
+    /// wins, and the number is here so that a test of how the mapping
+    /// goes back can say the run actually went down that path. #776.
+    pub fn remap_lost(&self) -> u64 {
+        self.remap_lost.load(Ordering::Relaxed)
     }
 
     pub fn mapped_pages(&self) -> usize {

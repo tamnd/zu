@@ -1190,6 +1190,17 @@ impl Db {
         self.core.log.remap_refused()
     }
 
+    /// Mappings made and then given back without ever being published,
+    /// because an evictor took the page while the mapping was being
+    /// made.
+    ///
+    /// Nothing is wrong when this climbs, it is the ordinary cost of
+    /// mapping outside the allocation lock. It is public so that a test
+    /// can say a run reached the path at all. #776.
+    pub fn remap_lost(&self) -> u64 {
+        self.core.log.remap_lost()
+    }
+
     /// Bytes the file occupies on the device, holes excluded. This is
     /// the honest storage number: a compacted log keeps its addresses
     /// but not its blocks.

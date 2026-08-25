@@ -115,6 +115,81 @@ fn a_mapping_database_does_not_take_a_region_of_address_space_per_page() {
     }
 }
 
+/// A mapping that loses the race to an evictor goes back the way the
+/// reservation takes it back, and not with a `munmap` that would punch a
+/// hole in the reservation.
+///
+/// `remap_settled` maps outside the allocation lock and only publishes
+/// under it, so a page can be evicted between the two and the mapping is
+/// given back unpublished. Doing that with a plain `munmap` returns the
+/// range to the process rather than to the log, and the next unrelated
+/// `mmap` anywhere in the process is free to take it, at which point the
+/// log's next `MAP_FIXED` over that page takes it away again. #776.
+///
+/// The visible consequence is regions: the reservation is one region
+/// while it is whole and three the first time a page is punched out of
+/// the middle of it. So this writes under a page bound, which is what
+/// puts an evictor on the writer's thread while the flusher is mapping,
+/// and then asks whether the count followed the races.
+#[test]
+fn a_mapping_that_loses_its_race_does_not_punch_a_hole_in_the_reservation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let before = regions();
+    let db = Db::create(
+        &dir.path().join("l.zu2"),
+        Options {
+            // Four pages of memory against sixty four of log, so the
+            // writer is evicting behind itself for the whole run and the
+            // flusher is mapping into the same slots.
+            memory_pages: 4,
+            ..options()
+        },
+    )
+    .expect("create");
+
+    let value = vec![b'v'; 8 << 10];
+    {
+        let mut s = db.session();
+        for i in 0..20000u32 {
+            s.upsert(&key(i % 6000), &value).expect("upsert");
+        }
+    }
+    db.sync().expect("sync");
+    for _ in 0..500 {
+        if db.remap_lost() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let lost = db.remap_lost();
+    if lost == 0 {
+        // The race is a race. A run that did not hit it has not shown
+        // the giveback is wrong and has not shown it is right, so it
+        // says so rather than passing quietly.
+        eprintln!("no mapping ever lost its race, so this run tested nothing");
+        return;
+    }
+    eprintln!("{lost} mappings lost their race");
+    if let (Some(before), Some(after)) = (before, regions()) {
+        let added = after.saturating_sub(before) as u64;
+        assert!(
+            added < lost,
+            "{added} regions of address space after {lost} lost mappings, \
+             which is a hole a race of #776 rather than a whole reservation"
+        );
+    }
+
+    // And the pages that were mapped over those holes still read, which
+    // is what a `MAP_FIXED` over somebody else's mapping turns into.
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in (0..6000u32).step_by(37) {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost {i}");
+        assert_eq!(out.len(), value.len(), "{i} came back the wrong length");
+    }
+}
+
 /// The reservation goes back at drop, all of it, and does not leak a
 /// region per database opened.
 ///

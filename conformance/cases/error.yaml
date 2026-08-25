@@ -197,9 +197,21 @@ cases:
     raises: "42000"
 
   - name: a-property-type-no-column-can-hold
-    doc: A declared type is written into the catalog with the codes a column stores, so a type no column has is a type no element type can name. DECIMAL parses and has no column here, and the refusal is about the statement rather than about the file, which is why it is 42000 and not a report of damage.
-    query: "CREATE GRAPH TYPE t { (:P {v :: DECIMAL(12,2)}) }"
+    doc: A declared type is written into the catalog with the codes a column stores, so a type no column has is a type no element type can name. A decimal column holds unscaled units in a 64 bit word and the declared scale is what makes them a number, so thirty eight digits of them are more than a column here has room for. The refusal is about the statement rather than about the file, which is why it is 42000 and not a report of damage.
+    query: "CREATE GRAPH TYPE t { (:P {v :: DECIMAL(38,2)}) }"
     raises: "42000"
+
+  - name: a-decimal-column-is-a-declaration-a-graph-type-takes
+    doc: The other side of the line above. A decimal whose unscaled units fit a 64 bit word is a column, so the declaration stands, and eighteen digits is the widest that does. The declaration is the setup because a catalog statement returns no rows, so what the case asserts is that it did not raise.
+    setup:
+      - "CREATE GRAPH TYPE ledger { (:Purchase {total :: DECIMAL(18,2)}) }"
+    query: RETURN 18 AS digits
+    columns:
+      - digits
+    rows:
+      - values:
+          - type: INT64
+            value: "18"
 
   - name: an-embedding-column-is-a-declaration-a-graph-type-takes
     doc: A property declared LIST<FLOAT32 NOT NULL>[768] is the embedding column, and a graph type takes it. The declaration is the setup here because a catalog statement returns no rows, so what the case asserts is that it did not raise. What the catalog keeps is the bound and the element's nullability, which are what every later check about the column is made against, and a catalog that took the declaration and forgot either of them would be worse than one that refused it.

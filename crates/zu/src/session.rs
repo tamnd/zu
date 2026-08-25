@@ -4266,12 +4266,13 @@ mod tests {
         let epoch = session.epoch;
         let labels = session.graph.catalog().labels().len();
         // The catalog writes a property type in a declared form, and a
-        // decimal has no shape in it. The statement interned `Ghost` on
-        // the way to finding that out, and the file still has to come
-        // out unchanged.
+        // decimal this wide has no shape in it: its unscaled units want
+        // more than the sixty four bit lane word a narrow one rides.
+        // The statement interned `Ghost` on the way to finding that out,
+        // and the file still has to come out unchanged.
         let err = session
             .run(
-                "CREATE GRAPH TYPE strict { (:Ghost {seen :: DECIMAL(12,2)}) }",
+                "CREATE GRAPH TYPE strict { (:Ghost {seen :: DECIMAL(38,2)}) }",
                 &[],
             )
             .expect_err("a property type no column can hold")

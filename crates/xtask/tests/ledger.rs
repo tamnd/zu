@@ -112,7 +112,7 @@ fn the_surface_a_binding_owes_is_the_one_a_user_touches() {
 
 #[test]
 fn a_binding_map_written_against_this_ledger_is_checked_the_other_way() {
-    // The nine repositories have no maps yet, so what this asserts is
+    // The thirteen repositories have no maps yet, so what this asserts is
     // that the release direction works against the real ledger and not
     // only against a fixture: a map naming one tier-1 entity is short
     // by the rest, and naming a tier-3 entity is a disagreement.

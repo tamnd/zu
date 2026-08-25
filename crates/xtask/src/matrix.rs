@@ -9,7 +9,7 @@
 //! Reading the block by its indentation rather than parsing YAML: what
 //! is wanted is a list of `key: value` under one key, the files are
 //! written here, and a YAML library to read six keys out of them would
-//! be a dependency in the build tooling of nine repositories. A
+//! be a dependency in the build tooling of thirteen repositories. A
 //! structure this does not understand is an error with a line number
 //! rather than a row silently dropped, which is the rule the TOML
 //! reader beside it follows too.

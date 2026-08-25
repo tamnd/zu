@@ -1,6 +1,6 @@
 schema = 1
 doc = "The clients of this engine, who maintains each one, and what its tier promises."
-audited = "2026-08-22"
+audited = "2026-08-25"
 
 # The scorecard of dx/01 section 5. A tier is a promise, and a promise
 # with nobody's name on it is a commitment nobody made, so every client
@@ -157,7 +157,7 @@ registry = "Maven Central"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
 holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "leaks", "install", "stability"]
-doc = "Panama with a JNI fallback, and the Kotlin and Scala layers on top of it."
+doc = "Panama with a JNI fallback. The Kotlin and Scala layers were on top of it until DX5 and are their own clients now, because a dependency is taken by name and the name a Kotlin project wants is a Kotlin one."
 
 [[client]]
 repository = "https://github.com/tamnd/zu-c"
@@ -178,6 +178,46 @@ maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 2
 holds = []
 doc = "Source-generated P/Invoke, NativeAOT-clean."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-kotlin"
+language = "Kotlin"
+package = "dev.zudb:zu-kotlin"
+registry = "Maven Central"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 2
+holds = []
+doc = "Kotlin/JVM over the Panama layer. use for closing, Sequence for rows, a suspend query and a Flow, and cancellation that reaches the interrupt rather than being dropped."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-scala"
+language = "Scala"
+package = "dev.zudb::zu-scala"
+registry = "Maven Central"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 2
+holds = []
+doc = "Scala 3 first, cross published for 2.13. Using for resources, a sealed value type, Either at the edges, and the Cats Effect and ZIO modules kept apart."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-swift"
+language = "Swift"
+package = "zu-swift"
+registry = "Swift Package Manager"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 2
+holds = []
+doc = "The C ABI through the clang importer, AsyncSequence over rows, a non-copyable handle that closes in its deinit, and the one-thread rule said in Sendable rather than in a comment."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-dart"
+language = "Dart"
+package = "zudb"
+registry = "pub.dev"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 2
+holds = []
+doc = "dart:ffi with the declarations generated from zu.h and regenerated in CI, so a drift in the header is a diff in a pull request."
 
 [[client]]
 repository = "https://github.com/tamnd/zu-kit"

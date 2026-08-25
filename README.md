@@ -82,8 +82,12 @@ This repository holds the engine, the Rust SDK, the CLI, the C ABI and its gener
 | [zu-python](https://github.com/tamnd/zu-python) | `zudb` on PyPI. PyO3, three wheels per platform | 1 |
 | [zu-node](https://github.com/tamnd/zu-node) | `zudb` on npm. napi-rs, plus the WASM build, for Node, Bun, Deno, and the browser | 1 |
 | [zu-go](https://github.com/tamnd/zu-go) | `github.com/tamnd/zu-go`. cgo, with a `purego` path | 1 |
-| [zu-java](https://github.com/tamnd/zu-java) | `dev.zudb` on Maven Central. Panama, with a JNI fallback, plus Kotlin and Scala layers | 1 |
+| [zu-java](https://github.com/tamnd/zu-java) | `dev.zudb` on Maven Central. Panama, with a JNI fallback | 1 |
 | [zu-dotnet](https://github.com/tamnd/zu-dotnet) | `ZuDb` on NuGet. Source-generated P/Invoke, NativeAOT-clean | 2 |
+| [zu-kotlin](https://github.com/tamnd/zu-kotlin) | `dev.zudb:zu-kotlin` on Maven Central. Kotlin/JVM over the Panama layer, coroutines and `Flow` | 2 |
+| [zu-scala](https://github.com/tamnd/zu-scala) | `dev.zudb::zu-scala` on Maven Central. Scala 3 and 2.13, with Cats Effect and ZIO modules kept apart | 2 |
+| [zu-swift](https://github.com/tamnd/zu-swift) | Swift Package Manager. The C ABI through the clang importer, `AsyncSequence` over rows | 2 |
+| [zu-dart](https://github.com/tamnd/zu-dart) | `zudb` on pub.dev. `dart:ffi`, with the declarations generated from `zu.h` | 2 |
 | [zu-kit](https://github.com/tamnd/zu-kit) | The binding kit: generated FFI declarations, corpus runners, a reference binding, the scorecard tool | 3 |
 | [zu-web](https://github.com/tamnd/zu-web) | The documentation site. Two thirds of it is generated from this repository's release artifacts | |
 

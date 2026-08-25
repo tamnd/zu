@@ -1,6 +1,6 @@
 schema = 1
-doc = "The nine repositories of the split, and what the release train asks of each."
-audited = "2026-08-16"
+doc = "The thirteen repositories of the split, and what the release train asks of each."
+audited = "2026-08-25"
 
 # One row per repository of dx/18 section 2. The engine is the first row
 # and the only one the train does not dispatch to, because the train is
@@ -61,7 +61,7 @@ tier = 1
 created = "DX4"
 workflow = "release.yml"
 reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
-doc = "dev.zudb on Maven Central, Panama with a JNI fallback, plus the Kotlin and Scala layers."
+doc = "dev.zudb on Maven Central, Panama with a JNI fallback. The Kotlin and Scala layers moved to repositories of their own at DX5, because a Kotlin project takes a Kotlin artifact and a Scala project takes one built for its binary version."
 
 [[repo]]
 name = "zu-c"
@@ -80,6 +80,42 @@ created = "DX5"
 workflow = "release.yml"
 reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
 doc = "ZuDb on NuGet, source-generated P/Invoke, NativeAOT-clean."
+
+[[repo]]
+name = "zu-kotlin"
+role = "binding"
+tier = 2
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "dev.zudb:zu-kotlin on Maven Central, Kotlin/JVM over the Panama layer, coroutines and Flow. Its own artifact rather than a package inside zu-java's jar."
+
+[[repo]]
+name = "zu-scala"
+role = "binding"
+tier = 2
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "dev.zudb::zu-scala on Maven Central, Scala 3 first and cross published for 2.13, with the Cats Effect and ZIO modules separate so neither is the other's dependency."
+
+[[repo]]
+name = "zu-swift"
+role = "binding"
+tier = 2
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "Swift Package Manager, a binary target per platform, AsyncSequence over rows. Its publish is a git tag, which it shares with zu-go as the one that cannot be taken back."
+
+[[repo]]
+name = "zu-dart"
+role = "binding"
+tier = 2
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "zudb on pub.dev, dart:ffi with the declarations generated from zu.h, the library shipped as a native asset rather than found on the path."
 
 [[repo]]
 name = "zu-kit"

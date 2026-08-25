@@ -1245,11 +1245,15 @@ mod tests {
         let notes = table.check(&root, false).expect("the tree is readable");
         assert!(notes.is_empty(), "{notes:#?}");
 
-        // Seven clients: the five tier 1 SDKs of DX4, the tier 2 one,
-        // and the kit. Every one of them owes a scorecard back, which is
-        // the list in repos.toml, and every one of them has a name on
-        // it, which is what dx/01 section 5 asks for.
-        assert_eq!(table.clients.len(), 7);
+        // Eleven clients: the five tier 1 SDKs of DX4, the five tier 2
+        // ones DX5 adds, and the kit. Every one of them owes a
+        // scorecard back, which is the list in repos.toml, and every one
+        // of them has a name on it, which is what dx/01 section 5 asks
+        // for. The five new ones start at tier 2 rather than at tier 1,
+        // because tier 1 asks for 100 on conformance and 90 on practice
+        // and a binding earns that by having shipped rather than by
+        // having been written.
+        assert_eq!(table.clients.len(), 11);
         let tier1: Vec<&str> = table
             .clients
             .iter()

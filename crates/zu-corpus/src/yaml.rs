@@ -4,7 +4,7 @@
 //! block mappings, block sequences, and scalars. Everything else is
 //! refused with a line number, for the reason the map reader gives.
 //! These files are hand written, they have to be read by people in
-//! nine repositories who did not write them, and a construct the
+//! thirteen repositories who did not write them, and a construct the
 //! reader quietly reinterpreted would be a case that says one thing to
 //! a reviewer and another to the runner.
 //!

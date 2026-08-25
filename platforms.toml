@@ -1,5 +1,5 @@
 schema = 2
-doc = "The platforms zu builds for, one table for nine repositories."
+doc = "The platforms zu builds for, one table for thirteen repositories."
 audited = "2026-08-16"
 
 # The tiers of dx/14 section 2, as data rather than as a paragraph nine

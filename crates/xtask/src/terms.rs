@@ -9,7 +9,7 @@
 //! not. The table is `style/zu/terms.yml` in `tamnd/zu-web`, because
 //! the site is where the program's prose is published from; the reader
 //! is here, because the prose with the most readers is here and because
-//! a table checked by nine repositories against nine readers would be
+//! a table checked by thirteen repositories against thirteen readers would be
 //! nine tables.
 //!
 //! What is checked is prose, and only prose. Markdown, and the doc
@@ -43,7 +43,7 @@ use zu_corpus::yaml::{self, Node};
 pub const SCHEMA: i64 = 1;
 
 /// The floor on a definition. It is here rather than in a test because
-/// the table is read by nine repositories and a definition nobody wrote
+/// the table is read by thirteen repositories and a definition nobody wrote
 /// is worse than a term nobody defined: the first looks like an answer.
 const DOC_MIN: usize = 24;
 

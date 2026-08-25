@@ -21,7 +21,7 @@ mod sel;
 mod str;
 mod vector;
 
-pub use arena::{BLOCK_BYTES, MorselArena, Pod, RawBuf};
+pub use arena::{BLOCK_BYTES, MorselArena, Pod, PooledArena, RawBuf};
 pub use bitmap::Bitmap;
 pub use chunk::{ChunkSet, DataChunk};
 pub use expr::{ExprOp, OwnedValue, Program, Reg, const_str};

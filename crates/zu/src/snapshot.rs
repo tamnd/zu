@@ -131,7 +131,6 @@ pub struct Zu1Snapshot<'a> {
 /// is, which is the caller's business: hand it back to
 /// [`Zu1Snapshot::with_cache`] while the epoch holds and drop it when
 /// the epoch moves.
-#[derive(Default)]
 pub struct SnapshotCache {
     pub(crate) readers: IdMap<u32, GraphReader>,
     pub(crate) props: IdMap<u32, Option<PropsReader>>,
@@ -141,6 +140,43 @@ pub struct SnapshotCache {
     gone: Option<Deleted>,
     patches: Arc<Patches>,
     frames: Arc<FrameSet>,
+}
+
+/// The empty patch and the empty frame set, one of each for the whole
+/// process, so that building an empty cache is two reference counts
+/// rather than two trips to the allocator.
+///
+/// A default cache is not a rare thing. Every run on the pipeline takes
+/// the session's cache and leaves a default one in its place for the
+/// length of the query, so a session doing nothing but point reads
+/// builds one per read, and the two `Arc`s in it were the only part
+/// that touched the heap. Sharing them is sound because neither is ever
+/// written through: a commit that changes the patch does it with
+/// [`Arc::make_mut`] on the writer's own handle, which sees a shared
+/// count and copies, and what it copies is empty.
+fn empty_patches() -> Arc<Patches> {
+    static EMPTY: std::sync::OnceLock<Arc<Patches>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(Arc::default))
+}
+
+fn empty_frames() -> Arc<FrameSet> {
+    static EMPTY: std::sync::OnceLock<Arc<FrameSet>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(Arc::default))
+}
+
+impl Default for SnapshotCache {
+    fn default() -> SnapshotCache {
+        SnapshotCache {
+            readers: IdMap::default(),
+            props: IdMap::default(),
+            scratch: Vec::new(),
+            str_bytes: Vec::new(),
+            str_ends: Vec::new(),
+            gone: None,
+            patches: empty_patches(),
+            frames: empty_frames(),
+        }
+    }
 }
 
 impl SnapshotCache {

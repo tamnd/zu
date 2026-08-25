@@ -178,7 +178,18 @@ impl Neighbourhood {
             // SAFETY: the caller's epoch keeps any retired block alive,
             // and the version check below discards a torn read.
             let answer = visit(unsafe { self.slice() });
-            if self.version.load(Ordering::Acquire) == before {
+            // The neighbours are read with plain loads and an acquire
+            // load orders only what comes after it, so without this
+            // fence nothing stops those loads from being taken after
+            // the check below: the check reads a version from before
+            // the writer started and the data comes back from the
+            // middle of what the writer did, and a torn read is
+            // returned as the answer. This is the `smp_rmb` a seqlock
+            // reader needs between the data and the second read of the
+            // sequence. It costs nothing on x86 and is a `dmb ishld` on
+            // aarch64, which is where it was caught. #782.
+            std::sync::atomic::fence(Ordering::Acquire);
+            if self.version.load(Ordering::Relaxed) == before {
                 return answer;
             }
         }

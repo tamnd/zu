@@ -303,7 +303,13 @@ impl<'a> RecordRef<'a> {
             // caught by the version recheck below, and the length can
             // not change in place because only the value may.
             out.extend_from_slice(unsafe { self.value_unchecked() });
-            if self.version_cell().load(Ordering::Acquire) == before {
+            // The copy above is plain loads and an acquire load orders
+            // only what follows it, so the copy is free to be taken
+            // after the check below and hand back half of an in-place
+            // update that the check said was not happening. Same fence
+            // and same reason as `Neighbourhood::read`. #782.
+            std::sync::atomic::fence(Ordering::Acquire);
+            if self.version_cell().load(Ordering::Relaxed) == before {
                 return before;
             }
         }

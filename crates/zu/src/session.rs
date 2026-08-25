@@ -513,6 +513,23 @@ impl Session {
         Session::attached(FileHandle::attach_to(db)?)
     }
 
+    /// A session on the file `open` opens, opened through the registry
+    /// rather than before it.
+    ///
+    /// [`Self::on`] is for a file the caller already has in hand, and a
+    /// file already open is a file that was opened at some moment
+    /// nobody here chose: if that moment was inside another handle's
+    /// close, what it read is the header from before that close folded.
+    /// This is the same constructor for a caller that can hand over the
+    /// open itself, which is every caller with a path.
+    pub fn opening(
+        path: &Path,
+        read_only: bool,
+        open: impl FnOnce() -> Result<Zu1File>,
+    ) -> Result<Session> {
+        Session::attached(FileHandle::attach(path, read_only, open)?)
+    }
+
     /// A session on a file this process already holds the write side
     /// of: its own descriptor for reading, forked off that side so the
     /// block cache and the decoded pools are shared, and the roots the

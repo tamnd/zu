@@ -401,7 +401,7 @@
       "name": "connect",
       "of": "zu::Database",
       "signature": "fn connect(&self) -> Result<Connection>",
-      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
+      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds.\n\nThe open goes through the registry rather than ahead of it, so\nthat a connection made while the last one is closing waits for\nthe fold that close is running instead of reading the file\nhalf way through it."
     },
     {
       "id": "zu::Database::create",
@@ -3138,7 +3138,7 @@
       "name": "connect",
       "of": "zu::db::Database",
       "signature": "fn connect(&self) -> Result<Connection>",
-      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
+      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds.\n\nThe open goes through the registry rather than ahead of it, so\nthat a connection made while the last one is closing waits for\nthe fold that close is running instead of reading the file\nhalf way through it."
     },
     {
       "id": "zu::db::Database::create",
@@ -5782,6 +5782,14 @@
       "signature": "fn open(path: &Path) -> Result<Session>"
     },
     {
+      "id": "zu::session::Session::opening",
+      "kind": "method",
+      "name": "opening",
+      "of": "zu::session::Session",
+      "signature": "fn opening(path: &Path, read_only: bool, open: impl FnOnce) -> Result<Session>",
+      "doc": "A session on the file `open` opens, opened through the registry\nrather than before it.\n\n[`Self::on`] is for a file the caller already has in hand, and a\nfile already open is a file that was opened at some moment\nnobody here chose: if that moment was inside another handle's\nclose, what it read is the header from before that close folded.\nThis is the same constructor for a caller that can hand over the\nopen itself, which is every caller with a path."
+    },
+    {
       "id": "zu::session::Session::options",
       "kind": "method",
       "name": "options",
@@ -5981,7 +5989,7 @@
       "name": "attach",
       "of": "zu::shared::FileHandle",
       "signature": "fn attach(path: &Path, read_only: bool, open: impl FnOnce) -> Result<Arc<FileHandle>>",
-      "doc": "The handle for the file `open` opens, opening it only if this\nprocess does not already hold one.\n\nThe closure is what keeps the common case honest: a second\nconnection to a file that is already open costs a lock and a\nmap lookup rather than an open, a header read and a free list\nwalk."
+      "doc": "The handle for the file `open` opens, opening it only if this\nprocess does not already hold one.\n\nThe closure is what keeps the common case honest: a second\nconnection to a file that is already open costs a lock and a\nmap lookup rather than an open, a header read and a free list\nwalk. It is also what makes the open safe: it runs with the\nregistry held, so it cannot read the header of a file another\nhandle is folding on its way out. A caller that opens the file\nitself and hands it over has no such promise, which is why\n[`Self::attach_to`] is for the files that have no other\nconnection to race with."
     },
     {
       "id": "zu::shared::FileHandle::attach_to",
@@ -10717,6 +10725,61 @@
       "doc": "Applies an old-to-new map in place. The caller re-sorts afterward."
     },
     {
+      "id": "zu::zu1::rows",
+      "kind": "module",
+      "name": "rows",
+      "doc": "Columns of byte rows: the Stride structural layout, and which layout\none of these columns takes.\n\nA byte row column is FullZip (`crate::fullzip`) unless every row of\nit is the same length, in which case it is Stride. Stride is the\nlayout with nothing in it: `stride: u32`, then `value_count * stride`\nbytes of rows end to end. There is no chunk index, because row `i`\nbegins at `4 + i * stride` and nothing has to be walked to find it,\nand there is no compression pass, because the columns this layout is\nfor hold numbers rather than text. A 768 dimension `FLOAT32`\nembedding is the case it exists for: FullZip trains a symbol table on\na sample of the column and then encodes every chunk twice to find out\nthat float bytes do not compress, which is a scan of the column for\nan answer known before it starts.\n\nWhich layout a column took is in its meta, so no caller has to\nremember: [`write_rows`] chooses and [`read_rows`] and\n[`read_rows_range`] ask. A column that stops being uniform, because a\nrow was written into it that is a different length, becomes FullZip\nat the next write with nothing to migrate.\n\nThe crc covers the whole payload and is verified by [`read_rows`],\nthe full scan. The point path skips it the way the other two layouts\ndo, and bounds every access against the meta instead: the one\nstructural claim a Stride payload makes is that `4 + count * stride`\nis its length, and that is checked before any row is named."
+    },
+    {
+      "id": "zu::zu1::rows::read_rows",
+      "kind": "function",
+      "name": "read_rows",
+      "signature": "fn read_rows(db: &mut zu_zu1::file::Zu1File, meta: &zu_zu1::segment::SegmentMeta, bytes_out: &mut Vec<u8>, ends_out: &mut Vec<u64>) -> zu_common::Result<()>",
+      "doc": "Reads a byte row column back whole, verifying the payload crc, and\nappends every row to `bytes_out` with its end offset in `ends_out`."
+    },
+    {
+      "id": "zu::zu1::rows::read_rows_range",
+      "kind": "function",
+      "name": "read_rows_range",
+      "signature": "fn read_rows_range(db: &mut zu_zu1::file::Zu1File, meta: &zu_zu1::segment::SegmentMeta, start: u64, end: u64, bytes_out: &mut Vec<u8>, ends_out: &mut Vec<u64>) -> zu_common::Result<()>",
+      "doc": "Point access: appends rows `[start, end)` to `bytes_out` and their\nend offsets to `ends_out`, reading only the bytes they occupy."
+    },
+    {
+      "id": "zu::zu1::rows::rewrite_rows",
+      "kind": "function",
+      "name": "rewrite_rows",
+      "signature": "fn rewrite_rows(db: &mut zu_zu1::file::Zu1File, old: &zu_zu1::segment::SegmentMeta, updates: &std::collections::BTreeMap<u64, Vec<u8>>, appended: &[Vec<u8>]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "[`crate::fullzip::rewrite_blob_segment`] for a column that may be in\neither layout: `updates` written over the rows they name and\n`appended` added on the end.\n\nA FullZip column keeps the per chunk rewrite it has, which is what\nthat function is for. A Stride one has no chunks to spare and no\nencoding to skip, so it is read out and written again, which moves\nthe same bytes the FullZip path moves and does none of the work\naround them. A column that stops being uniform, which is what a\nnull does, comes back as FullZip and nothing has to migrate it.\n\nA FullZip column that becomes uniform stays FullZip. Deciding the\nother way would mean a column changing layout under a single cell\nwrite, and the layout is worth having where the column is written\nwhole, which is where the choice is made."
+    },
+    {
+      "id": "zu::zu1::rows::rewrite_rows_reordered",
+      "kind": "function",
+      "name": "rewrite_rows_reordered",
+      "signature": "fn rewrite_rows_reordered(db: &mut zu_zu1::file::Zu1File, old: &zu_zu1::segment::SegmentMeta, values: &[&[u8]]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "[`crate::fullzip::rewrite_blob_reordered`] for a column that may be\nin either layout: the same values again in a new order.\n\nThe FullZip path exists to keep the symbol table the column was\nencoded with rather than train a second one on the same bytes. A\nStride column has no table, so a reorder is the write and nothing\nelse."
+    },
+    {
+      "id": "zu::zu1::rows::spans",
+      "kind": "function",
+      "name": "spans",
+      "signature": "fn spans(bytes: &[u8], ends: &[u64]) -> Vec<&[u8]>",
+      "doc": "The rows a `bytes`, `ends` pair holds, as the slices every writer\nhere takes."
+    },
+    {
+      "id": "zu::zu1::rows::uniform_len",
+      "kind": "function",
+      "name": "uniform_len",
+      "signature": "fn uniform_len(values: &[&[u8]]) -> Option<usize>",
+      "doc": "The length every row of `values` has, or `None` for a column no\nstride describes.\n\nA column of no rows has no stride to speak of and a column of empty\nrows would give a stride of zero, which is a divisor. Both go to\nFullZip, where they cost nothing anyway."
+    },
+    {
+      "id": "zu::zu1::rows::write_rows",
+      "kind": "function",
+      "name": "write_rows",
+      "signature": "fn write_rows(db: &mut zu_zu1::file::Zu1File, values: &[&[u8]]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "Writes a column of byte rows in whichever layout fits it."
+    },
+    {
       "id": "zu::zu1::segment",
       "kind": "module",
       "name": "segment",
@@ -10865,7 +10928,7 @@
       "id": "zu::zu1::segment::Structural",
       "kind": "enum",
       "name": "Structural",
-      "doc": "Structural layout of a segment payload (docs/04 §3): MiniBlock packs\nfixed-width values in 1024-row cascade chunks, FullZip zips\nvariable-width values with their lengths (`crate::fullzip`). The ids\nare format-stable; readers reject any other value by name."
+      "doc": "Structural layout of a segment payload (docs/04 §3): MiniBlock packs\nfixed-width values in 1024-row cascade chunks, FullZip zips\nvariable-width values with their lengths (`crate::fullzip`), and\nStride lays equal-length byte rows end to end (`crate::rows`). The\nids are format-stable; readers reject any other value by name.\n\nThe ids skip 2 and 3 because the structural byte carries the sorted\nflag in bit 1, so an id with that bit set would be two things."
     },
     {
       "id": "zu::zu1::segment::Structural::FullZip",
@@ -10880,6 +10943,13 @@
       "name": "MiniBlock",
       "of": "zu::zu1::segment::Structural",
       "signature": "MiniBlock"
+    },
+    {
+      "id": "zu::zu1::segment::Structural::Stride",
+      "kind": "variant",
+      "name": "Stride",
+      "of": "zu::zu1::segment::Structural",
+      "signature": "Stride"
     },
     {
       "id": "zu::zu1::segment::cached_chunk",

@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 use zu_common::Result;
 
@@ -366,6 +366,33 @@ fn key_of(file: &Zu1File) -> Key {
     (path, file.is_writable())
 }
 
+/// The registry, with no handle on `key` on its way out.
+///
+/// A handle whose last owner has let go is already gone as far as
+/// `Weak::upgrade` is concerned, and its drop has not run yet. Its drop
+/// is where the file is folded and the log is cut, so a caller that
+/// read the failed upgrade as "nobody has this file" would open a
+/// second write side on a file in the middle of a checkpoint, and what
+/// it opened would be the header from before the fold with the log
+/// that fold cut behind it: the rows of the last connection to write,
+/// gone.
+///
+/// So an entry that is there and cannot be upgraded means wait. The
+/// drop takes this same lock and holds it from clearing the entry
+/// through the fold, so an entry that is gone is a file nobody is
+/// working on.
+fn settled_registry(key: &Key) -> MutexGuard<'static, HashMap<Key, Weak<FileHandle>>> {
+    loop {
+        let open_files = registry().lock().expect("registry");
+        match open_files.get(key) {
+            Some(weak) if weak.strong_count() == 0 => drop(open_files),
+            _ => return open_files,
+        }
+        // The drop is running or about to; it wants this lock.
+        std::thread::yield_now();
+    }
+}
+
 impl FileHandle {
     /// The handle for the file `open` opens, opening it only if this
     /// process does not already hold one.
@@ -373,7 +400,12 @@ impl FileHandle {
     /// The closure is what keeps the common case honest: a second
     /// connection to a file that is already open costs a lock and a
     /// map lookup rather than an open, a header read and a free list
-    /// walk.
+    /// walk. It is also what makes the open safe: it runs with the
+    /// registry held, so it cannot read the header of a file another
+    /// handle is folding on its way out. A caller that opens the file
+    /// itself and hands it over has no such promise, which is why
+    /// [`Self::attach_to`] is for the files that have no other
+    /// connection to race with.
     pub fn attach(
         path: &Path,
         read_only: bool,
@@ -381,13 +413,11 @@ impl FileHandle {
     ) -> Result<Arc<FileHandle>> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let key = (canonical, !read_only);
-        {
-            let open_files = registry().lock().expect("registry");
-            if let Some(handle) = open_files.get(&key).and_then(Weak::upgrade) {
-                return Ok(handle);
-            }
+        let open_files = settled_registry(&key);
+        if let Some(handle) = open_files.get(&key).and_then(Weak::upgrade) {
+            return Ok(handle);
         }
-        FileHandle::attach_to(open()?)
+        FileHandle::install(open_files, open()?)
     }
 
     /// The handle for a file the caller has already opened.
@@ -396,13 +426,24 @@ impl FileHandle {
     /// already, because the one already registered is the one every
     /// other connection is reading through and a second would be a
     /// second writer of the same log.
-    pub fn attach_to(mut file: Zu1File) -> Result<Arc<FileHandle>> {
+    pub fn attach_to(file: Zu1File) -> Result<Arc<FileHandle>> {
         let key = key_of(&file);
-        let mut open_files = registry().lock().expect("registry");
+        let open_files = settled_registry(&key);
         if let Some(handle) = open_files.get(&key).and_then(Weak::upgrade) {
             drop(file);
             return Ok(handle);
         }
+        FileHandle::install(open_files, file)
+    }
+
+    /// Registers `file` as the handle for its key, with the registry
+    /// already held so that nothing can attach to the same file or
+    /// finish closing it in between.
+    fn install(
+        mut open_files: MutexGuard<'static, HashMap<Key, Weak<FileHandle>>>,
+        mut file: Zu1File,
+    ) -> Result<Arc<FileHandle>> {
+        let key = key_of(&file);
         replay_sidecar(&mut file)?;
         // This handle is the one connections read behind, so the blocks
         // its checkpoints free wait for [`FileHandle::reclaim`] and the
@@ -617,11 +658,17 @@ pub fn forget(path: &Path) {
 /// replay to match. Nothing here can report a failure to do it, which
 /// is the reason a caller with something to say about it checkpoints
 /// itself before letting go.
+///
+/// The registry is held across the fold rather than taken after it.
+/// This handle is unreachable by then, because the count that says so
+/// is what got the drop called, so a connection arriving now would find
+/// nothing to upgrade and open the file for itself: a second write side
+/// on a file being checkpointed, reading the header from before the
+/// fold with the log the fold is cutting behind it. Holding the lock is
+/// what makes the close one thing, and [`settled_registry`] is the
+/// other half of it.
 impl Drop for FileHandle {
     fn drop(&mut self) {
-        if let Some(side) = self.gate.get_mut().expect("write gate").side.as_mut() {
-            let _ = side.fold_writer();
-        }
         let mut open_files = registry().lock().expect("registry");
         // Only if it is still ours: an entry replaced since is another
         // handle's, and the weak pointer in the map is the way to tell.
@@ -630,6 +677,9 @@ impl Drop for FileHandle {
             .is_some_and(|weak| weak.strong_count() == 0)
         {
             open_files.remove(&self.key);
+        }
+        if let Some(side) = self.gate.get_mut().expect("write gate").side.as_mut() {
+            let _ = side.fold_writer();
         }
     }
 }

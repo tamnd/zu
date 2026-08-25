@@ -31,7 +31,8 @@ pub use kernels::{
 pub use sel::SelVector;
 pub use str::{Dictionary, INLINE_LEN, NO_BUFFERS, StrBuffers, StrBuilder, StrView};
 pub use vector::{
-    Aux, PhysType, ValueVector, VecEncoding, node_group, node_ref, node_row, node_table, str_vector,
+    Aux, PhysType, ValueVector, VecEncoding, node_group, node_ref, node_row, node_table,
+    str_vector, str_vector_from_ends,
 };
 
 /// Rows per vector, unchanged from the executor's chunk fill width.

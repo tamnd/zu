@@ -220,40 +220,75 @@ impl ValueVector {
     }
 }
 
+/// Write the views of `it` into `vec`, answering the bytes of whatever
+/// was too long to sit in its own view.
+///
+/// One pass and one buffer: a long string is appended as it is met, so
+/// the offset it needs is where the buffer has got to and nothing has
+/// to be remembered between the two. There is only ever the one buffer
+/// here, so its id is zero and no id has to be carried either.
+fn fill_str<'a>(vec: &mut ValueVector, it: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut long_bytes = Vec::new();
+    let views = vec.values_mut::<StrView>();
+    for (i, v) in it.enumerate() {
+        views[i] = if v.len() > crate::str::INLINE_LEN {
+            let start = long_bytes.len() as u32;
+            long_bytes.extend_from_slice(v);
+            StrView::long(v, 0, start)
+        } else {
+            StrView::inline(v)
+        };
+    }
+    long_bytes
+}
+
+/// Hand `long_bytes` to `vec`, or leave it with no buffers at all when
+/// every one of its strings was short enough to live in its own view.
+///
+/// The empty case is the common one on a scan and it is worth not
+/// allocating for: a vector that carries no long string carries no
+/// [`StrBuffers`] and no `Arc` around one, and a kernel that resolves a
+/// view of it reaches [`crate::str::NO_BUFFERS`] instead.
+fn attach_str(vec: &mut ValueVector, long_bytes: Vec<u8>) {
+    if long_bytes.is_empty() {
+        return;
+    }
+    let mut bufs = StrBuffers::new();
+    let id = bufs.push(Arc::from(long_bytes.into_boxed_slice()));
+    debug_assert_eq!(id, 0, "the first buffer of a fresh set is buffer zero");
+    vec.aux = Aux::Str(Arc::new(bufs));
+}
+
 /// Convenience constructor for tests and result building: a flat string
 /// vector from byte slices, short ones inline, long ones packed into one
 /// shared buffer.
 pub fn str_vector<B: AsRef<[u8]>>(arena: &mut MorselArena, values: &[B]) -> ValueVector {
-    let mut long_bytes = Vec::new();
-    let mut spans = Vec::with_capacity(values.len());
-    for v in values {
-        let v = v.as_ref();
-        if v.len() > crate::str::INLINE_LEN {
-            let start = long_bytes.len() as u32;
-            long_bytes.extend_from_slice(v);
-            spans.push(Some(start));
-        } else {
-            spans.push(None);
-        }
-    }
-    let mut bufs = StrBuffers::new();
-    let id = if long_bytes.is_empty() {
-        0
-    } else {
-        bufs.push(Arc::from(long_bytes.into_boxed_slice()))
-    };
     let mut vec = ValueVector::flat_uninit(arena, PhysType::Str, values.len());
-    {
-        let views = vec.values_mut::<StrView>();
-        for (i, v) in values.iter().enumerate() {
-            let v = v.as_ref();
-            views[i] = match spans[i] {
-                Some(start) => StrView::long(v, id, start),
-                None => StrView::inline(v),
-            };
-        }
-    }
-    vec.aux = Aux::Str(Arc::new(bufs));
+    let long_bytes = fill_str(&mut vec, values.iter().map(AsRef::as_ref));
+    attach_str(&mut vec, long_bytes);
+    vec
+}
+
+/// A flat string vector over the `bytes` and `ends` a decoded string
+/// column arrives in, where `ends` is the offset one past each string.
+///
+/// This is the read path's constructor and it exists because the
+/// general one above wants a slice of slices, which a scan would have
+/// to build first: sixteen bytes a row written and read again to get at
+/// bytes that are already laid out end to end. Here the ends walk
+/// straight into the views.
+pub fn str_vector_from_ends(arena: &mut MorselArena, bytes: &[u8], ends: &[u64]) -> ValueVector {
+    let mut lo = 0usize;
+    let mut vec = ValueVector::flat_uninit(arena, PhysType::Str, ends.len());
+    let long_bytes = fill_str(
+        &mut vec,
+        ends.iter().map(move |&e| {
+            let s = &bytes[lo..e as usize];
+            lo = e as usize;
+            s
+        }),
+    );
+    attach_str(&mut vec, long_bytes);
     vec
 }
 
@@ -292,6 +327,47 @@ mod tests {
         let views = v.values::<StrView>();
         for (view, want) in views.iter().zip(vals) {
             assert_eq!(view.bytes(bufs), want.as_bytes());
+        }
+    }
+
+    #[test]
+    fn ends_build_the_same_vector_as_slices() {
+        let mut arena = MorselArena::new();
+        let vals: [&str; 5] = [
+            "",
+            "short",
+            "a considerably longer string than twelve bytes",
+            "twelve bytes",
+            "another long one, well past the inline limit",
+        ];
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        for v in vals {
+            bytes.extend_from_slice(v.as_bytes());
+            ends.push(bytes.len() as u64);
+        }
+        let v = str_vector_from_ends(&mut arena, &bytes, &ends);
+        let bufs = v.str_buffers().expect("two of them are long");
+        assert_eq!(v.len(), vals.len());
+        for (view, want) in v.values::<StrView>().iter().zip(vals) {
+            assert_eq!(view.bytes(bufs), want.as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_vector_of_short_strings_carries_no_buffers() {
+        let mut arena = MorselArena::new();
+        let vals = ["ann", "bo", "", "twelve bytes"];
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        for v in vals {
+            bytes.extend_from_slice(v.as_bytes());
+            ends.push(bytes.len() as u64);
+        }
+        let v = str_vector_from_ends(&mut arena, &bytes, &ends);
+        assert!(v.str_buffers().is_none(), "nothing needed a buffer");
+        for (view, want) in v.values::<StrView>().iter().zip(vals) {
+            assert_eq!(view.bytes(&crate::str::NO_BUFFERS), want.as_bytes());
         }
     }
 }

@@ -717,6 +717,24 @@ exec_scale_8x = 2.0
 # which is the check that this was the tail and not the scan: twelve
 # groups have no tail worth the name.
 #
+# What was left of that tail went to the pool next. Folding the eight
+# workers' tables into one is seven full width merges one after
+# another, because the morsel scheduler hands every worker keys from
+# all over the scan, so each partial is about as wide as the answer.
+# That fold goes pairwise up a tree now, which is the same seven
+# merges in three rounds. The row build went to slices of the settled
+# order, one hand per worker that ran rather than one per core, since
+# a query asked for on one thread has to be answered on one thread or
+# this number stops measuring a core. On gamingpc, quiet, medians of
+# six paired alternating runs of two separately built binaries, the
+# hundred thousand group query went 40.8 ms to 33.9 at eight workers,
+# 243 to 296 M rows/s, and the branch was faster in all six pairs. At
+# one worker it read 99.5 against 99.4, which is the check that the
+# hand count follows the run and not the machine. The twelve group
+# and thousand group string shapes did not move either, the first
+# because it has no tail and the second because a thousand groups is
+# under the split.
+#
 # The bench crosschecks the group count and the row total against the
 # generator on every run. Raise this floor, never lower it.
 exec_group_mrows_s_core = 8.0

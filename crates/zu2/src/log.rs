@@ -1030,35 +1030,46 @@ impl Log {
             .max(page_of(self.head()));
         let mut mapped = false;
         while page < boundary && page_start(page + 1) <= flushed {
-            // The same lock the allocating path takes, so a page cannot
-            // be published by one thread while another is replacing it.
-            let guard = self.allocating.lock().expect("zu2 page allocation");
+            // Everything up to the publish is done without the lock.
+            // The lock is the one the allocating path takes to open a
+            // page, so a bulk load has writers waiting on it, and an
+            // `mmap` held under it put a syscall a page in their way
+            // for no reason: the mapping does not need to be made
+            // atomically with the swap, it only needs to be published
+            // atomically.
             let Some(slot) = self.page_slot(page) else {
-                drop(guard);
                 page += 1;
                 continue;
             };
             let stale = slot.load(Ordering::Acquire);
             if stale.is_null() || is_mapped(stale) {
-                drop(guard);
                 page += 1;
                 continue;
             }
-            match crate::file::map_read(&self.file, page_start(page), PAGE_SIZE) {
-                Some(at) => {
-                    slot.store(tag_mapped(at), Ordering::Release);
-                    drop(guard);
-                    self.release_page(stale);
-                    mapped = true;
-                }
-                None => {
-                    // The platform has no mapping call or the kernel
-                    // refused this one. Neither is an error: the page
-                    // stays where it is and the cursor moves on, so a
-                    // refusal costs one syscall a page and not a retry
-                    // loop.
-                    drop(guard);
-                }
+            // The platform has no mapping call or the kernel refused
+            // this one. Neither is an error: the page stays where it is
+            // and the cursor moves on, so a refusal costs one syscall a
+            // page and not a retry loop.
+            let Some(at) = crate::file::map_read(&self.file, page_start(page), PAGE_SIZE) else {
+                page += 1;
+                continue;
+            };
+            // The same lock the allocating path takes, so a page cannot
+            // be published by one thread while another is replacing it.
+            let guard = self.allocating.lock().expect("zu2 page allocation");
+            if slot.load(Ordering::Acquire) == stale {
+                slot.store(tag_mapped(at), Ordering::Release);
+                drop(guard);
+                self.release_page(stale);
+                mapped = true;
+            } else {
+                drop(guard);
+                // Somebody evicted or replaced the page while the
+                // mapping was being made, so this mapping describes a
+                // slot nobody owns and no reader has ever seen the
+                // pointer. It goes back now rather than through the
+                // epoch, which is for pointers that were published.
+                unsafe { crate::file::unmap(at, PAGE_SIZE) };
             }
             page += 1;
         }

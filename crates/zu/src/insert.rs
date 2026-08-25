@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Subject, codes};
 use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
@@ -684,6 +684,24 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
     };
     Ok(match (ty, value) {
         (LogicalType::Bool, Value::Bool(b)) => Cell::Int(u64::from(*b)),
+        // A column declared narrower than the lane is a promise about
+        // the values, and this is where the promise is kept: the word
+        // that goes in is the same word either way, so nothing later
+        // would notice a value the declaration does not admit.
+        (
+            LogicalType::Int {
+                signed,
+                bits,
+                precision: None,
+            },
+            Value::Int(n),
+        ) if !bits.holds(*n as u64, *signed) => {
+            return Err(ZuError::gql(
+                codes::C22003,
+                format!("property '{key}' holds {ty}, and {n} is not a value of it"),
+            )
+            .about(Subject::Property(key.to_string())));
+        }
         (LogicalType::Int { .. }, Value::Int(n)) => Cell::Int(*n as u64),
         // A whole number written into a float column is the one
         // widening allowed, the same one the appender allows, because a
@@ -699,13 +717,27 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
                 _ => Cell::Int(f.to_bits()),
             }
         }
-        (LogicalType::Str { .. }, Value::Str(s)) => Cell::Str(s.as_bytes().to_vec()),
+        // A length bound counts two different things on the two sides.
+        // A character is a Unicode scalar value and an octet is a byte,
+        // so `STRING(5,5)` admits five astral characters in twenty
+        // bytes and `BINARY(5)` admits five bytes whatever they spell.
+        // The bound on the byte side is a layout as well as a check,
+        // since a column whose rows are all one width carries no
+        // offsets, so a row of the wrong width is one the reader would
+        // walk into the next row for.
+        (LogicalType::Str { min, max, .. }, Value::Str(s)) => {
+            bounded(ty, key, s.chars().count(), *min, *max, "characters")?;
+            Cell::Str(s.as_bytes().to_vec())
+        }
         // A byte string goes down the same side of the store a
         // character string does, which is the blob side, because the
         // store keeps a run of bytes and a run of bytes is what both
         // of them are. What tells the two apart is the column's own
         // type, and this pairing is the whole of the telling.
-        (LogicalType::Bytes { .. }, Value::Bytes(b)) => Cell::Str(b.clone()),
+        (LogicalType::Bytes { min, max, .. }, Value::Bytes(b)) => {
+            bounded(ty, key, b.len(), *min, *max, "octets")?;
+            Cell::Str(b.clone())
+        }
         (LogicalType::Date, Value::Temporal(Temporal::Date(d))) => Cell::Int(*d as i64 as u64),
         (LogicalType::LocalTime, Value::Temporal(Temporal::LocalTime(t))) => Cell::Int(*t as u64),
         (LogicalType::LocalDatetime, Value::Temporal(Temporal::LocalDatetime(t))) => {
@@ -725,6 +757,36 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
         (_, Value::Null) => Cell::Null,
         _ => return Err(wrong()),
     })
+}
+
+/// Refuses a value outside the length bound its column is declared
+/// with, `unit` naming what was counted.
+///
+/// The two ends raise two conditions. A value past the maximum is
+/// 22001, right truncation, which is what would have to happen for it
+/// to fit; a value short of the minimum is nothing being truncated and
+/// is 22G03 with the others, a value that is not one of the column's
+/// type.
+fn bounded(
+    ty: &LogicalType,
+    key: &str,
+    len: usize,
+    min: Option<u32>,
+    max: Option<u32>,
+    unit: &str,
+) -> Result<()> {
+    let over = max.is_some_and(|n| len > n as usize);
+    if !over && !min.is_some_and(|n| len < n as usize) {
+        return Ok(());
+    }
+    Err(ZuError::gql(
+        match over {
+            true => codes::C22001,
+            false => codes::C22G03,
+        },
+        format!("property '{key}' holds {ty}, and this one is {len} {unit}"),
+    )
+    .about(Subject::Property(key.to_string())))
 }
 
 /// What a value is, for the message when its column cannot hold it.

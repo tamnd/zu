@@ -1,5 +1,5 @@
 schema = 1
-doc = "The versions zu builds against, one table for nine repositories."
+doc = "The versions zu builds against, one table for thirteen repositories."
 audited = "2026-08-21"
 
 # One table, referenced rather than restated, so that "which version do
@@ -10,7 +10,7 @@ audited = "2026-08-21"
 # well as the pin, because a library that only ever builds against the
 # newest release finds out its floor is broken from a bug report.
 #
-# `repos` says which of the nine repositories build against a component.
+# `repos` says which of the thirteen repositories build against a component.
 # A component this one builds against says where the version is written,
 # in a `[[site]]` below it, and `cargo xtask pins` holds the file to the
 # table. Bumping a version is a pull request that touches this table and

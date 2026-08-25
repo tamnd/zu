@@ -1,7 +1,7 @@
 //! The subset of TOML `api-map.toml` is written in.
 //!
 //! A general TOML parser is not what this needs. The map is a
-//! hand-written file that has to exist in nine repositories and be
+//! hand-written file that has to exist in thirteen repositories and be
 //! read by people who did not write it, so the reader's job is to
 //! refuse anything it does not understand rather than to accept as
 //! much as possible. A key it silently ignored would be a mapping

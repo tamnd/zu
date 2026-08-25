@@ -102,7 +102,7 @@ jobs:
       # a test too, and here for the same reason as the two above.
       - run: cargo run -p xtask -- platforms
       # And the table on the end of the release: what a tag publishes,
-      # which eight repositories fetch by version. release.yml assembles
+      # which twelve repositories fetch by version. release.yml assembles
       # from it and verifies the directory back against it, so an
       # artifact that stopped being produced fails the release that
       # dropped it rather than the eight that wanted it.
@@ -123,7 +123,7 @@ jobs:
       # floor catches is the order of magnitude, since a rewrite that
       # allocates per block turns a release into a minute of hashing.
       - run: ZU_GATE=1 cargo bench -p xtask --bench sha256
-      # And the table under all of it: the nine repositories the split
+      # And the table under all of it: the thirteen repositories the split
       # created. The conductor dispatches to that list, the README
       # publishes it, and the contract above names its consumers from
       # it, so a repository joining or leaving the project is one row
@@ -559,7 +559,7 @@ jobs:
       # them. It is not allowed on a branch heading for a release, so
       # the gate lives here rather than in the runner's defaults.
       - run: cargo run -p zu-cli --release -- corpus conformance/cases --strict
-      # The reader is read by nine repositories on every CI run of each
+      # The reader is read by thirteen repositories on every CI run of each
       # of them, so its cost per case is asserted to stay linear as the
       # corpus grows. The bench fails rather than reporting when it
       # does not.

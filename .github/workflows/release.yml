@@ -1,7 +1,7 @@
 name: release
 
 # The release train of dx/14 section 6: one version number, one day,
-# one orchestrated run across nine repositories. This is the skeleton of
+# one orchestrated run across thirteen repositories. This is the skeleton of
 # it, and what is real here is deliberate. The build is the same matrix
 # every pull request runs, the assemble step gathers exactly the rows of
 # artifacts.toml, and the verify step reads the directory back against
@@ -88,7 +88,7 @@ jobs:
           if-no-files-found: error
           path: packaging
 
-  # The eight repositories, driven rather than releasing on their own
+  # The twelve repositories, driven rather than releasing on their own
   # schedule, which is what keeps one version number meaning one thing.
   # It runs after the artifacts exist because every one of them builds
   # against those artifacts, and before the registries because a binding
@@ -141,5 +141,5 @@ jobs:
           echo "no-op: deploy zu-web against this version, publish the notes, push the rendered Homebrew formula and Scoop manifest to the tap and the bucket, and bump AUR"
       - name: What this run did not do
         run: |
-          echo "The dispatches to the eight repositories ran and did nothing, because none of them has a release workflow yet."
+          echo "The dispatches to the twelve repositories ran and did nothing, because none of them has a release workflow yet."
           echo "Every publish above is idempotent when it is real, so a partial release is resumed and not restarted."

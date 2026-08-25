@@ -1,7 +1,7 @@
 //! The repository table, and the three places that have to agree with
 //! it.
 //!
-//! The split of dx/18 section 2 put eight repositories outside this one,
+//! The split of dx/18 section 2 put twelve repositories outside this one,
 //! and a split is only a decision once: after it, the list of what was
 //! split out is a thing every part of the project quotes. The release
 //! train dispatches to it, the README publishes it, the artifact
@@ -921,12 +921,16 @@ mod tests {
         let notes = table.check(&root).expect("the tree is readable");
         assert!(notes.is_empty(), "{notes:#?}");
 
-        // dx/18 section 2 is nine repositories, one of them this one,
-        // and the split is a decision that was made once. A row that
-        // quietly appeared or went is that decision changing without
-        // anybody saying so.
-        assert_eq!(table.repos.len(), 9);
-        assert_eq!(table.dispatched().count(), 8);
+        // dx/18 section 2 was nine repositories, one of them this one,
+        // and DX5 made it thirteen: zu-kotlin and zu-scala came out of
+        // zu-java, because a dependency is taken by name and the name a
+        // Kotlin project wants is a Kotlin one, and zu-swift and
+        // zu-dart were added on the reasoning that gave .NET its own
+        // row. The split is still a decision made deliberately, which
+        // is what this number is for: a row that quietly appeared or
+        // went is that decision changing without anybody saying so.
+        assert_eq!(table.repos.len(), 13);
+        assert_eq!(table.dispatched().count(), 12);
         let tier1 = table
             .repos
             .iter()

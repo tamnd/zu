@@ -2,7 +2,7 @@ name: conductor
 
 # The dispatching half of the release train (dx/14 section 6). The tag
 # on this repository builds and publishes the artifacts; this drives the
-# eight repositories that build against them, collects what each reports
+# twelve repositories that build against them, collects what each reports
 # back, and fails the release if any of them fails a gate.
 #
 # Every dispatch here is a no-op, because none of the eight has a
@@ -40,7 +40,7 @@ on:
 
 concurrency:
   # One conductor per version. Two runs of one version dispatching to
-  # eight repositories is eight repositories building the same tag twice
+  # twelve repositories is twelve repositories building the same tag twice
   # and reporting back in whichever order they finish.
   group: conductor-${{ inputs.version }}
   cancel-in-progress: false
@@ -72,6 +72,18 @@ jobs:
             workflow: release.yml
             reports: scorecard corpus sizes
           - repo: zu-dotnet
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-kotlin
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-scala
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-swift
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-dart
             workflow: release.yml
             reports: scorecard api-map corpus perf sizes
           - repo: zu-kit

@@ -4,7 +4,7 @@
 
 The clients of this engine, who maintains each one, and what its tier promises.
 
-Every client is a repository of its own, with a person who answers for it and a tier that says what it promises. The tier is the same one the engine's README publishes, because a client cannot be tier 1 on one page and tier 2 on another. Audited 2026-08-22.
+Every client is a repository of its own, with a person who answers for it and a tier that says what it promises. The tier is the same one the engine's README publishes, because a client cannot be tier 1 on one page and tier 2 on another. Audited 2026-08-25.
 
 | Client | Language | Package | Registry | Maintainer | Tier |
 |---|---|---|---|---|---|
@@ -14,6 +14,10 @@ Every client is a repository of its own, with a person who answers for it and a 
 | [zu-java](https://github.com/tamnd/zu-java) | Java | `dev.zudb` | Maven Central | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 1 |
 | [zu-c](https://github.com/tamnd/zu-c) | C and C++ | `zu` | vcpkg and Conan | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 1 |
 | [zu-dotnet](https://github.com/tamnd/zu-dotnet) | C# | `ZuDb` | NuGet | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 2 |
+| [zu-kotlin](https://github.com/tamnd/zu-kotlin) | Kotlin | `dev.zudb:zu-kotlin` | Maven Central | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 2 |
+| [zu-scala](https://github.com/tamnd/zu-scala) | Scala | `dev.zudb::zu-scala` | Maven Central | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 2 |
+| [zu-swift](https://github.com/tamnd/zu-swift) | Swift | `zu-swift` | Swift Package Manager | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 2 |
+| [zu-dart](https://github.com/tamnd/zu-dart) | Dart | `zudb` | pub.dev | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 2 |
 | [zu-kit](https://github.com/tamnd/zu-kit) | Rust | `zu-kit` | crates.io | Tam Nguyen Duc ([@tamnd](https://github.com/tamnd)) | 3 |
 
 ## What a tier promises
@@ -55,6 +59,10 @@ The practice score, today, out of what the client's tier asks for. What is missi
 | [zu-java](https://github.com/tamnd/zu-java) | 1 | 90 | 90 | `api-map`, `perf` |
 | [zu-c](https://github.com/tamnd/zu-c) | 1 | 100 | 90 | nothing |
 | [zu-dotnet](https://github.com/tamnd/zu-dotnet) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-kotlin](https://github.com/tamnd/zu-kotlin) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-scala](https://github.com/tamnd/zu-scala) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-swift](https://github.com/tamnd/zu-swift) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
+| [zu-dart](https://github.com/tamnd/zu-dart) | 2 | 0 | 75 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
 | [zu-kit](https://github.com/tamnd/zu-kit) | 3 | 0 | 50 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability` |
 
 A client under its tier is a client with work left rather than a client that broke: the apparatus arrives one milestone at a time, and this page is what says which milestone is owed what. `cargo xtask clients --gate` is the run that fails on a row below its threshold, and it is the release's, which is where a promise has to hold.

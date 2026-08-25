@@ -24,7 +24,7 @@
 //! a `later` row is an artifact the contract names that nothing makes
 //! yet, carrying the milestone that will make it: naming it early is
 //! the point, since a consumer needs to know what a release will
-//! eventually carry, and the alternative is eight repositories each
+//! eventually carry, and the alternative is twelve repositories each
 //! guessing.
 
 use std::collections::BTreeMap;

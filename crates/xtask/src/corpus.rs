@@ -20,7 +20,7 @@
 //! reproducible, which is the shared tar writer's doing and the reason
 //! a mirror can be compared against a release rather than trusted. And
 //! the packer parses every case before it ships one, so a corpus that
-//! does not load cannot become an artifact that eight repositories fail
+//! does not load cannot become an artifact that twelve repositories fail
 //! on.
 
 use std::path::Path;

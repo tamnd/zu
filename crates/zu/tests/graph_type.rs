@@ -101,16 +101,23 @@ fn probe() -> Vec<(&'static str, Answer)> {
         // twelve digits of them fit a word and this is a column a
         // statement can fill.
         ("DECIMAL(12,2)", Answer::Declared),
+        // The signed hundred and twenty eight bit integer is the first
+        // number here that does not ride the lane. It is sixteen bytes
+        // at a fixed stride, the layout BINARY(16) above already uses,
+        // and it reads back as an exact numeric of scale zero, which is
+        // a carrier the engine has.
+        ("INT128", Answer::Declared),
         // Spelled and not stored. This is the list S2 works through.
         // The condition is 42000 for all of them, which is what S1
         // replaced the sentence about corruption with.
         //
-        // The wide decimal is here for the same reason INT128 is: its
-        // unscaled units want more than a lane word, and the lane is
-        // sixty four bits. It is the one row on this list whose sibling
-        // is on the list above.
-        ("DECIMAL(38,2)", cannot_write(27)),
-        ("INT128", cannot_write(28)),
+        // The wide decimal's unscaled units want more than a lane word
+        // and the lane is sixty four bits. The two wide integers below
+        // it are refused for a different reason: the top half of a
+        // `UINT128` and the whole of an `INT256` are ranges no value
+        // the engine carries can name, so a column of one would take a
+        // row in and be unable to give it back.
+        ("DECIMAL(38,2)", cannot_write(28)),
         ("INT256", cannot_write(29)),
         ("UINT128", cannot_write(30)),
         ("FLOAT16", cannot_write(31)),
@@ -145,7 +152,7 @@ fn a_graph_type_declares_the_types_the_frontier_says_it_can() {
             declared += 1;
         }
     }
-    assert_eq!(declared, 26, "the declarable set changed");
+    assert_eq!(declared, 27, "the declarable set changed");
 }
 
 /// The frontier has a far side, and one type is on it.

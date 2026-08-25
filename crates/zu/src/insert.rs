@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use zu_common::gqlstatus::{Subject, codes};
-use zu_common::{Decimal, FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
+use zu_common::{Decimal, FloatBits, GqlStatus, IntBits, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::deleted::Deleted;
@@ -684,6 +684,40 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
     };
     Ok(match (ty, value) {
         (LogicalType::Bool, Value::Bool(b)) => Cell::Int(u64::from(*b)),
+        // A hundred and twenty eight bit integer goes down the blob side
+        // of the store, as sixteen little endian bytes, because a cell
+        // is one word and this is two. It has to come before the integer
+        // arms below or the word would go in the lane and the top half
+        // of the number would be gone.
+        //
+        // What it takes is an exact numeric of scale nought, which is
+        // what a whole number is, and an `Int`, which is one already. A
+        // value with a fraction is refused rather than rounded, for the
+        // reason a decimal column refuses one: the caller who meant to
+        // drop it says so with a cast.
+        (
+            LogicalType::Int {
+                bits: IntBits::B128,
+                ..
+            },
+            Value::Decimal(_) | Value::Int(_),
+        ) => {
+            let given = match value {
+                Value::Decimal(d) => *d,
+                Value::Int(n) => Decimal::new(i128::from(*n), 0),
+                _ => unreachable!("matched just above"),
+            };
+            match given.rescale(0) {
+                Some(whole) => Cell::Str(whole.unscaled().to_le_bytes().to_vec()),
+                None => {
+                    return Err(ZuError::gql(
+                        codes::C22003,
+                        format!("property '{key}' holds {ty}, and {given} is not a value of it"),
+                    )
+                    .about(Subject::Property(key.to_string())));
+                }
+            }
+        }
         // A column declared narrower than the lane is a promise about
         // the values, and this is where the promise is kept: the word
         // that goes in is the same word either way, so nothing later

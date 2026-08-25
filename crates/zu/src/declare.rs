@@ -1277,6 +1277,66 @@ mod tests {
         assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
     }
 
+    /// An `INT128` column holds numbers no lane word could, and hands
+    /// them back whole.
+    ///
+    /// This is the first column that is a number and is not stored in
+    /// the scalar lane. Sixteen little endian bytes a row at a fixed
+    /// stride is the layout `BINARY(16)` already had, so the storage
+    /// side asked for nothing new; what is new is that the bytes are
+    /// read as a number rather than as a run of octets.
+    ///
+    /// A value comes back as an exact numeric of scale nought, which is
+    /// what a whole number is and what the engine has a carrier for. It
+    /// prints without a point and compares equal to the integer of the
+    /// same size, so a caller who wrote 7 reads 7.
+    #[test]
+    fn a_declared_int128_column_holds_a_number_wider_than_a_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wide.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        // The largest and smallest values thirty eight digits can spell,
+        // which is the widest a declaration may ask a decimal for, and a
+        // small one to show the ordinary case still reads plainly.
+        let big = "99999999999999999999999999999999999999";
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:ledger {n :: INT128}) }".to_string(),
+            "CREATE GRAPH g TYPED t".to_string(),
+            "USE g INSERT (l:ledger {n: 7})".to_string(),
+            format!("USE g INSERT (l:ledger {{n: CAST('{big}' AS DECIMAL(38,0))}})"),
+            format!("USE g INSERT (l:ledger {{n: CAST('-{big}' AS DECIMAL(38,0))}})"),
+        ] {
+            session
+                .run(&stmt, &[])
+                .expect("the graph, its type, its rows");
+        }
+
+        let rows = session
+            .run("USE g MATCH (l:ledger) RETURN l.n AS n ORDER BY n", &[])
+            .expect("the rows read back");
+        let read: Vec<String> = rows
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Decimal(d) => d.to_string(),
+                other => panic!("expected an exact numeric, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, [format!("-{big}"), "7".to_string(), big.to_string()]);
+
+        // A number with a fraction is not a value of an integer column,
+        // and it is refused rather than rounded, which is the rule the
+        // decimal column above set.
+        let err = session
+            .run(
+                "USE g INSERT (l:ledger {n: CAST('1.5' AS DECIMAL(2,1))})",
+                &[],
+            )
+            .expect_err("an integer column holds no halves");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
+    }
+
     /// A refusal is asked once whether this module can do anything for
     /// it, and the answer is held with it, so the second send of the
     /// same bad statement does not parse it again to find out. What

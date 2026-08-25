@@ -213,6 +213,23 @@ cases:
           - type: INT64
             value: "18"
 
+  - name: an-int128-column-is-a-declaration-a-graph-type-takes
+    doc: A signed hundred and twenty eight bit integer is a column, stored as sixteen bytes a row at a fixed stride rather than in the sixty four bit lane every other number rides. It reads back as an exact numeric of scale nought, which is a carrier the engine has for the whole of that range. The declaration is the setup because a catalog statement returns no rows, so what the case asserts is that it did not raise.
+    setup:
+      - "CREATE GRAPH TYPE wide { (:Ledger {n :: INT128}) }"
+    query: RETURN 128 AS bits
+    columns:
+      - bits
+    rows:
+      - values:
+          - type: INT64
+            value: "128"
+
+  - name: an-unsigned-wide-integer-no-value-can-name
+    doc: The unsigned hundred and twenty eight bit integer is refused where the signed one is taken, and the reason is the value side rather than the storage side. Sixteen bytes would hold one; the engine's exact numeric carries a signed hundred and twenty eight bit number, so the top half of the unsigned range is a range no value could name. A column that took a row in and could not give it back would be worse than a refusal at the declaration, which is where the user wrote it.
+    query: "CREATE GRAPH TYPE t { (:P {v :: UINT128}) }"
+    raises: "42000"
+
   - name: an-embedding-column-is-a-declaration-a-graph-type-takes
     doc: A property declared LIST<FLOAT32 NOT NULL>[768] is the embedding column, and a graph type takes it. The declaration is the setup here because a catalog statement returns no rows, so what the case asserts is that it did not raise. What the catalog keeps is the bound and the element's nullability, which are what every later check about the column is made against, and a catalog that took the declaration and forgot either of them would be worse than one that refused it.
     setup:

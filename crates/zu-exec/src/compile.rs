@@ -1035,6 +1035,7 @@ pub(crate) fn compile(
         every_row_answers: false,
         params_read: Cell::new(0),
         holes: Vec::new(),
+        holds_rows: false,
     };
     c.compile(plan)
 }
@@ -1138,6 +1139,9 @@ struct Compiler<'a> {
     /// parameters; see [`Reuse`].
     params_read: Cell<u64>,
     holes: Vec<Hole>,
+    /// Whether this compile read rows out of the store and left them on
+    /// the plan. See [`Self::read_rows`].
+    holds_rows: bool,
     /// Where each mark slot the binder made landed: the level its block
     /// was written on and the chunk vector position of the column that
     /// holds the answer. A predicate naming the slot compiles into a
@@ -2401,10 +2405,12 @@ impl Compiler<'_> {
         }
 
         // A leading CALL ran its kernel while this plan was built and
-        // the answer is on the plan, so the plan is an answer about
-        // this graph at this moment and not a shape to fill in later.
+        // the answer is on the plan, the same as the joins and pins
+        // [`Self::read_rows`] marks: a plan carrying rows is an answer
+        // about this graph at this moment and not a shape to fill in
+        // later, so it is not offered for another run.
         let func = self.func.take();
-        let reuse = if func.is_some() {
+        let reuse = if func.is_some() || self.holds_rows {
             None
         } else {
             Reuse::of(self.params_read.get(), std::mem::take(&mut self.holes))
@@ -3093,10 +3099,6 @@ impl Compiler<'_> {
         })
     }
 
-    /// Puts a value on the plan and answers the ref that reads it back.
-    /// Two items that wrote the same constant take two entries, because
-    /// a `Value` is cheaper than the walk that would find the first
-    /// one.
     /// The value bound at parameter position `ix`, noted as read.
     ///
     /// Every look at a parameter goes through here, which is what
@@ -3110,6 +3112,26 @@ impl Compiler<'_> {
         self.params.get(ix)
     }
 
+    /// Notes that this compile read rows out of the store and put them
+    /// on the plan, which is what makes the plan an answer about the
+    /// graph as it was rather than a shape to fill in later.
+    ///
+    /// A plan that holds rows is never handed back for another run. The
+    /// rows a run reads come out of the snapshot it is given, so a plan
+    /// that carries its own would answer from whenever it was built,
+    /// and the epoch a cache checks is a weaker thing than that: it
+    /// moves on a commit and a read inside an open write sees rows the
+    /// commit has not reached yet. Marking the read is exact where the
+    /// epoch is close, and it costs only the shapes that hold rows,
+    /// which are the joins and pins that already paid a scan to build.
+    fn read_rows(&mut self) {
+        self.holds_rows = true;
+    }
+
+    /// Puts a value on the plan and answers the ref that reads it back.
+    /// Two items that wrote the same constant take two entries, because
+    /// a `Value` is cheaper than the walk that would find the first
+    /// one.
     fn push_const(&mut self, value: Value) -> ScalarRef {
         self.consts.push(value);
         ScalarRef::Const {
@@ -3332,6 +3354,9 @@ impl Compiler<'_> {
         let Some(key) = key.and_then(|k| u64::try_from(k).ok()) else {
             return Ok(None);
         };
+        // The row this answers goes on the plan, and which row a key
+        // sits in is a fact about the store and not about the query.
+        self.read_rows();
         Ok(self.snap.seek_key(table, key)?.map(|row| row as i64))
     }
 
@@ -3822,6 +3847,8 @@ impl Compiler<'_> {
         };
         let mut rows = Vec::new();
         let mut arena = MorselArena::new();
+        // What this walk finds is pinned onto the plan.
+        self.read_rows();
         // A chunk the zones ruled out answers with nothing, the same as
         // a chunk past the end of the table, so the walk counts the
         // chunks out rather than stopping at the first empty one: the
@@ -3962,6 +3989,9 @@ impl Compiler<'_> {
         let mut payload = Vec::with_capacity(rows as usize);
         let mut arena = MorselArena::new();
         let mut chunk = 0;
+        // Keys and payload both go on the plan, so this plan answers
+        // for the build side as this scan saw it and no other.
+        self.read_rows();
         while let Some(sc) = self.snap.scan(table, chunk, &[col], None, &mut arena)? {
             let vec = &sc.columns[0];
             let vals = vec.values::<i64>();

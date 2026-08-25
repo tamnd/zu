@@ -151,6 +151,31 @@ fn a_paged_read_pages_where_this_run_asked_for() {
 }
 
 #[test]
+fn a_plan_that_pinned_rows_does_not_answer_from_the_rows_it_pinned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Built by statement rather than bulk loaded, because the pin this
+    // is about reads a stored column and a bulk loaded table has none.
+    let db = Database::create(dir.path().join("pin.zu1")).expect("create");
+    let mut conn = db.connect().expect("connect");
+    for uid in 0..20i64 {
+        conn.execute(&format!("INSERT (p:person {{uid: {uid}}})"))
+            .expect("insert");
+    }
+    // Two patterns tied to nothing but their own column is the shape
+    // that pins: the compiler scans for the rows each one names and
+    // puts them on the plan, so this plan is an answer about the table
+    // as it stood and not a shape. The second pattern names no row yet.
+    let source = "MATCH (a:person {uid: 1}), (b:person {uid: 500}) RETURN a.uid AS x, b.uid AS y";
+    assert!(rows(&mut conn, source, &[]).is_empty());
+    conn.execute("INSERT (p:person {uid: 500})")
+        .expect("insert");
+    let after = rows(&mut conn, source, &[]);
+    assert_eq!(after.len(), 1, "the row the write made is one to pin");
+    let mut fresh = db.connect().expect("connect");
+    assert_eq!(after, rows(&mut fresh, source, &[]));
+}
+
+#[test]
 fn two_statements_taking_turns_each_keep_their_own_answer() {
     let (_dir, db) = opened("turns.zu1");
     let mut conn = db.connect().expect("connect");

@@ -681,6 +681,30 @@ vec_unpack_gvals_s = 0.9
 # 3.9x with the 1-worker time itself moving 12 percent run to run.
 # Nothing in the fleet is 8 quiet equal cores, so the floor sits under
 # server3's worst run. Raise this floor, never lower it.
+#
+# Timing every worker in place rather than the query around them found
+# part of what those numbers were measuring. The pool queued a batch a
+# job at a time and woke one worker for each, and a wakeup is not
+# addressed to a job: a worker already awake takes the job the notify
+# was meant for, the notified worker finds the queue empty and parks
+# again, and the job it should have taken waits for whoever finishes
+# first, which for a morsel scan is the end of the query. On gamingpc
+# under WSL the last of eight regularly started after the other seven
+# had finished the scan between them, and the six before it started in
+# a ramp about twenty five microseconds apart, because a parked thread
+# there does not wake in microseconds the way this pool assumed. The
+# batch goes under one lock and one broadcast now, and an idle worker
+# spins a hundred microseconds before it parks on Linux as it already
+# did on Windows. All eight are inside the scan after that, starting
+# within a tenth of a millisecond of the first.
+#
+# gamingpc under WSL, medians of nine paired alternating runs of two
+# separately built binaries: the expand query went 4.9x to 5.4x at
+# eight workers, 1.12 ms to 1.02, faster in all nine pairs, and the
+# scan query beside it went 4.2x to 5.3x, 0.80 ms to 0.67. The one
+# worker times moved 2 percent the wrong way on both, which is a
+# single worker run not going near the pool at all. The same box
+# measured 3.6 to 3.7x when the note above was written.
 exec_scale_8x = 2.0
 
 # The grouping sink at one worker, M rows/s (perf/05 section 4): ten

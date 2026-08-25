@@ -39,7 +39,8 @@ use crate::graph::{
 use crate::keys::write_key_index_live;
 use crate::meta;
 use crate::props::{
-    PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing, load_props_at,
+    PropsDirectory, PropsReader, fixed_octets, free_props_keeping_labels, free_props_reusing,
+    load_props_at,
 };
 use crate::rows::{read_rows, rewrite_rows, rewrite_rows_reordered};
 use crate::segment::{CHUNK_ROWS, read_segment, rewrite_segment, write_segment};
@@ -415,6 +416,26 @@ fn spell(word: u64, names: &[String]) -> String {
     out
 }
 
+/// Refuses a value the column's declared width does not admit.
+///
+/// A fold is the last place between a statement and the file, so this
+/// is where a column declared `BINARY(16)` stops holding fifteen
+/// octets, whatever wrote them. The check is by the column and not by
+/// the statement on purpose: a column whose own type does not describe
+/// its rows is worse than a refused write, because every reader after
+/// it takes the type at its word.
+fn at_width(col: &crate::props::PropColumn, value: &[u8]) -> Result<()> {
+    match fixed_octets(&col.ty) {
+        Some(width) if value.len() != width as usize => Err(ZuError::InvalidArgument(format!(
+            "column '{}' is {} and was given {} octets",
+            col.name,
+            col.ty,
+            value.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn fold_props(
     db: &mut Zu1File,
     mvcc: &Mvcc,
@@ -472,6 +493,7 @@ fn fold_props(
             "row {offset} of column '{name}' does not match its stored type"
         ))
     };
+
     let missing = |name: &str, offset: u64| {
         ZuError::InvalidArgument(format!(
             "appended row {offset} carries no value for column '{name}'"
@@ -564,10 +586,17 @@ fn fold_props(
             // to change one cell of it is the cost the rewrite exists
             // to avoid: the segment reads back only the chunks these
             // rows land in.
+            // What a column declared `BINARY(n)` holds where it holds
+            // nothing. The absence below is the empty string, which in a
+            // column of equal length rows is a row of another length: it
+            // would cost the column its layout for bytes no reader looks
+            // at, so it is written at the declared width instead.
+            let absent = || fixed_octets(&col.ty).map_or_else(Vec::new, |n| vec![0u8; n as usize]);
             let mut updates = BTreeMap::new();
             for (offset, cell) in mvcc.col_updates(table, ci as u32, base, epoch) {
                 match cell {
                     Cell::Str(s) => {
+                        at_width(col, &s)?;
                         updates.insert(offset, s);
                         valid.set(offset);
                     }
@@ -576,7 +605,7 @@ fn fold_props(
                     // addressed by its ends and two equal ends are no
                     // bytes at all.
                     Cell::Null => {
-                        updates.insert(offset, Vec::new());
+                        updates.insert(offset, absent());
                         valid.clear(offset);
                     }
                     Cell::Int(_) => return Err(mismatch(&col.name, offset)),
@@ -586,11 +615,12 @@ fn fold_props(
             for offset in base..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
                     Some(Cell::Str(s)) => {
+                        at_width(col, &s)?;
                         appended.push(s);
                         valid.set(offset);
                     }
                     Some(Cell::Null) => {
-                        appended.push(Vec::new());
+                        appended.push(absent());
                         valid.clear(offset);
                     }
                     Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
@@ -1117,17 +1147,25 @@ fn fold_rel_props(
                 old.push(&bytes[start..end as usize]);
                 start = end as usize;
             }
+            // An edge column takes the same rule a node column does: in
+            // a column whose declaration fixes the width, the absence is
+            // a row of that width rather than no bytes at all, and a
+            // value of another length is refused.
+            let pad = vec![0u8; fixed_octets(&col.ty).unwrap_or(0) as usize];
             let mut values: Vec<&[u8]> = Vec::with_capacity(order.len());
             for (slot, came) in order.iter().enumerate() {
                 values.push(match written(slot) {
-                    Some(Cell::Str(s)) => s.as_slice(),
+                    Some(Cell::Str(s)) => {
+                        at_width(col, s)?;
+                        s.as_slice()
+                    }
                     // The blob side says the absence with no bytes at
                     // all, which costs the edge nothing: a blob is
                     // addressed by its ends and two equal ends are
                     // empty.
                     Some(Cell::Null) => {
                         valid.clear(slot as u64);
-                        &[]
+                        &pad
                     }
                     Some(Cell::Int(_)) => return Err(mismatch(&col.name)),
                     None => match came {
@@ -1138,10 +1176,13 @@ fn fold_rel_props(
                             old[*at]
                         }
                         Came::Overlay(at) => match cell(*at)? {
-                            Cell::Str(s) => s.as_slice(),
+                            Cell::Str(s) => {
+                                at_width(col, s)?;
+                                s.as_slice()
+                            }
                             Cell::Null => {
                                 valid.clear(slot as u64);
-                                &[]
+                                &pad
                             }
                             Cell::Int(_) => return Err(mismatch(&col.name)),
                         },
@@ -1171,6 +1212,7 @@ mod tests {
     use super::*;
     use crate::graph::{bulk_load_as, bulk_load_keyed};
     use crate::props::{PropValues, PropsReader, load_props, store_props};
+    use zu_common::LogicalType;
 
     struct Fixture {
         db: Zu1File,
@@ -1255,6 +1297,84 @@ mod tests {
         let mut out = Vec::new();
         reader.read_str(db, col, row, &mut out).unwrap();
         out
+    }
+
+    /// A file with one `BINARY(4)` column over four rows, and a log to
+    /// write into it.
+    fn hashed(dir: &std::path::Path) -> (Fixture, LogicalType) {
+        let mut db = Zu1File::create(&dir.join("fold.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        let binary4 = LogicalType::Bytes {
+            min: Some(4),
+            max: Some(4),
+            fixed: true,
+        };
+        let rows: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
+        crate::props::store_props_nullable(
+            &mut db,
+            "person",
+            &[crate::props::PropInput::typed(
+                "hash",
+                PropValues::Bytes(&rows),
+                &binary4,
+            )],
+        )
+        .unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.node_by_name("person").unwrap().id;
+        let knows = catalog.rel_by_name("knows").unwrap().id;
+        let wal = Wal::open(&dir.join("fold.wal")).unwrap();
+        let fixture = Fixture {
+            db,
+            wal,
+            mvcc: Mvcc::new(0),
+            person,
+            knows,
+        };
+        (fixture, binary4)
+    }
+
+    /// A fold over a column whose declaration fixes the width leaves it
+    /// at that width: the row a statement wrote is the new value, and
+    /// the row it cleared is the declared width of nothing rather than
+    /// no bytes at all, so one null does not cost the column its layout.
+    #[test]
+    fn a_fold_keeps_a_fixed_width_column_at_its_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut f, binary4) = hashed(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.update(f.person, 1, 0, Cell::Str(b"zzzz".to_vec()));
+        txn.update(f.person, 2, 0, Cell::Null);
+        txn.commit(&mut f.wal).unwrap();
+        checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+
+        let directory = load_props(&mut f.db, f.person).unwrap().unwrap();
+        assert_eq!(directory.columns[0].ty, binary4);
+        let meta = &directory.columns[0].meta;
+        assert_eq!(meta.structural, crate::segment::Structural::Stride);
+        assert_eq!(meta.payload_len, 4 + 4 * 4);
+        let mut reader = PropsReader::new(directory);
+        let mut out = Vec::new();
+        reader.read_str(&mut f.db, 0, 1, &mut out).unwrap();
+        assert_eq!(out, b"zzzz");
+        assert!(!reader.is_valid(&mut f.db, 0, 2).unwrap());
+        let path = dir.path().join("fold.zu1");
+        drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A value the column's width does not admit is refused by the fold
+    /// whatever wrote it, because the fold is the last place between a
+    /// statement and the file.
+    #[test]
+    fn a_fold_refuses_a_value_the_column_width_does_not_admit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut f, _) = hashed(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.update(f.person, 1, 0, Cell::Str(b"zzz".to_vec()));
+        txn.commit(&mut f.wal).unwrap();
+        let err = checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap_err();
+        assert!(err.to_string().contains("was given 3 octets"), "{err}");
     }
 
     /// After the fold the base file alone answers what the overlay

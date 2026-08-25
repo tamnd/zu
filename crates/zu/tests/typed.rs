@@ -177,6 +177,7 @@ fn ages(dir: &std::path::Path) -> Zu1File {
             name: "age",
             values: zu_zu1::props::PropValues::Int(&values),
             validity: Some(&held),
+            declared: None,
         }],
     )
     .unwrap();

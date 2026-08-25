@@ -2937,11 +2937,13 @@ mod tests {
                     name: "rank",
                     values: PropValues::Int(&ranks),
                     validity: Some(&validity),
+                    declared: None,
                 },
                 PropInput {
                     name: "nick",
                     values: PropValues::Str(&nick_refs),
                     validity: Some(&validity),
+                    declared: None,
                 },
             ],
         )

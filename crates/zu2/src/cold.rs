@@ -56,6 +56,7 @@
 //! is rare.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -118,13 +119,112 @@ pub fn plain<'a>(kind: u32, value: &'a [u8], address: Address) -> Result<Cow<'a,
     if !record::is_compressed(kind) {
         return Ok(Cow::Borrowed(value));
     }
-    match zstd::bulk::decompress(value, PAGE_SIZE) {
-        Ok(bytes) => Ok(Cow::Owned(bytes)),
-        Err(_) => Err(Error::Malformed {
-            address,
-            why: "a cold record's value is not a zstd frame this tier wrote",
-        }),
+    let mut out = Vec::new();
+    decode(value, address, &mut out)?;
+    Ok(Cow::Owned(out))
+}
+
+thread_local! {
+    /// The decoder a read on this thread uses, and the encoder an
+    /// append on it uses.
+    ///
+    /// Kept rather than built per call because building one is the
+    /// cost. A zstd context is its window and its tables, and
+    /// `zstd::bulk::decompress` builds one every time it is called: the
+    /// end to end half of `benches/compress.rs` measured that as a cold
+    /// read of 1.17 us becoming one of 34.94 us, against a decode that
+    /// takes 1.8 us on its own. Nearly all of a read was the context.
+    ///
+    /// One per thread rather than one per tier, because a context is
+    /// not shareable and a lock on the read path would be the thing
+    /// this is avoiding. A thread that never reads a compressed record
+    /// never builds either of these.
+    static DECODER: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+    static ENCODER: RefCell<Option<zstd::bulk::Compressor<'static>>> = const { RefCell::new(None) };
+}
+
+/// A frame the tier wrote, back into `out`, which keeps whatever buffer
+/// it already had.
+fn decode(frame: &[u8], address: Address, out: &mut Vec<u8>) -> Result<()> {
+    let malformed = || Error::Malformed {
+        address,
+        why: "a cold record's value is not a zstd frame this tier wrote",
+    };
+    // The length the value had, which is written in front of the frame
+    // rather than read out of it. A zstd frame carries the content size
+    // only when the encoder was told it in advance, and neither the
+    // bulk compressor nor the free function does that, so a decoder
+    // that wants to size its buffer has either to be handed a bound or
+    // to be told. Being handed a bound means a page, and a page is four
+    // MiB: the version of this that passed `PAGE_SIZE` to
+    // `zstd::bulk::decompress` allocated four MiB a read. Four bytes in
+    // the record is the cheaper answer and it is exact.
+    let (length, frame) = frame.split_at_checked(LENGTH).ok_or_else(malformed)?;
+    let want = u32::from_le_bytes(length.try_into().expect("four bytes")) as usize;
+    if want > PAGE_SIZE {
+        return Err(malformed());
     }
+    out.clear();
+    out.reserve(want);
+    DECODER.with(|cell| {
+        let mut held = cell.borrow_mut();
+        let decoder = match &mut *held {
+            Some(decoder) => decoder,
+            none => none.insert(zstd::bulk::Decompressor::new().map_err(|_| malformed())?),
+        };
+        let got = decoder
+            .decompress_to_buffer(frame, out)
+            .map_err(|_| malformed())?;
+        if got != want {
+            return Err(malformed());
+        }
+        Ok(())
+    })
+}
+
+/// A value as a frame, or `None` when the coder did not find anything.
+/// Also `None` when the frame came back no smaller than the value,
+/// which is what makes this safe on data that arrives compressed
+/// already.
+///
+/// The frame is written behind four bytes of the value's own length,
+/// for the reason [`decode`] gives.
+fn encode(value: &[u8]) -> Option<Vec<u8>> {
+    ENCODER.with(|cell| {
+        let mut held = cell.borrow_mut();
+        let encoder = match &mut *held {
+            Some(encoder) => encoder,
+            none => none.insert(zstd::bulk::Compressor::new(LEVEL).ok()?),
+        };
+        // Into a scratch buffer and then copied out behind the length,
+        // because `compress_to_buffer` writes a frame from the start of
+        // what it is given rather than appending to it, so a prefix put
+        // there first is a prefix the coder overwrites.
+        FRAME.with(|frame| {
+            let mut frame = frame.borrow_mut();
+            frame.clear();
+            frame.reserve(value.len());
+            encoder.compress_to_buffer(value, &mut *frame).ok()?;
+            let size = LENGTH + frame.len();
+            if size >= value.len() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(size);
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame);
+            Some(out)
+        })
+    })
+}
+
+/// The length written in front of a frame.
+const LENGTH: usize = 4;
+
+thread_local! {
+    /// Where an append's frame is built before it is copied out behind
+    /// its length.
+    static FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The suffix the cold file takes beside the log.
@@ -359,9 +459,7 @@ impl Cold {
         // expanded and squeezed again.
         let carried = record::is_compressed(kind);
         let frame = if self.compress && !carried && value.len() >= MIN_COMPRESS {
-            zstd::bulk::compress(value, LEVEL)
-                .ok()
-                .filter(|frame| frame.len() < value.len())
+            encode(value)
         } else {
             None
         };
@@ -780,39 +878,51 @@ fn expand(into: &mut Vec<u64>, address: Address) -> Result<()> {
             r.value_unchecked(),
         )
     };
-    let value = match zstd::bulk::decompress(frame, PAGE_SIZE) {
-        Ok(value) => value,
-        Err(_) => {
+    VALUE.with(|value| {
+        let mut value = value.borrow_mut();
+        decode(frame, address, &mut value)?;
+        let size = record::size_of(key.len(), value.len());
+        if size > PAGE_SIZE {
             return Err(Error::Malformed {
                 address,
-                why: "a cold record's value is not a zstd frame this tier wrote",
+                why: "a cold record expands to more than a page",
             });
         }
-    };
-    let size = record::size_of(key.len(), value.len());
-    if size > PAGE_SIZE {
-        return Err(Error::Malformed {
-            address,
-            why: "a cold record expands to more than a page",
-        });
-    }
-    let mut out = vec![0u64; size.div_ceil(8)];
-    // SAFETY: the buffer is `size` bytes and a Vec<u64> is 8 byte
-    // aligned. `key` points into `into`, which is not touched until the
-    // write has finished with it.
-    unsafe {
-        record::write_at(
-            out.as_mut_ptr().cast(),
-            previous,
-            version,
-            key,
-            &value,
-            tombstone,
-            record::kind_of(kind),
-        );
-    }
-    *into = out;
-    Ok(())
+        RECORD.with(|out| {
+            let mut out = out.borrow_mut();
+            out.clear();
+            out.resize(size.div_ceil(8), 0);
+            // SAFETY: the buffer is `size` bytes and a Vec<u64> is 8
+            // byte aligned. `key` points into `into`, which is a
+            // different buffer and is not touched until the write has
+            // finished with it.
+            unsafe {
+                record::write_at(
+                    out.as_mut_ptr().cast(),
+                    previous,
+                    version,
+                    key,
+                    &value,
+                    tombstone,
+                    record::kind_of(kind),
+                );
+            }
+            // Swapped rather than assigned, so the record the caller
+            // arrived with becomes the scratch and neither side
+            // allocates on the next read. A cold read that allocates
+            // twice a record is a cold read that is measuring the
+            // allocator.
+            std::mem::swap(&mut *out, into);
+            Ok(())
+        })
+    })
+}
+
+thread_local! {
+    /// Where a read's value and its rebuilt record are put, so that
+    /// expanding one costs no allocation after the first.
+    static VALUE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static RECORD: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Whether the tier is worth having at all for a log in this format. A

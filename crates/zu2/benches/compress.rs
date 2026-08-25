@@ -188,4 +188,122 @@ fn main() {
             r.decode_ns / 100.0
         );
     }
+
+    end_to_end();
+}
+
+/// The same question asked of the engine rather than of the coder.
+///
+/// The table above is zstd on a buffer, which is the ceiling on what
+/// this can save and the floor on what it can cost. What a host sees is
+/// a point read of a record the tier holds, and that is a `pread`, a
+/// checksum, a decompress and a copy. So this builds the same database
+/// twice, once with the coder and once without, and reports the file
+/// and the read side by side. If the file is smaller and the read is
+/// not slower by a share anyone can see, #725 is paid for.
+fn end_to_end() {
+    println!("#");
+    println!("# the same thing end to end, a database at a time (#725)");
+    println!("setting	cold_MiB	ratio	read_us	span_MiB");
+    let mut before = 0.0;
+    for compress in [false, true] {
+        let (disk, ratio, read, span) = tier(compress);
+        println!(
+            "{}	{:.1}	{:.4}	{:.2}	{:.1}",
+            if compress { "zstd-3" } else { "plain" },
+            disk as f64 / (1 << 20) as f64,
+            ratio,
+            read * 1e6,
+            span as f64 / (1 << 20) as f64
+        );
+        if !compress {
+            before = read;
+        } else {
+            println!(
+                "# the coder costs {:+.1}% on a cold read and saves {:.1}% of the file",
+                100.0 * (read - before) / before,
+                100.0 * (1.0 - ratio)
+            );
+        }
+    }
+}
+
+/// Loads a cold tier and times reads out of it, returning the bytes it
+/// costs the device, what the coder saved, the mean read, and the span.
+///
+/// The shape is `tests/coldtier.rs`'s: a record is only cold by having
+/// survived a lap of the log unwritten, so the load is followed by a
+/// churn over a small hot set until the log has lapped. Promotion is
+/// off, because a promoted record is read out of the log the second time
+/// and this is measuring the tier.
+fn tier(compress: bool) -> (u64, f64, f64, u64) {
+    use zu2::{Db, Durability, Options};
+
+    const RECORDS: u32 = 20_000;
+    const BYTES: usize = 1000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = Options {
+        durability: Durability::Async,
+        index_buckets: 1 << 16,
+        max_pages: 64,
+        max_nodes: 1 << 18,
+        mutable_pages: 1,
+        compact_below: 0,
+        promote_reads: false,
+        compress_cold: compress,
+        ..Options::default()
+    };
+    let db = Db::create(&dir.path().join("z.zu2"), options).expect("create");
+    let set = values(RECORDS as usize, BYTES, 0x243F6A8885A308D3);
+    let churn = values(2000, BYTES, 0x13198A2E03707344);
+
+    let mut s = db.session();
+    for (i, v) in set.iter().enumerate() {
+        s.upsert(format!("user{i:09}").as_bytes(), v).expect("load");
+    }
+    // Enough laps that the loaded set is below the boundary and a pass
+    // can reach it, and a hot set small enough that the laps are cheap.
+    for round in 0..40u32 {
+        for (i, v) in churn.iter().enumerate() {
+            s.upsert(format!("hot_{round}_{i:09}").as_bytes(), v)
+                .expect("churn");
+        }
+    }
+    s.set_durability(Durability::Durable);
+    s.upsert(b"hot_last", &churn[0]).expect("churn");
+    drop(s);
+    while db.compact().expect("compact") > 0 {}
+
+    let mut s = db.session();
+    let mut out = Vec::with_capacity(BYTES + 64);
+    let mut read = f64::MAX;
+    for _ in 0..REPEATS {
+        let t = Instant::now();
+        let mut held = 0usize;
+        for i in 0..RECORDS as usize {
+            out.clear();
+            if s.read(format!("user{i:09}").as_bytes(), &mut out)
+                .expect("read")
+            {
+                held += out.len();
+            }
+        }
+        std::hint::black_box(held);
+        read = read.min(t.elapsed().as_secs_f64() / RECORDS as f64);
+    }
+    drop(s);
+
+    let (given, stored) = db.cold_value_bytes();
+    let ratio = if given > 0 {
+        stored as f64 / given as f64
+    } else {
+        1.0
+    };
+    (
+        db.cold_disk_bytes().expect("cold disk bytes"),
+        ratio,
+        read,
+        db.cold_span(),
+    )
 }

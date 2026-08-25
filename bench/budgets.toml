@@ -516,7 +516,10 @@ session_point_held_us = 10.0
 # empty frame set for the process rather than allocating a pair each
 # time. That is 19 allocations and 8496 bytes off the warm point read,
 # which now asks for 17 and 9304, and of those bytes 8200 are one
-# adjacency block read that belongs to the storage layer.
+# adjacency block read that belongs to the storage layer. The p50 went
+# 2.31 us to 1.98 on the local M series, medians of eight runs of each
+# binary run alternately under the same load, and the branch was faster
+# in seven of the eight pairs.
 hot_plan_hit_allocs = 0
 hot_point_allocs = 20
 hot_hop_allocs = 20

@@ -969,12 +969,26 @@ impl Log {
     ///
     /// [`opened_page`]: Log::opened_page
     pub fn evict_settled(&self) {
-        self.remap_settled();
-        if self.memory_pages == usize::MAX {
-            return;
+        // Eviction first, and the order is load bearing rather than
+        // arbitrary. `remap_settled` starts at the floor, so with a
+        // bound set and the remap running ahead of it every settled
+        // page was mapped by one half of this call and unmapped by the
+        // other half of the same call: two syscalls a page, a mapping
+        // that never served a read, and page cache warmed only to be
+        // dropped. Moving the floor first means the remap never looks
+        // below it. With no bound `evict_behind` returns at its first
+        // line, so this costs the common case nothing.
+        let bounded = self.memory_pages != usize::MAX;
+        if bounded {
+            self.evict_behind(page_of(self.tail()));
         }
-        self.evict_behind(page_of(self.tail()));
-        self.retire_pages();
+        // Retires its own pages if it maps any, so a database with no
+        // bound still does no epoch work on a flush that changed
+        // nothing.
+        self.remap_settled();
+        if bounded {
+            self.retire_pages();
+        }
     }
 
     /// Turns the pages that have settled from heap into mappings of the

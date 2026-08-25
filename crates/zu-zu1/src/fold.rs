@@ -31,7 +31,6 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::{Catalog, ElementKind, GraphType, RelTable, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
-use crate::fullzip::{read_blob_segment, rewrite_blob_reordered, rewrite_blob_segment};
 use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, build_direction_over,
     free_chain, free_directory_keeping_edges, free_directory_keeping_props, group_bases,
@@ -42,6 +41,7 @@ use crate::meta;
 use crate::props::{
     PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing, load_props_at,
 };
+use crate::rows::{read_rows, rewrite_rows, rewrite_rows_reordered};
 use crate::segment::{CHUNK_ROWS, read_segment, rewrite_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
@@ -597,7 +597,7 @@ fn fold_props(
                     None => return Err(missing(&col.name, offset)),
                 }
             }
-            rewrite_blob_segment(db, &col.meta, &updates, &appended)?
+            rewrite_rows(db, &col.meta, &updates, &appended)?
         };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),
@@ -1110,7 +1110,7 @@ fn fold_rel_props(
             write_segment(db, &values)?
         } else {
             let (mut bytes, mut ends) = (Vec::new(), Vec::new());
-            read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;
+            read_rows(db, &col.meta, &mut bytes, &mut ends)?;
             let mut old: Vec<&[u8]> = Vec::with_capacity(ends.len());
             let mut start = 0usize;
             for &end in &ends {
@@ -1148,7 +1148,7 @@ fn fold_rel_props(
                     },
                 });
             }
-            rewrite_blob_reordered(db, &col.meta, &values)?
+            rewrite_rows_reordered(db, &col.meta, &values)?
         };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),

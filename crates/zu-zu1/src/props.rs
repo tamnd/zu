@@ -37,8 +37,9 @@ use zu_common::{
 
 use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, Zu1File};
-use crate::fullzip::{read_blob_range, write_blob_segment};
+use crate::fullzip::write_blob_segment;
 use crate::meta;
+use crate::rows::{read_rows_range, write_rows};
 use crate::segment::{
     CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, cached_chunk, chunk_zone, decode_chunk,
     load_chunk_directory_pooled, read_one_cached, read_range, write_segment,
@@ -1399,7 +1400,7 @@ fn write_columns(
         let meta = match (values.lane(), values) {
             (Some(words), _) => write_segment(db, &words)?,
             (None, PropValues::Str(v) | PropValues::Bytes(v)) => write_blob_segment(db, v)?,
-            (None, PropValues::List { .. }) => write_blob_segment(db, &blobs)?,
+            (None, PropValues::List { .. }) => write_rows(db, &blobs)?,
             (None, _) => unreachable!("every variable width column is a blob"),
         };
         // A mask with every bit set says nothing a reader does not
@@ -2563,7 +2564,7 @@ impl PropsReader {
         ends.clear();
         let stored = self.stored();
         if start < end.min(stored) {
-            read_blob_range(db, &column.meta, start, end.min(stored), bytes, ends)?;
+            read_rows_range(db, &column.meta, start, end.min(stored), bytes, ends)?;
         }
         self.overwrite(col, start, bytes, ends);
         // The appended rows come after the stored ones, which is the
@@ -2782,7 +2783,7 @@ impl PropsReader {
                 let end = meta.value_count.min(chunk_start + CHUNK_ROWS as u64);
                 chunk_bytes.clear();
                 chunk_ends.clear();
-                read_blob_range(
+                read_rows_range(
                     db,
                     meta,
                     chunk_start,
@@ -2842,7 +2843,7 @@ impl PropsReader {
                 bytes: Vec::new(),
                 ends: Vec::new(),
             };
-            read_blob_range(db, meta, start, end, &mut fresh.bytes, &mut fresh.ends)?;
+            read_rows_range(db, meta, start, end, &mut fresh.bytes, &mut fresh.ends)?;
             self.str_state.insert(col, fresh);
         }
         let c = self.str_state.get(&col).expect("just decoded");
@@ -4070,6 +4071,60 @@ mod tests {
         assert_eq!(list_elements(&elem, &new).unwrap(), want);
         // A length that is neither form is a row nothing wrote.
         assert!(list_elements(&elem, &old[..old.len() - 1]).is_err());
+    }
+
+    /// The column an embedding lands in, end to end. Every row is the
+    /// same length, so the column takes the Stride layout and costs the
+    /// bytes the floats are and the four the count is: no per row
+    /// length, no chunk index, and no symbol table trained on float
+    /// bytes to find out that they do not compress.
+    #[test]
+    fn an_embedding_column_lands_in_the_stride_layout() {
+        const ROWS: usize = 64;
+        const DIM: usize = 768;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("props.zu1")).unwrap();
+        bulk_load_keyed(&mut db, "doc", "cites", ROWS as u64, &[(0, 1)], None).unwrap();
+        let elem = LogicalType::Float {
+            bits: FloatBits::B32,
+            precision: None,
+        };
+        let vectors: Vec<Vec<ListElement>> = (0..ROWS)
+            .map(|r| {
+                (0..DIM)
+                    .map(|i| ListElement::Word(u64::from(((r * DIM + i) as f32).to_bits())))
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<&[ListElement]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let directory = store_props(
+            &mut db,
+            "doc",
+            &[(
+                "embedding",
+                PropValues::List {
+                    elem: &elem,
+                    rows: &rows,
+                },
+            )],
+        )
+        .unwrap();
+
+        let meta = &directory.columns[0].meta;
+        assert_eq!(meta.structural, crate::segment::Structural::Stride);
+        assert_eq!(meta.value_count, ROWS as u64);
+        // Four bytes of stride word for the column, and 3076 a row:
+        // 3072 of floats and the four the row's own count takes. The
+        // eight byte element form cost 6148 and FullZip a length on top
+        // of that.
+        assert_eq!(meta.payload_len, 4 + (ROWS * 3076) as u64);
+
+        // And a row read back out of the middle is the vector that went
+        // in, element for element.
+        let mut reader = PropsReader::new(directory);
+        let mut buf = Vec::new();
+        reader.read_str(&mut db, 0, 40, &mut buf).unwrap();
+        assert_eq!(list_elements(&elem, &buf).unwrap(), vectors[40]);
     }
 
     /// A version 2 directory holds every code but the list one, and a

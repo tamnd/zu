@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use zu_common::{FloatBits, IdMap, IntBits, LogicalType, Result, ZuError};
-use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
+use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector_from_ends};
 
 use zu_query::frame::FrameSet;
 pub use zu_query::snapshot::{
@@ -469,17 +469,6 @@ fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
     Ok(ix)
 }
 
-/// Rebuilds `bytes`/`ends` blob output as one arena string vector.
-fn str_views(arena: &mut MorselArena, bytes: &[u8], ends: &[u64]) -> ValueVector {
-    let mut views: Vec<&[u8]> = Vec::with_capacity(ends.len());
-    let mut lo = 0usize;
-    for &e in ends {
-        views.push(&bytes[lo..e as usize]);
-        lo = e as usize;
-    }
-    str_vector(arena, &views)
-}
-
 impl Snapshot for Zu1Snapshot<'_> {
     fn epoch(&self) -> u64 {
         self.db.db_header().epoch
@@ -662,7 +651,7 @@ impl Snapshot for Zu1Snapshot<'_> {
                     str_bytes,
                     str_ends,
                 )?;
-                columns.push(str_views(arena, str_bytes, str_ends));
+                columns.push(str_vector_from_ends(arena, str_bytes, str_ends));
             }
         }
         Ok(Some(ScanChunk {
@@ -764,7 +753,7 @@ impl Snapshot for Zu1Snapshot<'_> {
             Ok(ValueVector::flat_from(arena, phys, scratch))
         } else {
             reader.gather_str(db, ix, rows, str_bytes, str_ends)?;
-            Ok(str_views(arena, str_bytes, str_ends))
+            Ok(str_vector_from_ends(arena, str_bytes, str_ends))
         }
     }
 
@@ -795,7 +784,7 @@ impl Snapshot for Zu1Snapshot<'_> {
             Ok(ValueVector::flat_from(arena, phys, scratch))
         } else {
             reader.gather_str(db, ix, ords, str_bytes, str_ends)?;
-            Ok(str_views(arena, str_bytes, str_ends))
+            Ok(str_vector_from_ends(arena, str_bytes, str_ends))
         }
     }
 

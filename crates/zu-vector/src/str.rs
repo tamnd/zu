@@ -30,21 +30,55 @@ unsafe impl Pod for StrView {}
 
 const _: () = assert!(size_of::<StrView>() == 16);
 
+/// Up to eight bytes as a word, zero above them, in loads of a width
+/// the compiler knows.
+///
+/// A copy of a length only known at run time is a `memcpy` call, and a
+/// call is more than the whole of this for eight bytes. Four or more
+/// bytes is a load of the first four and a load of the last four
+/// shifted up to where they belong, which overlap and cost nothing for
+/// overlapping. Under four there is nowhere to overlap, so it is the
+/// three bytes a string that short can have.
+#[inline(always)]
+fn load_short(s: &[u8]) -> u64 {
+    let n = s.len();
+    debug_assert!(n <= 8, "one word holds eight bytes");
+    if n >= 4 {
+        let head = u32::from_le_bytes(s[..4].try_into().expect("four bytes")) as u64;
+        let tail = u32::from_le_bytes(s[n - 4..].try_into().expect("four bytes")) as u64;
+        let above = if n > 4 { tail >> ((8 - n) * 8) } else { 0 };
+        head | above << 32
+    } else if n > 0 {
+        u64::from(s[0]) | u64::from(s[n / 2]) << (n / 2 * 8) | u64::from(s[n - 1]) << ((n - 1) * 8)
+    } else {
+        0
+    }
+}
+
 impl StrView {
     /// Build a view over a short string, bytes stored inline.
+    ///
+    /// The payload arrives as two words rather than as two copies of a
+    /// run time length, because a copy of a run time length is a
+    /// `memcpy` call and this runs once per row of every string column
+    /// the engine reads.
+    #[inline]
     pub fn inline(bytes: &[u8]) -> Self {
-        debug_assert!(bytes.len() <= INLINE_LEN);
-        let mut prefix = [0u8; 4];
-        let mut tail = [0u8; 8];
-        let head = bytes.len().min(4);
-        prefix[..head].copy_from_slice(&bytes[..head]);
-        if bytes.len() > 4 {
-            tail[..bytes.len() - 4].copy_from_slice(&bytes[4..]);
-        }
+        let n = bytes.len();
+        debug_assert!(n <= INLINE_LEN);
+        let (lo, hi) = if n >= 8 {
+            let lo = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+            let tail = u32::from_le_bytes(bytes[n - 4..].try_into().expect("four bytes"));
+            (lo, if n > 8 { tail >> ((12 - n) * 8) } else { 0 })
+        } else {
+            (load_short(bytes), 0)
+        };
+        let w = lo.to_le_bytes();
+        let h = hi.to_le_bytes();
         Self {
-            len: bytes.len() as u32,
-            prefix,
-            tail,
+            len: n as u32,
+            prefix: [w[0], w[1], w[2], w[3]],
+            tail: [w[4], w[5], w[6], w[7], h[0], h[1], h[2], h[3]],
         }
     }
 
@@ -483,6 +517,32 @@ mod tests {
         let mut bufs = StrBuffers::new();
         let id = bufs.push(Arc::from(&b"twenty bytes exactly"[..]));
         bufs.slice(id, 16, 8);
+    }
+
+    #[test]
+    fn every_inline_length_round_trips() {
+        // The packing loads whole words and masks, so the lengths
+        // either side of four and eight are where it would go wrong.
+        let all = b"abcdefghijkl";
+        for n in 0..=INLINE_LEN {
+            let want = &all[..n];
+            let view = StrView::inline(want);
+            assert_eq!(view.len(), n, "length of {n}");
+            assert_eq!(view.inline_bytes(), want, "bytes of {n}");
+            assert!(view.is_inline(), "{n} bytes should be inline");
+            // Two views of the same string are the same sixteen bytes,
+            // which is what the word compare in `eq_with` rests on.
+            assert!(view.eq_with(&NO_BUFFERS, &StrView::inline(want), &NO_BUFFERS));
+        }
+    }
+
+    #[test]
+    fn inline_views_of_different_lengths_stay_apart() {
+        let a = StrView::inline(b"abcdefgh");
+        let b = StrView::inline(b"abcdefghi");
+        assert!(!a.eq_with(&NO_BUFFERS, &b, &NO_BUFFERS));
+        // Nothing above the length leaks in from the load either.
+        assert_eq!(a.tail[4..], [0, 0, 0, 0]);
     }
 
     #[test]

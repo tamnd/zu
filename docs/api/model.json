@@ -10162,6 +10162,14 @@
       "doc": "The column's validity words, one bit per row and the low bit of\na word first, set where the row holds a value. `None` is a\ncolumn every row of which holds one, which is what every column\nwas before a property could be null."
     },
     {
+      "id": "zu::zu1::props::PropColumn::zones",
+      "kind": "field",
+      "name": "zones",
+      "of": "zu::zu1::props::PropColumn",
+      "signature": "Option<zu_zu1::segment::SegmentMeta>",
+      "doc": "The zone plane of a zoned column: one word a row, the offset\nfrom UTC in minutes that the row's value was written with.\n`None` is every other column, which has no second plane.\n\nIt is a segment beside `meta` rather than a second column\nbecause it is not a property: no query names it, nothing\ndeclares it, and it means nothing without the instant it sits\nbeside. Physically it is a lane segment like any other, which is\nwhy a column of one zone costs almost nothing for it."
+    },
+    {
       "id": "zu::zu1::props::PropInput",
       "kind": "struct",
       "name": "PropInput",
@@ -10293,6 +10301,22 @@
       "name": "Str",
       "of": "zu::zu1::props::PropValues",
       "signature": "Str(&[&[u8]])"
+    },
+    {
+      "id": "zu::zu1::props::PropValues::ZonedDatetime",
+      "kind": "variant",
+      "name": "ZonedDatetime",
+      "of": "zu::zu1::props::PropValues",
+      "signature": "ZonedDatetime { nanos: &[i64], zones: &[i16] }",
+      "doc": "Nanoseconds since the epoch in UTC, and the offset from UTC in\nminutes the value was written with, one of each per row.\n\nThe instant is UTC and the offset is beside it rather than\nfolded into it, which is what lets two rows written in two zones\nfor one instant be one number in the lane and still each print\nwhere they were written."
+    },
+    {
+      "id": "zu::zu1::props::PropValues::ZonedTime",
+      "kind": "variant",
+      "name": "ZonedTime",
+      "of": "zu::zu1::props::PropValues",
+      "signature": "ZonedTime { nanos: &[i64], zones: &[i16] }",
+      "doc": "Nanoseconds since midnight in the offset's own day, and the\noffset from UTC in minutes, one of each per row."
     },
     {
       "id": "zu::zu1::props::PropValues::is_empty",
@@ -10480,6 +10504,14 @@
       "name": "read_str",
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn read_str(&mut self, db: &mut Zu1File, col: usize, row: u64, out: &mut Vec<u8>) -> Result<()>"
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::read_zoned",
+      "kind": "method",
+      "name": "read_zoned",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn read_zoned(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<(i64, i16)>",
+      "doc": "The whole of row `row` of a zoned column: the instant in the\nlane, and the offset from UTC in minutes the value was written\nwith, from the plane beside it.\n\nEvery other read of a zoned column answers the instant, which is\nwhat a comparison, a sort and a range all want and is what the\nlane holds. This is the read that materialises a value, and it\nis the only one that touches the second plane, so a scan that\nfilters on a timestamp and returns no timestamp never pays for\nthe zones at all."
     },
     {
       "id": "zu::zu1::props::PropsReader::rows",
@@ -10717,6 +10749,13 @@
       "name": "stored_label_word",
       "signature": "fn stored_label_word(db: &mut zu_zu1::file::Zu1File, directory: &PropsDirectory, row: u64) -> zu_common::Result<Option<u64>>",
       "doc": "The label word row `row` carries in a stored bitset, `None` when the\ntable stores none or the row is past the end of it, which is a row\ncarrying its table's own label and nothing else.\n\nThis is [`PropsReader::label_word`] for a caller holding a directory\nrather than a reader, which is the write side: it asks once per\nstatement, to put a change's masks over the word the row had, so\nthere is nothing for a cache to save."
+    },
+    {
+      "id": "zu::zu1::props::zoned",
+      "kind": "function",
+      "name": "zoned",
+      "signature": "fn zoned(ty: &zu_common::LogicalType) -> bool",
+      "doc": "Whether this is one of the two zoned temporal types, which are the\ncolumn shape that is two planes rather than one.\n\nA zoned value is an instant and the offset from UTC it was written\nwith, which is two numbers, and everything else here is one. The two\nare stored as two segments over the same rows: the instants in the\nscalar lane, where they get the integer cascade and where a\ncomparison, a sort and a range estimate all read them, and the\noffsets in a plane of their own that only materialising a value\ntouches. A column of one zone, which is what a column of timestamps\nalmost always is, pays a handful of bytes for the whole of the\nsecond plane."
     },
     {
       "id": "zu::zu1::reorder",

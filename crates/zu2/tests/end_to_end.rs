@@ -296,6 +296,83 @@ fn a_record_that_left_memory_still_reads() {
     }
 }
 
+/// The bound is a bound on the steady state, so it has to hold once the
+/// writing stops.
+///
+/// Eviction runs where a thread opens a page and it can only drop a
+/// page whose bytes are already on the device, so a burst of async
+/// appends outruns the flusher and leaves the last pages resident. That
+/// is expected while the burst is going on. What is not is that the
+/// last thing to open a page is the last append, so when the flusher
+/// catches up a moment later there is nobody left to notice, and a
+/// database that has stopped writing sits above its bound for as long
+/// as it stays open. A read heavy run after a load is exactly that
+/// shape, and it is the shape every memory number in the series was
+/// taken on. #636.
+#[test]
+fn the_page_bound_holds_after_the_writing_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bound = 2;
+    let db = Db::create(
+        &dir.path().join("m.zu2"),
+        Options {
+            durability: Durability::Async,
+            // One mutable page, so the bound is not clamped up to the
+            // window. Two pages is 8 MiB and the load below is ten
+            // times that.
+            mutable_pages: 1,
+            memory_pages: bound,
+            max_pages: 64,
+            index_buckets: 1 << 12,
+            // Compaction would move the head on its own and this is
+            // about eviction.
+            compact_below: 0,
+            ..Options::default()
+        },
+    )
+    .expect("create");
+    let mut s = db.session();
+    let big = vec![b'v'; 8192];
+    for i in 0..10_000u32 {
+        s.upsert(&key(i), &big).expect("upsert");
+    }
+    drop(s);
+    db.sync().expect("sync");
+
+    // The flusher is what makes a page evictable, so give it the
+    // moment it needs to get to the last of them. This is generous: the
+    // bytes are already on the device by the time sync returns and what
+    // is being waited for is a thread noticing.
+    //
+    // The page the log ends in is above the bound rather than inside
+    // it, which is the engine's own reading of `memory_pages` and is
+    // what `an_evicted_page_gives_its_memory_back` in log.rs asserts
+    // too. So the number to hold is one more than the bound, and what
+    // this test is here to catch is the twenty it held before.
+    let want = bound + 1;
+    let mut resident = db.resident_pages();
+    for _ in 0..100 {
+        if resident <= want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resident = db.resident_pages();
+    }
+    assert!(
+        resident <= want,
+        "a database that stopped writing holds {resident} pages against a bound of {bound}"
+    );
+
+    // And it still reads, which is the thing the bound is not allowed
+    // to cost.
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in (0..10_000u32).step_by(97) {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost key {i}");
+        assert_eq!(out.len(), big.len(), "key {i} came back short");
+    }
+}
+
 #[test]
 fn an_overflowing_bucket_keeps_every_key_through_updates() {
     // Sixteen buckets, eight entries each, so 128 slots hold 4000 keys.

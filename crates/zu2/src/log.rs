@@ -879,6 +879,38 @@ impl Log {
         let boundary = page_start(page.saturating_sub(self.mutable_pages));
         self.read_only.fetch_max(boundary, Ordering::AcqRel);
         self.wake_flusher();
+        self.evict_behind(page);
+        self.retire_pages();
+    }
+
+    /// The eviction the write path runs, for a thread that is not
+    /// writing.
+    ///
+    /// A page can only leave memory once its bytes are durable, so a
+    /// burst of async appends outruns the flusher and [`opened_page`]
+    /// stops at the first page that is not flushed yet. That is fine
+    /// while the burst is going on. What is not is that the last thing
+    /// to open a page is the last append, so when the flusher catches
+    /// up a moment later there is nobody left to finish the job, and a
+    /// database that has stopped writing sits above its bound for as
+    /// long as it stays open. That is the shape of every run in this
+    /// series: a load, and then a read phase that appends nothing.
+    /// Measured on the test that goes with this, a bound of two pages
+    /// held twenty. So the maintainer calls this after every flush,
+    /// which is the thread that just made the pages evictable. #636.
+    ///
+    /// [`opened_page`]: Log::opened_page
+    pub fn evict_settled(&self) {
+        if self.memory_pages == usize::MAX {
+            return;
+        }
+        self.evict_behind(page_of(self.tail()));
+        self.retire_pages();
+    }
+
+    /// Drops the pages that have fallen out of memory, given the page
+    /// the log now ends in.
+    fn evict_behind(&self, page: usize) {
         if self.memory_pages == usize::MAX {
             return;
         }
@@ -891,7 +923,12 @@ impl Log {
             if page_start(victim + 1) > self.flushed() {
                 break;
             }
-            self.head.store(page_start(victim + 1), Ordering::Release);
+            // fetch_max rather than a store, because a writer opening
+            // a page and the maintainer finishing the job behind it can
+            // be in here at the same time and the slower of two stores
+            // would put the floor back down.
+            self.head
+                .fetch_max(page_start(victim + 1), Ordering::AcqRel);
             // The chunk stays. Eviction only says the page is not in
             // memory, and the addresses in it are still live and still
             // readable off the file, so the slot has to keep being
@@ -914,7 +951,6 @@ impl Log {
                 }));
             }
         }
-        self.retire_pages();
     }
 
     /// Checks that the file on disk fits the span `max_pages` allows,

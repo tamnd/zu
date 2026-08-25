@@ -1510,6 +1510,14 @@ fn maintain(core: &Core, options: Options) {
             debug_assert!(false, "zu2 flusher: {error}");
             return;
         }
+        // After the flush, because a flush is what makes a page
+        // evictable and this thread is the one that just did it. The
+        // write path evicts too, where a thread opens a page, but the
+        // last append is the last thing to open one and the pages it
+        // left behind are not durable yet at that moment. Without this
+        // a database that has stopped writing stays above its page
+        // bound for as long as it is open. #636.
+        core.log.evict_settled();
         if stopping {
             return;
         }

@@ -1076,6 +1076,9 @@ pub(crate) fn finish_agg(
     partials: Vec<SinkState>,
     keys_empty: bool,
 ) -> Result<QueryResult> {
+    // One hand per worker that ran, so a query asked for on one thread
+    // is finished on one thread too.
+    let hands = partials.len();
     // A bare aggregate has one group whichever way the input went, so
     // it never needs the table: fold the per-worker state vectors and
     // emit the row even when no worker saw a row at all.
@@ -1101,7 +1104,7 @@ pub(crate) fn finish_agg(
             "string property is not UTF-8".to_string(),
         ));
     }
-    let rows = merged.map(|t| t.rows(item_agg)).unwrap_or_default();
+    let rows = merged.map(|t| t.rows(item_agg, hands)).unwrap_or_default();
     Ok(QueryResult::new(columns, apply_post(post, rows)))
 }
 

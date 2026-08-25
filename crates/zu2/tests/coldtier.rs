@@ -30,9 +30,25 @@ fn key(i: u32) -> Vec<u8> {
 /// update of the same length over a record above the boundary is an in
 /// place rewrite and appends nothing, so a constant length makes how much
 /// log a round produces depend on how busy the machine is.
+/// The filler is letters rather than a run of one byte because the tier
+/// compresses what it holds now (#725), and how big a tier a given
+/// number of records makes is what decides whether a pass over it runs
+/// at all. A thousand x's is a record that compresses to nothing, so a
+/// fixture sized in records would be sized in nothing in particular.
+/// These are go-ycsb's own fifty two letters, the data every number in
+/// the series is measured on, and they compress to about three
+/// quarters, so a record here costs about what a record costs there.
 fn value(i: u32, round: u32) -> Vec<u8> {
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut v = format!("{i:09}-{round:09}").into_bytes();
-    v.resize(1000 + (round as usize % 2) * 8, b'x');
+    let want = 1000 + (round as usize % 2) * 8;
+    let mut state = (i as u64) << 32 | round as u64 | 1;
+    while v.len() < want {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        v.push(LETTERS[(state % LETTERS.len() as u64) as usize]);
+    }
     v
 }
 
@@ -238,36 +254,173 @@ fn a_reopened_cold_key_takes_an_update() {
 /// The tier reclaims too, on its own schedule. Rewriting every key makes
 /// everything in the tier garbage, and a pass over it should hand the
 /// blocks back without losing a key.
+///
+/// The word is eventually, and the rounds are a loop rather than a
+/// count, because when a cold pass runs is a decision about size and not
+/// about how much garbage is down there. A tier under one page is left
+/// alone, and a pass that could not reach anything leaves the bar a page
+/// above the span it saw, so the tier has to grow before it is looked at
+/// again. A fixed number of rounds asks for a shrink at an address the
+/// tier may not have reached yet, and that is what this test did until
+/// #725: the same eight rounds put 3.1 MiB in the tier written plain and
+/// 2.4 MiB written compressed, the smaller one never reached the bar, no
+/// pass ran, and the test read the new arrivals as the tier growing.
+/// Eight thousand records rather than three thousand for the same
+/// reason, so that the fixture is a tier worth compacting under either
+/// setting rather than only under one of them.
 #[test]
 fn a_stale_tier_gives_its_blocks_back() {
+    // One cold page, which is the span a pass waits for.
+    const PAGE: u64 = 4 << 20;
+    // Rounds to give it. Each one rewrites every key, so this is a cap
+    // on a loop that is expected to end after a few, and it is here so
+    // that a tier that never gives anything back fails rather than runs
+    // forever.
+    const ROUNDS: u32 = 32;
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::create(&dir.path().join("z.zu2"), options()).expect("create");
-    let records = lapped(&db, 3000);
+    let records = lapped(&db, 8000);
     assert!(db.cold_span() > 0, "nothing migrated");
+    assert!(
+        db.cold_span() > PAGE,
+        "the fixture has to outgrow a page or no pass runs: {}",
+        db.cold_span()
+    );
     let before = db.cold_disk_bytes().expect("cold disk bytes");
 
-    let mut s = db.session();
-    for round in 1..9 {
+    let mut last = 0;
+    let mut after = before;
+    for round in 1..=ROUNDS {
+        let mut s = db.session();
         for i in 0..records {
             s.upsert(&key(i), &value(i, round)).expect("upsert");
         }
+        // A durable write so the pass has a flushed region to work on
+        // rather than racing the background thread.
+        s.set_durability(Durability::Durable);
+        s.upsert(&key(0), &value(0, round)).expect("upsert");
+        drop(s);
+        while db.compact().expect("compact") > 0 {}
+        last = round;
+        after = db.cold_disk_bytes().expect("cold disk bytes");
+        if after < before {
+            break;
+        }
     }
-    s.set_durability(Durability::Durable);
-    s.upsert(&key(0), &value(0, 8)).expect("upsert");
-    drop(s);
-    while db.compact().expect("compact") > 0 {}
 
-    let after = db.cold_disk_bytes().expect("cold disk bytes");
     assert!(
         after < before,
-        "a tier that is all garbage should shrink: {after} against {before}"
+        "a tier that is all garbage should shrink: {after} against {before} after {last} rounds"
     );
     let mut s = db.session();
     for i in 0..records {
         assert_eq!(
             read(&mut s, &key(i)).as_deref(),
-            Some(value(i, 8).as_slice()),
+            Some(value(i, last).as_slice()),
             "key {i} was lost by a cold pass"
+        );
+    }
+}
+
+/// The tier compresses the values it takes, and what comes back out is
+/// what went in (#725).
+///
+/// Both settings over the same fixture, so the saving is measured rather
+/// than asserted from the coder's reputation, and both are read back
+/// key by key, since a tier that compresses and hands back something
+/// else is worse than one that does not compress at all.
+#[test]
+fn the_tier_compresses_what_it_takes() {
+    let mut disk = Vec::new();
+    for compress in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::create(
+            &dir.path().join("z.zu2"),
+            Options {
+                compress_cold: compress,
+                ..options()
+            },
+        )
+        .expect("create");
+        let records = lapped(&db, 3000);
+        assert!(db.cold_span() > 0, "nothing migrated");
+
+        let (given, stored) = db.cold_value_bytes();
+        assert!(given > 0, "the tier took nothing with compress {compress}");
+        if compress {
+            assert!(
+                stored * 100 < given * 85,
+                "go-ycsb values should give back at least fifteen percent: {stored} of {given}"
+            );
+        } else {
+            assert_eq!(stored, given, "nothing should have been coded");
+        }
+
+        let mut s = db.session();
+        for i in 0..records {
+            assert_eq!(
+                read(&mut s, &key(i)).as_deref(),
+                Some(value(i, 0).as_slice()),
+                "key {i} came back wrong with compress {compress}"
+            );
+        }
+        disk.push(db.cold_disk_bytes().expect("cold disk bytes"));
+    }
+    assert!(
+        disk[1] < disk[0],
+        "the compressed tier should be the smaller file: {} against {}",
+        disk[1],
+        disk[0]
+    );
+}
+
+/// A compressed record read by a database that has compression off,
+/// which is what a host that turns the option off after writing has.
+///
+/// The setting says what an append does and nothing about what a read
+/// does, because the record carries its own flag. Anything else would
+/// make an option on a durable format a way to lose data.
+#[test]
+fn compressed_records_read_back_with_the_option_off() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("z.zu2");
+    let records = {
+        let db = Db::create(&path, options()).expect("create");
+        let records = lapped(&db, 3000);
+        assert!(db.cold_span() > 0, "nothing migrated");
+        let (given, stored) = db.cold_value_bytes();
+        assert!(stored < given, "the fixture has to have compressed");
+        db.sync().expect("sync");
+        records
+    };
+
+    let db = Db::open(
+        &path,
+        Options {
+            compress_cold: false,
+            ..options()
+        },
+    )
+    .expect("open");
+    let mut s = db.session();
+    for i in 0..records {
+        assert_eq!(
+            read(&mut s, &key(i)).as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i} was not readable with the option off"
+        );
+    }
+    // And a pass over the tier, which is the other way a compressed
+    // record leaves it: expanded on the way out and written plain on
+    // the way back in, since this database is not compressing.
+    drop(s);
+    while db.compact().expect("compact") > 0 {}
+    let mut s = db.session();
+    for i in 0..records {
+        assert_eq!(
+            read(&mut s, &key(i)).as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i} was lost by a pass that expanded it"
         );
     }
 }

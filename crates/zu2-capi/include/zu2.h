@@ -194,6 +194,19 @@ typedef struct zu2_options {
    * every page a read touches stays resident and a workload that reads
    * uniformly ends up holding the whole database. */
   uint64_t memory_pages;
+  /* Nonzero stops the cold tier compressing the values it takes. On by
+   * default: a record only reaches the tier by surviving a lap of the
+   * log unwritten, and reading it back is a pread of a device, so a few
+   * microseconds of decompress sit under a cost that is already there.
+   * Off is for measuring what the coder is worth, and for data that is
+   * already compressed, though the tier works that out per record
+   * anyway and writes the value as it came when the frame is no
+   * smaller. zu2_cold_value_bytes() is what it saved.
+   *
+   * Reading never consults this. A record says for itself whether it is
+   * compressed, so turning it off stops new records being compressed
+   * and leaves everything already written readable. */
+  uint32_t no_cold_compression;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;
@@ -439,6 +452,20 @@ zu2_status zu2_disk_bytes(zu2_db *db, uint64_t *bytes);
  * across otherwise identical runs, and two runs that settled
  * differently are two different storage layouts. */
 zu2_status zu2_cold_disk_bytes(zu2_db *db, uint64_t *bytes);
+
+/* What the cold tier was given and what it wrote: value is the value
+ * bytes of the records it has taken since it was opened, stored is the
+ * bytes it wrote for them. Both zero with no tier, equal with
+ * compression off, and either pointer may be null.
+ *
+ * stored over value is what the coder is buying on this data, which is
+ * the only honest way to report it since it depends entirely on the
+ * data. Records reclaimed since are in both numbers, so the ratio is a
+ * property of the workload and not of when it is asked for.
+ * zu2_cold_disk_bytes() is the other question, what the tier costs the
+ * device right now. */
+zu2_status zu2_cold_value_bytes(const zu2_db *db, uint64_t *value,
+                                uint64_t *stored);
 
 /* Addresses the cold tier still spans, and zero when there is no tier.
  * What it holds rather than what it costs the device, so this stays put

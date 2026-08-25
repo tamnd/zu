@@ -85,6 +85,7 @@
 //! neither can see the other half done.
 
 use crate::addr::{Address, PAGE_SIZE, page_of, page_start};
+use crate::cold;
 use crate::db::{Carried, Placement, Session};
 use crate::error::Result;
 use crate::graph;
@@ -406,12 +407,22 @@ pub fn compact_cold(session: &mut Session<'_>, upto: Address) -> Result<Compacte
         // SAFETY: the walk hands over a whole record inside its own page
         // buffer, and everything is copied out before it moves on.
         unsafe {
+            // Expanded on the way out, and the kind loses its
+            // compression flag with it, so what goes into `Carried` is a
+            // record in the shape the rest of the engine knows. A
+            // survivor headed back to the tier is compressed again on
+            // the way in, which is the coder run twice on a record that
+            // has already settled twice, and a survivor going to the hot
+            // log has to arrive plain because nothing up there expands
+            // anything. Passing the frame through untouched would be
+            // cheaper for the first and wrong for the second, and this
+            // pass is rare by construction. See [`crate::cold`].
             batch.push((
                 address,
                 header.key().to_vec(),
-                header.value_unchecked().to_vec(),
+                cold::plain(header.kind(), header.value_unchecked(), address)?.into_owned(),
                 header.tombstone(),
-                header.kind(),
+                record::kind_of(header.kind()),
                 header.version(),
             ));
         }

@@ -479,11 +479,14 @@ fn cold_scan(
             // SAFETY: the walk hands over a whole record in its page
             // buffer, and it is copied out before the walk moves on.
             unsafe {
+                // Expanded, and the kind loses its compression flag with
+                // it, because this record is going to the hot log and
+                // nothing up there expands anything. #725.
                 rehome.push((
                     header.key().to_vec(),
-                    header.value_unchecked().to_vec(),
+                    cold::plain(header.kind(), header.value_unchecked(), address)?.into_owned(),
                     header.tombstone(),
-                    header.kind(),
+                    record::kind_of(header.kind()),
                     header.version(),
                 ));
             }

@@ -120,6 +120,45 @@ pub const KIND_END: u32 = 6;
 /// which an all-zero header does not.
 pub const KIND_PAD: u32 = 3;
 
+/// Top bit of `kind`: the value is a zstd frame rather than the bytes
+/// the caller wrote, and `value_len` is the length of that frame.
+///
+/// Only the cold tier ever sets it, and [`crate::cold`] has the argument
+/// for why there and nowhere else (#725). What it buys the format is
+/// that nothing else has to change: `size_of(key_len, value_len)`
+/// describes the bytes actually on the device, so every walk and every
+/// offset in the tier keeps working, the checksum covers what came off
+/// the device rather than what it expands to, and the uncompressed
+/// length rides in the coder's own frame so no header field has to carry
+/// it. There is no spare field in the header for a second length and
+/// this is how that is avoided rather than worked around.
+///
+/// It is a flag on the kind and not a kind of its own, which is the one
+/// place this departs from the design written on #725. A kind of its own
+/// would have to replace the record's real kind, and [`KIND_VERTEX`] is
+/// a keyed value that can settle into the tier like any other, so
+/// replacing its kind would lose the thing that tells a replay to
+/// restore the node id. The flag keeps the kind and adds to it.
+///
+/// An older build meeting a newer file sees a kind it does not know and
+/// refuses, which is the direction that pair has to fail in. A newer
+/// build meeting an older file sees the bit clear on every record and
+/// reads it exactly as it always did, so there is no version rule and
+/// no migration.
+pub const KIND_COMPRESSED: u32 = 1 << 31;
+
+/// What the record is, with the compression flag taken off.
+#[inline]
+pub const fn kind_of(kind: u32) -> u32 {
+    kind & !KIND_COMPRESSED
+}
+
+/// Whether a record's value is a coder frame rather than its bytes.
+#[inline]
+pub const fn is_compressed(kind: u32) -> bool {
+    kind & KIND_COMPRESSED != 0
+}
+
 /// Bytes a record with these lengths occupies, padded so the next
 /// record starts 8 byte aligned.
 #[inline]

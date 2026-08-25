@@ -55,6 +55,7 @@
 //! written again, so the cold file goes stale slowly and a pass over it
 //! is rare.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -80,6 +81,50 @@ pub(crate) const SPECULATE: usize = 1152;
 #[inline]
 pub const fn is_cold(address: Address) -> bool {
     address >= BASE
+}
+
+/// What the tier compresses values at.
+///
+/// Level 3 is zstd's own default and it is the level the ratio was
+/// measured at. Levels above it spend more time for very little on an
+/// input of a kilobyte, and the input here is one record: `benches/
+/// compress.rs` has the table, and per record at a thousand bytes the
+/// strong coders come out *worse* than deflate because their framing
+/// costs more than they find. This is not a knob because there is
+/// nothing on either side of it worth reaching.
+const LEVEL: i32 = 3;
+
+/// The shortest value worth compressing.
+///
+/// Under this the frame's own header is a real share of the record and
+/// the ratio goes above one, which the measurement in #725 shows
+/// directly: the same generator gives 1.019 at a hundred bytes and
+/// 0.748 at a thousand. A [`record::KIND_VERTEX`] value is four bytes of
+/// node id and is the case this exists for.
+const MIN_COMPRESS: usize = 256;
+
+/// Turns a stored value back into the bytes the caller wrote.
+///
+/// Borrowed when the record is not compressed, which is every record
+/// written before this existed and every one whose value was too short
+/// or did not shrink, so an uncompressed tier costs nothing to read
+/// through this.
+///
+/// The bound on the answer is a page, which is not arbitrary: a value is
+/// only ever compressed on its way into a record that had to fit a page
+/// uncompressed, so a frame claiming more than that is a frame that did
+/// not come from here.
+pub fn plain<'a>(kind: u32, value: &'a [u8], address: Address) -> Result<Cow<'a, [u8]>> {
+    if !record::is_compressed(kind) {
+        return Ok(Cow::Borrowed(value));
+    }
+    match zstd::bulk::decompress(value, PAGE_SIZE) {
+        Ok(bytes) => Ok(Cow::Owned(bytes)),
+        Err(_) => Err(Error::Malformed {
+            address,
+            why: "a cold record's value is not a zstd frame this tier wrote",
+        }),
+    }
 }
 
 /// The suffix the cold file takes beside the log.
@@ -129,24 +174,37 @@ pub struct Cold {
     /// Bytes written here since the tier was opened, and records.
     pub written: AtomicU64,
     pub records: AtomicU64,
+    /// Whether an append compresses the value it is given.
+    ///
+    /// Reading does not consult this. A record says for itself whether
+    /// it is compressed, so turning it off stops new records being
+    /// compressed and leaves every one already in the file readable,
+    /// which is what a setting on a durable format has to do.
+    compress: bool,
+    /// Bytes the tier's values would have taken uncompressed, and the
+    /// bytes they took, both counted since it was opened. The ratio of
+    /// the two is the only honest way to report what this is saving on a
+    /// live database, since it depends entirely on the data.
+    pub value_bytes: AtomicU64,
+    pub stored_bytes: AtomicU64,
 }
 
 impl Cold {
     /// The tier of a database being created, which replaces whatever is
     /// beside the path. A new log with an old cold file next to it would
     /// hand back records from a database that no longer exists.
-    pub fn create(path: &Path) -> Result<Self> {
-        Self::with(path, true)
+    pub fn create(path: &Path, compress: bool) -> Result<Self> {
+        Self::with(path, true, compress)
     }
 
     /// The tier of a database being reopened. A database that never had
     /// a pass reach the tier has no cold file, and that is not an error:
     /// it gets an empty one.
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::with(path, false)
+    pub fn open(path: &Path, compress: bool) -> Result<Self> {
+        Self::with(path, false, compress)
     }
 
-    fn with(path: &Path, fresh: bool) -> Result<Self> {
+    fn with(path: &Path, fresh: bool, compress: bool) -> Result<Self> {
         let beside = path_beside(path);
         let file = if fresh {
             file::create_or_replace(&beside)?
@@ -172,6 +230,9 @@ impl Cold {
             filling: AtomicU64::new(BASE + FIRST),
             written: AtomicU64::new(0),
             records: AtomicU64::new(0),
+            compress,
+            value_bytes: AtomicU64::new(0),
+            stored_bytes: AtomicU64::new(0),
         };
         let begin = cold.read_begin()?;
         cold.begin.store(begin, Ordering::Release);
@@ -281,6 +342,45 @@ impl Cold {
         tombstone: bool,
         kind: u32,
     ) -> Result<Address> {
+        // The value is compressed here and nowhere else, which is the
+        // whole of #725: this is the one door into the tier, so a record
+        // that is in the file went through it and a record that did not
+        // is not in the file.
+        //
+        // Three ways out of it, all of which write the value as it came:
+        // the tier was told not to, the value is short enough that the
+        // frame is a real share of the record, or the coder came back
+        // with something no smaller than it started with. The last is
+        // what makes this safe on data that is already compressed, which
+        // is a case the benchmark does not have and a host will.
+        //
+        // A record arriving already compressed is a cold pass copying
+        // one forward, and it is written through untouched rather than
+        // expanded and squeezed again.
+        let carried = record::is_compressed(kind);
+        let frame = if self.compress && !carried && value.len() >= MIN_COMPRESS {
+            zstd::bulk::compress(value, LEVEL)
+                .ok()
+                .filter(|frame| frame.len() < value.len())
+        } else {
+            None
+        };
+        let (stored, kind) = match &frame {
+            Some(frame) => (frame.as_slice(), kind | record::KIND_COMPRESSED),
+            None => (value, kind),
+        };
+        if !carried {
+            // A record copied forward already compressed is not counted,
+            // because its uncompressed length is not in hand here and
+            // counting the frame as both sides would drift the ratio
+            // towards one every time a pass ran.
+            self.value_bytes
+                .fetch_add(value.len() as u64, Ordering::Relaxed);
+            self.stored_bytes
+                .fetch_add(stored.len() as u64, Ordering::Relaxed);
+        }
+        let value = stored;
+
         let size = record::size_of(key.len(), value.len());
         if size > PAGE_SIZE {
             return Err(Error::RecordTooLarge {
@@ -377,7 +477,22 @@ impl Cold {
     /// cold record ever reaches a reader: there are no resident pages
     /// down here, so nothing else would ever look at it (see
     /// [`crate::log::Log::load`], which checks for the same reason).
+    ///
+    /// A compressed record is expanded before it is handed back, so what
+    /// the caller gets is a record in the one shape the rest of the
+    /// engine knows, and nothing above this has to ask whether the tier
+    /// compresses. The order matters and it is the order here: the
+    /// checksum is over the bytes that came off the device, so it is
+    /// verified against those, and the expansion happens after it has
+    /// held. See [`expand`].
     pub fn load(&self, address: Address, into: &mut Vec<u64>) -> Result<()> {
+        self.read_raw(address, into)?;
+        expand(into, address)
+    }
+
+    /// [`Cold::load`] without the expansion, which is the record exactly
+    /// as the file holds it.
+    fn read_raw(&self, address: Address, into: &mut Vec<u64>) -> Result<()> {
         if address < self.begin() || address >= self.tail() {
             return Err(Error::Malformed {
                 address,
@@ -631,6 +746,73 @@ impl Buffer {
         bytes.copy_from_slice(&self.filled()[from..from + size]);
         Ok(())
     }
+}
+
+/// Turns a record buffer holding a compressed record into one holding
+/// the record it stands for, and leaves anything else alone.
+///
+/// This is the one place the two shapes meet. Above it a cold record
+/// looks like every other record: `value_len` is the value's length and
+/// the value is the caller's bytes. Below it `value_len` is the frame's
+/// length, which is what makes `size_of` describe the bytes on the
+/// device and is why the tier's walks and offsets needed no change at
+/// all.
+///
+/// The record is rebuilt rather than patched, so the checksum is
+/// recomputed over what it now holds and a reader that verifies one gets
+/// the answer it should. That is a second buffer and a copy on a path
+/// that has already paid for a device round trip, which is the trade
+/// #725 is built on.
+fn expand(into: &mut Vec<u64>, address: Address) -> Result<()> {
+    // SAFETY: `into` holds a whole record, 8 byte aligned, which is what
+    // every caller of this has just put there.
+    let (kind, previous, version, tombstone, key, frame) = unsafe {
+        let r = RecordRef::new(into.as_ptr().cast());
+        if !record::is_compressed(r.kind()) {
+            return Ok(());
+        }
+        (
+            r.kind(),
+            r.previous(),
+            r.version(),
+            r.tombstone(),
+            r.key(),
+            r.value_unchecked(),
+        )
+    };
+    let value = match zstd::bulk::decompress(frame, PAGE_SIZE) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(Error::Malformed {
+                address,
+                why: "a cold record's value is not a zstd frame this tier wrote",
+            });
+        }
+    };
+    let size = record::size_of(key.len(), value.len());
+    if size > PAGE_SIZE {
+        return Err(Error::Malformed {
+            address,
+            why: "a cold record expands to more than a page",
+        });
+    }
+    let mut out = vec![0u64; size.div_ceil(8)];
+    // SAFETY: the buffer is `size` bytes and a Vec<u64> is 8 byte
+    // aligned. `key` points into `into`, which is not touched until the
+    // write has finished with it.
+    unsafe {
+        record::write_at(
+            out.as_mut_ptr().cast(),
+            previous,
+            version,
+            key,
+            &value,
+            tombstone,
+            record::kind_of(kind),
+        );
+    }
+    *into = out;
+    Ok(())
 }
 
 /// Whether the tier is worth having at all for a log in this format. A

@@ -246,6 +246,27 @@ pub struct Options {
     /// cold range would otherwise rewrite the range into the log, and
     /// the next pass would put it straight back.
     pub promote_reads: bool,
+    /// Whether a value that settles into the cold tier is compressed.
+    ///
+    /// On. A record reaches the tier by going a whole lap of the log
+    /// without anybody touching it, and reading one back is a `pread` of
+    /// a device that answers in tens to hundreds of microseconds, so a
+    /// decompress measured in single microseconds sits underneath a cost
+    /// that is already there. The hot log is not compressed and is not
+    /// going to be: a warm point read is the whole product and a
+    /// microsecond would double it.
+    ///
+    /// What it saves is a quarter to a third of whatever share of the
+    /// database has gone cold, and for a database larger than memory
+    /// that share tends to one. It also takes bytes off every cold read,
+    /// which is the axis zu2 is weakest on against an LSM, so this is a
+    /// read amplification setting as much as a storage one. #725 has the
+    /// measurements and [`crate::cold`] has the format.
+    ///
+    /// Off is for measuring the difference and for data that is already
+    /// compressed, though the second does not need it: a value the coder
+    /// cannot shrink is written as it came.
+    pub compress_cold: bool,
     /// Whether the scan plane is kept, which is what a range scan runs
     /// on. See [`crate::scan`].
     ///
@@ -275,6 +296,7 @@ impl Default for Options {
             space_target_percent: 200,
             cold_tier: true,
             cold_target_percent: 200,
+            compress_cold: true,
             salvage: false,
             checkpoint_on_close: true,
             promote_reads: true,
@@ -921,9 +943,9 @@ impl Db {
     ) -> Result<Arc<Core>> {
         let cold = if options.cold_tier {
             Some(if fresh {
-                Cold::create(path)?
+                Cold::create(path, options.compress_cold)?
             } else {
-                Cold::open(path)?
+                Cold::open(path, options.compress_cold)?
             })
         } else {
             None
@@ -1044,6 +1066,28 @@ impl Db {
         match &self.core.cold {
             Some(cold) => cold.disk_bytes(),
             None => Ok(0),
+        }
+    }
+
+    /// Value bytes handed to the cold tier since it was opened, and the
+    /// bytes it wrote for them. The two are equal when
+    /// [`Options::compress_cold`] is off, and the second over the first
+    /// is what the coder is buying on this data (#725).
+    ///
+    /// Both are counted where a record enters the tier, so they are the
+    /// values of records the tier has taken and not the values it holds:
+    /// a record that arrived and was later reclaimed is in these numbers
+    /// and is not in the file. That makes the ratio a property of the
+    /// data rather than of when it is asked for, which is what a report
+    /// comparing engines wants. [`Db::cold_disk_bytes`] is the other
+    /// question, what the tier costs right now.
+    pub fn cold_value_bytes(&self) -> (u64, u64) {
+        match &self.core.cold {
+            Some(cold) => (
+                cold.value_bytes.load(Ordering::Relaxed),
+                cold.stored_bytes.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
         }
     }
 

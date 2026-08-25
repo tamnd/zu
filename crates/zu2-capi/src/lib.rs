@@ -132,6 +132,20 @@ pub struct Zu2Options {
     /// bound the whole time; it just never reached C, so no host could
     /// ask for it.
     pub memory_pages: u64,
+    /// Nonzero stops the cold tier compressing the values it takes. On
+    /// by default, the way `Options::compress_cold` is: a record only
+    /// reaches the tier by surviving a lap of the log unwritten, and
+    /// reading it back is a `pread` of a device, so a few microseconds
+    /// of decompress sit under a cost that is already there. Off is for
+    /// measuring what the coder is worth, and it is also the setting
+    /// for data that is already compressed, though the tier works that
+    /// out per record anyway and writes the value as it came when the
+    /// frame is no smaller. `zu2_cold_value_bytes` is what it saved.
+    ///
+    /// Reading never consults this. A record says for itself whether it
+    /// is compressed, so turning it off stops new records being
+    /// compressed and leaves everything already written readable.
+    pub no_cold_compression: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -427,6 +441,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.memory_pages > 0 {
         options.memory_pages = given.memory_pages as usize;
+    }
+    if given.no_cold_compression != 0 {
+        options.compress_cold = false;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,
@@ -1879,6 +1896,39 @@ pub unsafe extern "C" fn zu2_cold_disk_bytes(db: *mut Zu2Db, bytes: *mut u64) ->
         }
         Err(status) => status,
     }
+}
+
+/// What the cold tier was given and what it wrote: `value` is the value
+/// bytes of the records it has taken since it was opened, `stored` is
+/// the bytes it wrote for them. Both zero when there is no tier, and
+/// equal when compression is off.
+///
+/// `stored` over `value` is what the coder is buying on this data, and
+/// it is the only honest way to report that, since it depends entirely
+/// on the data. Records reclaimed since are in both numbers, which is
+/// what makes the ratio a property of the workload rather than of the
+/// moment it is asked for. `zu2_cold_disk_bytes` is the other question,
+/// what the tier costs the device right now. #725.
+///
+/// # Safety
+/// `db` is live, and `value` and `stored` are writable or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_cold_value_bytes(
+    db: *const Zu2Db,
+    value: *mut u64,
+    stored: *mut u64,
+) -> Zu2Status {
+    let Some(handle) = (unsafe { handle(db) }) else {
+        return Zu2Status::Misuse;
+    };
+    let (given, written) = handle.db.cold_value_bytes();
+    if !value.is_null() {
+        unsafe { value.write(given) };
+    }
+    if !stored.is_null() {
+        unsafe { stored.write(written) };
+    }
+    Zu2Status::Ok
 }
 
 /// Addresses the cold tier still spans, and zero when there is no tier.

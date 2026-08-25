@@ -28,10 +28,24 @@ type Job = Box<dyn FnOnce() + Send>;
 #[cfg(windows)]
 const SPIN: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// Elsewhere a parked thread wakes in microseconds and spinning only
-/// steals cores from the query still running, so workers park at once.
+/// Elsewhere it used to be zero, on the reading that a parked thread
+/// wakes in microseconds and that spinning only steals cores from the
+/// query still running. Timing every worker in place said otherwise:
+/// on a quiet 32 core Linux box, a batch of eight started in a ramp of
+/// about twenty five microseconds a worker and the last one or two of
+/// them regularly did not arrive until the others had finished the scan
+/// between them. A tenth of a millisecond is not microseconds against a
+/// query that runs in one.
+///
+/// A tenth of what Windows takes, because the wakeups here are that
+/// much cheaper and because a worker that spins is a worker not parked
+/// on a host with fewer cores than the query wanted. Long enough to
+/// cover the gap between one query and the next in a session, which is
+/// the case that matters: a worker that stayed awake is the difference
+/// between a query getting the hands it asked for and getting most of
+/// them.
 #[cfg(not(windows))]
-const SPIN: std::time::Duration = std::time::Duration::ZERO;
+const SPIN: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// How long the submitting thread spins on the latch before parking.
 ///

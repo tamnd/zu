@@ -88,6 +88,89 @@ fn lapped(db: &Db, records: u32) -> u32 {
     records
 }
 
+/// A load that only inserts puts nothing in the tier, however far past
+/// `compact_below` it runs.
+///
+/// This is the other side of the test below and it is #736. The tier's
+/// rule for cold is that a record was still live in the oldest region of
+/// the log, which reads as "a whole lap and nobody touched it". During a
+/// bulk load every record satisfies that trivially: each key is written
+/// once, nothing is stale because nothing was updated, and nothing was
+/// read because the load has not finished. So a pass triggered by size
+/// alone found every record live, reclaimed not one byte, and moved the
+/// survivors to a tier whose read is a pread. Measured on gamingpc,
+/// 346.6 MiB of a 1007.3 MiB load, and a scan then paid a syscall about
+/// every third row: 2.8x on a scan at one thread and 3.55x at thirty
+/// two.
+///
+/// The gate is the survey, which reads the region and works out what a
+/// pass would reclaim before making it. So the assertion is on both
+/// halves: nothing migrated, and the survey is the reason rather than
+/// the maintainer never having looked.
+///
+/// The explicit `Db::compact` is deliberately not used here. It is a
+/// caller saying compact now and it does what it is told; this is about
+/// what the engine does on its own.
+#[test]
+fn a_load_that_updates_nothing_puts_nothing_in_the_tier() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("l.zu2"),
+        Options {
+            // Small enough that a load of the size below goes well past
+            // it, so the trigger the survey has to override fires many
+            // times over.
+            compact_below: 8 << 20,
+            ..options()
+        },
+    )
+    .expect("create");
+
+    let mut s = db.session();
+    for i in 0..40_000u32 {
+        s.upsert(&key(i), &value(i, 0)).expect("upsert");
+    }
+    // The maintainer runs after a flush, so this is what puts it on the
+    // path rather than a sleep hoping one happened.
+    s.set_durability(Durability::Durable);
+    s.upsert(&key(0), &value(0, 0)).expect("upsert");
+    drop(s);
+    db.sync().expect("sync");
+
+    let skipped = || db.compaction().skipped.load(Ordering::Relaxed);
+    for _ in 0..400 {
+        if skipped() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        skipped() > 0,
+        "the maintainer never surveyed, so this run says nothing about \
+         what the survey decided: {} passes, {} migrated",
+        db.compaction().passes.load(Ordering::Relaxed),
+        db.compaction().migrated.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        db.cold_span(),
+        0,
+        "a load that updated nothing put {} bytes in the tier over {} \
+         passes, so a scan of it would pay a pread a row",
+        db.cold_span(),
+        db.compaction().passes.load(Ordering::Relaxed),
+    );
+
+    // And the keys are all still readable out of the log, which is the
+    // part that would notice if the gate had skipped something it should
+    // have moved.
+    let mut s = db.session();
+    for i in (0..40_000u32).step_by(97) {
+        assert_eq!(read(&mut s, &key(i)), Some(value(i, 0)), "key {i}");
+    }
+}
+
 #[test]
 fn a_record_that_survives_a_pass_moves_to_the_cold_tier() {
     let dir = tempfile::tempdir().expect("tempdir");

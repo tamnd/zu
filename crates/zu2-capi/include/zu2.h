@@ -550,6 +550,11 @@ uint32_t zu2_index_resizing(const zu2_db *db);
  * this says what the process does. */
 uint64_t zu2_resident_pages(const zu2_db *db);
 
+/* Of those, the ones held as a mapping of the file rather than as heap,
+ * which is zero unless map_settled is on. The rest is anonymous memory,
+ * and the split is what a memory column actually turns on. */
+uint64_t zu2_mapped_pages(const zu2_db *db);
+
 /* Records a read moved out of the cold tier and back into the log,
  * which is the cost side of promote_reads. */
 uint64_t zu2_promoted(const zu2_db *db);

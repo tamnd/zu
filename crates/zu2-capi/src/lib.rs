@@ -2173,6 +2173,23 @@ pub unsafe extern "C" fn zu2_resident_pages(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// Of the resident pages, the ones held as a mapping of the file rather
+/// than as heap. Zero unless `map_settled` is on.
+///
+/// The rest is anonymous memory, so this is the split a memory column
+/// actually turns on: mapped pages are page cache the kernel can drop
+/// and fault back, and the remainder is heap it can only swap. #757.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_mapped_pages(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.mapped_pages() as u64,
+        None => 0,
+    }
+}
+
 /// Records a read moved out of the cold tier and back into the log.
 ///
 /// The cost side of `promote_reads`: it says how much writing the reads

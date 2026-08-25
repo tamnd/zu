@@ -1470,7 +1470,7 @@ impl Db {
 /// after it do not, and nothing waits for this to finish.
 ///
 /// `memory_pages` is the ceiling, which is the same ceiling eviction
-/// works to. It defaults to no ceiling at all, so the default is the
+/// works to and is a count of anonymous pages. It defaults to no ceiling at all, so the default is the
 /// residency every open had before checkpoints existed, and a caller who
 /// wants the log to stay on the device says so with the option that has
 /// always meant that.
@@ -1501,7 +1501,11 @@ fn warm(core: &Core, options: Options) {
             let next = &next;
             scope.spawn(move || {
                 loop {
-                    if core.log.stopping() || core.log.resident_pages() >= options.memory_pages {
+                    // The anonymous count and not the resident one. It is
+                    // the number the bound is about since #759, and it is
+                    // a load where the other is a walk of the page table
+                    // taken once a page by every worker.
+                    if core.log.stopping() || core.log.anonymous_pages() >= options.memory_pages {
                         return;
                     }
                     let page = next.fetch_add(1, Ordering::Relaxed);

@@ -1203,14 +1203,28 @@ impl Log {
         if self.memory_pages == usize::MAX {
             return;
         }
-        // The cursor stops at the page being written to whatever the
-        // count says, so a bound smaller than the log can hold cannot
-        // evict its way into the mutable window. The durability test
-        // below does the same job for the flusher's frontier, and this
-        // one is what stops a run of mapped pages from walking the floor
-        // up to the tail when there is no anonymous page left to give.
+        // The cursor stops below the read-only boundary whatever the
+        // count says, and that is the mutable window's protection now
+        // that the rule is a count.
+        //
+        // The old rule got this for free. It evicted up to
+        // `memory_pages` behind the tail and the constructor clamps
+        // `memory_pages` to at least `mutable_pages` plus one, so the
+        // floor could not reach the window however small the bound was.
+        // A count has no such geometry: pages the flusher has not caught
+        // up with, or a page warmed at startup, can put the count over
+        // the bound while everything below the window is already gone,
+        // and the loop would then take the window itself. Those pages
+        // are the ones an in place update writes to, so that is a writer
+        // rewriting a record in a page that has just left memory.
+        //
+        // The durability test below does the same job for the flusher's
+        // frontier, and the two together are also what stops a run of
+        // mapped pages from walking the floor up to the tail when there
+        // is no anonymous page left to give.
+        let stop = page.min(page_of(self.read_only()));
         while self.anonymous.load(Ordering::Acquire) > self.memory_pages
-            && page_of(self.head()) < page
+            && page_of(self.head()) < stop
         {
             let victim = page_of(self.head());
             // A page can only leave memory once its bytes are durable,

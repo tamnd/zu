@@ -17,6 +17,15 @@
 //! run, which is what makes a block double over and over rather than
 //! once.
 //!
+//! One node is not owned by anybody. Every thread links its own nodes
+//! to the sink, so four threads write the sink's inward neighbourhood at
+//! once, through four different edge order stripes, and the only thing
+//! keeping them off each other is the neighbourhood's own lock. That is
+//! the case the rest of this file does not reach: elsewhere a
+//! neighbourhood has one writer and many readers, and here it has four
+//! writers. The model stays exact because a thread only ever links its
+//! own node ids, so no two threads write the same neighbour.
+//!
 //! The threads also read each other's hubs, and there the model says
 //! nothing, since the owner is changing it. What is asserted there is
 //! what has to hold of any answer whatever the writer is doing: sorted,
@@ -93,6 +102,11 @@ fn base(t: u32) -> u32 {
     t * PER
 }
 
+/// The node every thread links into, so one neighbourhood has four
+/// writers. Its id is above every run, which is why appending it to a
+/// thread's expected out list keeps that list sorted.
+const SINK: u32 = THREADS * PER;
+
 #[test]
 fn concurrent_sessions_keep_their_own_edges_under_compaction() {
     let ops: u64 = std::env::var("ZU2_GRAPH_OPS")
@@ -108,7 +122,7 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
     // worked out from that rather than looked up.
     {
         let mut s = db.session();
-        for i in 0..THREADS * PER {
+        for i in 0..=SINK {
             let id = s.add_node(&key(i)).expect("node");
             assert_eq!(id, i, "ids are handed out in creation order");
         }
@@ -132,6 +146,8 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
             std::thread::spawn(move || {
                 let mut s = db.session();
                 let mut out: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); PER as usize];
+                // Which of this thread's nodes are linked to the sink.
+                let mut sink: BTreeSet<u32> = BTreeSet::new();
                 let mut state = 0x2545_f491_4f6c_dd1d ^ u64::from(t) << 32;
                 let mut got = Vec::new();
                 for op in 0..ops {
@@ -145,13 +161,25 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
                         0
                     };
                     let dst = (draw >> 20) as u32 % PER;
+                    // A quarter of the edge writes go to the sink
+                    // instead, which is the neighbourhood every thread
+                    // is writing at once.
+                    let to_sink = ((draw >> 32) as u32).is_multiple_of(4);
                     // The log has to move for a pass to have anything to
                     // do, and edges are too small to move it.
                     s.upsert(&pad_key(t, op), &pad(op)).expect("pad");
                     match draw % 8 {
+                        0..=5 if to_sink => {
+                            s.add_edge(base(t) + src, SINK).expect("add sink");
+                            sink.insert(src);
+                        }
                         0..=5 => {
                             s.add_edge(base(t) + src, base(t) + dst).expect("add");
                             out[src as usize].insert(dst);
+                        }
+                        6 if to_sink => {
+                            s.remove_edge(base(t) + src, SINK).expect("remove sink");
+                            sink.remove(&src);
                         }
                         6 => {
                             s.remove_edge(base(t) + src, base(t) + dst).expect("remove");
@@ -161,7 +189,12 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
                             // This thread's own hub, against the model,
                             // exactly.
                             s.neighbours_into(Direction::Out, base(t), &mut got);
-                            let want: Vec<u32> = out[0].iter().map(|&d| base(t) + d).collect();
+                            let mut want: Vec<u32> = out[0].iter().map(|&d| base(t) + d).collect();
+                            if sink.contains(&0) {
+                                // Above every run, so the list stays
+                                // sorted with it on the end.
+                                want.push(SINK);
+                            }
                             assert_eq!(
                                 got, want,
                                 "thread {t} at op {op}: its own hub disagrees with the model"
@@ -185,10 +218,29 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
                                  unsorted or with a duplicate: {got:?}"
                             );
                             assert!(
-                                got.iter().all(|&n| n >= low && n < high),
+                                got.iter().all(|&n| (n >= low && n < high) || n == SINK),
                                 "thread {t} at op {op}: hub of {other} has a \
-                                 neighbour outside {low}..{high}: {got:?}"
+                                 neighbour outside {low}..{high} that is not \
+                                 the sink: {got:?}"
                             );
+                            // And the sink, which all four threads are
+                            // writing at once. No model here either,
+                            // for the same reason, but a neighbourhood
+                            // with four writers on it has to come back
+                            // sorted, without a repeat, and made of
+                            // node ids that exist.
+                            s.neighbours_into(Direction::In, SINK, &mut got);
+                            assert!(
+                                got.windows(2).all(|w| w[0] < w[1]),
+                                "thread {t} at op {op}: the sink came back \
+                                 unsorted or with a duplicate: {got:?}"
+                            );
+                            assert!(
+                                got.iter().all(|&n| n < SINK),
+                                "thread {t} at op {op}: the sink has a \
+                                 neighbour that is not a node: {got:?}"
+                            );
+
                             // No degree check here. It is a second call
                             // and the owner writes between the two, so a
                             // count off by one is this test racing rather
@@ -198,7 +250,7 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
                         }
                     }
                 }
-                out
+                (out, sink)
             })
         })
         .collect();
@@ -231,7 +283,7 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
     // nothing.
     let mut s = db.session();
     let mut got = Vec::new();
-    for (t, out) in held.iter().enumerate() {
+    for (t, (out, sink)) in held.iter().enumerate() {
         let t = t as u32;
         let mut into: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); PER as usize];
         for (src, dsts) in out.iter().enumerate() {
@@ -241,11 +293,31 @@ fn concurrent_sessions_keep_their_own_edges_under_compaction() {
         }
         for i in 0..PER {
             s.neighbours_into(Direction::Out, base(t) + i, &mut got);
-            let want: Vec<u32> = out[i as usize].iter().map(|&d| base(t) + d).collect();
+            let mut want: Vec<u32> = out[i as usize].iter().map(|&d| base(t) + d).collect();
+            if sink.contains(&i) {
+                want.push(SINK);
+            }
             assert_eq!(got, want, "thread {t} node {i} out at rest");
             s.neighbours_into(Direction::In, base(t) + i, &mut got);
             let want: Vec<u32> = into[i as usize].iter().map(|&d| base(t) + d).collect();
             assert_eq!(got, want, "thread {t} node {i} in at rest");
         }
     }
+
+    // And the neighbourhood four threads were writing, against the union
+    // of what they say they wrote. This is the one list in the file that
+    // no single thread owns.
+    let want: Vec<u32> = held
+        .iter()
+        .enumerate()
+        .flat_map(|(t, (_, sink))| sink.iter().map(move |&i| base(t as u32) + i))
+        .collect();
+    s.neighbours_into(Direction::In, SINK, &mut got);
+    assert_eq!(got, want, "the sink at rest");
+    assert_eq!(
+        s.degree(Direction::In, SINK) as usize,
+        want.len(),
+        "the sink's degree at rest"
+    );
+    println!("sink degree {}", want.len());
 }

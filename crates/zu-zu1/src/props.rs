@@ -73,8 +73,11 @@ use crate::txn::Cell;
 /// 11 adds the exact decimal to the extended form, which is the first
 /// column type whose declaration is needed to read a row back: the lane
 /// holds unscaled units and the scale that says how large a unit is
-/// lives in the type.
-const PROPS_VERSION: u16 = 11;
+/// lives in the type. Version 12 lets a list column's rows say their
+/// count in fewer than four bytes, and writes the width they said it in
+/// into the column entry, which is the second field there that is about
+/// the encoding rather than about the declaration.
+const PROPS_VERSION: u16 = 12;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -306,6 +309,47 @@ pub(crate) fn bounded_list(ty: &LogicalType) -> Option<(u32, usize)> {
         }
         _ => None,
     }
+}
+
+/// How wide the count at the head of a row of this list column is, for
+/// a column being written now.
+///
+/// A count is a number between nought and the declared bound, and the
+/// bound is in the catalog, so a `LIST<INT8>(4)` column has no use for
+/// four bytes to say a number that cannot exceed four. One byte carries
+/// a bound to 255 and two to 65535, and that is the whole of the saving.
+///
+/// It is worth having where the elements are small and the bound is
+/// small with them, which is where the count was the larger part of the
+/// row: a `LIST<INT8>(4)` row of four elements is four bytes of payload,
+/// and four more to say so doubled it. On an embedding column the same
+/// change is two bytes in three thousand and is beneath noticing, which
+/// is fine, because an embedding column written whole at its bound
+/// carries no count at all.
+///
+/// A list with no declared bound has no number to be smaller than, so it
+/// keeps the four bytes it has always had.
+pub(crate) fn count_width(ty: &LogicalType) -> usize {
+    match bounded_list(ty) {
+        Some((bound, _)) if bound <= u32::from(u8::MAX) => 1,
+        Some((bound, _)) if bound <= u32::from(u16::MAX) => 2,
+        _ => 4,
+    }
+}
+
+/// How a row of a list column says how many elements it holds.
+///
+/// The two are not tellable apart from the bytes, which is why this is
+/// carried rather than worked out: a bounded `LIST<INT32>(768)` row of
+/// 767 counted elements is the same length as one of 768 uncounted
+/// ones. The column entry says, and a reader takes the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRows {
+    /// The directory says the count and no row carries one, which is a
+    /// column every row of which was written at its declared bound.
+    Fixed(usize),
+    /// Every row says its own count, in this many bytes.
+    Counted(usize),
 }
 
 /// The type a column entry holds, which for a list is the declaration
@@ -564,6 +608,17 @@ pub struct PropColumn {
     /// `LIST<INT32>(768)` column of 767 counted elements a row is the
     /// same 3072 bytes a row as one of 768 uncounted ones.
     pub fixed_len: Option<u32>,
+    /// How many bytes each row of this list column spends saying its own
+    /// element count, where it says one at all. Four is what every
+    /// version before 12 wrote and what an unbounded list still writes.
+    ///
+    /// It is carried rather than worked out from the declared bound
+    /// because a column is read at the width its rows were written at,
+    /// and those are two different questions once the rule has changed
+    /// once. A version 11 column of `LIST<INT8>(4)` rows holds four byte
+    /// counts, and a fold that leaves those rows alone has to leave the
+    /// four with them, whatever a column written today would have used.
+    pub count_width: u8,
     /// The zone plane of a zoned column: one word a row, the offset
     /// from UTC in minutes that the row's value was written with.
     /// `None` is every other column, which has no second plane.
@@ -589,11 +644,14 @@ impl PropColumn {
         lane_type(&self.ty)
     }
 
-    /// The count to read a row of this column at, which is what
-    /// [`list_elements`] wants and `None` for every row that says its
-    /// own.
-    pub fn fixed_list(&self) -> Option<usize> {
-        self.fixed_len.map(|n| n as usize)
+    /// How to read a row of this list column, which is what
+    /// [`list_elements`] wants beside the bytes: the count the directory
+    /// holds, or the width the row says its own in.
+    pub fn list_rows(&self) -> ListRows {
+        match self.fixed_len {
+            Some(count) => ListRows::Fixed(count as usize),
+            None => ListRows::Counted(self.count_width as usize),
+        }
     }
 
     /// The bytes every row of this column occupies, where its type
@@ -837,30 +895,46 @@ pub enum ListElement<'a> {
     Blob(&'a [u8]),
 }
 
-/// Encodes one row of a list column: `count: u32` where the row says
-/// its own count, then the elements, each a little endian run of
-/// `lane_width` bytes for a lane element type or a `len: u32` and its
-/// bytes otherwise.
+/// Encodes one row of a list column: the count in as many bytes as
+/// `rows` says, where the row says its own count at all, then the
+/// elements, each a little endian run of `lane_width` bytes for a lane
+/// element type or a `len: u32` and its bytes otherwise.
 ///
 /// Version 6 and older wrote every lane element in eight bytes whatever
 /// its type. A list of 768 `FLOAT32` is the type this series is for and
 /// that cost it 6148 bytes a row against the 3076 the floats need, so
 /// version 7 writes each element at its own width. Version 9 takes the
 /// count out of the rows of a column whose declaration already gives it,
-/// which is the last of the 3076 that is not a float. The reader below
-/// still reads every form, and schema/06 §2 is the rule all three are an
+/// which is the last of the 3076 that is not a float. Version 12 narrows
+/// the count that is left, for the bounded column whose rows are not all
+/// at the bound and so still have to carry one. The reader below still
+/// reads every form, and schema/06 §2 is the rule all four are an
 /// instance of: the catalog holds the declaration, the bytes hold the
 /// narrowest thing that carries it.
 fn encode_list_row(
     elem: &LogicalType,
     items: &[ListElement<'_>],
-    counted: bool,
+    rows: ListRows,
 ) -> Result<Vec<u8>> {
     let lane = lane_width(elem);
     let stride = lane.map_or(4, |(width, _)| width);
-    let mut out = Vec::with_capacity(4 + items.len() * stride);
-    if counted {
-        out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    let head = match rows {
+        ListRows::Fixed(_) => 0,
+        ListRows::Counted(width) => width,
+    };
+    let mut out = Vec::with_capacity(head + items.len() * stride);
+    if let ListRows::Counted(width) = rows {
+        // A count wider than its head is a row that would read back as
+        // another row, so it is refused here rather than truncated. The
+        // writer picked the width from the declared bound and checked
+        // every row against that bound, so nothing reaches this.
+        if items.len() as u64 >= 1u64 << (width * 8) {
+            return Err(ZuError::InvalidArgument(format!(
+                "a list of {} does not fit a {width} byte count",
+                items.len()
+            )));
+        }
+        out.extend_from_slice(&(items.len() as u64).to_le_bytes()[..width]);
     }
     for item in items {
         match (item, lane) {
@@ -889,13 +963,14 @@ fn encode_list_row(
 
 /// Reads back a row written by `encode_list_row`.
 ///
-/// `fixed` is the element count a column whose rows do not carry one
-/// holds, which is [`PropColumn::fixed_list`], and `None` is every row
-/// that says its own count. Which of the two a row is cannot be settled
-/// from the bytes the way the element width can: a bounded
-/// `LIST<INT32>(768)` row of 767 counted elements is the same length as
-/// one of 768 uncounted ones. So the directory says, and this takes the
-/// answer rather than guessing at it.
+/// `rows` is [`PropColumn::list_rows`], which says whether the count is
+/// in the directory or at the head of the row and how wide the head is.
+/// Neither can be settled from the bytes the way the element width can:
+/// a bounded `LIST<INT32>(768)` row of 767 counted elements is the same
+/// length as one of 768 uncounted ones, and the head that says 767 is
+/// one, two or four bytes according to what the column was written at.
+/// So the directory says, and this takes the answer rather than guessing
+/// at it.
 ///
 /// The elements borrow the buffer they came out of, so a read of a list
 /// column is the blob read and a walk over it, with no allocation per
@@ -903,15 +978,19 @@ fn encode_list_row(
 pub fn list_elements<'a>(
     elem: &LogicalType,
     bytes: &'a [u8],
-    fixed: Option<usize>,
+    rows: ListRows,
 ) -> Result<Vec<ListElement<'a>>> {
-    let (count, head_len) = match fixed {
-        Some(count) => (count, 0usize),
-        None => {
+    let (count, head_len) = match rows {
+        ListRows::Fixed(count) => (count, 0usize),
+        ListRows::Counted(width) => {
             let head = bytes
-                .get(..4)
+                .get(..width)
                 .ok_or_else(|| corrupt("truncated list length".into()))?;
-            (u32::from_le_bytes(head.try_into().unwrap()) as usize, 4)
+            let mut count = 0u64;
+            for (i, byte) in head.iter().enumerate() {
+                count |= u64::from(*byte) << (i * 8);
+            }
+            (count as usize, width)
         }
     };
     let body = bytes.len() - head_len;
@@ -1217,6 +1296,12 @@ impl PropsDirectory {
             // what the column was declared, and what the block kept of
             // it. `NO_BOUND` is a column whose rows say it themselves.
             out.extend_from_slice(&col.fixed_len.unwrap_or(NO_BOUND).to_le_bytes());
+            // And beside that, the width the rows that do say it said it
+            // in. A column written before version 12 said it in four,
+            // and a fold that leaves those rows where they are writes
+            // the four back here, so a directory read forward and
+            // written back still describes the rows it points at.
+            out.push(col.count_width);
             col.meta.encode(&mut out);
             match &col.validity {
                 Some(meta) => {
@@ -1362,6 +1447,26 @@ impl PropsDirectory {
                 }
                 false => None,
             };
+            // A directory older than version 12 wrote every count it
+            // wrote in four bytes, which is the same column read either
+            // way. A width that is none of the three is a byte nothing
+            // here wrote, and it decides every row offset below it, so
+            // it is refused rather than clamped.
+            let count_width = match version >= 12 {
+                true => match bytes.get(pos) {
+                    Some(&width @ (1 | 2 | 4)) => {
+                        pos += 1;
+                        width
+                    }
+                    Some(&other) => {
+                        return Err(corrupt(format!(
+                            "list count width {other} is not 1, 2 or 4"
+                        )));
+                    }
+                    None => return Err(corrupt("truncated list count width".into())),
+                },
+                false => 4,
+            };
             let (meta, next) = seg(bytes, pos, version)?;
             pos = next;
             // A directory older than version 4 has no flag byte and no
@@ -1430,6 +1535,7 @@ impl PropsDirectory {
                 meta,
                 validity,
                 fixed_len,
+                count_width,
                 zones,
             });
         }
@@ -2043,6 +2149,21 @@ fn write_columns(
             }
             _ => None,
         };
+        // And where they are not all at it, the bound is still worth
+        // something: a count cannot exceed it, `check_declared` has just
+        // said so for every row, and a number that cannot exceed 255
+        // does not need four bytes to say. This is the same sentence as
+        // the one above with the count kept rather than dropped.
+        //
+        // The width goes in the column entry whether the rows use it or
+        // not: a column of anything but a list has no count to write,
+        // and a fixed one has taken its counts out, so both write the
+        // four an older file wrote and neither is ever asked.
+        let counts = count_width(&ty) as u8;
+        let list_rows = match fixed_len {
+            Some(count) => ListRows::Fixed(count as usize),
+            None => ListRows::Counted(counts as usize),
+        };
         let encoded: Vec<Vec<u8>> = match values {
             PropValues::List { elem, rows } => {
                 let elem = list_elem(elem).expect("storable");
@@ -2056,10 +2177,9 @@ fn write_columns(
                 rows.iter()
                     .enumerate()
                     .map(
-                        |(row, items)| match (fixed_len.is_some(), column.holds(row)) {
-                            (true, true) => encode_list_row(elem, items, false),
-                            (true, false) => encode_list_row(elem, &absent, false),
-                            (false, _) => encode_list_row(elem, items, true),
+                        |(row, items)| match fixed_len.is_some() && !column.holds(row) {
+                            true => encode_list_row(elem, &absent, list_rows),
+                            false => encode_list_row(elem, items, list_rows),
                         },
                     )
                     .collect::<Result<_>>()?
@@ -2155,6 +2275,7 @@ fn write_columns(
             meta,
             validity,
             fixed_len,
+            count_width: counts,
             zones,
         });
     }
@@ -3124,10 +3245,10 @@ impl PropsReader {
         &self.directory.columns
     }
 
-    /// The element count to read a row of `col` at, which is what
+    /// How to read a row of list column `col`, which is what
     /// [`list_elements`] wants beside the bytes.
-    pub fn fixed_list(&self, col: usize) -> Option<usize> {
-        self.directory.columns[col].fixed_list()
+    pub fn list_rows(&self, col: usize) -> ListRows {
+        self.directory.columns[col].list_rows()
     }
 
     /// Rows in the table's domain; every column is row-aligned to it.
@@ -4691,7 +4812,7 @@ mod tests {
                 buf.clear();
                 reader.read_str(&mut db, col, row as u64, &mut buf).unwrap();
                 assert_eq!(
-                    &list_elements(elem, &buf, None).unwrap(),
+                    &list_elements(elem, &buf, ListRows::Counted(4)).unwrap(),
                     items,
                     "row {row}"
                 );
@@ -4758,28 +4879,32 @@ mod tests {
             max: None,
             fixed: false,
         };
-        let good =
-            encode_list_row(&int, &[ListElement::Word(3), ListElement::Word(4)], true).unwrap();
+        let good = encode_list_row(
+            &int,
+            &[ListElement::Word(3), ListElement::Word(4)],
+            ListRows::Counted(4),
+        )
+        .unwrap();
         assert_eq!(
-            list_elements(&int, &good, None).unwrap(),
+            list_elements(&int, &good, ListRows::Counted(4)).unwrap(),
             vec![ListElement::Word(3), ListElement::Word(4)]
         );
         for len in 0..good.len() {
             assert!(
-                list_elements(&int, &good[..len], None).is_err(),
+                list_elements(&int, &good[..len], ListRows::Counted(4)).is_err(),
                 "prefix {len}"
             );
         }
         let mut trailing = good.clone();
         trailing.push(0);
-        assert!(list_elements(&int, &trailing, None).is_err());
+        assert!(list_elements(&int, &trailing, ListRows::Counted(4)).is_err());
         // A count no payload can hold must not size an allocation, and
         // reading a list of words as a list of strings must not read a
         // length out of a value.
         let mut hostile = good.clone();
         hostile[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(list_elements(&int, &hostile, None).is_err());
-        assert!(list_elements(&text, &good, None).is_err());
+        assert!(list_elements(&int, &hostile, ListRows::Counted(4)).is_err());
+        assert!(list_elements(&text, &good, ListRows::Counted(4)).is_err());
     }
 
     /// A list element takes the width its own type needs. This is where
@@ -4819,10 +4944,11 @@ mod tests {
             (LogicalType::LocalDatetime, 8, -1i64 as u64),
         ];
         for (elem, width, word) in table {
-            let row = encode_list_row(elem, &[ListElement::Word(*word)], true).unwrap();
+            let row =
+                encode_list_row(elem, &[ListElement::Word(*word)], ListRows::Counted(4)).unwrap();
             assert_eq!(row.len(), 4 + width, "{elem}");
             assert_eq!(
-                list_elements(elem, &row, None).unwrap(),
+                list_elements(elem, &row, ListRows::Counted(4)).unwrap(),
                 vec![ListElement::Word(*word)],
                 "{elem}"
             );
@@ -4831,7 +4957,7 @@ mod tests {
         let row = encode_list_row(
             &float(FloatBits::B32),
             &vec![ListElement::Word(0); 768],
-            true,
+            ListRows::Counted(4),
         )
         .unwrap();
         assert_eq!(row.len(), 3076, "a 768 dimension FLOAT32 embedding row");
@@ -4846,16 +4972,32 @@ mod tests {
             bits: IntBits::B8,
             precision: None,
         };
-        assert!(encode_list_row(&byte, &[ListElement::Word(255)], true).is_ok());
-        assert!(encode_list_row(&byte, &[ListElement::Word(256)], true).is_err());
+        assert!(encode_list_row(&byte, &[ListElement::Word(255)], ListRows::Counted(4)).is_ok());
+        assert!(encode_list_row(&byte, &[ListElement::Word(256)], ListRows::Counted(4)).is_err());
         let small = LogicalType::Int {
             signed: true,
             bits: IntBits::B16,
             precision: None,
         };
-        assert!(encode_list_row(&small, &[ListElement::Word(-32768i64 as u64)], true).is_ok());
-        assert!(encode_list_row(&small, &[ListElement::Word(-32769i64 as u64)], true).is_err());
-        assert!(encode_list_row(&small, &[ListElement::Word(32768)], true).is_err());
+        assert!(
+            encode_list_row(
+                &small,
+                &[ListElement::Word(-32768i64 as u64)],
+                ListRows::Counted(4)
+            )
+            .is_ok()
+        );
+        assert!(
+            encode_list_row(
+                &small,
+                &[ListElement::Word(-32769i64 as u64)],
+                ListRows::Counted(4)
+            )
+            .is_err()
+        );
+        assert!(
+            encode_list_row(&small, &[ListElement::Word(32768)], ListRows::Counted(4)).is_err()
+        );
     }
 
     /// Version 6 and older wrote every lane element in eight bytes, and
@@ -4874,14 +5016,20 @@ mod tests {
             old.extend_from_slice(&word.to_le_bytes());
         }
         let want: Vec<ListElement> = words.iter().map(|w| ListElement::Word(*w as u64)).collect();
-        assert_eq!(list_elements(&elem, &old, None).unwrap(), want);
+        assert_eq!(
+            list_elements(&elem, &old, ListRows::Counted(4)).unwrap(),
+            want
+        );
         // And the same values written now are the same values read
         // back, in half the bytes.
-        let new = encode_list_row(&elem, &want, true).unwrap();
+        let new = encode_list_row(&elem, &want, ListRows::Counted(4)).unwrap();
         assert_eq!(new.len(), 4 + 3 * 4);
-        assert_eq!(list_elements(&elem, &new, None).unwrap(), want);
+        assert_eq!(
+            list_elements(&elem, &new, ListRows::Counted(4)).unwrap(),
+            want
+        );
         // A length that is neither form is a row nothing wrote.
-        assert!(list_elements(&elem, &old[..old.len() - 1], None).is_err());
+        assert!(list_elements(&elem, &old[..old.len() - 1], ListRows::Counted(4)).is_err());
     }
 
     /// The column an embedding lands in, end to end. Every row is the
@@ -4935,7 +5083,10 @@ mod tests {
         let mut reader = PropsReader::new(directory);
         let mut buf = Vec::new();
         reader.read_str(&mut db, 0, 40, &mut buf).unwrap();
-        assert_eq!(list_elements(&elem, &buf, None).unwrap(), vectors[40]);
+        assert_eq!(
+            list_elements(&elem, &buf, ListRows::Counted(4)).unwrap(),
+            vectors[40]
+        );
     }
 
     /// The same embedding under a declaration that gives its length.
@@ -4991,15 +5142,21 @@ mod tests {
         let mut reader = PropsReader::new(directory);
         let mut buf = Vec::new();
         reader.read_str(&mut db, 0, 40, &mut buf).unwrap();
-        let fixed = reader.fixed_list(0);
-        assert_eq!(fixed, Some(DIM));
-        assert_eq!(list_elements(&elem, &buf, fixed).unwrap(), vectors[40]);
+        let rows = reader.list_rows(0);
+        assert_eq!(rows, ListRows::Fixed(DIM));
+        assert_eq!(list_elements(&elem, &buf, rows).unwrap(), vectors[40]);
     }
 
     /// The bound is a maximum, so a column of shorter lists is a legal
     /// column of the same type and its rows keep their counts. Nothing
     /// about the type says which of the two a column is, which is why
     /// the directory says.
+    ///
+    /// It says the width as well as the fact. A count that cannot pass
+    /// four does not need four bytes to say four, so the rows of this
+    /// column spend one byte each on saying how long they are, and the
+    /// widths a row can be written at are the widths a directory entry
+    /// can name: one, two or four.
     #[test]
     fn a_column_short_of_its_bound_keeps_the_count_in_its_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -5032,16 +5189,132 @@ mod tests {
         .unwrap();
 
         assert_eq!(directory.columns[0].fixed_len, None);
+        assert_eq!(directory.columns[0].count_width, 1);
+        assert_eq!(
+            PropsDirectory::decode(&directory.encode()).unwrap(),
+            directory,
+            "the width survives a round trip through the directory"
+        );
         let mut reader = PropsReader::new(directory);
         let mut buf = Vec::new();
         for (row, want) in vectors.iter().enumerate() {
             buf.clear();
             reader.read_str(&mut db, 0, row as u64, &mut buf).unwrap();
+            // One byte of count and four of element each, where the same
+            // rows written before version 12 spent four and four.
+            assert_eq!(buf.len(), 1 + want.len() * 4, "row {row}");
             assert_eq!(
-                &list_elements(&elem, &buf, None).unwrap(),
+                &list_elements(&elem, &buf, reader.list_rows(0)).unwrap(),
                 want,
                 "row {row}"
             );
+        }
+    }
+
+    /// A segment that points at nothing, for the two tests below, which
+    /// are about a directory entry rather than about the bytes it names.
+    fn blank_meta() -> SegmentMeta {
+        SegmentMeta {
+            value_count: 0,
+            payload_len: 0,
+            uncompressed_bytes: 0,
+            min: 0,
+            max: 0,
+            crc: 0,
+            structural: crate::segment::Structural::MiniBlock,
+            sorted: false,
+            start: 0,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// The width the rows said their counts in is read off the column
+    /// entry and not worked out from the declared bound, and this is the
+    /// test that makes the two different.
+    ///
+    /// A fold rewrites a directory at the current version over row blobs
+    /// it leaves where they are, so a column written at version 11 comes
+    /// back through `encode` with a version 12 header and rows that
+    /// still spend four bytes on a count a one byte field would hold.
+    /// Deriving the width from the bound would read those rows as a
+    /// count of a few and a great many elements, which is to say it
+    /// would refuse a file that is not damaged.
+    #[test]
+    fn a_narrow_bound_written_before_version_12_still_reads_four_byte_counts() {
+        let elem = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        };
+        let declared = LogicalType::List {
+            elem: Box::new(elem.clone()),
+            max: Some(4),
+        };
+        // What the column entry of such a file decodes to: a narrow
+        // bound and the wide count its rows were written with.
+        let column = PropColumn {
+            name: "xs".into(),
+            ty: declared,
+            meta: blank_meta(),
+            validity: None,
+            fixed_len: None,
+            count_width: 4,
+            zones: None,
+        };
+        assert_eq!(column.list_rows(), ListRows::Counted(4));
+        assert_eq!(count_width(&column.ty), 1, "a fresh write would say one");
+        let row = encode_list_row(
+            &elem,
+            &[ListElement::Word(1), ListElement::Word(2)],
+            ListRows::Counted(4),
+        )
+        .unwrap();
+        assert_eq!(
+            list_elements(&elem, &row, column.list_rows()).unwrap(),
+            vec![ListElement::Word(1), ListElement::Word(2)]
+        );
+    }
+
+    /// One, two or four, because those are the widths a write can
+    /// choose. Any other byte in that field is a directory nothing here
+    /// wrote, and a length read at a width nobody wrote it at is a row
+    /// of nonsense, so it is refused where it is read rather than
+    /// carried to whatever reads the row.
+    #[test]
+    fn a_list_count_width_no_write_chooses_is_refused() {
+        let elem = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        };
+        // The encoder writes the field it is given, so a directory with
+        // a width no write chooses is the way to make those bytes
+        // without going looking for the byte in a buffer.
+        let of = |count_width| PropsDirectory {
+            node_count: 1,
+            columns: vec![PropColumn {
+                name: "xs".into(),
+                ty: LogicalType::List {
+                    elem: Box::new(elem.clone()),
+                    max: Some(4),
+                },
+                meta: blank_meta(),
+                validity: None,
+                fixed_len: None,
+                count_width,
+                zones: None,
+            }],
+            labels: None,
+        };
+        for width in [1u8, 2, 4] {
+            let want = of(width);
+            assert_eq!(PropsDirectory::decode(&want.encode()).unwrap(), want);
+        }
+        for width in [0u8, 3, 8, 255] {
+            let err = PropsDirectory::decode(&of(width).encode())
+                .expect_err("a width nothing writes")
+                .to_string();
+            assert!(err.contains("corrupt"), "width {width}: {err}");
         }
     }
 
@@ -5316,7 +5589,7 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_str(&mut db, 0, 2, &mut buf).unwrap();
         assert_eq!(
-            list_elements(&elem, &buf, Some(3)).unwrap(),
+            list_elements(&elem, &buf, ListRows::Fixed(3)).unwrap(),
             vec![ListElement::Word(0); 3]
         );
     }

@@ -137,7 +137,12 @@ fn staged_value(
         LogicalType::List { elem, .. } => {
             buf.clear();
             reader.read_str(zu, ci, row, buf)?;
-            Value::Text(list_text::write(&staged_items(elem, buf, name)?))
+            Value::Text(list_text::write(&staged_items(
+                elem,
+                buf,
+                name,
+                reader.fixed_list(ci),
+            )?))
         }
         LogicalType::Float { bits, .. } => {
             let word = reader.read_int(zu, ci, row)?;
@@ -277,13 +282,18 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
 /// The word arms undo exactly what the lane put there: a float is IEEE
 /// bits, everything else is a count, and the element type is what says
 /// which, the same reading `word_value` gives a scalar column.
-fn staged_items(elem: &LogicalType, bytes: &[u8], name: &str) -> Result<Vec<list_text::Item>> {
+fn staged_items(
+    elem: &LogicalType,
+    bytes: &[u8],
+    name: &str,
+    fixed: Option<usize>,
+) -> Result<Vec<list_text::Item>> {
     let kind = list_kind(elem).ok_or_else(|| {
         ZuError::InvalidArgument(format!(
             "column '{name}' holds a list of {elem}, which has no sqlite staging form"
         ))
     })?;
-    list_elements(elem, bytes)?
+    list_elements(elem, bytes, fixed)?
         .into_iter()
         .map(|item| match (item, kind) {
             (ListElement::Word(w), Kind::Int) => Ok(list_text::Item::Int(w as i64)),

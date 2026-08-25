@@ -645,7 +645,7 @@ fn column_value(
         LogicalType::List { ref elem, .. } => {
             let mut bytes = Vec::new();
             reader.read_str(db, col, row, &mut bytes)?;
-            let items = list_elements(elem, &bytes)?;
+            let items = list_elements(elem, &bytes, reader.fixed_list(col))?;
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 out.push(match item {

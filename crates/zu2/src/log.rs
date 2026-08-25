@@ -78,6 +78,16 @@ pub enum Durability {
     Durable,
 }
 
+/// How long a writer over the memory bound waits for the flusher before
+/// giving up and taking the memory anyway, and how many turns it takes
+/// getting there. See [`Log::throttle`], #775.
+///
+/// Ten milliseconds because that is long enough to cover a device write
+/// on anything we publish numbers on and short enough that a flusher
+/// which has stopped answering costs throughput rather than liveness.
+const THROTTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+const THROTTLE_TRIES: usize = 20;
+
 /// The page memory layout, 64 byte aligned so a record's alignment
 /// follows from its offset.
 fn page_layout() -> Layout {
@@ -961,6 +971,9 @@ impl Log {
                 page: PAGE_SIZE,
             });
         }
+        if !reserved {
+            self.throttle();
+        }
         loop {
             let observed = self.tail.load(Ordering::Acquire);
             slot.appending_at(observed);
@@ -1008,6 +1021,65 @@ impl Log {
                 }
                 return Ok(start);
             }
+        }
+    }
+
+    /// Holds a writer that is over the memory bound until the flusher
+    /// has brought it back under, or until the patience below runs out.
+    ///
+    /// Without this `memory_pages` bounds nothing while the writing is
+    /// going on. A page can only be evicted once its bytes are durable,
+    /// so under [`Durability::Async`] the writer never waits for the
+    /// device, the flusher never catches up, and the log holds the whole
+    /// load. Measured at a bound of two pages and 8 KiB values: 80 MiB
+    /// of writes peaked at 48 MiB held and 320 MiB of writes peaked at
+    /// 240 MiB, so four times the load was five times the overshoot.
+    /// Under `Durable` the same load held three pages, because there the
+    /// commit is its own back pressure. #775.
+    ///
+    /// Three things make this safe to call from a writer.
+    ///
+    /// It runs before the frontier goes out. A session that has
+    /// published where it is appending is a session the flusher waits
+    /// for, so a writer that waited for a flush while holding one would
+    /// be waiting for itself. Here there is no frontier yet, and
+    /// [`Slotted::wrote`] cleared the one from the previous record.
+    ///
+    /// It never waits without a ceiling. The wait is on the condition
+    /// variable a landed device write signals, so the common case wakes
+    /// as soon as there is something to take, but every wait has a
+    /// timeout and the whole thing gives up after [`THROTTLE_WAIT`] and
+    /// lets the writer through. Holding memory over the bound for a
+    /// while is a worse database; a writer that cannot be woken is not a
+    /// database at all.
+    ///
+    /// The engine's own sessions are not throttled. Compaction copies a
+    /// record to the tail before it can reclaim the page the record was
+    /// in, so holding a compaction pass because memory is tight would
+    /// hold the one thing that makes memory less tight.
+    fn throttle(&self) {
+        if self.memory_pages == usize::MAX
+            || self.anonymous.load(Ordering::Acquire) <= self.memory_pages
+        {
+            return;
+        }
+        for _ in 0..THROTTLE_TRIES {
+            self.wake_flusher();
+            // Take whatever the flusher has already made durable before
+            // waiting for it to make more. On the first turn this alone
+            // is usually enough, since the writer got here by opening a
+            // page and eviction stops at the first page that is not
+            // flushed rather than at the first page it cannot have.
+            self.evict_behind(page_of(self.tail()));
+            self.retire_pages();
+            if self.anonymous.load(Ordering::Acquire) <= self.memory_pages {
+                return;
+            }
+            let state = self.flushing.lock().expect("zu2 flush state");
+            let _ = self
+                .synced
+                .wait_timeout(state, THROTTLE_WAIT / THROTTLE_TRIES as u32)
+                .expect("zu2 throttle wait");
         }
     }
 

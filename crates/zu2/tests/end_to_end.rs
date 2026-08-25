@@ -296,13 +296,94 @@ fn a_record_that_left_memory_still_reads() {
     }
 }
 
+/// The bound holds while the writing is going on, and not only after it
+/// stops.
+///
+/// A page can only be evicted once its bytes are durable, so under
+/// `Async` nothing used to connect the writer to the flusher and the
+/// log held the whole load: at a bound of two pages, 80 MiB of writes
+/// peaked at 48 MiB held and 320 MiB peaked at 240, four times the load
+/// for five times the overshoot. #775 put back pressure on the append
+/// path, and this is what says so.
+///
+/// The ceiling is generous on purpose. The writer's patience runs out
+/// after ten milliseconds and then it takes the memory anyway, which is
+/// the right way round for liveness, so a machine whose flusher is
+/// starved can go over. What it cannot do is go over by an amount that
+/// scales with the load, and eight pages against a load of eighty is
+/// the assertion that it does not: to gain a single page over the bound
+/// a writer has to get through five hundred appends of eight kilobytes,
+/// which at ten milliseconds of patience each is five seconds of a
+/// flusher that has stopped answering.
+#[test]
+fn the_page_bound_holds_while_the_writing_is_going() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bound = 2;
+    let db = Arc::new(
+        Db::create(
+            &dir.path().join("w.zu2"),
+            Options {
+                durability: Durability::Async,
+                mutable_pages: 1,
+                memory_pages: bound,
+                max_pages: 512,
+                index_buckets: 1 << 12,
+                compact_below: 0,
+                ..Options::default()
+            },
+        )
+        .expect("create"),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let watcher = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        let peak = Arc::clone(&peak);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(db.resident_pages(), Ordering::Relaxed);
+            }
+        })
+    };
+    {
+        let mut s = db.session();
+        let big = vec![b'v'; 8192];
+        // 320 MiB of appends, eighty times the bound.
+        for i in 0..40_000u32 {
+            s.upsert(&key(i), &big).expect("upsert");
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().expect("watcher");
+
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(
+        peak <= 8,
+        "a database with a bound of {bound} pages held {peak} while writing 320 MiB"
+    );
+
+    // And it still reads back, which is what the back pressure is not
+    // allowed to cost.
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in (0..40_000u32).step_by(397) {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost key {i}");
+        assert_eq!(out.len(), 8192, "key {i} came back short");
+    }
+}
+
 /// The bound is a bound on the steady state, so it has to hold once the
 /// writing stops.
 ///
 /// Eviction runs where a thread opens a page and it can only drop a
 /// page whose bytes are already on the device, so a burst of async
 /// appends outruns the flusher and leaves the last pages resident. That
-/// is expected while the burst is going on. What is not is that the
+/// used to be expected while the burst was going on, until #775 made the
+/// writer wait for the flusher rather than run away from it. What is not
 /// last thing to open a page is the last append, so when the flusher
 /// catches up a moment later there is nobody left to notice, and a
 /// database that has stopped writing sits above its bound for as long

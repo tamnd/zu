@@ -722,6 +722,19 @@ impl Log {
         // The pages go back after the boundary moves, so a session that
         // was already walking a chain either sees the old boundary and
         // real bytes, or the new one and stops before it asks.
+        //
+        // The range is a run at the bottom and that is worth saying out
+        // loud, because #768 leans on it. A mapped page goes back to
+        // `PROT_NONE` inside one reservation, and the kernel merges the
+        // pages that are still mapped into a single region only while
+        // they are contiguous: drop every other page and the one region
+        // becomes 512 again. What keeps them contiguous is that the two
+        // things which ever drop a mapped page take them from the
+        // bottom of the run. Here it is `from..upto`, a prefix by
+        // construction. In `evict_behind` it is the head boundary
+        // walking up. Anything that learns to drop a page from the
+        // middle, a read bit or a per page policy, gets the old
+        // behaviour back and has to say so.
         for page in page_of(from)..page_of(upto) {
             let Some(slot) = self.page_slot(page) else {
                 continue;

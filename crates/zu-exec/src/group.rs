@@ -326,11 +326,11 @@ pub(crate) struct GroupTable {
 /// covers the many-groups-of-one queries that never grow past a handful.
 const INIT_SLOTS: usize = 64;
 
-/// Groups a hand needs before the finished rows are worth building on
-/// more than one thread. Four thousand of them is a few hundred
-/// microseconds of decoding, which is well clear of what a latch and a
-/// lock per hand cost, and it keeps every query that groups into tens
-/// or hundreds on the one thread it was already answered on.
+/// Groups a hand needs before ordering them and building their rows is
+/// worth more than one thread. Four thousand of them is a few hundred
+/// microseconds of sorting and decoding, which is well clear of what a
+/// latch and a lock per hand cost, and it keeps every query that groups
+/// into tens or hundreds on the one thread it was already answered on.
 const SPLIT_ROWS: usize = 4096;
 
 const IDX_MASK: u64 = (1 << 48) - 1;
@@ -842,56 +842,128 @@ impl GroupTable {
         } else {
             (0..self.groups as u32).collect()
         };
+        // Ordering and decoding are both per group and the groups are
+        // settled by now, so the pool the scan has just finished with can
+        // take both. `hands` is the run's worker count and not the
+        // machine's, because a query asked to run on one worker is
+        // answered on one worker, tail included. Under the split neither
+        // is worth a latch and a lock per hand.
+        let hands = hands.min(order.len() / SPLIT_ROWS);
+        if hands < 2 {
+            self.sort_groups(&mut order);
+            return self.build(&order, item_agg);
+        }
+        let total = order.len();
+        let mut buckets = self.split_groups(order, hands);
+        {
+            let me = &self;
+            let (head, rest) = buckets.split_at_mut(1);
+            let slots: Vec<Mutex<Option<Vec<Vec<Value>>>>> =
+                rest.iter().map(|_| Mutex::new(None)).collect();
+            let mine = {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = rest
+                    .iter_mut()
+                    .zip(&slots)
+                    .map(|(bucket, slot)| {
+                        Box::new(move || {
+                            me.sort_groups(bucket);
+                            *slot.lock().unwrap() = Some(me.build(bucket, item_agg));
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                let pending = crate::pool::submit(jobs);
+                me.sort_groups(&mut head[0]);
+                let mine = me.build(&head[0], item_agg);
+                pending.wait();
+                mine
+            };
+            let mut out = mine;
+            out.reserve(total - out.len());
+            for (slot, bucket) in slots.into_iter().zip(rest.iter_mut()) {
+                // A slot still empty after the latch means that hand
+                // panicked, and its rows are gone. Its bucket is still
+                // here and still holds the same groups, sorted or not,
+                // so doing the pair over keeps the answer whole and
+                // costs the panic handler's path only.
+                match slot.into_inner().unwrap() {
+                    Some(rows) => out.extend(rows),
+                    None => {
+                        me.sort_groups(bucket);
+                        out.extend(me.build(bucket, item_agg));
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// Puts a set of groups in key ascending order.
+    ///
+    /// Reads the key kind once and sorts under that rather than asking
+    /// [`GroupTable::cmp_groups`] per pair, because this is the one place
+    /// that compares a group tens of times over.
+    fn sort_groups(&self, groups: &mut [u32]) {
         if self.counting {
             let part = self.parts[0];
-            order.sort_unstable_by(|&a, &b| {
+            groups.sort_unstable_by(|&a, &b| {
                 cmp_word(part, self.slots[a as usize][0], self.slots[b as usize][0])
             });
         } else {
-            order.sort_unstable_by(|&a, &b| self.cmp_keys(a as usize, b as usize));
+            groups.sort_unstable_by(|&a, &b| self.cmp_keys(a as usize, b as usize));
         }
-        // Decoding is per group and the groups are settled by now, so
-        // the slices of the order are independent and the pool the scan
-        // has just finished with is sitting there. `hands` is the run's
-        // worker count and not the machine's, because a query asked to
-        // run on one worker is answered on one worker, tail included.
-        // Under the split it is not worth a latch and two locks.
-        let hands = hands.min(order.len() / SPLIT_ROWS);
-        if hands < 2 {
-            return self.build(&order, item_agg);
+    }
+
+    /// Splits the groups into `hands` ascending key ranges, so that
+    /// sorting each range and laying them end to end is the sort.
+    ///
+    /// Sorting the whole vector first and then cutting it into equal
+    /// slices would be the same ranges, but the sort would be the one
+    /// serial thing left in a query that is otherwise all on the pool,
+    /// and on a hundred thousand groups it is a couple of milliseconds
+    /// of chasing a random word per compare. Splitting first costs one
+    /// pass with a binary search over a handful of pivots per group,
+    /// which is a few compares against a pivot list small enough to stay
+    /// in cache, and leaves every compare after it on a hand.
+    ///
+    /// The pivots come from every `step`th group, taken before anything
+    /// is ordered. Groups sit here in the order they were first seen,
+    /// which is the order their keys turned up in the scan, so a stride
+    /// through them is a fair sample of the keys whether the column
+    /// arrived shuffled or already sorted. Uneven ranges cost a hand
+    /// some idle time and nothing else, so eight samples a hand is
+    /// enough to keep that small without the sample itself mattering.
+    fn split_groups(&self, groups: Vec<u32>, hands: usize) -> Vec<Vec<u32>> {
+        const PER_HAND: usize = 8;
+        debug_assert!(groups.len() >= hands, "a range apiece at the least");
+        let step = (groups.len() / (hands * PER_HAND)).max(1);
+        let mut sample: Vec<u32> = groups.iter().copied().step_by(step).collect();
+        self.sort_groups(&mut sample);
+        let pivots: Vec<u32> = (1..hands)
+            .map(|i| sample[i * sample.len() / hands])
+            .collect();
+        let room = groups.len() / hands;
+        let mut buckets = vec![Vec::with_capacity(room + room / 4); hands];
+        for g in groups {
+            // How many pivots this group is at or past, which is its
+            // range. The pivots ascend, so the answer is a partition
+            // point rather than a walk.
+            let at = pivots.partition_point(|&p| self.cmp_groups(p, g) != Ordering::Greater);
+            buckets[at].push(g);
         }
-        let slices: Vec<&[u32]> = order.chunks(order.len().div_ceil(hands)).collect();
-        let slots: Vec<Mutex<Option<Vec<Vec<Value>>>>> =
-            slices[1..].iter().map(|_| Mutex::new(None)).collect();
-        let mine = {
-            let me = &self;
-            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = slices[1..]
-                .iter()
-                .zip(&slots)
-                .map(|(slice, slot)| {
-                    Box::new(move || {
-                        *slot.lock().unwrap() = Some(me.build(slice, item_agg));
-                    }) as Box<dyn FnOnce() + Send + '_>
-                })
-                .collect();
-            let pending = crate::pool::submit(jobs);
-            let mine = self.build(slices[0], item_agg);
-            pending.wait();
-            mine
-        };
-        let mut out = mine;
-        out.reserve(order.len() - out.len());
-        for (slot, slice) in slots.into_iter().zip(&slices[1..]) {
-            // A slot still empty after the latch means that hand
-            // panicked, and the rows it was building are gone. Building
-            // them here keeps the answer whole and costs the panic
-            // handler's path only.
-            match slot.into_inner().unwrap() {
-                Some(rows) => out.extend(rows),
-                None => out.extend(self.build(slice, item_agg)),
-            }
+        buckets
+    }
+
+    /// Two groups of this table, compared by the keys they hold.
+    fn cmp_groups(&self, a: u32, b: u32) -> Ordering {
+        if self.counting {
+            cmp_word(
+                self.parts[0],
+                self.slots[a as usize][0],
+                self.slots[b as usize][0],
+            )
+        } else {
+            self.cmp_keys(a as usize, b as usize)
         }
-        out
     }
 
     /// The rows for one slice of the settled order.
@@ -1431,6 +1503,74 @@ mod tests {
             "wide enough that the split is taken"
         );
         assert_eq!(t.rows(&[false, true], 8), same.rows(&[false, true], 1));
+    }
+
+    /// The counting table takes the same split, and its groups live in
+    /// the slots rather than in the key words, so it gets its own pass.
+    #[test]
+    fn many_hands_answer_what_one_hand_answers_counting() {
+        let words: Vec<u64> = (0..200_000).map(|i: u64| (i * 7919) % 20_000).collect();
+        let mut t = GroupTable::counting(vec![PartKind::Int], 1);
+        t.count_ints(&words);
+        let mut same = GroupTable::counting(vec![PartKind::Int], 1);
+        same.count_ints(&words);
+        assert!(t.groups() > SPLIT_ROWS * 2, "wide enough for the split");
+        assert_eq!(t.rows(&[false, true], 8), same.rows(&[false, true], 1));
+    }
+
+    /// The same check on a table whose keys arrived already in order,
+    /// which is the case where a stride through the groups samples an
+    /// ordered list rather than a shuffled one.
+    #[test]
+    fn many_hands_answer_what_one_hand_answers_on_sorted_input() {
+        let vals: Vec<i64> = (0..200_000).map(|i| i / 10).collect();
+        let mut t = GroupTable::new(vec![PartKind::Int], 1);
+        count_ints(&mut t, &vals);
+        let mut same = GroupTable::new(vec![PartKind::Int], 1);
+        same.merge_from(&t).unwrap();
+        assert!(t.groups() > SPLIT_ROWS * 2, "wide enough for the split");
+        assert_eq!(t.rows(&[false, true], 8), same.rows(&[false, true], 1));
+    }
+
+    /// The split has to hand every group to exactly one range, and the
+    /// ranges have to ascend, or laying them end to end is not the sort.
+    /// It should also split them somewhere near evenly, since a hand
+    /// that gets most of the groups is the serial sort back again.
+    #[test]
+    fn the_split_covers_every_group_once_and_the_ranges_ascend() {
+        let vals: Vec<i64> = (0..200_000).map(|i| (i * 7919) % 20_000).collect();
+        let mut t = GroupTable::new(vec![PartKind::Int], 1);
+        count_ints(&mut t, &vals);
+        let groups: Vec<u32> = (0..t.groups as u32).collect();
+        let want = groups.len();
+        let buckets = t.split_groups(groups, 8);
+        let mut seen: Vec<u32> = buckets.iter().flatten().copied().collect();
+        assert_eq!(seen.len(), want, "no group dropped or handed out twice");
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), want);
+        let mut last = i64::MIN;
+        for bucket in &buckets {
+            assert!(
+                bucket.len() < want / 2,
+                "a range with {} of {want} groups is not a split",
+                bucket.len()
+            );
+            let (mut low, mut high) = (i64::MAX, i64::MIN);
+            for &g in bucket {
+                let key = t.keys[g as usize * t.stride] as i64;
+                low = low.min(key);
+                high = high.max(key);
+            }
+            if bucket.is_empty() {
+                continue;
+            }
+            assert!(
+                low > last,
+                "range starts at {low}, the one before ended {last}"
+            );
+            last = high;
+        }
     }
 
     /// A date is the one lane stored narrower than the word it rides in,

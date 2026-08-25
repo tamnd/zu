@@ -2226,6 +2226,24 @@ pub unsafe extern "C" fn zu2_index_bytes(db: *const Zu2Db) -> u64 {
     }
 }
 
+/// Mappings the kernel refused since the database was opened.
+///
+/// Zero on every healthy run and on every run with `map_settled` off,
+/// since nothing asked. A number here means the option asked and did not
+/// get what it asked for, which is what the memory figures look like when
+/// the process is at `vm.max_map_count`, and it is the difference between
+/// a database that settled and one that gave up. #769.
+///
+/// # Safety
+/// `db` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_remap_refused(db: *const Zu2Db) -> u64 {
+    match unsafe { handle(db) } {
+        Some(handle) => handle.db.remap_refused(),
+        None => 0,
+    }
+}
+
 /// Records a read moved out of the cold tier and back into the log.
 ///
 /// The cost side of `promote_reads`: it says how much writing the reads

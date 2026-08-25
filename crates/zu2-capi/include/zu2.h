@@ -568,6 +568,13 @@ uint64_t zu2_anonymous_pages(const zu2_db *db);
  * this rises at a doubling and never at a key. */
 uint64_t zu2_index_bytes(const zu2_db *db);
 
+/* Mappings the kernel refused since the database was opened. Zero on a
+ * healthy run and on a run with map_settled off, since nothing asked. A
+ * number here is what the memory figures look like when the process is
+ * at vm.max_map_count, and it is the difference between a database that
+ * settled and one that gave up. */
+uint64_t zu2_remap_refused(const zu2_db *db);
+
 /* Records a read moved out of the cold tier and back into the log,
  * which is the cost side of promote_reads. */
 uint64_t zu2_promoted(const zu2_db *db);

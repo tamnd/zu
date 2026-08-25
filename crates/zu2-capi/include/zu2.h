@@ -219,7 +219,14 @@ typedef struct zu2_options {
    *
    * It does not change how many pages are resident, only what kind of
    * memory they are, and the read of a mapped page is a fault where the
-   * read of a heap page is a load. Off until that has been measured. */
+   * read of a heap page is a load. Off until that has been measured.
+   *
+   * Turning it on reserves max_pages of address space at open, so VSZ
+   * goes up by 256 GiB at the default and none of it is memory: it is
+   * PROT_NONE and MAP_NORESERVE, nothing is resident in it and nothing
+   * is charged for it. RSS is unchanged. The reservation is what keeps
+   * the mapped pages in one region of address space instead of one per
+   * page, and a host that refuses it gets the mapping without it. */
   uint32_t map_settled;
 } zu2_options;
 

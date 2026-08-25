@@ -164,6 +164,17 @@ pub struct Options {
     /// page cache it can drop and fault back. Off by default until the
     /// cost of the fault has been measured against the load it replaces
     /// on a host that publishes numbers. #757.
+    ///
+    /// Visible from outside in one way that surprises. Turning this on
+    /// reserves [`Options::max_pages`] of address space at open, so
+    /// `VSZ` goes up by 256 GiB at the default, and none of it is
+    /// memory: it is `PROT_NONE` and `MAP_NORESERVE`, nothing is
+    /// resident in it, nothing is charged for it, and touching it
+    /// faults. `RSS` is unchanged. The reservation is what keeps the
+    /// mapped pages in one region of address space instead of one a
+    /// page, which is #768, and a host that refuses it, an `RLIMIT_AS`
+    /// below the size being the way that happens, gets the mapping
+    /// without it rather than no mapping.
     pub map_settled: bool,
     /// Concurrent sessions the epoch table has room for.
     pub sessions: usize,

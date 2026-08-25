@@ -24,8 +24,8 @@ use zu_query::exec::{Options, QueryResult, Sink, Streaming, Value};
 use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
-    Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
-    VecEncoding,
+    Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, PooledArena, SelVector, StrView,
+    ValueVector, VecEncoding,
 };
 
 use crate::columns;
@@ -1165,7 +1165,7 @@ struct Worker<'a> {
     /// schedule. Empty for work that is not cut along a frontier.
     fronts: &'a [Arc<FrontierList>],
     snap: SnapHandle<'a>,
-    arena: MorselArena,
+    arena: PooledArena,
     /// Pinned CSR groups, keyed (rel, backward, group). Pins are Arc
     /// pairs; the cache lives for the query, across morsels.
     pins: IdMap<(RelId, bool, u32), CsrPin>,
@@ -1353,7 +1353,7 @@ impl<'a> Worker<'a> {
             seeded: &sched.seeded,
             fronts: &sched.fronts,
             snap,
-            arena: MorselArena::new(),
+            arena: MorselArena::pooled(),
             pins: IdMap::default(),
             scan_cols: plan.levels[0]
                 .cols

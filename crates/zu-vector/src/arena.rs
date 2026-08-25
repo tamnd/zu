@@ -176,6 +176,102 @@ impl MorselArena {
         self.blocks.iter().map(|b| b.bytes).sum()
     }
 
+    /// An arena off this thread's pool, or a new one when the pool is
+    /// empty, handed back to the pool when it is dropped.
+    ///
+    /// An arena is born per run and dies with it, so a warm query that
+    /// allocates nothing per morsel still pays three trips to the heap
+    /// before its first row: the block list, the generation counter and
+    /// the first block, which at eight kilobytes is most of what a warm
+    /// point read asks the allocator for. None of that is about the run.
+    /// A thread runs one worker at a time and the pool threads outlive
+    /// any one query, so the arena the last query left is the arena this
+    /// one wants.
+    ///
+    /// Reuse is safe for the same reason a reset is: taking one resets
+    /// it, which moves the generation, so a buffer that outlived the
+    /// query it was cut from fails its tag in debug rather than reading
+    /// the next query's bytes.
+    pub fn pooled() -> PooledArena {
+        let arena = POOL.with(|p| p.borrow_mut().pop()).map(|mut a| {
+            a.reset();
+            a
+        });
+        PooledArena {
+            arena: arena.or_else(|| Some(MorselArena::new())),
+        }
+    }
+
+    /// Drops every block but the first, which is what an arena that grew
+    /// for one wide query hands back so the next small one does not keep
+    /// its memory.
+    fn shrink(&mut self) {
+        self.blocks.truncate(1);
+        self.cur = 0;
+        self.off = 0;
+    }
+}
+
+/// Arenas one thread keeps between runs. One is the working number,
+/// since a thread runs one worker at a time; the rest of the room is for
+/// a run that nests, which costs a pointer each and saves that run the
+/// same three allocations.
+const POOL_ARENAS: usize = 4;
+
+/// The most an arena may still hold when it comes back and be kept
+/// whole. A query that grew past this grew for itself, and holding its
+/// blocks on the thread would charge every later query for it, so it is
+/// cut back to its first block and kept for that.
+const POOL_KEEP_BYTES: usize = BLOCK_BYTES;
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<MorselArena>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An arena on loan from this thread's pool.
+///
+/// It is a [`MorselArena`] in every way that matters, through `Deref`,
+/// and the only thing it adds is where it goes when it is dropped.
+pub struct PooledArena {
+    /// Always `Some` until the drop takes it.
+    arena: Option<MorselArena>,
+}
+
+impl std::ops::Deref for PooledArena {
+    type Target = MorselArena;
+
+    fn deref(&self) -> &MorselArena {
+        self.arena.as_ref().expect("arena is taken only on drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledArena {
+    fn deref_mut(&mut self) -> &mut MorselArena {
+        self.arena.as_mut().expect("arena is taken only on drop")
+    }
+}
+
+impl Drop for PooledArena {
+    fn drop(&mut self) {
+        let Some(mut arena) = self.arena.take() else {
+            return;
+        };
+        if arena.capacity() > POOL_KEEP_BYTES {
+            arena.shrink();
+        }
+        // A thread on its way out has already torn its locals down, and
+        // an arena that cannot be handed back is simply dropped here.
+        let _ = POOL.try_with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < POOL_ARENAS {
+                pool.push(arena);
+            }
+        });
+    }
+}
+
+impl MorselArena {
     #[cfg(debug_assertions)]
     fn tag(&self, mut buf: RawBuf) -> RawBuf {
         buf.tag = Some((
@@ -407,6 +503,67 @@ mod tests {
             )
         };
         buf.as_mut_slice::<u64>()[0] = 1;
+    }
+
+    #[test]
+    fn a_pooled_arena_comes_back_with_the_block_the_last_run_left() {
+        // On a thread of its own, because the pool is per thread and
+        // what is being checked is what one thread hands itself between
+        // two runs.
+        std::thread::spawn(|| {
+            let first = {
+                let mut arena = MorselArena::pooled();
+                let _ = arena.alloc_of::<u64>(64);
+                arena.blocks[0].ptr
+            };
+            let mut arena = MorselArena::pooled();
+            assert_eq!(arena.capacity(), FIRST_BLOCK_BYTES, "the block is kept");
+            assert_eq!(arena.blocks[0].ptr, first, "and it is the same block");
+            // Taken means reset, so the second run bumps from the top of
+            // it rather than from where the first one stopped.
+            assert_eq!(arena.alloc_of::<u64>(64).as_slice::<u64>().len(), 64);
+            assert_eq!(arena.capacity(), FIRST_BLOCK_BYTES, "nothing new is taken");
+        })
+        .join()
+        .expect("thread");
+    }
+
+    #[test]
+    fn an_arena_that_grew_for_one_run_does_not_charge_the_next() {
+        std::thread::spawn(|| {
+            {
+                let mut arena = MorselArena::pooled();
+                let _ = arena.alloc(64, 64);
+                for _ in 0..8 {
+                    arena.alloc(BLOCK_BYTES, 64);
+                }
+                assert!(arena.capacity() > POOL_KEEP_BYTES, "this run went wide");
+            }
+            let arena = MorselArena::pooled();
+            assert_eq!(
+                arena.capacity(),
+                FIRST_BLOCK_BYTES,
+                "a wide run hands back its first block and no more"
+            );
+        })
+        .join()
+        .expect("thread");
+    }
+
+    #[test]
+    #[should_panic(expected = "arena was reset")]
+    #[cfg(debug_assertions)]
+    fn a_buffer_that_outlived_its_run_fails_on_the_next_one() {
+        // Reuse is only as safe as the reset, and this is the reset: a
+        // buffer that escaped the run it was cut from reads as a use
+        // after reset on the run that takes the arena next, rather than
+        // quietly reading that run's bytes.
+        let buf = {
+            let mut arena = MorselArena::pooled();
+            arena.alloc_of::<u64>(8)
+        };
+        let _next = MorselArena::pooled();
+        let _ = buf.as_slice::<u64>();
     }
 
     #[test]

@@ -58,7 +58,7 @@ use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
 use crate::zu1::graph::{Direction, EdgePatch, GraphReader};
 use crate::zu1::props::{
     CellPatch, LabelPatch, PropColumn, PropsDirectory, RowPatch, load_props, load_rel_props,
-    stored_label_word,
+    stored_label_word, zoned,
 };
 use crate::zu1::txn::{Cell, Deferred, Mvcc, WriteTxn};
 use crate::zu1::wal::{Commits, Wal};
@@ -1438,7 +1438,17 @@ fn row_of(width: usize, cols: &[(u32, Cell)]) -> Vec<Cell> {
 /// a word goes over the word a lane column holds, and bytes go over the
 /// bytes a blob column holds. Nothing goes over a value that is not
 /// there, which is why an absent one is refused here.
+///
+/// A zoned column takes neither. It rides the lane and its value is two
+/// numbers, and a cell is one, so a word written over it would keep the
+/// instant and lose the zone. Nothing makes such a cell today, because
+/// no statement writes a zoned value, and saying so here is what keeps
+/// it that way rather than leaving a silent half write for whichever
+/// path reaches it first.
 fn holds(column: &PropColumn, value: &Cell) -> bool {
+    if zoned(&column.ty) {
+        return false;
+    }
     match value {
         Cell::Int(_) => column.is_lane(),
         Cell::Str(_) => !column.is_lane(),

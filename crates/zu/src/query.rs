@@ -21,7 +21,9 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::{NULL_BLOCK, Zu1File};
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{ListElement, PropsReader, list_elements, load_props, load_props_at};
+use crate::zu1::props::{
+    ListElement, PropsReader, list_elements, load_props, load_props_at, zoned,
+};
 use zu_common::{FloatBits, LogicalType, Temporal};
 
 /// The same rows read down their columns, which is the shape every
@@ -274,10 +276,13 @@ fn word_value(ty: &LogicalType, word: u64, key: &str) -> Result<Value> {
     })
 }
 
-/// A column zu can store but the runtime has no value for yet. The
-/// zoned temporal types are stored here before the lane can carry the
-/// offset that makes them zoned, so a read of one says what it met
-/// rather than handing back a word dressed as an integer.
+/// A column zu can store but the runtime has no value for yet, which
+/// says what it met rather than handing back a word dressed as
+/// something else.
+///
+/// A zoned column no longer reaches this. It is two planes rather than
+/// one word, so it is read above by the only caller that has both of
+/// them, and what is left here is the types with no column at all.
 fn unreadable(ty: &LogicalType, key: &str) -> ZuError {
     ZuError::InvalidArgument(format!(
         "property '{key}' holds {ty}, which this engine cannot yet read into a value"
@@ -615,6 +620,18 @@ fn column_value(
         return Ok(Value::Null);
     }
     let ty = reader.columns()[col].ty.clone();
+    // A zoned value is the one column whose row is two reads, because
+    // it is two numbers: the instant, which is the lane and is what
+    // every comparison saw, and the offset it was written with, which
+    // is the plane beside it and is what makes it print where it was
+    // written rather than in UTC.
+    if zoned(&ty) {
+        let (nanos, offset) = reader.read_zoned(db, col, row)?;
+        return Ok(Value::Temporal(match ty {
+            LogicalType::ZonedTime => Temporal::ZonedTime { nanos, offset },
+            _ => Temporal::ZonedDatetime { nanos, offset },
+        }));
+    }
     if reader.columns()[col].is_lane() {
         let word = reader.read_int(db, col, row)?;
         return word_value(&ty, word, key);

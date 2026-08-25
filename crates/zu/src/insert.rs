@@ -748,6 +748,26 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
         {
             Cell::Int(*n as u64)
         }
+        // A zoned column holds two numbers, the instant and the offset
+        // it was written with, and a cell is one word. So this is not
+        // the value failing to be one of the type, which it is, but the
+        // carrier between here and the column having room for half of
+        // it, and the message says which of the two it is. A word
+        // written with the zone dropped would be an instant that prints
+        // in the wrong place, and that is a wrong answer rather than a
+        // missing one.
+        (
+            LogicalType::ZonedTime | LogicalType::ZonedDatetime,
+            Value::Temporal(Temporal::ZonedTime { .. } | Temporal::ZonedDatetime { .. }),
+        ) => {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                format!(
+                    "property '{key}' holds {ty}, and a statement has nowhere to put the zone of one yet"
+                ),
+            )
+            .about(Subject::Property(key.to_string())));
+        }
         // A null goes in whatever the column holds, because an absence
         // is not a value of a type and no type refuses one. The store
         // keeps it the way it keeps every other one, as a clear

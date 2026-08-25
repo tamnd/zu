@@ -160,6 +160,15 @@ pub fn verify(path: &Path) -> Result<u64> {
                     bytes += meta.payload_len;
                     live.extend(meta.blocks.iter().copied());
                 }
+                // The zone plane of a zoned column, which is a segment
+                // of the directory like any other and would read as a
+                // leak if the walk did not know it was there.
+                if let Some(meta) = &col.zones {
+                    values.clear();
+                    segment::read_segment(&mut db, meta, &mut values)?;
+                    bytes += meta.payload_len;
+                    live.extend(meta.blocks.iter().copied());
+                }
             }
             // The label bitset is checked against the catalog, which is
             // the only place that says what a bit means: a row may carry
@@ -281,6 +290,15 @@ pub fn verify(path: &Path) -> Result<u64> {
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());
                 if let Some(meta) = &col.validity {
+                    values.clear();
+                    segment::read_segment(&mut db, meta, &mut values)?;
+                    bytes += meta.payload_len;
+                    live.extend(meta.blocks.iter().copied());
+                }
+                // The zone plane of a zoned column, which is a segment
+                // of the directory like any other and would read as a
+                // leak if the walk did not know it was there.
+                if let Some(meta) = &col.zones {
                     values.clear();
                     segment::read_segment(&mut db, meta, &mut values)?;
                     bytes += meta.payload_len;

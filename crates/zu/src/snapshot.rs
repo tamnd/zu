@@ -28,7 +28,7 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{PropsReader, load_props, load_rel_props};
+use crate::zu1::props::{PropsReader, load_props, load_rel_props, zoned};
 
 /// Whether every neighbor list is to be read on its own, whatever the
 /// group it sits in costs. Read once: this sits under the walk and the
@@ -464,6 +464,19 @@ fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
         return Err(ZuError::InvalidArgument(format!(
             "column {col} out of 0..{}",
             reader.columns().len()
+        )));
+    }
+    // A zoned column rides the lane and is not a lane the vector layer
+    // has: what the words hold is instants, and the offsets that make
+    // them zoned are a plane a vector has no room for. `vector_col`
+    // already keeps one out of a plan, and this is the same rule said
+    // where the read happens, so a caller that reached here another way
+    // is refused rather than handed instants dressed as integers.
+    let column = &reader.columns()[ix];
+    if zoned(&column.ty) {
+        return Err(ZuError::InvalidArgument(format!(
+            "column '{}' holds {}, which the vector layer has no lane for",
+            column.name, column.ty
         )));
     }
     Ok(ix)

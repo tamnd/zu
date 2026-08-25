@@ -242,6 +242,17 @@ pub fn ingest_nodes(
                 stored.name, stored.ty
             )));
         }
+        // An ingest seals one segment a column, and a zoned column is
+        // two planes, so what would be sealed here is the instants
+        // alone and the offsets beside them would be dropped without
+        // anything saying so. That is a wrong answer rather than a
+        // missing one, which is why it is refused and not deferred.
+        if crate::props::zoned(&stored.ty) {
+            return Err(ZuError::Unsupported {
+                what: "ingesting into a zoned column, which is two planes and not one",
+                id: col,
+            });
+        }
         // An appended row would have no bit in the column's validity
         // mask, and there is no way in this call to say whether it
         // holds a value. Refused here rather than at the fold, so the

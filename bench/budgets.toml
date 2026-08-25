@@ -735,6 +735,25 @@ exec_scale_8x = 2.0
 # because it has no tail and the second because a thousand groups is
 # under the split.
 #
+# That left the ordering of the groups as the one thing in the tail
+# still on a single thread. It goes to the pool by splitting before
+# sorting rather than after: the groups are cut into as many ascending
+# key ranges as there are hands, by a binary search against pivots
+# sampled every nth group, and each hand then sorts its own range and
+# builds its rows. On gamingpc, quiet, the tail alone, meaning the
+# sort and the row build and not the fold, timed in place over twenty
+# four runs of each of two separately built binaries, read 3.53 ms
+# against 2.07 at eight workers and 4.59 against 4.81 at one. The
+# whole query over ten paired alternating runs went 28.3 ms to 25.8 at
+# eight workers, 354 to 388 M rows/s, faster in eight of the ten
+# pairs, and read 90.9 against 91.6 at one worker, which is unmoved.
+# That shape scales 3.6x from one worker to eight now, against 3.2x
+# before it and 1.7x three changes ago. The rest of the gap to the
+# twelve group shape's 6.4x is the scan and not the tail: eight
+# workers each hold their own hundred thousand group table and the
+# random probe into thirty two megabytes of them is what does not
+# scale.
+#
 # The bench crosschecks the group count and the row total against the
 # generator on every run. Raise this floor, never lower it.
 exec_group_mrows_s_core = 8.0

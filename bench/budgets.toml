@@ -696,12 +696,15 @@ exec_group_mrows_s_core = 8.0
 # the key is bytes rather than a word and the group table has to hash
 # and compare them.
 #
-# It reads 41 on gamingpc and the integer shape beside it reads 94, so
-# a string key costs a little over twice what a word key does rather
-# than the four times it cost before short keys started living in
-# their own two words. Medians of three paired runs at e907ab5:
-# 311.0 ms before and 242.9 after at one worker, 44.6 and 35.8 at
-# eight, with the integer shapes unmoved either side.
+# It reads 53 on gamingpc and the integer shape beside it reads 93, so
+# a string key costs about eight tenths more than a word key does
+# rather than the three times more it cost two changes ago. Medians of
+# three paired runs each time, integer shapes unmoved either side of
+# both. At e907ab5, short keys moved into the two words their part
+# already owns in the group table: 311.0 ms to 242.9 at one worker,
+# 44.6 to 35.8 at eight. At cfbe23f, the scan built its string vector
+# straight from the bytes it decoded to: 240.2 ms to 188.2 at one
+# worker, 36.5 to 29.3 at eight.
 #
 # The floor is derived rather than measured, which is the one thing
 # worth knowing about it. Both shared vCPU hosts were saturated by

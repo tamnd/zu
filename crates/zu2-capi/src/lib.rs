@@ -1022,6 +1022,17 @@ pub unsafe extern "C" fn zu2_scan(
     };
     state.scan_bytes = buffer;
     state.scan_spans = spans;
+    // The error check comes first, the same way it does in `zu2_read`
+    // and for the same reason. A walk that failed released its own
+    // protection on the way out, so after an error this session holds
+    // nothing: recording a hold would have the next `enter` release a
+    // protection it does not own, and taking the other branch would do
+    // that release right here. Both are stores to a slot that is
+    // already idle today, and neither is a claim this wants to be
+    // making.
+    if let Err(status) = note(&mut state.error, outcome) {
+        return status;
+    }
     // Whether anything was borrowed decides whether a release is owed.
     // A scan that found every record in the mutable window borrowed
     // nothing, and holding a floor under reclamation for that would be
@@ -1030,9 +1041,6 @@ pub unsafe extern "C" fn zu2_scan(
         state.scan_held = true;
     } else {
         state.session.scan_release();
-    }
-    if let Err(status) = note(&mut state.error, outcome) {
-        return status;
     }
     // After the buffer has stopped growing and not before. A pointer
     // taken while it was still being pushed to would be into whatever

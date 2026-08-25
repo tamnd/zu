@@ -36,9 +36,16 @@
 //! once instead of one, and the same trick works on the accumulator
 //! updates, which the caller runs as its own loop over group indices.
 //!
-//! Ordering is not the table's job. Groups come out in insertion order
-//! and the sink sorts them at the end, which is where the old engine's
-//! ascending-key output is reproduced.
+//! Ordering is not the probe's job, but it is the table's. Groups are
+//! built in insertion order and put out by key ascending, which is the
+//! old engine's output, and [`GroupTable::rows`] is where that happens.
+//! It is here rather than in the sink because the sink only had the
+//! decoded `Value`s to sort, and sorting those meant building every
+//! group's key and states before knowing where any of them went. The
+//! table has the packed words, so it orders an index vector against
+//! them and decodes each group once, straight into its finished row.
+
+use std::cmp::Ordering;
 
 use zu_query::exec::Value;
 use zu_query::snapshot::TemporalLane;
@@ -781,54 +788,179 @@ impl GroupTable {
     }
 
     /// Every group as its key values and its states, insertion ordered.
-    pub(crate) fn drain(self) -> Vec<(Vec<Value>, Vec<Acc>)> {
+    #[cfg(test)]
+    pub(crate) fn drain(mut self) -> Vec<(Vec<Value>, Vec<Acc>)> {
         let mut out = Vec::with_capacity(self.groups);
         if self.counting {
             // Every counter over the same group counted the same rows,
             // so the one count in the slot answers all of them.
             for &at in &self.order {
                 let slot = self.slots[at as usize];
-                let key = match self.parts[0] {
-                    PartKind::Int => Value::Int(slot[0] as i64),
-                    PartKind::Temporal(lane) => Value::Temporal(lane.value(slot[0] as i64)),
-                    PartKind::Node | PartKind::Str => {
-                        unreachable!("counting mode is one fixed-width word")
-                    }
-                };
-                out.push((vec![key], vec![Acc::Count(slot[1] as i64); self.n_aggs]));
+                out.push((
+                    vec![self.counted_key(at)],
+                    vec![Acc::Count(slot[1] as i64); self.n_aggs],
+                ));
             }
             return out;
         }
-        let mut accs = self.accs.into_iter();
-        let mut scratch = [0u8; INLINE_MAX + 1];
+        let mut accs = std::mem::take(&mut self.accs).into_iter();
+        let mut vals = Vec::new();
         for g in 0..self.groups {
-            let base = g * self.stride;
-            let mut vals = Vec::with_capacity(self.parts.len());
-            let mut w = 0;
-            for &part in &self.parts {
-                vals.push(match part {
-                    PartKind::Int => Value::Int(self.keys[base + w] as i64),
-                    PartKind::Temporal(lane) => {
-                        Value::Temporal(lane.value(self.keys[base + w] as i64))
-                    }
-                    PartKind::Node => Value::Node {
-                        table: self.keys[base + w] as u32,
-                        offset: self.keys[base + w + 1],
-                    },
-                    PartKind::Str => {
-                        let (w0, w1) = (self.keys[base + w], self.keys[base + w + 1]);
-                        // The caller checked these bytes for UTF-8 on
-                        // the way in, so the lossy read never replaces
-                        // anything.
-                        let bytes = str_bytes(w0, w1, &self.heap, &mut scratch);
-                        Value::Str(String::from_utf8_lossy(bytes).into_owned())
-                    }
-                });
-                w += part.words();
-            }
-            out.push((vals, accs.by_ref().take(self.n_aggs).collect()));
+            self.key_into(g, &mut vals);
+            out.push((
+                std::mem::take(&mut vals),
+                accs.by_ref().take(self.n_aggs).collect(),
+            ));
         }
         out
+    }
+
+    /// Every group as one answer row, key columns ascending, with the
+    /// keys and the finalized aggregates put back in the order the
+    /// RETURN clause named them. `item_agg` is that order: true where
+    /// the item is an aggregate and false where it is a key.
+    ///
+    /// One pass rather than a drain and a sort over what the drain
+    /// built, because the drain built two vectors per group and the
+    /// sort then compared groups through the `Value`s they decoded to.
+    /// A hundred thousand groups was three hundred thousand small
+    /// allocations and a sort chasing a pointer per compare, all of it
+    /// thrown away a moment later. The order is settled over an index
+    /// vector against the stored words, so nothing is decoded until the
+    /// row is built and each row is built once, in its final place.
+    pub(crate) fn rows(mut self, item_agg: &[bool]) -> Vec<Vec<Value>> {
+        // Out of the table first, while it is still whole, so that the
+        // sort below can borrow the rest of it.
+        let states = std::mem::take(&mut self.accs);
+        let mut done: Vec<Value> = states.into_iter().map(Acc::finalize).collect();
+        let mut order: Vec<u32> = if self.counting {
+            std::mem::take(&mut self.order)
+        } else {
+            (0..self.groups as u32).collect()
+        };
+        if self.counting {
+            let part = self.parts[0];
+            order.sort_unstable_by(|&a, &b| {
+                cmp_word(part, self.slots[a as usize][0], self.slots[b as usize][0])
+            });
+        } else {
+            order.sort_unstable_by(|&a, &b| self.cmp_keys(a as usize, b as usize));
+        }
+        let mut out = Vec::with_capacity(order.len());
+        let mut keys = Vec::new();
+        for &g in &order {
+            if self.counting {
+                keys.push(self.counted_key(g));
+            } else {
+                self.key_into(g as usize, &mut keys);
+            }
+            let (mut key_at, mut agg_at) = (0, g as usize * self.n_aggs);
+            let mut row = Vec::with_capacity(item_agg.len());
+            for &is_agg in item_agg {
+                row.push(if is_agg {
+                    let v = if self.counting {
+                        Value::Int(self.slots[g as usize][1] as i64)
+                    } else {
+                        std::mem::replace(&mut done[agg_at], Value::Null)
+                    };
+                    agg_at += 1;
+                    v
+                } else {
+                    key_at += 1;
+                    std::mem::replace(&mut keys[key_at - 1], Value::Null)
+                });
+            }
+            keys.clear();
+            out.push(row);
+        }
+        out
+    }
+
+    /// The key of a group counting mode holds in slot `at`, which is
+    /// the whole group: the slot carries the key rather than an index
+    /// into the key buffer.
+    fn counted_key(&self, at: u32) -> Value {
+        let word = self.slots[at as usize][0] as i64;
+        match self.parts[0] {
+            PartKind::Int => Value::Int(word),
+            PartKind::Temporal(lane) => Value::Temporal(lane.value(word)),
+            PartKind::Node | PartKind::Str => {
+                unreachable!("counting mode is one fixed-width word")
+            }
+        }
+    }
+
+    /// The stored key of group `g`, part by part, appended to `out`.
+    fn key_into(&self, g: usize, out: &mut Vec<Value>) {
+        let base = g * self.stride;
+        let mut scratch = [0u8; INLINE_MAX + 1];
+        let mut w = 0;
+        for &part in &self.parts {
+            out.push(match part {
+                PartKind::Int => Value::Int(self.keys[base + w] as i64),
+                PartKind::Temporal(lane) => Value::Temporal(lane.value(self.keys[base + w] as i64)),
+                PartKind::Node => Value::Node {
+                    table: self.keys[base + w] as u32,
+                    offset: self.keys[base + w + 1],
+                },
+                PartKind::Str => {
+                    let (w0, w1) = (self.keys[base + w], self.keys[base + w + 1]);
+                    // The caller checked these bytes for UTF-8 on the
+                    // way in, so the lossy read never replaces anything.
+                    let bytes = str_bytes(w0, w1, &self.heap, &mut scratch);
+                    Value::Str(String::from_utf8_lossy(bytes).into_owned())
+                }
+            });
+            w += part.words();
+        }
+    }
+
+    /// Group order: the stored keys compared left to right, which is
+    /// the order the sink used to reach by decoding both groups and
+    /// comparing the `Value`s. Reading the words gives the same answer
+    /// for every kind a key part can be. An integer orders by its word.
+    /// A temporal lane orders by its word too, because every group in
+    /// one table shares the lane, so the kind that ranks ahead of the
+    /// number in the general compare is the same on both sides. A node
+    /// orders by table and then offset, which is how the two words sit.
+    /// A string orders by its bytes, which is what comparing the two
+    /// `String`s came to.
+    fn cmp_keys(&self, a: usize, b: usize) -> Ordering {
+        let (mut i, mut j) = (a * self.stride, b * self.stride);
+        let mut sa = [0u8; INLINE_MAX + 1];
+        let mut sb = [0u8; INLINE_MAX + 1];
+        for &part in &self.parts {
+            let ord = match part {
+                PartKind::Int | PartKind::Temporal(_) => cmp_word(part, self.keys[i], self.keys[j]),
+                PartKind::Node => (self.keys[i] as u32, self.keys[i + 1])
+                    .cmp(&(self.keys[j] as u32, self.keys[j + 1])),
+                PartKind::Str => str_bytes(self.keys[i], self.keys[i + 1], &self.heap, &mut sa)
+                    .cmp(str_bytes(
+                        self.keys[j],
+                        self.keys[j + 1],
+                        &self.heap,
+                        &mut sb,
+                    )),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            i += part.words();
+            j += part.words();
+        }
+        Ordering::Equal
+    }
+}
+
+/// Two words of a one word key part, compared as the values they decode
+/// to. A date is the one lane narrower than the word it rides in, so it
+/// compares through the same narrowing the decode does rather than over
+/// the bits above it.
+fn cmp_word(part: PartKind, a: u64, b: u64) -> Ordering {
+    if part == PartKind::Temporal(TemporalLane::Date) {
+        (a as i32).cmp(&(b as i32))
+    } else {
+        (a as i64).cmp(&(b as i64))
     }
 }
 
@@ -850,6 +982,8 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use zu_query::exec::OrdValue;
+
     use super::*;
 
     /// Feeds ints one per row and counts them, the shape the sink drives.
@@ -1120,5 +1254,127 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0[0], Value::Int(0));
         assert_eq!(count_of(&rows[0].1[0]), 2);
+    }
+
+    /// The order the drain used to be put in by the sink, so that the
+    /// word compare can be held to it.
+    fn by_value(rows: &mut [(Vec<Value>, Vec<Acc>)]) {
+        rows.sort_by(|a, b| {
+            a.0.iter()
+                .zip(&b.0)
+                .map(|(x, y)| OrdValue(x.clone()).cmp(&OrdValue(y.clone())))
+                .find(|o| *o != std::cmp::Ordering::Equal)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    #[test]
+    fn rows_come_out_by_key_ascending_and_in_clause_order() {
+        let mut t = GroupTable::new(vec![PartKind::Int], 1);
+        // Negative keys among them, because the words are unsigned and
+        // the order is not.
+        count_ints(&mut t, &[5, -3, 5, 0, 12, -3, -3]);
+        // count(*) first and the key second, which is what
+        // `RETURN count(*), n.k` asks for, so a row that just
+        // concatenated the two halves would come out backwards.
+        let rows = t.rows(&[true, false]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(3), Value::Int(-3)],
+                vec![Value::Int(1), Value::Int(0)],
+                vec![Value::Int(2), Value::Int(5)],
+                vec![Value::Int(1), Value::Int(12)],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_counting_table_orders_its_slots_too() {
+        // Insertion order here is 7, 1, 4, which is neither the slot
+        // order nor the answer.
+        let mut t = GroupTable::counting(vec![PartKind::Int], 1);
+        t.count_ints(&[7, 1, 4, 7, 7]);
+        let rows = t.rows(&[false, true]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(4), Value::Int(1)],
+                vec![Value::Int(7), Value::Int(3)],
+            ]
+        );
+    }
+
+    /// The point of the whole change: ordering over the packed words has
+    /// to be the ordering over the values they decode to, column by
+    /// column, for a key that has one of every kind in it.
+    #[test]
+    fn the_word_order_is_the_value_order() {
+        let parts = vec![PartKind::Node, PartKind::Str, PartKind::Int];
+        let specs = [AggSpec::CountStar];
+        // Both string forms are here on purpose: "a longer string past
+        // the inline limit" lives in the heap and the rest live in their
+        // words, and they still have to sort against each other by their
+        // bytes rather than by where the bytes are.
+        let keys: [(u64, u64, &str, i64); 8] = [
+            (2, 5, "x", 9),
+            (1, 5, "x", 9),
+            (1, 5, "x", -8),
+            (1, 4, "x", 9),
+            (1, 5, "a longer string past the inline limit", 9),
+            (1, 5, "y", 9),
+            (1, 5, "", 9),
+            (0, 0, "zz", 0),
+        ];
+        let mut t = GroupTable::new(parts.clone(), 1);
+        let mut batch = KeyBatch::default();
+        batch.reset(t.stride(), keys.len());
+        for (row, &(table, offset, s, n)) in keys.iter().enumerate() {
+            let (words, stride) = batch.words_mut();
+            words[row * stride] = table;
+            words[row * stride + 1] = offset;
+            words[row * stride + 4] = n as u64;
+            batch.set_str(row, 2, s.as_bytes());
+        }
+        let mut gids = Vec::new();
+        t.probe(&batch, &specs, &mut gids);
+        for &g in &gids {
+            t.accs_mut()[g as usize].add_star(1);
+        }
+        // The same table twice, since one of the two ways of reading it
+        // consumes it.
+        let mut same = GroupTable::new(parts, 1);
+        same.merge_from(&t).unwrap();
+        let mut expect = same.drain();
+        by_value(&mut expect);
+        let want: Vec<Vec<Value>> = expect
+            .into_iter()
+            .map(|(mut vals, accs)| {
+                vals.push(accs.into_iter().next().expect("one count").finalize());
+                vals
+            })
+            .collect();
+        assert_eq!(t.rows(&[false, false, false, true]), want);
+    }
+
+    /// A date is the one lane stored narrower than the word it rides in,
+    /// so a negative one is the case where comparing the raw word and
+    /// comparing the value part ways.
+    #[test]
+    fn dates_before_the_epoch_sort_before_the_ones_after() {
+        let lane = TemporalLane::Date;
+        let mut t = GroupTable::new(vec![PartKind::Temporal(lane)], 1);
+        count_ints(&mut t, &[10, -5, 0, -400]);
+        let rows = t.rows(&[false, true]);
+        let days: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Temporal(zu_common::Temporal::Date(d)) => i64::from(d),
+                _ => panic!("date key"),
+            })
+            .collect();
+        assert_eq!(days, [-400, -5, 0, 10]);
     }
 }

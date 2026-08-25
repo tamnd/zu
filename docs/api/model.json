@@ -4651,6 +4651,14 @@
       "doc": "A PMR chain (docs/07 §5): the executor-internal form of a\nvariable-length path. [`settle`] turns it into the edge list\nbefore any value leaves the pipeline, so results never hold one."
     },
     {
+      "id": "zu::query::Value::Decimal",
+      "kind": "variant",
+      "name": "Decimal",
+      "of": "zu::query::Value",
+      "signature": "Decimal(zu_common::Decimal)",
+      "doc": "GV17, an exact decimal: an integer of units and the scale that\nsays how large a unit is.\n\nIt is an arm of its own rather than a float because a tenth is\nnot a binary fraction, so a price held as binary64 is not the\nprice. Two decimals written at different scales are one value\nand print differently, which is why the scale rides on the\nnumber: a decimal in a `RETURN` has no column to ask."
+    },
+    {
       "id": "zu::query::Value::Float",
       "kind": "variant",
       "name": "Float",
@@ -5035,6 +5043,14 @@
       "of": "zu::query::column::ColumnType",
       "signature": "DayTime",
       "doc": "Nanoseconds."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Decimal",
+      "kind": "variant",
+      "name": "Decimal",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Decimal { scale: u16 }",
+      "doc": "GV17, exact decimals at one scale. The scale is the column's\nand not each value's: a column mixing `1.5` and `1.25` settles\non hundredths, because the wider scale holds both exactly and\nthe narrower one would round a value away."
     },
     {
       "id": "zu::query::column::ColumnType::Float",

@@ -949,19 +949,33 @@ fn intersects(plan: &ExecPlan) -> bool {
     plan.ops.iter().any(|op| matches!(op, Op::Intersect { .. }))
 }
 
-/// Splits the scan into morsels: chunk-multiple sizes targeting eight
-/// morsels per worker, never crossing a storage group boundary so a
+/// Splits the scan into morsels: chunk-multiple sizes targeting thirty
+/// two morsels per worker, never crossing a storage group boundary so a
 /// morsel's CSR pins and zone reads stay within one group.
 ///
-/// Eight rather than four because the tail decides the query: on a
+/// Many rather than few because the tail decides the query: on a
 /// machine with slow and fast cores the slow worker picks up a last
 /// morsel nobody else can finish for it, so the whole query waits on
 /// one morsel's worth of rows. Halving the morsel halves that tail.
-/// Sixteen per worker gave nothing back over eight, so the claim
-/// traffic starts costing what the shorter tail saves somewhere in
-/// between.
+/// This used to be eight, on a measurement saying sixteen gave nothing
+/// back over it, but that was taken while the pool was still losing a
+/// worker to a lost wakeup, and a query running on seven hands when it
+/// asked for eight is not measuring how well eight of them balance.
+/// With the pool fixed, thirty two beat eight over eight paired runs on
+/// a quiet 32 core box: the expand query went 1.03 ms to 0.93 ms at
+/// eight workers in seven of the eight pairs, and 5.4x scaling to 5.9x.
+///
+/// The single worker figures moved with them, the scan by five percent
+/// over eight pairs of eight, and one worker has no tail and no claim to
+/// contend over. So this is not only balance. A morsel is a pass over
+/// its rows by every operator above the scan in turn, and a shorter one
+/// is a pass whose rows are still in cache when the next operator asks
+/// for them. Thirty two of them at ten million rows and eight workers is
+/// about forty thousand rows a morsel, which is where that starts to
+/// tell. The claim traffic that pays for it is one `fetch_add` a morsel
+/// against work that is tens of microseconds.
 fn make_morsels(rows: u64, workers: usize) -> Vec<(u64, u64)> {
-    split_morsels(rows, rows / (workers as u64 * 8))
+    split_morsels(rows, rows / (workers as u64 * 32))
 }
 
 /// The same tiling with the morsel size asked for rather than derived

@@ -705,6 +705,22 @@ vec_unpack_gvals_s = 0.9
 # worker times moved 2 percent the wrong way on both, which is a
 # single worker run not going near the pool at all. The same box
 # measured 3.6 to 3.7x when the note above was written.
+#
+# With the pool no longer losing a worker it was worth asking again how
+# finely the scan should be cut, since the note in make_morsels saying
+# sixteen morsels a worker gave nothing over eight was written while a
+# query asking for eight hands was running on seven. Thirty two a
+# worker, over eight paired alternating runs on the same box: the
+# expand query 1.03 ms to 0.93 at eight workers in seven of the eight
+# pairs, 5.4x to 5.9x, and the scan query 0.62 ms to 0.60. The single
+# worker times moved with them, the scan by five percent in eight of
+# eight, and one worker has no tail and nothing to contend over, so a
+# shorter morsel is buying cache as well as balance: it is a pass over
+# rows that are still warm when the next operator above the scan asks
+# for them. The groupby bench agreed at eight workers over three runs
+# apiece, 28.3 ms to 26.6 on the hundred thousand group shape, 8.4 to
+# 7.2 on the twelve group one and 32.5 to 27.9 on the string key, all
+# of them unmoved at one worker.
 exec_scale_8x = 2.0
 
 # The grouping sink at one worker, M rows/s (perf/05 section 4): ten

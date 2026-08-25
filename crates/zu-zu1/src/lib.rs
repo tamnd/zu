@@ -21,6 +21,7 @@ pub mod meta;
 pub mod parquet;
 pub mod props;
 pub mod reorder;
+pub mod rows;
 pub mod segment;
 pub mod stats;
 pub mod txn;
@@ -149,7 +150,7 @@ pub fn verify(path: &Path) -> Result<u64> {
                     segment::read_segment(&mut db, &col.meta, &mut values)?;
                 } else {
                     let (mut blob, mut ends) = (Vec::new(), Vec::new());
-                    fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
+                    rows::read_rows(&mut db, &col.meta, &mut blob, &mut ends)?;
                 }
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());
@@ -275,7 +276,7 @@ pub fn verify(path: &Path) -> Result<u64> {
                     segment::read_segment(&mut db, &col.meta, &mut values)?;
                 } else {
                     let (mut blob, mut ends) = (Vec::new(), Vec::new());
-                    fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
+                    rows::read_rows(&mut db, &col.meta, &mut blob, &mut ends)?;
                 }
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());

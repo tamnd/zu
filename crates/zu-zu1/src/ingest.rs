@@ -27,9 +27,10 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::Catalog;
 use crate::file::{BlockPtr, Zu1File};
-use crate::fullzip::{read_blob_segment, write_blob_segment};
+use crate::fullzip::write_blob_segment;
 use crate::meta;
 use crate::props::{PropValues, load_props};
+use crate::rows::read_rows;
 use crate::segment::{SegmentMeta, read_segment, write_segment};
 use crate::txn::{IngestPayload, Mvcc};
 use crate::wal::{Wal, WalColumn, WalRecord, WalValues};
@@ -435,7 +436,7 @@ pub(crate) fn resolve(
             }
             SealKind::Blob => {
                 let (mut bytes, mut ends) = (Vec::new(), Vec::new());
-                read_blob_segment(db, &seg.meta, &mut bytes, &mut ends)?;
+                read_rows(db, &seg.meta, &mut bytes, &mut ends)?;
                 let mut values = Vec::with_capacity(ends.len());
                 let mut start = 0usize;
                 for &end in &ends {

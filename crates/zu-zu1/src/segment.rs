@@ -47,12 +47,17 @@ pub const CHUNK_ROWS: usize = 1024;
 
 /// Structural layout of a segment payload (docs/04 §3): MiniBlock packs
 /// fixed-width values in 1024-row cascade chunks, FullZip zips
-/// variable-width values with their lengths (`crate::fullzip`). The ids
-/// are format-stable; readers reject any other value by name.
+/// variable-width values with their lengths (`crate::fullzip`), and
+/// Stride lays equal-length byte rows end to end (`crate::rows`). The
+/// ids are format-stable; readers reject any other value by name.
+///
+/// The ids skip 2 and 3 because the structural byte carries the sorted
+/// flag in bit 1, so an id with that bit set would be two things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Structural {
     MiniBlock = 0,
     FullZip = 1,
+    Stride = 4,
 }
 
 /// Location and integrity data for one stored segment.
@@ -157,6 +162,7 @@ impl SegmentMeta {
         let structural = match head[48] & !2 {
             0 => Structural::MiniBlock,
             1 => Structural::FullZip,
+            4 => Structural::Stride,
             _ => {
                 return Err(ZuError::Unsupported {
                     what: "structural layout",
@@ -202,10 +208,16 @@ impl SegmentMeta {
         // payload of n bytes cannot describe more than (n - 4) / 12
         // chunks in either layout. `index_and_body` makes the same
         // deduction later, but later is after the allocation.
-        if value_count.div_ceil(CHUNK_ROWS as u64) > payload_len.saturating_sub(4) / 12 {
-            return Err(corrupt(
-                "value count needs more chunks than the payload holds",
-            ));
+        //
+        // Stride has no chunk index at all, so the bound is the rows
+        // themselves: a stride is at least one byte, after the four the
+        // stride word takes.
+        let over = match structural {
+            Structural::Stride => value_count > payload_len.saturating_sub(4),
+            _ => value_count.div_ceil(CHUNK_ROWS as u64) > payload_len.saturating_sub(4) / 12,
+        };
+        if over {
+            return Err(corrupt("value count needs more payload than there is"));
         }
         // The claimed count must fit in the bytes actually present before
         // it sizes an allocation.
@@ -1412,7 +1424,7 @@ mod tests {
         meta.encode(&mut bytes);
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(
-            format!("{err}").contains("more chunks than the payload holds"),
+            format!("{err}").contains("more payload than there is"),
             "{err}"
         );
 
@@ -1423,6 +1435,18 @@ mod tests {
         for (count, ok) in [(6 * 1024u64, true), (6 * 1024 + 1, false)] {
             let mut m = meta.clone();
             m.value_count = count;
+            let mut bytes = Vec::new();
+            m.encode(&mut bytes);
+            assert_eq!(SegmentMeta::decode(&bytes, 0).is_ok(), ok, "{count}");
+        }
+
+        // Stride has no chunk index, so its bound is the rows: an 80
+        // byte payload holds a four byte stride word and 76 rows of one
+        // byte, and 77 of anything do not fit.
+        for (count, ok) in [(76u64, true), (77, false)] {
+            let mut m = meta.clone();
+            m.value_count = count;
+            m.structural = Structural::Stride;
             let mut bytes = Vec::new();
             m.encode(&mut bytes);
             assert_eq!(SegmentMeta::decode(&bytes, 0).is_ok(), ok, "{count}");

@@ -296,8 +296,13 @@ impl Database {
     /// A new connection: its own file handle, its own caches, its own
     /// plan cache. Costs an open and a catalog load, which on the
     /// 11 GB file of the B7 gate is tens of microseconds.
+    ///
+    /// The open goes through the registry rather than ahead of it, so
+    /// that a connection made while the last one is closing waits for
+    /// the fold that close is running instead of reading the file
+    /// half way through it.
     pub fn connect(&self) -> Result<Connection> {
-        let mut session = Session::on(self.handle()?)?;
+        let mut session = Session::opening(&self.path, self.config.read_only, || self.handle())?;
         session.set_options(self.config.over(session.options().clone()));
         session.set_stale_bound(self.config.stale_bound);
         Ok(Connection {

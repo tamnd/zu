@@ -1167,6 +1167,18 @@ impl Db {
         self.core.index.bytes()
     }
 
+    /// Mappings the kernel refused since the database was opened.
+    ///
+    /// Zero on every healthy run, and zero on a run with
+    /// [`Options::map_settled`] off, since nothing asked. A number here
+    /// means the option asked and did not get what it asked for, which
+    /// is what the memory figures look like at `vm.max_map_count`, and
+    /// it is the difference between a database that settled and one that
+    /// gave up. #769.
+    pub fn remap_refused(&self) -> u64 {
+        self.core.log.remap_refused()
+    }
+
     /// Bytes the file occupies on the device, holes excluded. This is
     /// the honest storage number: a compacted log keeps its addresses
     /// but not its blocks.

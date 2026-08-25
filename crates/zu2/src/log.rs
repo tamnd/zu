@@ -341,6 +341,24 @@ pub struct Log {
     /// walk from the head to the boundary, which with no eviction floor
     /// set is the whole log and grows without bound.
     remap_from: AtomicUsize,
+    /// The lowest page a mapping was refused for, `usize::MAX` when
+    /// none was.
+    ///
+    /// The cursor above is a high water mark and a refusal is not a
+    /// reason to give a page up, so the two are separate numbers rather
+    /// than one that has to go backwards. A kernel refuses an `mmap`
+    /// when the process is at `vm.max_map_count`, which is pressure that
+    /// lifts, and stepping over the page for the life of the database
+    /// turns a temporary refusal into a permanent one. #769.
+    ///
+    /// The walk restarts here and not at the refusal itself, so the
+    /// pages above a refused one are still mapped on the call that
+    /// refused. Rewalking them costs no syscall, because a mapped slot
+    /// is recognised and stepped over.
+    remap_retry: AtomicUsize,
+    /// Mappings the kernel refused, which is what says a run stopped
+    /// mapping rather than ran out of pages to map.
+    remap_refused: AtomicU64,
     /// How far past the write frontier the blocks are reserved. Zero
     /// never reserves.
     provision_bytes: u64,
@@ -422,6 +440,8 @@ impl Log {
             map_settled,
             anonymous: AtomicUsize::new(0),
             remap_from: AtomicUsize::new(0),
+            remap_retry: AtomicUsize::new(usize::MAX),
+            remap_refused: AtomicU64::new(0),
             epochs: Epochs::new(sessions),
         }
     }
@@ -1088,8 +1108,10 @@ impl Log {
         let mut page = self
             .remap_from
             .load(Ordering::Acquire)
+            .min(self.remap_retry.load(Ordering::Acquire))
             .max(page_of(self.head()));
         let mut mapped = false;
+        let mut refused = usize::MAX;
         while page < boundary && page_start(page + 1) <= flushed {
             // Everything up to the publish is done without the lock.
             // The lock is the one the allocating path takes to open a
@@ -1108,10 +1130,22 @@ impl Log {
                 continue;
             }
             // The platform has no mapping call or the kernel refused
-            // this one. Neither is an error: the page stays where it is
-            // and the cursor moves on, so a refusal costs one syscall a
-            // page and not a retry loop.
+            // this one. Neither is an error and the page stays where it
+            // is, but they are remembered differently: the walk carries
+            // on so the pages above this one are still mapped, and the
+            // lowest refusal is kept so the next call starts there
+            // rather than above it. A kernel refuses when the process is
+            // at `vm.max_map_count` and that is pressure that lifts, so
+            // a cursor that stepped over it would turn a temporary
+            // refusal into a database that never maps anything again.
+            // #769.
+            //
+            // On a platform with no mapping call at all this retries
+            // from the same page every flush, which is a call into a
+            // function that returns `None` without a syscall.
             let Some(at) = crate::file::map_read(&self.file, page_start(page), PAGE_SIZE) else {
+                refused = refused.min(page);
+                self.remap_refused.fetch_add(1, Ordering::Relaxed);
                 page += 1;
                 continue;
             };
@@ -1135,6 +1169,12 @@ impl Log {
             page += 1;
         }
         self.remap_from.fetch_max(page, Ordering::AcqRel);
+        // A plain store and not a `fetch_min`, because this has to be
+        // able to go up as well as down: a refusal that is not there any
+        // more has to clear. Two callers racing here can lose a retry or
+        // schedule an extra one, and both are a walk that costs no
+        // syscall, so it is not worth a lock.
+        self.remap_retry.store(refused, Ordering::Release);
         if mapped {
             self.retire_pages();
         }
@@ -1145,6 +1185,17 @@ impl Log {
     /// The rest of [`Log::resident_pages`] is anonymous memory, so the
     /// difference between the two is what a memory column is actually
     /// measuring.
+    /// Mappings the kernel refused since the log was opened.
+    ///
+    /// Zero on every healthy run. A number here says `map_settled` asked
+    /// for a mapping and did not get one, which is what the memory
+    /// figures look like when the process is at `vm.max_map_count`, and
+    /// it is the difference between a database that settled and one that
+    /// gave up. #769.
+    pub fn remap_refused(&self) -> u64 {
+        self.remap_refused.load(Ordering::Relaxed)
+    }
+
     pub fn mapped_pages(&self) -> usize {
         let mut total = 0;
         for chunk in &self.chunks {

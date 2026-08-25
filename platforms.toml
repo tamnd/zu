@@ -192,9 +192,9 @@ doc = "The CLI, which is the same engine plus a shell and an argument parser."
 [[budget]]
 artifact = "zu"
 target = "x86_64-pc-windows-msvc"
-mib = 16
+mib = 17
 repo = "zu"
-doc = "The same CLI on MSVC, which is a megabyte and a half more of the same code. One tree measures 15.20 MiB here against 11.36 on darwin, and the shared library beside it 7.53 against 5.00, so the difference is the object format and the linker rather than anything the source did. A ceiling set high enough for the widest format would stop holding the six platforms that are not it, so the exception is written where it belongs and the rest keep 15."
+doc = "The same CLI on MSVC, which is a megabyte and a half more of the same code. One tree measures 15.20 MiB here against 11.36 on darwin, and the shared library beside it 7.53 against 5.00, so the difference is the object format and the linker rather than anything the source did. A ceiling set high enough for the widest format would stop holding the six platforms that are not it, so the exception is written where it belongs and the rest keep 15. It was 16 until the tree reached 16.00 and this became the one platform where every pull request was red for what the ones before it had added rather than for anything of its own. The megabyte between the two numbers has no single owner, and the shared library on the same platform sits at 8.12 of 14, so what is drifting is the CLI's own half and not the engine both share."
 
 [[budget]]
 artifact = "wheel"

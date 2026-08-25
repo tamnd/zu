@@ -62,7 +62,10 @@ use crate::txn::Cell;
 /// eight bytes, which is the first version change that is about the
 /// inside of a row rather than about the directory: nothing here moves,
 /// and `list_elements` reads a version 6 row and a version 7 one alike.
-const PROPS_VERSION: u16 = 7;
+/// Version 8 lets a column entry carry a declared type in the extended
+/// form, so a column may hold a type no single code names: `BINARY(16)`
+/// and `STRING(1,5)` were declarable and unstorable before it.
+const PROPS_VERSION: u16 = 8;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -201,6 +204,29 @@ fn type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
             Some(vec![LIST_CODE, type_code(list_elem(elem)?)?])
         }
         other => Some(vec![type_code(other)?]),
+    }
+}
+
+/// The bytes a column entry writes for its type, which is a code where
+/// a code says it and the extended form where nothing does.
+///
+/// A code stands for a whole type and there are eighteen of them, so
+/// `BINARY(16)` and `STRING(1,5)` had nowhere to go: the catalog could
+/// name them, because a name is only a promise about values, and a
+/// column could not hold one. The extended form already existed for the
+/// catalog and this is the same bytes in the same order, so a type a
+/// graph type names and a type a column holds stay one encoding.
+///
+/// A length bound is the only declaration a column takes this way for
+/// now. The rest of the extended form is a zoned temporal, which has no
+/// lane yet, and a declared list, whose element nullability a stored
+/// list does not have; both stay unstorable, and saying so here is what
+/// keeps the writer from making a file the reader below would refuse.
+fn column_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
+    match ty {
+        _ if type_bytes(ty).is_some() => type_bytes(ty),
+        LogicalType::Str { .. } | LogicalType::Bytes { .. } => extended_bytes(ty),
+        _ => None,
     }
 }
 
@@ -846,6 +872,10 @@ fn code_allowed(code: u8, version: u16) -> bool {
     match version {
         1 => code <= 1,
         2 => code != LIST_CODE,
+        // The extended form was a catalog encoding before version 8 and
+        // no column entry carried it, so one in an older directory is a
+        // file that has been edited rather than an older column.
+        3..=7 => code != EXTENDED_CODE,
         _ => true,
     }
 }
@@ -884,7 +914,7 @@ impl PropsDirectory {
             out.extend_from_slice(col.name.as_bytes());
             // Unstorable types are refused at store time, so a column
             // that reached the directory has a code.
-            out.extend_from_slice(&type_bytes(&col.ty).expect("column type is storable"));
+            out.extend_from_slice(&column_type_bytes(&col.ty).expect("column type is storable"));
             col.meta.encode(&mut out);
             match &col.validity {
                 Some(meta) => {
@@ -957,20 +987,35 @@ impl PropsDirectory {
                     )));
                 }
                 Some(&LIST_CODE) => {
-                    pos += 1;
                     let elem = bytes
-                        .get(pos)
+                        .get(pos + 1)
                         .ok_or_else(|| corrupt("truncated list element type".into()))?;
                     let elem = code_type(*elem)
                         .ok_or_else(|| corrupt(format!("unknown element type {elem}")))?;
+                    pos += 2;
                     list_of(elem)
                 }
+                // The extended form is the only type field that is not
+                // one byte or two, so it moves `pos` itself. What it
+                // may say here is narrower than what it may say in the
+                // catalog, and the writer knows the same rule, so a
+                // type this refuses is a type nothing wrote.
+                Some(&EXTENDED_CODE) => {
+                    pos += 1;
+                    let ty = decode_extended_type(bytes, &mut pos)?;
+                    if column_type_bytes(&ty).is_none() {
+                        return Err(corrupt(format!("column type {ty} is not storable")));
+                    }
+                    ty
+                }
                 Some(&code) => {
-                    code_type(code).ok_or_else(|| corrupt(format!("unknown column type {code}")))?
+                    let ty = code_type(code)
+                        .ok_or_else(|| corrupt(format!("unknown column type {code}")))?;
+                    pos += 1;
+                    ty
                 }
                 None => return Err(corrupt("truncated column type".into())),
             };
-            pos += 1;
             let (meta, next) = seg(bytes, pos, version)?;
             pos = next;
             // A directory older than version 4 has no flag byte and no
@@ -1161,6 +1206,20 @@ pub struct PropInput<'a> {
     /// an empty string is the usual choice. The mask is what a reader
     /// consults, and it is the only thing that says the row is null.
     pub validity: Option<&'a [u64]>,
+    /// The type the catalog says this column has, where that is
+    /// narrower than the type the values arrive in. `None` is a column
+    /// whose declaration is exactly what its values imply.
+    ///
+    /// This is the split of schema/06 §2 at the point it starts: the
+    /// declaration comes from the catalog, the values come from the
+    /// batch, and the encoding is chosen here from both. A caller with
+    /// no catalog to consult passes `None` and gets what it always got.
+    /// What the declaration may say is checked against every value
+    /// before anything is written, because a column that is declared
+    /// `BINARY(16)` and holds a row of 15 octets is a column whose own
+    /// type is a lie, and the first reader to trust it reads the next
+    /// row's bytes.
+    pub declared: Option<&'a LogicalType>,
 }
 
 impl<'a> PropInput<'a> {
@@ -1170,6 +1229,16 @@ impl<'a> PropInput<'a> {
             name,
             values,
             validity: None,
+            declared: None,
+        }
+    }
+
+    /// A column with a value in every row, of the type the catalog says
+    /// it has rather than the type its values imply.
+    pub fn typed(name: &'a str, values: PropValues<'a>, declared: &'a LogicalType) -> Self {
+        Self {
+            declared: Some(declared),
+            ..Self::dense(name, values)
         }
     }
 
@@ -1337,6 +1406,91 @@ fn write_props(
     written
 }
 
+/// The octet count every row of a column of this type holds, for a
+/// declaration that fixes one. `None` is a column whose rows may differ
+/// in length.
+///
+/// A character bound is not one of these. `STRING(5,5)` is five
+/// characters and a character is one to four octets, so the width it
+/// fixes is a width in a unit the storage does not count in. A bound on
+/// characters is a check; a bound on octets is a layout.
+pub(crate) fn fixed_octets(ty: &LogicalType) -> Option<u32> {
+    match ty {
+        LogicalType::Bytes {
+            min: Some(min),
+            max: Some(max),
+            ..
+        } if min == max && *min > 0 => Some(*min),
+        _ => None,
+    }
+}
+
+/// Refuses a declaration the values do not satisfy, before any of them
+/// is written.
+///
+/// Two questions that are one question: the declaration has to be a
+/// type this arm of [`PropValues`] carries at all, and every value has
+/// to be a value of it. A null row is skipped, because what a null row
+/// holds is a placeholder whose writer was told it would never be read,
+/// and refusing a column over a byte nobody looks at would make the
+/// mask's promise conditional.
+///
+/// The two length bounds are two branches because they count two
+/// things. A character is a Unicode scalar value and an octet is a
+/// byte, so `STRING(5,5)` admits five astral characters in twenty
+/// bytes, and `BINARY(5)` admits five bytes whatever they spell.
+fn check_declared(
+    name: &str,
+    ty: &LogicalType,
+    values: &PropValues<'_>,
+    column: &PropInput<'_>,
+) -> Result<()> {
+    let (min, max, chars) = match (ty, values) {
+        (LogicalType::Str { min, max, .. }, PropValues::Str(_)) => (*min, *max, true),
+        (LogicalType::Bytes { min, max, .. }, PropValues::Bytes(_)) => (*min, *max, false),
+        _ if *ty == values.ty() => return Ok(()),
+        _ => {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' is declared {ty} and was given {}",
+                values.ty()
+            )));
+        }
+    };
+    if min.is_none() && max.is_none() {
+        return Ok(());
+    }
+    let rows = match values {
+        PropValues::Str(v) | PropValues::Bytes(v) => *v,
+        _ => unreachable!("only the two blob arms reach a length bound"),
+    };
+    for (row, value) in rows.iter().enumerate() {
+        if !column.holds(row) {
+            continue;
+        }
+        let len = match chars {
+            true => std::str::from_utf8(value)
+                .map_err(|_| {
+                    ZuError::InvalidArgument(format!(
+                        "column '{name}' is declared {ty} and row {row} is not UTF-8"
+                    ))
+                })?
+                .chars()
+                .count(),
+            false => value.len(),
+        };
+        if min.is_some_and(|n| len < n as usize) || max.is_some_and(|n| len > n as usize) {
+            let unit = match chars {
+                true => "characters",
+                false => "octets",
+            };
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' is declared {ty} and row {row} holds {len} {unit}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn write_columns(
     db: &mut Zu1File,
     rows: u64,
@@ -1352,12 +1506,16 @@ fn write_columns(
         // where the estimator's statistics get built: a COPY that
         // brings properties leaves the optimizer able to reason about
         // them, without anyone remembering to ANALYZE (perf/12 §1).
-        let ty = values.ty();
-        if type_bytes(&ty).is_none() {
+        let ty = match column.declared {
+            Some(declared) => declared.clone(),
+            None => values.ty(),
+        };
+        if column_type_bytes(&ty).is_none() {
             return Err(ZuError::InvalidArgument(format!(
                 "column '{name}' has type {ty}, which is not storable as a property"
             )));
         }
+        check_declared(name, &ty, values, column)?;
         // A list column is encoded here rather than by its caller, so
         // the row format has one writer and one reader and they sit
         // next to each other.
@@ -1397,8 +1555,38 @@ fn write_columns(
             }
         };
         col_stats.insert(name.to_string(), stat);
+        // A null row's value is a placeholder nothing reads, and the
+        // caller was told it may write anything there. In a column whose
+        // declaration fixes the width, anything is the one thing it may
+        // not be: a placeholder of another length makes the rows ragged
+        // and costs the whole column its layout for the sake of bytes no
+        // reader looks at. So the writer makes them the declared width,
+        // which is its job and not the caller's.
+        let padded: Vec<Vec<u8>> = match (fixed_octets(&ty), values, column.validity) {
+            (Some(width), PropValues::Bytes(v), Some(_)) => v
+                .iter()
+                .enumerate()
+                .map(|(row, value)| match column.holds(row) {
+                    true => value.to_vec(),
+                    false => vec![0u8; width as usize],
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let padded_refs: Vec<&[u8]> = padded.iter().map(|b| &b[..]).collect();
         let meta = match (values.lane(), values) {
             (Some(words), _) => write_segment(db, &words)?,
+            // A declaration that fixes the octet count says the rows are
+            // equal length, so the column goes to the layout for those
+            // and costs the width and nothing else. An unbounded byte
+            // string column stays zipped, because rows that happen to
+            // agree today are not rows a type says will agree.
+            (None, PropValues::Bytes(v)) if fixed_octets(&ty).is_some() => {
+                match padded.is_empty() {
+                    true => write_rows(db, v)?,
+                    false => write_rows(db, &padded_refs)?,
+                }
+            }
             (None, PropValues::Str(v) | PropValues::Bytes(v)) => write_blob_segment(db, v)?,
             (None, PropValues::List { .. }) => write_rows(db, &blobs)?,
             (None, _) => unreachable!("every variable width column is a blob"),
@@ -4170,6 +4358,236 @@ mod tests {
         );
     }
 
+    /// A hash column, which is the case the fixed octet declaration
+    /// exists for: 16 bytes a row and nothing else, no length beside
+    /// each row and no symbol table trained on bytes that are random by
+    /// construction.
+    #[test]
+    fn a_column_declared_binary_costs_its_width_a_row() {
+        const ROWS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("props.zu1")).unwrap();
+        bulk_load_keyed(&mut db, "doc", "cites", ROWS as u64, &[(0, 1)], None).unwrap();
+        let hashes: Vec<[u8; 16]> = (0..ROWS)
+            .map(|r| {
+                let mut h = [0u8; 16];
+                h[..8].copy_from_slice(&(r as u64).to_le_bytes());
+                h[8..].copy_from_slice(&(!(r as u64)).to_le_bytes());
+                h
+            })
+            .collect();
+        let rows: Vec<&[u8]> = hashes.iter().map(|h| &h[..]).collect();
+        let binary16 = LogicalType::Bytes {
+            min: Some(16),
+            max: Some(16),
+            fixed: true,
+        };
+        let directory = store_props_nullable(
+            &mut db,
+            "doc",
+            &[PropInput::typed(
+                "hash",
+                PropValues::Bytes(&rows),
+                &binary16,
+            )],
+        )
+        .unwrap();
+
+        // The declaration survives the round trip, which is the whole
+        // of what version 8 added: before it, this column came back
+        // spelled `BYTES`.
+        assert_eq!(directory.columns[0].ty, binary16);
+        let meta = &directory.columns[0].meta;
+        assert_eq!(meta.structural, crate::segment::Structural::Stride);
+        assert_eq!(meta.payload_len, 4 + (ROWS * 16) as u64);
+
+        let mut reader = PropsReader::new(directory);
+        let mut buf = Vec::new();
+        reader.read_str(&mut db, 0, 40, &mut buf).unwrap();
+        assert_eq!(buf, hashes[40]);
+    }
+
+    /// A row the declaration does not admit is refused, and the column
+    /// is not written at all: a `BINARY(16)` holding fifteen octets is
+    /// a column whose own type is a lie, and the first reader to take
+    /// the type at its word reads the next row's bytes.
+    #[test]
+    fn a_row_the_declaration_does_not_admit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let short: Vec<&[u8]> = vec![&[0u8; 16], &[0u8; 15], &[0u8; 16], &[0u8; 16]];
+        let binary16 = LogicalType::Bytes {
+            min: Some(16),
+            max: Some(16),
+            fixed: true,
+        };
+        let err = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed(
+                "hash",
+                PropValues::Bytes(&short),
+                &binary16,
+            )],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("row 1 holds 15 octets"), "{err}");
+    }
+
+    /// A character bound counts characters, so five characters may be
+    /// more than five bytes and a column of them is not a column of
+    /// equal length rows. The bound is a check and not a layout, which
+    /// is why a bounded string column stays zipped: text is what FSST
+    /// is for, and a currency code column would lose that by being
+    /// uniform.
+    #[test]
+    fn a_bounded_string_counts_characters_and_not_octets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let five = LogicalType::Str {
+            min: Some(1),
+            max: Some(5),
+            fixed: false,
+        };
+        let fits: Vec<&[u8]> = vec!["héllo".as_bytes(), b"a", "\u{1f600}".as_bytes(), b"abcde"];
+        assert_eq!(fits[0].len(), 6, "five characters in six octets");
+        let directory = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed("code", PropValues::Str(&fits), &five)],
+        )
+        .unwrap();
+        assert_eq!(directory.columns[0].ty, five);
+        assert_eq!(
+            directory.columns[0].meta.structural,
+            crate::segment::Structural::FullZip
+        );
+
+        let over: Vec<&[u8]> = vec![b"abcdef", b"a", b"b", b"c"];
+        let err = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed("code", PropValues::Str(&over), &five)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("row 0 holds 6 characters"),
+            "{err}"
+        );
+    }
+
+    /// A declaration is checked against the values it is given, so a
+    /// caller cannot label a column of strings as a column of octets
+    /// and have the two disagree from then on.
+    #[test]
+    fn a_declaration_the_values_do_not_carry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let text: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
+        let binary16 = LogicalType::Bytes {
+            min: Some(16),
+            max: Some(16),
+            fixed: true,
+        };
+        let err = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput::typed("hash", PropValues::Str(&text), &binary16)],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("was given STRING"), "{err}");
+    }
+
+    /// A null row holds a placeholder nothing reads, and the caller may
+    /// write anything there. In a fixed width column the writer makes it
+    /// the declared width anyway, so one null does not cost the column
+    /// its layout for bytes no reader looks at.
+    #[test]
+    fn a_null_row_keeps_a_fixed_width_column_uniform() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let rows: Vec<&[u8]> = vec![&[1u8; 16], b"", &[3u8; 16], &[4u8; 16]];
+        let binary16 = LogicalType::Bytes {
+            min: Some(16),
+            max: Some(16),
+            fixed: true,
+        };
+        let mask = [0b1101u64];
+        let directory = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput {
+                name: "hash",
+                values: PropValues::Bytes(&rows),
+                validity: Some(&mask),
+                declared: Some(&binary16),
+            }],
+        )
+        .unwrap();
+        let meta = &directory.columns[0].meta;
+        assert_eq!(meta.structural, crate::segment::Structural::Stride);
+        assert_eq!(meta.payload_len, 4 + 4 * 16);
+
+        let mut reader = PropsReader::new(directory);
+        assert!(!reader.is_valid(&mut db, 0, 1).unwrap());
+        let mut buf = Vec::new();
+        reader.read_str(&mut db, 0, 1, &mut buf).unwrap();
+        assert_eq!(buf, [0u8; 16], "the placeholder is the declared width");
+    }
+
+    /// The extended form was a catalog encoding before version 8 and no
+    /// column entry carried it, so one in an older directory is a file
+    /// somebody edited rather than an older column.
+    #[test]
+    fn an_extended_column_type_in_a_version_7_directory_is_refused() {
+        let meta = SegmentMeta {
+            value_count: 1,
+            payload_len: 17,
+            uncompressed_bytes: 8,
+            min: 0,
+            max: 0,
+            crc: 0,
+            structural: crate::segment::Structural::MiniBlock,
+            sorted: false,
+            start: 0,
+            blocks: vec![7],
+        };
+        let mut old = Vec::new();
+        old.extend_from_slice(&7u16.to_le_bytes());
+        old.extend_from_slice(&1u64.to_le_bytes());
+        old.extend_from_slice(&1u32.to_le_bytes());
+        old.extend_from_slice(&1u16.to_le_bytes());
+        old.extend_from_slice(b"x");
+        let binary16 = LogicalType::Bytes {
+            min: Some(16),
+            max: Some(16),
+            fixed: true,
+        };
+        old.extend_from_slice(&column_type_bytes(&binary16).unwrap());
+        meta.encode(&mut old);
+        old.push(0);
+        old.push(0);
+        assert!(PropsDirectory::decode(&old).is_err());
+        old[0] = 8;
+        let dir = PropsDirectory::decode(&old).unwrap();
+        assert_eq!(dir.columns[0].ty, binary16);
+    }
+
+    /// A column entry may carry a length bound and nothing else of the
+    /// extended form: a zoned temporal has no lane, and a bounded list
+    /// has no layout that keeps the bound, so both stay declarable and
+    /// unstorable.
+    #[test]
+    fn an_extended_column_type_a_column_cannot_hold_is_refused() {
+        assert!(column_type_bytes(&LogicalType::ZonedDatetime).is_none());
+        let bounded = LogicalType::List {
+            elem: Box::new(LogicalType::Bool),
+            max: Some(3),
+        };
+        assert!(declared_type_bytes(&bounded).is_some());
+        assert!(column_type_bytes(&bounded).is_none());
+    }
+
     #[test]
     fn decode_rejects_hostile_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -4214,6 +4632,7 @@ mod tests {
                     name: "id",
                     values: PropValues::Int(&ids),
                     validity: Some(&mask),
+                    declared: None,
                 },
                 PropInput::dense("firstName", PropValues::Str(&names)),
             ],
@@ -4547,6 +4966,7 @@ mod tests {
                 name: "id",
                 values: PropValues::Int(&ids),
                 validity: Some(&short),
+                declared: None,
             }],
         )
         .unwrap_err();

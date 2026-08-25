@@ -62,6 +62,7 @@ fn seeded() -> Fixture {
                 name: "maybe",
                 values: PropValues::Int(&maybe),
                 validity: Some(&mask),
+                declared: None,
             },
         ],
     )

@@ -689,6 +689,7 @@ impl<'a> Staged<'a> {
                     name: name.as_str(),
                     values,
                     validity: Some(mask.as_slice()),
+                    declared: None,
                 }
             })
             .collect();

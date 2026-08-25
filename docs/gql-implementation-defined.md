@@ -204,7 +204,7 @@ The effective binary precision of each supported integer type.
 
 The effective decimal precision of each decimal type.
 
-zu declares none. DECIMAL is accepted as a type name and a value under it is held as binary64, so there is no decimal type with a precision of its own to publish.
+38 decimal digits, which is what an `i128` of unscaled units holds, and it is the largest precision `DECIMAL(p, s)` accepts. A decimal carries its own scale rather than reading it off a declared type, so a value cast to `DECIMAL(5, 2)` is two places wherever it goes.
 
 ### ID037
 
@@ -228,7 +228,7 @@ None. A session starts with no parameters and the ones a statement reads are the
 
 The exact numeric type with scale 0 (zero) of list element ordinal positions.
 
-The 64 bit signed integer, which is the one exact numeric type.
+The 64 bit signed integer. It is the exact numeric type of scale 0; the other exact type is the decimal of ID034, which has a scale and is never what an ordinal position is.
 
 ### ID058
 
@@ -258,31 +258,31 @@ The 64 bit signed integer.
 
 The numeric declared type of the result of a dyadic arithmetic operator when either operand is approximate numeric.
 
-The binary64 float. An exact operand beside an approximate one is widened before the kernel sees them, so `2.0 * 3` is 6.0.
+The binary64 float. An exact operand beside an approximate one is widened before the kernel sees them, so `2.0 * 3` is 6.0, and a decimal beside a float widens the same way and stops being exact there.
 
 ### ID064
 
 The numeric declared type of the result of a dyadic arithmetic operator when both operands are exact numeric.
 
-The 64 bit signed integer, unwidened.
+The 64 bit signed integer where both are integers, unwidened. Where either is a decimal the answer is a decimal, and an integer beside a decimal is read as a decimal of scale 0 rather than the decimal being narrowed to it.
 
 ### ID065
 
 The precision of the result of addition and subtraction of exact numeric types.
 
-64 bits, the same as the operands. An answer that does not fit raises `22003` rather than growing the type.
+64 bits, the same as the operands. An answer that does not fit raises `22003` rather than growing the type. Two decimals add and subtract at the larger of their two scales, to 38 digits.
 
 ### ID066
 
 The precision of the result of multiplication of exact numeric types.
 
-64 bits, on the same terms.
+64 bits, on the same terms. Two decimals multiply at the sum of their scales, to 38 digits, and an answer wider than that raises `22003`.
 
 ### ID067
 
 The precision and scale of the result of division of exact numeric types.
 
-64 bits and scale 0, the answer truncated toward zero. A divisor of nought raises `22012`.
+64 bits and scale 0, the answer truncated toward zero, where both operands are integers. Two decimals divide at the larger of their two scales plus six guard digits, capped at 38, with the last digit rounded half away from zero. A divisor of nought raises `22012` either way.
 
 ### ID068
 

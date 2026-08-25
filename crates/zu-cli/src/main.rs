@@ -1495,6 +1495,15 @@ fn write_json_value(out: &mut String, v: &Value) {
             let _ = write!(out, "{f:?}");
         }
         Value::Float(_) => out.push_str("null"),
+        // An exact decimal goes out as a bare JSON number written at
+        // its scale, so `1.20` is the token `1.20`. It is not quoted:
+        // it is a number and a reader that wants the exact one parses
+        // the token, which every JSON reader that cares about money
+        // already does. Quoting it would hide a number inside a string
+        // for every reader that does not.
+        Value::Decimal(d) => {
+            let _ = write!(out, "{d}");
+        }
         Value::Str(s) => write_json_str(out, s),
         // A byte string goes out as the hexits it is written with,
         // which is a string as far as JSON is concerned. JSON has no
@@ -1653,6 +1662,7 @@ fn display_value(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
         Value::Str(s) => s.clone(),
         Value::Bytes(b) => zu::bytes::literal(b),
         Value::Node { table, offset } => format!("({table}:{offset})"),

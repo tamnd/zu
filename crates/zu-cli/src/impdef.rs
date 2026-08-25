@@ -202,7 +202,7 @@ const DEFINED: &[Answer] = &[
     },
     Answer {
         item: "ID034",
-        answer: "zu declares none. DECIMAL is accepted as a type name and a value under it is held as binary64, so there is no decimal type with a precision of its own to publish.",
+        answer: "38 decimal digits, which is what an `i128` of unscaled units holds, and it is the largest precision `DECIMAL(p, s)` accepts. A decimal carries its own scale rather than reading it off a declared type, so a value cast to `DECIMAL(5, 2)` is two places wherever it goes.",
     },
     Answer {
         item: "ID037",
@@ -218,7 +218,7 @@ const DEFINED: &[Answer] = &[
     },
     Answer {
         item: "ID057",
-        answer: "The 64 bit signed integer, which is the one exact numeric type.",
+        answer: "The 64 bit signed integer. It is the exact numeric type of scale 0; the other exact type is the decimal of ID034, which has a scale and is never what an ordinal position is.",
     },
     Answer {
         item: "ID058",
@@ -238,23 +238,23 @@ const DEFINED: &[Answer] = &[
     },
     Answer {
         item: "ID063",
-        answer: "The binary64 float. An exact operand beside an approximate one is widened before the kernel sees them, so `2.0 * 3` is 6.0.",
+        answer: "The binary64 float. An exact operand beside an approximate one is widened before the kernel sees them, so `2.0 * 3` is 6.0, and a decimal beside a float widens the same way and stops being exact there.",
     },
     Answer {
         item: "ID064",
-        answer: "The 64 bit signed integer, unwidened.",
+        answer: "The 64 bit signed integer where both are integers, unwidened. Where either is a decimal the answer is a decimal, and an integer beside a decimal is read as a decimal of scale 0 rather than the decimal being narrowed to it.",
     },
     Answer {
         item: "ID065",
-        answer: "64 bits, the same as the operands. An answer that does not fit raises `22003` rather than growing the type.",
+        answer: "64 bits, the same as the operands. An answer that does not fit raises `22003` rather than growing the type. Two decimals add and subtract at the larger of their two scales, to 38 digits.",
     },
     Answer {
         item: "ID066",
-        answer: "64 bits, on the same terms.",
+        answer: "64 bits, on the same terms. Two decimals multiply at the sum of their scales, to 38 digits, and an answer wider than that raises `22003`.",
     },
     Answer {
         item: "ID067",
-        answer: "64 bits and scale 0, the answer truncated toward zero. A divisor of nought raises `22012`.",
+        answer: "64 bits and scale 0, the answer truncated toward zero, where both operands are integers. Two decimals divide at the larger of their two scales plus six guard digits, capped at 38, with the last digit rounded half away from zero. A divisor of nought raises `22012` either way.",
     },
     Answer {
         item: "ID068",

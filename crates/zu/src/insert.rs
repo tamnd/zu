@@ -816,6 +816,7 @@ pub(crate) fn describe(value: &Value) -> &'static str {
         Value::Bool(_) => "a boolean",
         Value::Int(_) => "an integer",
         Value::Float(_) => "a float",
+        Value::Decimal(_) => "an exact decimal",
         Value::Str(_) => "a string",
         Value::Bytes(_) => "a byte string",
         Value::Node { .. } => "a node",

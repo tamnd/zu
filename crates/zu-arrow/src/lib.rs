@@ -516,6 +516,15 @@ pub fn data_type(name: &str, ty: &ColumnType) -> Result<DataType, Error> {
         ColumnType::Bool => DataType::Boolean,
         ColumnType::Int => DataType::Int64,
         ColumnType::Float => DataType::Float64,
+        // Arrow's exact decimal, which is the same pair this engine
+        // holds: an integer of units and a scale. The precision is the
+        // carrier's own rather than a declaration, because a result
+        // column is values and not a declared type, and thirty eight
+        // digits is what an `i128` holds.
+        ColumnType::Decimal { scale } => DataType::Decimal128(
+            zu_common::decimal::MAX_DIGITS as u8,
+            i8::try_from(*scale).map_err(|_| unsupported(name, ty))?,
+        ),
         ColumnType::Str => DataType::Utf8,
         // Arrow's binary type, which is the string layout over bytes
         // that are not text, the same relation the two column types

@@ -217,6 +217,10 @@ pub const ZU_TYPE_BINDING_TABLE: i32 = 12;
 /// through [`zu_value_str`], because the bytes need not be text and a
 /// host that took them for a string would decode them.
 pub const ZU_TYPE_BYTES: i32 = 13;
+/// GV17, an exact decimal. It reads through [`zu_value_decimal`] and
+/// not through [`zu_value_f64`]: the number a host wants is the exact
+/// one, and binary floating point is where that is lost.
+pub const ZU_TYPE_DECIMAL: i32 = 14;
 
 /// Which temporal a temporal cell is, on [`zu_value_temporal`].
 ///
@@ -2208,6 +2212,7 @@ pub unsafe extern "C" fn zu_result_cell_type(
         Some(Value::Bool(_)) => ZU_TYPE_BOOL,
         Some(Value::Int(_)) => ZU_TYPE_INT,
         Some(Value::Float(_)) => ZU_TYPE_FLOAT,
+        Some(Value::Decimal(_)) => ZU_TYPE_DECIMAL,
         Some(Value::Str(_)) => ZU_TYPE_STR,
         Some(Value::Bytes(_)) => ZU_TYPE_BYTES,
         Some(Value::Node { .. }) => ZU_TYPE_NODE,
@@ -3134,6 +3139,7 @@ pub unsafe extern "C" fn zu_value_type(v: *const ZuValue) -> i32 {
         Some(Value::Bool(_)) => ZU_TYPE_BOOL,
         Some(Value::Int(_)) => ZU_TYPE_INT,
         Some(Value::Float(_)) => ZU_TYPE_FLOAT,
+        Some(Value::Decimal(_)) => ZU_TYPE_DECIMAL,
         Some(Value::Str(_)) => ZU_TYPE_STR,
         Some(Value::Bytes(_)) => ZU_TYPE_BYTES,
         Some(Value::Node { .. }) => ZU_TYPE_NODE,
@@ -3267,6 +3273,47 @@ pub unsafe extern "C" fn zu_value_bytes(
         }
         _ => ZuStatus::Misuse,
     }
+}
+
+/// An exact decimal cell as its unscaled integer and its scale: the
+/// value is `unscaled` times ten to the minus `scale`.
+///
+/// The integer is handed over in two halves rather than as one number,
+/// because it is a hundred and twenty eight bit two's complement value
+/// and C has no portable type for one. `hi` is the top sixty four bits
+/// signed, `lo` the bottom sixty four unsigned, and a host that has
+/// `__int128` puts them back together with `((__int128)hi << 64) | lo`.
+/// A host that does not can read `hi` and find nought or minus one for
+/// every value that fits an `int64_t`, which is every value a decimal
+/// column of eighteen digits or fewer holds.
+///
+/// None of the three may be `NULL`: an unscaled integer without its
+/// scale is a different number, and half of one is not a number at all.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_decimal(
+    v: *const ZuValue,
+    hi: *mut i64,
+    lo: *mut u64,
+    scale: *mut i32,
+) -> ZuStatus {
+    if hi.is_null() || lo.is_null() || scale.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe {
+        *hi = 0;
+        *lo = 0;
+        *scale = 0;
+    }
+    let Some(Value::Decimal(d)) = (unsafe { value_of(v) }) else {
+        return ZuStatus::Misuse;
+    };
+    let unscaled = d.unscaled();
+    unsafe {
+        *hi = (unscaled >> 64) as i64;
+        *lo = unscaled as u64;
+        *scale = i32::from(d.scale());
+    }
+    ZuStatus::Ok
 }
 
 /// A temporal cell as its kind, its count, and its offset from UTC.

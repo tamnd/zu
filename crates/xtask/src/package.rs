@@ -710,14 +710,15 @@ mod tests {
         // and everything since has been additive: the error model, the
         // cancellation calls, the transaction boundaries, the appender,
         // the diagnostics, the frames, the table a node came out of, and
-        // at 0.14 the byte string. The two parts are counts and not a
-        // decimal, so 0.10 is the one after 0.9.
+        // at 0.14 the byte string and at 0.15 the exact decimal. The two
+        // parts are counts and not a decimal, so 0.10 is the one after
+        // 0.9.
         //
         // Written out rather than read from the constant the header is
         // generated from, which would agree with itself whatever it
         // said. Moving the ABI is a deliberate act and this is the line
         // that makes it one.
-        assert_eq!(abi.revision, ("0.14".to_string(), "0.14".to_string()));
+        assert_eq!(abi.revision, ("0.15".to_string(), "0.15".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

@@ -58,6 +58,7 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
             Value::Bool(_)
                 | Value::Int(_)
                 | Value::Float(_)
+                | Value::Decimal(_)
                 | Value::Str(_)
                 | Value::Bytes(_)
                 | Value::Temporal(_)
@@ -78,8 +79,17 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
         // A decimal's declared digits bound the value the same way an
         // integer's do, and an integer is an exact number with a scale
         // of zero, so it belongs to a decimal type wide enough for it.
+        //
+        // A decimal belongs when it can be written at the declared scale
+        // without dropping a digit and the digits it then has fit the
+        // declared precision. A value of a smaller scale is written at
+        // the larger one, which is why the test is a rescale and not an
+        // equality of scales: `1.5` belongs to `DECIMAL(5,2)`.
         LogicalType::Decimal { precision, scale } => match v {
             Value::Int(i) => fits_digits(i128::from(*i), precision.saturating_sub(*scale)),
+            Value::Decimal(d) => d
+                .rescale(*scale)
+                .is_some_and(|at| at.digits() <= *precision),
             _ => false,
         },
         LogicalType::Float { .. } => matches!(v, Value::Float(_)),

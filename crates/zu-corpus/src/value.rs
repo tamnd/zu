@@ -28,7 +28,7 @@
 //! that this can be checked at all.
 
 use zu::query::Value;
-use zu_common::{DurationKind, LogicalType, Temporal};
+use zu_common::{Decimal, DurationKind, LogicalType, Temporal};
 
 use crate::yaml::Node;
 
@@ -431,6 +431,11 @@ fn scalar(ty: &str, text: &str) -> Option<Value> {
             .map(Value::Int),
         "FLOAT32" => float(text).map(|f| Value::Float(f as f32 as f64)),
         "FLOAT64" => float(text).map(Value::Float),
+        // No digits in the type name, because a decimal carries its own
+        // scale and the way the case writes the number is what that
+        // scale is: `1.20` is two places and `1.2` is one, and those are
+        // two different assertions about what the engine printed.
+        "DECIMAL" => decimal(text),
         "DATE" => temporal(LogicalType::Date),
         "LOCALTIME" => temporal(LogicalType::LocalTime),
         "ZONEDTIME" => temporal(LogicalType::ZonedTime),
@@ -440,6 +445,22 @@ fn scalar(ty: &str, text: &str) -> Option<Value> {
             .or_else(|| temporal(LogicalType::Duration(DurationKind::YearMonth))),
         _ => None,
     }
+}
+
+/// An exact decimal, at the scale the case wrote it at.
+///
+/// An exponent is refused rather than read. `1E2` and `100` are the same
+/// number at two scales, and a case that means one of them should say
+/// which, so there is nothing lost by making it write the digits out.
+fn decimal(text: &str) -> Option<Value> {
+    if text.contains(['e', 'E']) {
+        return None;
+    }
+    let places = match text.split_once('.') {
+        Some((_, fraction)) => u16::try_from(fraction.len()).ok()?,
+        None => 0,
+    };
+    Decimal::parse(text, places).map(Value::Decimal)
 }
 
 /// A float, including the three spellings YAML has no opinion about.
@@ -486,6 +507,7 @@ fn plain(value: &Value) -> String {
         Value::Bool(b) => format!("BOOL {b}"),
         Value::Int(n) => format!("INT64 \"{n}\""),
         Value::Float(f) => format!("FLOAT64 \"{}\"", show_float(*f)),
+        Value::Decimal(d) => format!("DECIMAL \"{d}\""),
         Value::Str(s) => format!("STRING {s:?}"),
         Value::Bytes(b) => format!("BYTES \"{}\"", zu_common::bytes::hexits(b)),
         Value::Temporal(t) => format!("{} \"{t}\"", type_name(&t.logical_type())),
@@ -559,6 +581,10 @@ fn alike(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan() => true,
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        // Two decimals of one number at two scales are one value and
+        // print differently, and what a case asserts is what a reader
+        // would see, so the scale has to match as well.
+        (Value::Decimal(x), Value::Decimal(y)) => x.scale() == y.scale() && x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| alike(a, b))
         }

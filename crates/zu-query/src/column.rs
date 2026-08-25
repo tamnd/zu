@@ -68,6 +68,13 @@ pub enum ColumnType {
     Bool,
     Int,
     Float,
+    /// GV17, exact decimals at one scale. The scale is the column's
+    /// and not each value's: a column mixing `1.5` and `1.25` settles
+    /// on hundredths, because the wider scale holds both exactly and
+    /// the narrower one would round a value away.
+    Decimal {
+        scale: u16,
+    },
     Str,
     /// GV35, a byte string. It rides the same offsets and bytes a
     /// string column does and is not one: the bytes are octets and
@@ -116,6 +123,7 @@ impl ColumnType {
             ColumnType::Bool => "booleans".into(),
             ColumnType::Int => "integers".into(),
             ColumnType::Float => "floats".into(),
+            ColumnType::Decimal { scale } => format!("decimals of scale {scale}"),
             ColumnType::Str => "strings".into(),
             ColumnType::Bytes => "byte strings".into(),
             ColumnType::Date => "dates".into(),
@@ -148,6 +156,11 @@ impl ColumnType {
                 | ColumnType::Record(_)
                 | ColumnType::Graph
                 | ColumnType::BindingTable
+                // A decimal is a hundred and twenty eight bits and
+                // this crate's flat buffers are sixty four, so the
+                // values ride the complex path until there is a
+                // buffer their width.
+                | ColumnType::Decimal { .. }
         )
     }
 
@@ -164,6 +177,7 @@ impl ColumnType {
             Value::Bool(_) => ColumnType::Bool,
             Value::Int(_) => ColumnType::Int,
             Value::Float(_) => ColumnType::Float,
+            Value::Decimal(d) => ColumnType::Decimal { scale: d.scale() },
             Value::Str(_) => ColumnType::Str,
             Value::Bytes(_) => ColumnType::Bytes,
             Value::Node { .. } => ColumnType::Node,
@@ -205,6 +219,19 @@ impl ColumnType {
             (ColumnType::Int, ColumnType::Float) | (ColumnType::Float, ColumnType::Int) => {
                 ColumnType::Float
             }
+            // Two decimals widen to the wider scale, which holds both
+            // numbers exactly. An integer beside them is an exact
+            // number of scale nought and joins them; a float beside
+            // them makes the column approximate, the way it does with
+            // integers, because a column has one type and only the
+            // float type holds every value in it.
+            (ColumnType::Decimal { scale: a }, ColumnType::Decimal { scale: b }) => {
+                ColumnType::Decimal { scale: a.max(b) }
+            }
+            (ColumnType::Decimal { scale }, ColumnType::Int)
+            | (ColumnType::Int, ColumnType::Decimal { scale }) => ColumnType::Decimal { scale },
+            (ColumnType::Decimal { .. }, ColumnType::Float)
+            | (ColumnType::Float, ColumnType::Decimal { .. }) => ColumnType::Float,
             (ColumnType::ZonedTime { offset }, ColumnType::ZonedTime { .. }) => {
                 ColumnType::ZonedTime { offset }
             }

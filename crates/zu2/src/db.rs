@@ -1190,6 +1190,16 @@ impl Db {
         self.core.log.remap_refused()
     }
 
+    /// Mappings made and published since the database was opened.
+    ///
+    /// The total and not [`Db::mapped_pages`], which is a gauge: a run
+    /// that mapped every page it settled and then had them reclaimed by
+    /// a compaction leaves the gauge at zero, so the gauge cannot say
+    /// whether [`Options::map_settled`] ever did anything. #759.
+    pub fn remap_made(&self) -> u64 {
+        self.core.log.remap_made()
+    }
+
     /// Mappings made and then given back without ever being published,
     /// because an evictor took the page while the mapping was being
     /// made.

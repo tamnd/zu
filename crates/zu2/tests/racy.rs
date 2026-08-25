@@ -74,8 +74,71 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
+/// The same options with the settled pages mapped and a bound on how
+/// many pages memory holds.
+///
+/// The three together are what nothing else runs at once. A mapped page
+/// is given back with `munmap` and a heap page with `dealloc`, an
+/// evictor takes pages while the flusher is mapping them, a compaction
+/// reclaims underneath both, and a reader that is inside a page when it
+/// goes is a fault and not a wrong answer. The epoch is what makes that
+/// safe and this is the shape that leans on it.
+///
+/// Eight pages of memory against sixteen of log, so the evictor is
+/// working for the whole run. That does not stop the mapping happening,
+/// which is worth writing down because the gauge says otherwise: a run
+/// at four hundred thousand operations a thread makes 142 mappings with
+/// the bound and 150 without it, and both end with `mapped_pages` at
+/// zero because the last compaction reclaimed the lot. #759 is about
+/// what that churn costs, not about whether it happens.
+fn mapping_options() -> Options {
+    Options {
+        map_settled: true,
+        memory_pages: 8,
+        ..options()
+    }
+}
+
 #[test]
 fn concurrent_sessions_keep_their_own_keys_under_compaction() {
+    racy(options());
+}
+
+/// The same run with `map_settled` on and a page bound, which is where a
+/// page a reader is inside can be unmapped by somebody else.
+///
+/// Almost nothing to assert beyond what the run already asserts. A
+/// mapping given back too early is a `SIGSEGV` or a `SIGBUS` and not a
+/// value that comes back wrong, so this failing looks like the process
+/// dying rather than like an assertion. What is left to check is that
+/// the run went near a mapping at all, since one that mapped nothing is
+/// the test above with more options set. That is the total and not
+/// `mapped_pages`, which is a gauge and reads zero at the end of any run
+/// long enough for a compaction to have taken the last page back.
+#[test]
+fn concurrent_sessions_keep_their_own_keys_while_the_pages_are_mapped() {
+    if !cfg!(unix) {
+        // No mapping call here, so this would be the test above again.
+        return;
+    }
+    let db = racy(mapping_options());
+    println!(
+        "made {}, mapped now {}, refused {}, lost {}",
+        db.remap_made(),
+        db.mapped_pages(),
+        db.remap_refused(),
+        db.remap_lost()
+    );
+    assert!(
+        db.remap_made() > 0,
+        "not one page was ever mapped, so this run is the unmapped one \
+         with more options set"
+    );
+}
+
+/// The run, and the database it left behind so a caller can ask what
+/// machinery it went through.
+fn racy(options: Options) -> Arc<Db> {
     const THREADS: u32 = 4;
     const KEYS: u32 = 400;
     const RESIDENT: u32 = 400;
@@ -85,7 +148,7 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
         .unwrap_or(40000);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(Db::create(&dir.path().join("r.zu2"), options()).expect("create"));
+    let db = Arc::new(Db::create(&dir.path().join("r.zu2"), options).expect("create"));
     let stop = Arc::new(AtomicBool::new(false));
 
     // A pass every so often, so the reclaim races the readers rather
@@ -293,4 +356,6 @@ fn concurrent_sessions_keep_their_own_keys_under_compaction() {
             assert_eq!(out.as_slice(), value(t, i, 0).as_slice());
         }
     }
+    drop(session);
+    db
 }

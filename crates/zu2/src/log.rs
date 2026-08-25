@@ -369,6 +369,14 @@ pub struct Log {
     /// Mappings the kernel refused, which is what says a run stopped
     /// mapping rather than ran out of pages to map.
     remap_refused: AtomicU64,
+    /// Mappings made and published over the life of the log.
+    ///
+    /// [`Log::mapped_pages`] is a gauge and this is the total, and the
+    /// two answer different questions. A run that mapped every page it
+    /// settled and then had them all reclaimed by a compaction ends with
+    /// a gauge of zero, so the gauge cannot say whether `map_settled`
+    /// ever did anything. #759.
+    remap_made: AtomicU64,
     /// Mappings that were made and then thrown away because the slot
     /// changed underneath them, which is the path that gives a mapping
     /// back without ever having published it. Counted because it is the
@@ -499,6 +507,7 @@ impl Log {
             remap_from: AtomicUsize::new(0),
             remap_retry: AtomicUsize::new(usize::MAX),
             remap_refused: AtomicU64::new(0),
+            remap_made: AtomicU64::new(0),
             remap_lost: AtomicU64::new(0),
             epochs: Epochs::new(sessions),
         }
@@ -1295,6 +1304,7 @@ impl Log {
             if slot.load(Ordering::Acquire) == stale {
                 slot.store(tag_mapped(at), Ordering::Release);
                 drop(guard);
+                self.remap_made.fetch_add(1, Ordering::Relaxed);
                 self.release_page(stale);
                 mapped = true;
             } else {
@@ -1398,6 +1408,15 @@ impl Log {
     /// gave up. #769.
     pub fn remap_refused(&self) -> u64 {
         self.remap_refused.load(Ordering::Relaxed)
+    }
+
+    /// Mappings made and published since the log was opened.
+    ///
+    /// The total rather than [`Log::mapped_pages`], which is a gauge and
+    /// reads zero on a run that mapped everything and then had it all
+    /// reclaimed. #759.
+    pub fn remap_made(&self) -> u64 {
+        self.remap_made.load(Ordering::Relaxed)
     }
 
     /// Mappings that were made and then given back unpublished, because

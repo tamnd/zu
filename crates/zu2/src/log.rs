@@ -1089,12 +1089,20 @@ impl Log {
         // fits in the first is wrong. The two paths share the size, so
         // there is one number to argue about rather than two.
         //
-        // Bounded by the end of the page, because a record never
-        // straddles one, and short answers are allowed: the file's length
-        // need not reach the end of the page being appended to, and a
-        // speculation over the last record in a page asks for bytes that
-        // may be padding or may not be there at all. What comes back is
-        // the record, which is what this is for.
+        // Bounded by the end of the page. This is a performance guard
+        // and not a correctness one, and it is worth saying which:
+        // removing the bound passes every test in the crate, because a
+        // record never straddles a page so the bytes past the boundary
+        // are never used, and a short answer is fine anyway. What the
+        // bound buys is not touching the next 4 MiB region at all, which
+        // under memory pressure is the same mistake readahead was making
+        // one page down. See [`crate::file::advise_random`].
+        //
+        // Short answers are allowed on their own account: the file's
+        // length need not reach the end of the page being appended to, so
+        // a speculation over the last record in a page can ask for bytes
+        // nobody has written. What comes back is the record, which is
+        // what this is for.
         let ceiling = (page_start(page_of(address) + 1) - address) as usize;
         let ask = crate::cold::SPECULATE.min(ceiling).max(record::HEADER);
         into.clear();
@@ -1726,6 +1734,95 @@ mod tests {
         assert_eq!(r.key(), 0u32.to_be_bytes());
         assert_eq!(r.version(), 1);
         assert!(r.intact(), "the record did not survive the round trip");
+    }
+
+    /// Records of every size around the speculation boundary come back
+    /// off disk with their bytes.
+    ///
+    /// The test above uses an 8 KiB value, which is always longer than
+    /// the speculation and so only ever walks the second read. This walks
+    /// the other side: a value shorter than the speculation, one that
+    /// makes the record land within a few bytes of it either way, and one
+    /// longer, all in the same log so they are read back through the same
+    /// path. The sizes are picked off [`crate::cold::SPECULATE`] rather
+    /// than written out, so moving that constant moves the test with it
+    /// instead of quietly leaving it testing the wrong boundary.
+    #[test]
+    fn an_evicted_record_of_any_size_comes_back_with_its_bytes() {
+        let (_dir, log) = log(3);
+        let session = Slotted::claim(&log.epochs).expect("slot");
+        // The record is the value plus a header and a four byte key, so
+        // these put its size below, astride and above the speculation.
+        let speculate = crate::cold::SPECULATE;
+        let sizes = [
+            1usize,
+            64,
+            speculate - record::HEADER - 4 - 1,
+            speculate - record::HEADER - 4,
+            speculate - record::HEADER - 4 + 1,
+            speculate,
+            8192,
+        ];
+        let mut wrote = Vec::new();
+        for (i, size) in (0u32..).zip(sizes) {
+            // A distinct byte per record, so a read that returned the
+            // wrong record's bytes fails on the contents and not only on
+            // the key.
+            let value = vec![(i as u8).wrapping_add(1); size];
+            let at = log
+                .append(
+                    &session,
+                    0,
+                    u64::from(i) + 1,
+                    &i.to_be_bytes(),
+                    &value,
+                    false,
+                    record::KIND_VALUE,
+                )
+                .expect("append");
+            wrote.push((at, value));
+            session.protect();
+            session.unprotect();
+            log.flush_once().expect("flush");
+            log.opened_page(page_of(log.tail()));
+        }
+        // Push the tail far enough past them that every one is out of the
+        // resident window and the only copy is the file.
+        let filler = vec![0xCDu8; 8192];
+        for i in 1000u32..4000 {
+            log.append(
+                &session,
+                0,
+                u64::from(i) + 1,
+                &i.to_be_bytes(),
+                &filler,
+                false,
+                record::KIND_VALUE,
+            )
+            .expect("append");
+            session.protect();
+            session.unprotect();
+            log.flush_once().expect("flush");
+            log.opened_page(page_of(log.tail()));
+        }
+
+        let mut scratch = Vec::new();
+        for (i, (at, value)) in (0u32..).zip(&wrote) {
+            assert!(
+                log.resident(*at).is_null(),
+                "record {i} is still resident, so this read never reached the file"
+            );
+            log.load(*at, &mut scratch).expect("load");
+            // SAFETY: `load` sized the buffer to hold the whole record
+            // and it is a Vec<u64>, so it is aligned.
+            let r = unsafe { RecordRef::new(scratch.as_ptr().cast()) };
+            assert!(r.intact(), "record {i} did not survive the round trip");
+            assert_eq!(r.key(), i.to_be_bytes(), "record {i} came back as another");
+            // SAFETY: the buffer holds the whole record, so the value
+            // bytes its header names are inside it.
+            let bytes = unsafe { r.value_unchecked() };
+            assert_eq!(bytes, &value[..], "record {i} came back with wrong bytes");
+        }
     }
 
     /// The point of the write frontier, stated as a test that hangs

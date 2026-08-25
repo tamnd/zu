@@ -9,6 +9,7 @@
 
 use zu::query::{Value, run, run_with};
 use zu::{Engine, Options};
+use zu_common::Decimal;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 
@@ -142,10 +143,17 @@ fn a_length_pads_at_the_bottom_and_refuses_at_the_top() {
 fn a_decimal_takes_a_precision_and_a_scale() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
+    // Exact, and at the scale that was asked for: two places went in
+    // and two places come back out, which a binary64 could not promise
+    // for either the value or the printing of it.
     assert_eq!(
         one(&mut db, "RETURN CAST('1.20' AS DECIMAL(5, 2)) AS v"),
-        Value::Float(1.2)
+        Value::Decimal(Decimal::new(120, 2))
     );
+    let Value::Decimal(printed) = one(&mut db, "RETURN CAST('1.20' AS DECIMAL(5, 2)) AS v") else {
+        panic!("a decimal cast gave back something else");
+    };
+    assert_eq!(printed.to_string(), "1.20");
     assert_eq!(
         status(&mut db, "RETURN CAST('1000.00' AS DECIMAL(5, 2)) AS v"),
         "22003"
@@ -156,6 +164,51 @@ fn a_decimal_takes_a_precision_and_a_scale() {
     assert_eq!(
         status(&mut db, "RETURN CAST('1.20' AS DECIMAL(2, 5)) AS v"),
         "42001"
+    );
+}
+
+/// The reason the exact decimal exists, in one statement each.
+///
+/// A cast is the only way to make one today, so every case here starts
+/// with one, but what is being pinned is what happens afterwards: that
+/// the arithmetic and the rounding are done on the digits rather than on
+/// the nearest binary fraction to them.
+#[test]
+fn an_exact_number_stays_exact_through_the_arithmetic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    // A tenth and two tenths are three tenths. In binary64 they are
+    // 0.30000000000000004, which is the whole reason for the type.
+    assert_eq!(
+        one(
+            &mut db,
+            "RETURN CAST('0.1' AS DECIMAL(2, 1)) + CAST('0.2' AS DECIMAL(2, 1)) AS v"
+        ),
+        Value::Decimal(Decimal::new(3, 1))
+    );
+    // An integer is an exact number of scale nought, so mixing the two
+    // stays exact and settles at the wider scale.
+    assert_eq!(
+        one(&mut db, "RETURN CAST('1.50' AS DECIMAL(5, 2)) * 3 AS v"),
+        Value::Decimal(Decimal::new(450, 2))
+    );
+    // Half away from nought on the digits. The float nearest 1.005 is a
+    // shade below it, so a float would round this down to 1.00.
+    assert_eq!(
+        one(
+            &mut db,
+            "RETURN ROUND(CAST('1.005' AS DECIMAL(4, 3)), 2) AS v"
+        ),
+        Value::Decimal(Decimal::new(101, 2))
+    );
+    // Equal numbers written at two scales are one value, so this is a
+    // comparison of numbers and not of spellings.
+    assert_eq!(
+        one(
+            &mut db,
+            "RETURN CAST('1.20' AS DECIMAL(5, 2)) = CAST('1.2' AS DECIMAL(5, 1)) AS v"
+        ),
+        Value::Bool(true)
     );
 }
 

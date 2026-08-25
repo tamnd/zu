@@ -68,7 +68,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{Clock, DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
+use zu_common::{Clock, Decimal, DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
@@ -136,6 +136,15 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// GV17, an exact decimal: an integer of units and the scale that
+    /// says how large a unit is.
+    ///
+    /// It is an arm of its own rather than a float because a tenth is
+    /// not a binary fraction, so a price held as binary64 is not the
+    /// price. Two decimals written at different scales are one value
+    /// and print differently, which is why the scale rides on the
+    /// number: a decimal in a `RETURN` has no column to ask.
+    Decimal(Decimal),
     Str(String),
     /// GV35, a byte string: a sequence of octets and not of characters.
     /// `X'0041'` is one byte string of two bytes and never the letter
@@ -1506,7 +1515,11 @@ fn rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Bool(_) => 1,
-        Value::Int(_) | Value::Float(_) => 2,
+        // A decimal ranks with the other numbers, because it is one:
+        // 1.50 and 1.5 and 1 are three spellings that a sort has to put
+        // in one place, and a rank of its own would sort every decimal
+        // after every integer whatever the values were.
+        Value::Int(_) | Value::Float(_) | Value::Decimal(_) => 2,
         Value::Str(_) => 3,
         // A byte string sorts beside the character strings and after
         // them. The two are not comparable values, so where one goes
@@ -1554,6 +1567,19 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
         (Value::Float(a), Value::Float(b)) => float_order(*a, *b),
         (Value::Int(a), Value::Float(b)) => float_order(*a as f64, *b),
         (Value::Float(a), Value::Int(b)) => float_order(*a, *b as f64),
+        // Two exact numbers order exactly, whatever scale each was
+        // written at, so an integer beside a decimal is the integer at
+        // scale nought and no float is made on the way.
+        (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
+        (Value::Decimal(a), Value::Int(b)) => a.cmp(&Decimal::new(i128::from(*b), 0)),
+        (Value::Int(a), Value::Decimal(b)) => Decimal::new(i128::from(*a), 0).cmp(b),
+        // An approximate operand makes the comparison approximate,
+        // which is ID063's rule for arithmetic read as the rule for
+        // order: the decimal is taken to its nearest binary64 and the
+        // two floats are ordered. A query that wants the exact answer
+        // casts the float rather than the decimal.
+        (Value::Decimal(a), Value::Float(b)) => float_order(a.to_f64(), *b),
+        (Value::Float(a), Value::Decimal(b)) => float_order(*a, b.to_f64()),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Str(a), Value::Str(b)) => a.cmp(b),
         // Two byte strings order by their octets, which is the only
@@ -6017,10 +6043,18 @@ fn holds(v: &Value) -> Result<bool> {
     }
 }
 
+/// A value as binary floating point, for the operations defined on it
+/// and on nothing else.
+///
+/// A decimal answers here, which is where its exactness ends and why
+/// the exact arms come first at every call site: this is the widening
+/// an approximate operand forces (ID063), not a conversion anything
+/// reaches for on its own.
 fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        Value::Decimal(d) => Some(d.to_f64()),
         _ => None,
     }
 }
@@ -6071,6 +6105,17 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
         (Value::Float(x), Value::Float(y)) => Some(x == y),
         (Value::Int(x), Value::Float(y)) => Some((*x as f64) == *y),
         (Value::Float(x), Value::Int(y)) => Some(*x == (*y as f64)),
+        // Two exact numbers are equal when they are the same number,
+        // so `1.50` equals `1.5` and equals `CAST(1.5 AS DECIMAL(3,1))`
+        // and an integer is an exact number of scale nought.
+        (Value::Decimal(x), Value::Decimal(y)) => Some(x == y),
+        (Value::Decimal(x), Value::Int(y)) => Some(*x == Decimal::new(i128::from(*y), 0)),
+        (Value::Int(x), Value::Decimal(y)) => Some(Decimal::new(i128::from(*x), 0) == *y),
+        // Against a float the comparison is approximate, the way
+        // ID063 makes the arithmetic approximate, so it is the decimal
+        // that moves and the float that stands.
+        (Value::Decimal(x), Value::Float(y)) => Some(x.to_f64() == *y),
+        (Value::Float(x), Value::Decimal(y)) => Some(*x == y.to_f64()),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Str(x), Value::Str(y)) => Some(x == y),
         // Two byte strings are equal when they hold the same octets in
@@ -6309,6 +6354,41 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
                 _ => unreachable!("arith only sees arithmetic operators"),
             };
             Ok(Value::Int(r))
+        }
+        // Two exact numbers with a decimal among them answer exactly,
+        // which is ID064's rule carried past the integers: the scale of
+        // the answer is whatever the units give, so a sum of hundredths
+        // and tenths is hundredths and a product of the two is
+        // thousandths. An answer that will not fit the carrier raises
+        // 22003 rather than turning into a float, because a query that
+        // asked for an exact number and got an approximate one has been
+        // answered wrongly and told nothing.
+        (Value::Decimal(_) | Value::Int(_), Value::Decimal(_))
+        | (Value::Decimal(_), Value::Int(_)) => {
+            let exact = |v: &Value| match v {
+                Value::Decimal(d) => *d,
+                Value::Int(i) => Decimal::new(i128::from(*i), 0),
+                _ => unreachable!("the arm above is two exact numbers"),
+            };
+            let (x, y) = (exact(&a), exact(&b));
+            if matches!(op, Div | Mod) && y.is_zero() {
+                return Err(divide_by_zero(op));
+            }
+            let r = match op {
+                Add => x.add(&y),
+                Sub => x.sub(&y),
+                Mul => x.mul(&y),
+                Div => x.div(&y),
+                Mod => x.rem(&y),
+                _ => unreachable!("arith only sees arithmetic operators"),
+            };
+            let r = r.ok_or_else(|| {
+                gql(
+                    codes::C22003,
+                    format!("{x} {op:?} {y} has no exact decimal answer this engine can hold"),
+                )
+            })?;
+            Ok(Value::Decimal(r))
         }
         _ => match (as_f64(&a), as_f64(&b)) {
             (Some(x), Some(y)) => {
@@ -7482,6 +7562,16 @@ impl AggState {
                             gql(codes::C22003, "integer overflow in sum()".into())
                         })?),
                         Value::Float(f) => Value::Float(f * mult as f64),
+                        // A total of exact numbers is an exact number.
+                        // `arith` below adds the running total at the
+                        // wider of the two scales, so a column of
+                        // tuppences totals in pence and not in the
+                        // binary fraction nearest them.
+                        Value::Decimal(d) => {
+                            Value::Decimal(d.mul(&Decimal::new(i128::from(mult), 0)).ok_or_else(
+                                || gql(codes::C22003, "decimal overflow in sum()".into()),
+                            )?)
+                        }
                         other => {
                             return Err(gql(
                                 codes::C22G03,

@@ -14,7 +14,7 @@
 
 use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::temporal::{self, NANOS_PER_DAY, NANOS_PER_MINUTE};
-use zu_common::{FloatBits, IntBits, LogicalType, Result, Temporal, ZuError};
+use zu_common::{Decimal, FloatBits, IntBits, LogicalType, Result, Temporal, ZuError};
 
 use crate::exec::Value;
 
@@ -224,6 +224,9 @@ pub(crate) fn value_type(v: &Value) -> String {
         Value::Bool(_) => "BOOL".into(),
         Value::Int(_) => "INT64".into(),
         Value::Float(_) => "FLOAT64".into(),
+        // The precision a value needs and not the one it was declared
+        // with, since a value carries its scale and not its type.
+        Value::Decimal(d) => format!("DECIMAL({},{})", d.digits().max(d.scale()), d.scale()),
         Value::Str(_) => "STRING".into(),
         Value::Bytes(_) => "BYTES".into(),
         Value::Node { .. } => "NODE".into(),
@@ -491,6 +494,7 @@ fn show(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
         Value::Str(s) => format!("'{s}'"),
         // The references have no spelling a statement could have
         // written, so they are named by what they are: a message
@@ -522,6 +526,12 @@ fn to_bool(v: Value) -> Result<Value> {
         Value::Int(0) => false,
         Value::Int(1) => true,
         Value::Int(n) => return Err(out_of_range(n.to_string(), "BOOL")),
+        // A decimal is an exact number, so it reaches the same two
+        // truth values an integer does and refuses on the same terms.
+        // 1.00 is one, and 0.5 is a number that is neither.
+        Value::Decimal(d) if *d == Decimal::new(0, 0) => false,
+        Value::Decimal(d) if *d == Decimal::new(1, 0) => true,
+        Value::Decimal(d) => return Err(out_of_range(d.to_string(), "BOOL")),
         Value::Str(s) if s.eq_ignore_ascii_case("true") => true,
         Value::Str(s) if s.eq_ignore_ascii_case("false") => false,
         Value::Str(_) => return Err(not_castable(&v, "a boolean")),
@@ -561,6 +571,12 @@ fn to_int(v: Value, signed: bool, bits: IntBits, precision: Option<u16>) -> Resu
             }
             t as i128
         }
+        // A decimal truncates toward zero the way a float does, and
+        // exactly: the digits past the point are dropped rather than
+        // rounded, so 1.9 is 1 and -1.9 is -1.
+        Value::Decimal(d) => d
+            .truncate()
+            .ok_or_else(|| out_of_range(d.to_string(), &name(signed, bits)))?,
         Value::Str(s) => s
             .trim()
             .parse::<i128>()
@@ -593,6 +609,9 @@ fn to_float(v: Value, bits: FloatBits) -> Result<Value> {
     let f: f64 = match &v {
         Value::Float(f) => *f,
         Value::Int(i) => *i as f64,
+        // The one place exactness is given up on purpose, because the
+        // user asked for the approximate type by name.
+        Value::Decimal(d) => d.to_f64(),
         Value::Bool(b) => f64::from(u8::from(*b)),
         Value::Str(s) => s
             .trim()
@@ -616,76 +635,49 @@ fn to_float(v: Value, bits: FloatBits) -> Result<Value> {
 /// An exact decimal with `precision` digits in all and `scale` of them
 /// after the point, GV17.
 ///
-/// The check is exact and the carrier is not, which is worth stating
-/// plainly. The digits are counted on an unscaled integer, so a number
-/// with too many of them is refused rather than quietly rounded away,
-/// and the result is then handed back as binary floating point because
-/// that is the only number a row carries today. An exact carrier
-/// arrives with the physical decimal column, and the check written here
-/// is the one it will use.
+/// The result is an exact number and not a float, which is the whole
+/// point of the type: a tenth has no binary spelling, so a price held
+/// as binary64 is not the price. Everything past the scale rounds half
+/// away from zero, because that is what a person writing money means by
+/// rounding and it is a rounding ISO leaves to the implementation.
+/// Everything past the precision is refused with `22003`, because those
+/// are digits before the point and dropping one changes the number.
+///
+/// A float is read through its own decimal spelling rather than by
+/// scaling the bits, so `CAST(0.1 AS DECIMAL(3,2))` is `0.10` and not
+/// the nearest hundredth to whatever binary64 holds for a tenth. The
+/// value was already inexact when it arrived and this is the reading of
+/// it a person would give.
 fn to_decimal(v: Value, precision: u16, scale: u16) -> Result<Value> {
     let spelled = format!("DECIMAL({precision}, {scale})");
-    let text = match &v {
-        Value::Str(s) => s.trim().to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Bool(b) => u8::from(*b).to_string(),
-        // A float is already inexact, so it is scaled and rounded the
-        // same way a written number is, and the digit count is then
-        // checked on the result.
-        Value::Float(f) if f.is_finite() => format!("{f}"),
+    let decimal = match &v {
+        // Already exact, so nothing is read from text: it is moved to
+        // the wanted scale and rounded there if it has to be.
+        Value::Decimal(d) => match d.rescale(scale) {
+            Some(exact) => exact,
+            None => Decimal::parse(&d.to_string(), scale)
+                .ok_or_else(|| out_of_range(d.to_string(), &spelled))?,
+        },
+        Value::Str(s) => {
+            Decimal::parse(s, scale).ok_or_else(|| not_castable(&v, "an exact number"))?
+        }
+        Value::Int(i) => Decimal::new(i128::from(*i), 0)
+            .rescale(scale)
+            .ok_or_else(|| out_of_range(i.to_string(), &spelled))?,
+        Value::Bool(b) => Decimal::new(i128::from(*b), 0)
+            .rescale(scale)
+            .ok_or_else(|| out_of_range(b.to_string(), &spelled))?,
+        Value::Float(f) if f.is_finite() => Decimal::parse(&format!("{f}"), scale)
+            .ok_or_else(|| out_of_range(f.to_string(), &spelled))?,
         // An infinity has no exact spelling to round, which makes it
         // the range's own condition rather than a wrong kind of value.
         Value::Float(_) => return Err(out_of_range(show(&v), &spelled)),
         other => return Err(forbidden_named(other, &spelled)),
     };
-    let unscaled = unscaled(&text, scale).ok_or_else(|| not_castable(&v, "an exact number"))?;
-    let limit = 10i128
-        .checked_pow(u32::from(precision))
-        .ok_or_else(|| out_of_range(text.clone(), &spelled))?;
-    if unscaled >= limit || unscaled <= -limit {
-        return Err(out_of_range(text, &spelled));
+    if decimal.digits() > precision {
+        return Err(out_of_range(decimal.to_string(), &spelled));
     }
-    Ok(Value::Float(unscaled as f64 / 10f64.powi(i32::from(scale))))
-}
-
-/// `text` read as a decimal and multiplied by ten to the `scale`, with
-/// anything past the scale rounded half away from zero. `None` when the
-/// text is not a number at all.
-fn unscaled(text: &str, scale: u16) -> Option<i128> {
-    let (sign, digits) = match text.strip_prefix('-') {
-        Some(rest) => (-1i128, rest),
-        None => (1i128, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (whole, fraction) = match digits.split_once('.') {
-        Some((w, f)) => (w, f),
-        None => (digits, ""),
-    };
-    if whole.is_empty() && fraction.is_empty() {
-        return None;
-    }
-    if !whole
-        .bytes()
-        .chain(fraction.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let mut n: i128 = if whole.is_empty() {
-        0
-    } else {
-        whole.parse().ok()?
-    };
-    let scale = scale as usize;
-    for i in 0..scale {
-        n = n.checked_mul(10)?;
-        n += i128::from(fraction.as_bytes().get(i).map_or(0, |b| b - b'0'));
-    }
-    // The first digit the scale drops decides the rounding, half away
-    // from zero, which is what a written decimal means by rounding.
-    if fraction.as_bytes().get(scale).is_some_and(|b| *b >= b'5') {
-        n = n.checked_add(1)?;
-    }
-    Some(sign * n)
+    Ok(Value::Decimal(decimal))
 }
 
 /// A character string, GV30 to GV32.
@@ -715,6 +707,10 @@ fn to_str(
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        // At the scale it was written with, so a price cast to a
+        // string keeps its trailing nought and reads back the same
+        // number it was.
+        Value::Decimal(d) => d.to_string(),
         // A temporal value prints the way it was written and the way a
         // result row prints it, which is the one formatter, so a cast
         // to a string and the cell in the answer can never disagree.
@@ -902,17 +898,21 @@ mod tests {
     #[test]
     fn a_decimal_rounds_to_its_scale_and_refuses_past_its_precision() {
         let t = spelled("DECIMAL", &[5, 2]).expect("DECIMAL(5, 2)");
+        // At the declared scale, exactly, and holding the trailing
+        // nought the text was written with rather than dropping it.
         assert_eq!(
             cast(Value::Str("1.20".into()), &t).unwrap(),
-            Value::Float(1.2)
+            Value::Decimal(Decimal::new(120, 2))
         );
+        // A third place is one the type has no room for, so it rounds
+        // half away from nought on both sides.
         assert_eq!(
             cast(Value::Str("1.235".into()), &t).unwrap(),
-            Value::Float(1.24)
+            Value::Decimal(Decimal::new(124, 2))
         );
         assert_eq!(
             cast(Value::Str("-1.235".into()), &t).unwrap(),
-            Value::Float(-1.24)
+            Value::Decimal(Decimal::new(-124, 2))
         );
         // 1000.00 is seven digits unscaled and the type holds five.
         assert_eq!(
@@ -974,6 +974,10 @@ mod tests {
         ),
         (
             "int",
+            "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
+        ),
+        (
+            "decimal",
             "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
         ),
         (
@@ -1066,6 +1070,7 @@ mod tests {
             Value::Null,
             Value::Bool(true),
             Value::Int(1),
+            Value::Decimal(Decimal::new(100, 2)),
             Value::Float(1.5),
             Value::Str("1".into()),
             Value::Str("true".into()),
@@ -1204,6 +1209,7 @@ mod tests {
             Value::Null => "null",
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
+            Value::Decimal(_) => "decimal",
             Value::Float(_) => "float",
             Value::Str(_) => "a string",
             Value::List(_) => "list",

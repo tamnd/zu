@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array,
-    Int64Array, IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DurationNanosecondArray,
+    Float64Array, Int64Array, IntervalMonthDayNanoArray, ListArray, NullArray, StringArray,
+    StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 
-use zu_common::{DurationKind, Temporal};
+use zu_common::{Decimal, DurationKind, Temporal};
 use zu_query::column::ColumnType;
 use zu_query::exec::Value;
 
@@ -66,6 +66,33 @@ pub fn build<T: Tables + ?Sized>(
                 })
                 .collect::<Float64Array>(),
         ),
+        // Arrow holds one scale for the whole column, so every value
+        // is moved to the column's before it goes in. That is always
+        // exact: the column's scale is the widest any value was
+        // written at, and widening a decimal multiplies. An integer
+        // reaches here where the column holds both, which is the same
+        // widening the float column does one line above.
+        ColumnType::Decimal { scale } => {
+            let scaled = |value: &&Value| -> Option<i128> {
+                let held = match value {
+                    Value::Decimal(d) => *d,
+                    Value::Int(n) => Decimal::new(i128::from(*n), 0),
+                    _ => return None,
+                };
+                held.rescale(*scale).map(|at| at.unscaled())
+            };
+            Arc::new(
+                values
+                    .iter()
+                    .map(scaled)
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(
+                        zu_common::decimal::MAX_DIGITS as u8,
+                        i8::try_from(*scale).map_err(|_| unsupported(name, ty))?,
+                    )
+                    .map_err(Error::from)?,
+            )
+        }
         ColumnType::Str => Arc::new(
             values
                 .iter()

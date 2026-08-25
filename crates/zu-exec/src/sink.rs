@@ -321,6 +321,11 @@ fn fold(aggs: &[PostAgg], rows: &[Vec<Value>]) -> Vec<Value> {
 /// A sum over group values, integer while every value is one and real
 /// once any of them is. Nulls are skipped and a sum of nothing is
 /// zero, which is what the old engine answers.
+///
+/// An exact decimal is not one of the kinds counted here and cannot be:
+/// the only way to make one is a cast, and a cast that is not a widening
+/// keeps its plan off this engine, so a group reaching this sink holds
+/// integers and floats. The row engine's sum totals decimals exactly.
 fn sum_of<'a>(vals: impl Iterator<Item = &'a Value>) -> Value {
     let mut ints: i64 = 0;
     let mut reals = 0f64;

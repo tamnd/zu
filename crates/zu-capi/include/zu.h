@@ -59,7 +59,7 @@
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.14"
+#define ZU_ABI_VERSION "0.15"
 
 #ifdef __cplusplus
 extern "C" {
@@ -158,6 +158,10 @@ typedef enum zu_status {
    zu_value_str: the octets need not be text, and a host that took them
    for a string would decode them. */
 #define ZU_TYPE_BYTES 13
+/* GV17, an exact decimal. It reads through zu_value_decimal and not
+   through zu_value_f64: the number a host wants is the exact one, and
+   binary floating point is where that is lost. */
+#define ZU_TYPE_DECIMAL 14
 
 /* Which temporal a temporal cell is, from zu_value_temporal. The unit
  * follows the kind: days for a date, months for a year-month duration,
@@ -615,6 +619,14 @@ zu_status zu_value_str(const zu_value *v, const char **out, size_t *len);
  * one answering both would let a host read octets as text without ever
  * asking whether they were. */
 zu_status zu_value_bytes(const zu_value *v, const uint8_t **out, size_t *len);
+/* An exact decimal as its unscaled integer and its scale: the value is
+ * unscaled times ten to the minus scale. The integer comes in two
+ * halves because it is 128 bits two's complement and C has no portable
+ * type for one: hi is the top 64 signed, lo the bottom 64 unsigned, and
+ * a host with __int128 rebuilds it with ((__int128)hi << 64) | lo. A
+ * host without one finds hi is 0 or -1 for every value that fits an
+ * int64_t. None of the three may be NULL. */
+zu_status zu_value_decimal(const zu_value *v, int64_t *hi, uint64_t *lo, int32_t *scale);
 /* kind and count are required; offset may be NULL for a host with no
  * zoned type, and is minutes east of UTC, 0 for the five kinds that
  * carry none. */

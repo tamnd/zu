@@ -20,7 +20,7 @@
 
 use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
-use zu_common::{DurationKind, LogicalType, Result, Temporal, ZuError, temporal, unicode};
+use zu_common::{Decimal, DurationKind, LogicalType, Result, Temporal, ZuError, temporal, unicode};
 
 use crate::ast::{Literal, TemporalFn};
 use crate::binder::{BoundExpr, Cut, Deviation, Func, Math, Percentile, Trim, Type};
@@ -2117,10 +2117,16 @@ fn math_of(func: Func) -> Result<Math> {
 /// The number an argument holds, as a float. Every kernel here that
 /// answers an approximate number reads its arguments through this, so
 /// an integer argument is widened once and in one place.
+///
+/// A decimal is widened here too. The square root of an exact number is
+/// not in general an exact number, so there is nothing to keep exact
+/// past this point, and refusing the argument would only mean the
+/// statement had to write the widening out itself.
 fn real(func: Func, value: &Value) -> Result<f64> {
     match value {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
+        Value::Decimal(d) => Ok(d.to_f64()),
         other => Err(bad_type(func, "a number", other)),
     }
 }
@@ -2224,13 +2230,33 @@ fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
             };
             finite(func, *f, answer)
         }
+        // An exact number stays exact through all five. Sending a
+        // decimal through a float here would answer with the binary
+        // fraction nearest the answer, which is a different number, and
+        // the whole point of asking for a decimal was that it is not.
+        (Math::Abs, Value::Decimal(d)) => d
+            .abs()
+            .map(Value::Decimal)
+            .ok_or_else(|| out_of_range(func, format!("of {d} is one past the top of a decimal"))),
+        (Math::Sign, Value::Decimal(d)) => Ok(Value::Int(d.signum())),
+        (Math::Ceil, Value::Decimal(d)) => placed(func, d, d.ceil(digits), digits),
+        (Math::Floor, Value::Decimal(d)) => placed(func, d, d.floor(digits), digits),
+        (Math::Round, Value::Decimal(d)) => placed(func, d, d.round(digits), digits),
         (_, other) => Err(bad_type(func, "a number", other)),
     }
 }
 
+/// The answer of CEIL, FLOOR or ROUND over a decimal, refused when
+/// putting the digits back would have run past what a decimal holds.
+fn placed(func: Func, of: &Decimal, answer: Option<Decimal>, digits: i64) -> Result<Value> {
+    answer
+        .map(Value::Decimal)
+        .ok_or_else(|| out_of_range(func, format!("of {of} to {digits} digits does not fit")))
+}
+
 /// An integer rounded to a place left of the decimal point, kept in the
-/// integers the whole way: a hundred and fifty rounded to minus one
-/// digit is two hundred, and nothing here goes through a float, so a
+/// integers the whole way: a hundred and fifty rounded to minus two
+/// digits is two hundred, and nothing here goes through a float, so a
 /// number wider than a double holds is rounded exactly.
 fn rounded_int(value: i64, digits: i64) -> Option<i64> {
     let places = u32::try_from(-digits).ok()?;

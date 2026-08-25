@@ -14,6 +14,7 @@
 //! The bar for anything compiled here is exact old-engine output:
 //! same rows, same order, same errors on overflow.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use zu_common::types::LogicalType;
@@ -50,6 +51,89 @@ pub(crate) struct ExecPlan {
     /// The values [`ScalarRef::Const`] names, one entry per constant
     /// the sink writes into its rows.
     pub consts: Vec<Value>,
+    /// How to run this plan again on another set of parameters, `None`
+    /// when there is no way to and it has to be compiled again.
+    pub reuse: Option<Reuse>,
+}
+
+/// Where the parameters a compile read ended up in the plan it built,
+/// which is what lets the plan be run again with other values in those
+/// positions instead of compiled again.
+///
+/// A plan is only reusable if every parameter the compiler read landed
+/// somewhere this can name. That is the whole of the check and it is
+/// why the reads are counted rather than the holes: a parameter that
+/// steered a decision, picked how many seeks a batch has or how far a
+/// SKIP goes, leaves no hole and its bit stays uncovered, so the plan
+/// is not offered for reuse and the next set of parameters compiles
+/// its own. Nothing has to enumerate those cases or stay in step with
+/// them as they change.
+pub(crate) struct Reuse {
+    /// Where the parameters landed, in no particular order.
+    holes: Vec<Hole>,
+}
+
+/// One place in a compiled plan that a parameter's value was written
+/// into, and the position it came from.
+pub(crate) enum Hole {
+    /// The primary key of [`Source::Seek`].
+    SeekKey { param: usize },
+}
+
+impl Reuse {
+    /// The bit of parameter `ix`, or every bit for one too far out to
+    /// have its own. A plan reads a handful of parameters, so the far
+    /// out case is a query written by a generator and not a hot path;
+    /// giving it every bit costs it reuse and costs nothing to decide.
+    fn bit(ix: usize) -> u64 {
+        if ix < u64::BITS as usize {
+            1 << ix
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// The reuse record of a finished compile, `None` when a parameter
+    /// it read is not one of `holes`.
+    fn of(read: u64, holes: Vec<Hole>) -> Option<Reuse> {
+        let covered = holes.iter().fold(0u64, |acc, h| {
+            acc | match h {
+                Hole::SeekKey { param } => Reuse::bit(*param),
+            }
+        });
+        (read & !covered == 0).then_some(Reuse { holes })
+    }
+}
+
+impl ExecPlan {
+    /// Writes `params` into the holes of a reusable plan, `false` when
+    /// they do not fit and the caller has to compile instead.
+    ///
+    /// Not fitting is a parameter of the wrong type, since what a hole
+    /// records is where a value went and not that any value goes
+    /// there: `$id` bound to a string compiles to no seek at all, and
+    /// the check here is the same one the compiler made, in the same
+    /// order, so a set of parameters that would have been refused is
+    /// refused rather than run against the last set's plan.
+    pub fn restamp(&mut self, params: &[Value]) -> bool {
+        let Some(reuse) = &self.reuse else {
+            return false;
+        };
+        for hole in &reuse.holes {
+            match hole {
+                Hole::SeekKey { param } => {
+                    let Some(Value::Int(n)) = params.get(*param) else {
+                        return false;
+                    };
+                    let Ok(key) = u64::try_from(*n) else {
+                        return false;
+                    };
+                    self.source = Source::Seek(key);
+                }
+            }
+        }
+        true
+    }
 }
 
 /// Where level 0 comes from.
@@ -949,6 +1033,9 @@ pub(crate) fn compile(
         marks: IdMap::default(),
         consts: Vec::new(),
         every_row_answers: false,
+        params_read: Cell::new(0),
+        holes: Vec::new(),
+        holds_rows: false,
     };
     c.compile(plan)
 }
@@ -1046,6 +1133,15 @@ struct Compiler<'a> {
     func_slot: Option<usize>,
     /// That kernel's answer, held until it goes on the plan.
     func: Option<FuncCol>,
+    /// One bit per parameter position [`Self::param`] has been asked
+    /// for, and where the ones that went straight into the plan went.
+    /// Together they say whether the plan can be run again on other
+    /// parameters; see [`Reuse`].
+    params_read: Cell<u64>,
+    holes: Vec<Hole>,
+    /// Whether this compile read rows out of the store and left them on
+    /// the plan. See [`Self::read_rows`].
+    holds_rows: bool,
     /// Where each mark slot the binder made landed: the level its block
     /// was written on and the chunk vector position of the column that
     /// holds the answer. A predicate naming the slot compiles into a
@@ -1296,6 +1392,13 @@ impl Compiler<'_> {
             let Some(k) = self.const_int(key).and_then(|k| u64::try_from(k).ok()) else {
                 return Ok(None);
             };
+            // A key that came from a parameter is the one place a
+            // point read differs from run to run, so the plan records
+            // where it went and the next read writes its own key there
+            // rather than compiling the whole plan again.
+            if let BoundExpr::Param(ix) = key {
+                self.holes.push(Hole::SeekKey { param: *ix });
+            }
             it.next();
             seek = Some(k);
         }
@@ -2301,6 +2404,18 @@ impl Compiler<'_> {
             }
         }
 
+        // A leading CALL ran its kernel while this plan was built and
+        // the answer is on the plan, the same as the joins and pins
+        // [`Self::read_rows`] marks: a plan carrying rows is an answer
+        // about this graph at this moment and not a shape to fill in
+        // later, so it is not offered for another run.
+        let func = self.func.take();
+        let reuse = if func.is_some() || self.holds_rows {
+            None
+        } else {
+            Reuse::of(self.params_read.get(), std::mem::take(&mut self.holes))
+        };
+
         Ok(Some(ExecPlan {
             table,
             source: match (seek, seeks) {
@@ -2324,7 +2439,8 @@ impl Compiler<'_> {
                 })
                 .collect(),
             columns: self.query.columns.clone(),
-            func: self.func.take(),
+            func,
+            reuse,
         }))
     }
 
@@ -2983,6 +3099,35 @@ impl Compiler<'_> {
         })
     }
 
+    /// The value bound at parameter position `ix`, noted as read.
+    ///
+    /// Every look at a parameter goes through here, which is what
+    /// makes [`Reuse`] safe to build: a plan is offered for reuse only
+    /// if each bit this set has a hole against it, so a parameter read
+    /// for any purpose other than being written into the plan keeps
+    /// the plan out of the cache by doing nothing at all.
+    fn param(&self, ix: usize) -> Option<&Value> {
+        self.params_read
+            .set(self.params_read.get() | Reuse::bit(ix));
+        self.params.get(ix)
+    }
+
+    /// Notes that this compile read rows out of the store and put them
+    /// on the plan, which is what makes the plan an answer about the
+    /// graph as it was rather than a shape to fill in later.
+    ///
+    /// A plan that holds rows is never handed back for another run. The
+    /// rows a run reads come out of the snapshot it is given, so a plan
+    /// that carries its own would answer from whenever it was built,
+    /// and the epoch a cache checks is a weaker thing than that: it
+    /// moves on a commit and a read inside an open write sees rows the
+    /// commit has not reached yet. Marking the read is exact where the
+    /// epoch is close, and it costs only the shapes that hold rows,
+    /// which are the joins and pins that already paid a scan to build.
+    fn read_rows(&mut self) {
+        self.holds_rows = true;
+    }
+
     /// Puts a value on the plan and answers the ref that reads it back.
     /// Two items that wrote the same constant take two entries, because
     /// a `Value` is cheaper than the walk that would find the first
@@ -3001,7 +3146,7 @@ impl Compiler<'_> {
             BoundExpr::Literal(Literal::Float(f)) => Some(Value::Float(*f)),
             BoundExpr::Literal(Literal::Str(s)) => Some(Value::Str(s.clone())),
             BoundExpr::Literal(Literal::Bool(b)) => Some(Value::Bool(*b)),
-            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+            BoundExpr::Param(ix) => match self.param(*ix)? {
                 v @ (Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)) => {
                     Some(v.clone())
                 }
@@ -3025,7 +3170,7 @@ impl Compiler<'_> {
             // Whatever the caller bound, whole. A comparison is picky
             // about this and a projection is not: the old engine hands
             // the bound value straight out here too.
-            BoundExpr::Param(ix) => self.params.get(*ix).cloned(),
+            BoundExpr::Param(ix) => self.param(*ix).cloned(),
             BoundExpr::List(items) => items
                 .iter()
                 .map(|item| self.const_item(item))
@@ -3061,7 +3206,7 @@ impl Compiler<'_> {
                     _ => None,
                 })
                 .collect::<Option<_>>()?,
-            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+            BoundExpr::Param(ix) => match self.param(*ix)? {
                 Value::List(items) => items
                     .iter()
                     .map(|v| match v {
@@ -3080,7 +3225,7 @@ impl Compiler<'_> {
     fn const_count(&self, expr: &BoundExpr) -> Option<u64> {
         let v = match expr {
             BoundExpr::Literal(Literal::Int(n)) => *n,
-            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+            BoundExpr::Param(ix) => match self.param(*ix)? {
                 Value::Int(n) => *n,
                 _ => return None,
             },
@@ -3209,6 +3354,9 @@ impl Compiler<'_> {
         let Some(key) = key.and_then(|k| u64::try_from(k).ok()) else {
             return Ok(None);
         };
+        // The row this answers goes on the plan, and which row a key
+        // sits in is a fact about the store and not about the query.
+        self.read_rows();
         Ok(self.snap.seek_key(table, key)?.map(|row| row as i64))
     }
 
@@ -3699,6 +3847,8 @@ impl Compiler<'_> {
         };
         let mut rows = Vec::new();
         let mut arena = MorselArena::new();
+        // What this walk finds is pinned onto the plan.
+        self.read_rows();
         // A chunk the zones ruled out answers with nothing, the same as
         // a chunk past the end of the table, so the walk counts the
         // chunks out rather than stopping at the first empty one: the
@@ -3839,6 +3989,9 @@ impl Compiler<'_> {
         let mut payload = Vec::with_capacity(rows as usize);
         let mut arena = MorselArena::new();
         let mut chunk = 0;
+        // Keys and payload both go on the plan, so this plan answers
+        // for the build side as this scan saw it and no other.
+        self.read_rows();
         while let Some(sc) = self.snap.scan(table, chunk, &[col], None, &mut arena)? {
             let vec = &sc.columns[0];
             let vals = vec.values::<i64>();
@@ -4539,7 +4692,7 @@ impl Compiler<'_> {
                 Some((v, lane)) => b.push_const_lane(v, lane).map(Some),
                 None => Ok(None),
             },
-            BoundExpr::Param(ix) => match self.params.get(*ix) {
+            BoundExpr::Param(ix) => match self.param(*ix) {
                 Some(Value::Int(n)) => b.push_const(OwnedValue::Int(*n)).map(Some),
                 Some(Value::Float(f)) => b.push_const(OwnedValue::Float(*f)).map(Some),
                 Some(Value::Str(s)) => b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some),
@@ -5072,7 +5225,7 @@ impl Compiler<'_> {
     fn const_int(&self, expr: &BoundExpr) -> Option<i64> {
         match expr {
             BoundExpr::Literal(Literal::Int(n)) => Some(*n),
-            BoundExpr::Param(ix) => match self.params.get(*ix) {
+            BoundExpr::Param(ix) => match self.param(*ix) {
                 Some(Value::Int(n)) => Some(*n),
                 _ => None,
             },
@@ -5084,7 +5237,7 @@ impl Compiler<'_> {
     fn const_float(&self, expr: &BoundExpr) -> Option<f64> {
         match expr {
             BoundExpr::Literal(Literal::Float(f)) => Some(*f),
-            BoundExpr::Param(ix) => match self.params.get(*ix) {
+            BoundExpr::Param(ix) => match self.param(*ix) {
                 Some(Value::Float(f)) => Some(*f),
                 _ => None,
             },

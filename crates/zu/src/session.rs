@@ -418,6 +418,17 @@ pub struct Session {
     /// reopens the table readers it needs, which on a small graph is
     /// most of what the query costs.
     snap: crate::snapshot::SnapshotCache,
+    /// The physical plan the last statement to run on the pipeline
+    /// compiled to, and the compiled statement it belongs to.
+    ///
+    /// One entry rather than one per cached plan. A session sends the
+    /// same statement over and over or it does not; the first is the
+    /// case worth catching and it needs no more than this, and the
+    /// second gets a lookup that is a pointer comparison and a miss.
+    /// Holding the [`Arc`] is what makes that comparison sound, since
+    /// a plan this still points at cannot have been dropped and had
+    /// another land on its address.
+    exec: Option<(Arc<CachedPlan>, zu_exec::PlanCache)>,
     plans: HashMap<String, Compiled>,
     /// The texts whose `USE` named a parameter, and the parameter each
     /// one named.
@@ -558,6 +569,7 @@ impl Session {
             schemas: IdMap::from_iter([(working, Arc::new(schema))]),
             epoch,
             snap,
+            exec: None,
             plans: HashMap::new(),
             focused: HashMap::new(),
             stmts: IdMap::default(),
@@ -2110,14 +2122,26 @@ impl Session {
     /// Runs one compiled plan whole: on the pipeline executor when it
     /// covers the plan, and on the row executor when it hands the plan
     /// back.
-    fn run_plan(&mut self, cached: &CachedPlan, args: Vec<Value>) -> Result<QueryResult> {
+    /// The physical plan cache belonging to `cached`, taken out of the
+    /// session so the run can have it, empty if the last statement was
+    /// a different one.
+    fn exec_cache(&mut self, cached: &Arc<CachedPlan>) -> zu_exec::PlanCache {
+        match self.exec.take() {
+            Some((held, cache)) if Arc::ptr_eq(&held, cached) => cache,
+            _ => zu_exec::PlanCache::new(),
+        }
+    }
+
+    fn run_plan(&mut self, cached: &Arc<CachedPlan>, args: Vec<Value>) -> Result<QueryResult> {
         let options = self.options.clone();
         if options.engine == exec::Engine::Pipeline {
             let catalog = self.graph.catalog_handle();
             let warm = std::mem::take(&mut self.snap);
+            let mut exec = self.exec_cache(cached);
             let mut snap =
                 crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
-            let out = zu_exec::try_execute(
+            let out = zu_exec::try_execute_cached(
+                &mut exec,
                 &cached.plan,
                 &cached.query,
                 &cached.schema,
@@ -2125,6 +2149,7 @@ impl Session {
                 &args,
                 &options,
             );
+            self.exec = Some((Arc::clone(cached), exec));
             self.snap = snap.into_cache();
             if let Some(r) = out? {
                 return Ok(r);

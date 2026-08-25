@@ -966,7 +966,11 @@ mod tests {
 
     fn str_at(v: &ValueVector, i: usize) -> Vec<u8> {
         let views: &[StrView] = v.values();
-        views[i].bytes(v.str_buffers().unwrap()).to_vec()
+        // A column of short strings carries no buffers, which is most
+        // of the columns here.
+        views[i]
+            .bytes(v.str_buffers().unwrap_or(&zu_vector::NO_BUFFERS))
+            .to_vec()
     }
 
     #[test]

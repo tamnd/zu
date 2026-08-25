@@ -699,9 +699,26 @@ exec_scale_8x = 2.0
 # wide enough to miss. These boxes do not have the memory bandwidth
 # to feed one core a scan this size, and no amount of work on the
 # sink moves that. So the floor sits under server3's worst run and
-# the number that answers perf/05 is the bare metal one. The bench
-# crosschecks the group count and the row total against the generator
-# on every run. Raise this floor, never lower it.
+# the number that answers perf/05 is the bare metal one.
+#
+# At d745f07 the sink stopped building the groups before it knew where
+# any of them went. It used to drain the folded table into a pair of
+# vectors per group, sort those by comparing the values they decoded
+# to, and then walk the result a third time to put the keys and the
+# aggregates back in the order the RETURN clause named them, which for
+# a hundred thousand groups is three hundred thousand small
+# allocations made and thrown away in the tail of the query. The table
+# orders an index vector against its own packed key words instead, and
+# decodes each group once, straight into its finished row. The hundred
+# thousand group query went 136.7 ms to 111.9 at one worker and 80.6
+# to 64.9 at eight, medians of six paired alternating runs of two
+# separately built binaries on the local M series, and the branch was
+# faster in every pair. The twelve group shape beside it did not move,
+# which is the check that this was the tail and not the scan: twelve
+# groups have no tail worth the name.
+#
+# The bench crosschecks the group count and the row total against the
+# generator on every run. Raise this floor, never lower it.
 exec_group_mrows_s_core = 8.0
 
 # The same sink at one worker on a string key, M rows/s: the same ten

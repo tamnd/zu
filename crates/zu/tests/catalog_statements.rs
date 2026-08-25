@@ -234,7 +234,7 @@ fn every_element_type_a_graph_type_may_declare_is_performed() {
 /// A union of two property types is a `value_type` the grammar allows
 /// and the parser reads, and there is no column that holds either an
 /// `INT64` or a `STRING`, so the catalog will not write it. The refusal
-/// is the same shape `graph_type.rs` pins for `DECIMAL(38,2)`: 42000,
+/// is the same shape `graph_type.rs` pins for `INT256`: 42000,
 /// and nothing about a file that is not damaged. S2 decides whether a
 /// union gets a column at all.
 #[test]

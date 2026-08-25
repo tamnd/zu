@@ -1277,6 +1277,82 @@ mod tests {
         assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
     }
 
+    /// A decimal wider than a lane word is the same column on the other
+    /// plane, and the declaration still says what a unit is.
+    ///
+    /// This is the first type here stored two ways. `DECIMAL(12,2)`
+    /// above is a lane word of unscaled units and `DECIMAL(30,4)` is
+    /// sixteen bytes of them, and nothing about the declaration says
+    /// which: the precision does, through `props::fixed_octets`, which
+    /// is the one place that decides so the writer and the reader cannot
+    /// disagree. A caller writing the statement sees one type.
+    ///
+    /// What the wide plane buys is the range an `i128` has, which is
+    /// where a decimal now stops, because that is the carrier a value of
+    /// one arrives in. Thirty eight digits is the widest a declaration
+    /// may ask for and the widest a value can be, so the two ends meet.
+    #[test]
+    fn a_declared_wide_decimal_keeps_its_scale_on_the_other_plane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wide-decimal.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        // Twenty six digits and four places, which is a number of units
+        // no lane word holds: the units alone are thirty digits.
+        let units = "1234567890123456789012345678.9012";
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:tally {n :: DECIMAL(32,4)}) }".to_string(),
+            "CREATE GRAPH g TYPED t".to_string(),
+            format!("USE g INSERT (t:tally {{n: CAST('{units}' AS DECIMAL(32,4))}})"),
+            // At the column's scale, coarser than it, and a plain
+            // integer. All three are exact at four places.
+            "USE g INSERT (t:tally {n: CAST('0.5' AS DECIMAL(5,1))})".to_string(),
+            "USE g INSERT (t:tally {n: 7})".to_string(),
+        ] {
+            session
+                .run(&stmt, &[])
+                .expect("the graph, its type, its rows");
+        }
+
+        // The scale comes from the column and not from the literal, the
+        // same way it does on the lane, so 0.5 reads back at four
+        // places. That is the declaration doing the work on a plane
+        // where the value is sixteen bytes rather than a word.
+        let rows = session
+            .run("USE g MATCH (t:tally) RETURN t.n AS n ORDER BY n", &[])
+            .expect("the rows read back");
+        let read: Vec<String> = rows
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Decimal(d) => d.to_string(),
+                other => panic!("expected an exact decimal, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, ["0.5000", "7.0000", units]);
+
+        // The declared precision still binds, and it binds on the wide
+        // plane the way it does on the narrow one: thirty three digits
+        // is not a value of a column declared with thirty two.
+        let err = session
+            .run(
+                "USE g INSERT (t:tally {n: CAST('12345678901234567890123456789.0123' AS DECIMAL(33,4))})",
+                &[],
+            )
+            .expect_err("thirty three digits do not fit thirty two");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
+
+        // And a fifth place is a place this column has no room for,
+        // which is the refusal the narrow decimal already made.
+        let err = session
+            .run(
+                "USE g INSERT (t:tally {n: CAST('1.00001' AS DECIMAL(6,5))})",
+                &[],
+            )
+            .expect_err("the column has four places and this has five");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
+    }
+
     /// An `INT128` column holds numbers no lane word could, and hands
     /// them back whole.
     ///

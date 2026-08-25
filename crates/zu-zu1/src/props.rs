@@ -80,7 +80,11 @@ use crate::txn::Cell;
 /// hundred and twenty eight bit integer, which is the first column type
 /// that is a number and does not ride the lane: sixteen bytes at a fixed
 /// stride, on the side of the store a `BINARY(16)` already uses.
-const PROPS_VERSION: u16 = 13;
+/// Version 14 puts the wide decimal on that same plane, which is the
+/// first type here stored two ways: `DECIMAL(9,2)` is a lane word of
+/// unscaled units and `DECIMAL(29,2)` is sixteen bytes of them, and the
+/// precision in the declared type is what tells the reader which.
+const PROPS_VERSION: u16 = 14;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -484,16 +488,23 @@ fn extended_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
             bits: IntBits::B128,
             precision: None,
         } => vec![EXTENDED_CODE, EXT_INT128],
-        // A decimal is written where its unscaled units fit the lane,
-        // and refused where they do not. The bound belongs here rather
-        // than one caller up because the declared form and the column
-        // form are one encoding for this type: a precision no column can
-        // hold is a precision no element type can name, and the refusal
-        // then lands at the declaration, where the user wrote it, rather
-        // than at the first insert. Wider precisions want a plane of
-        // their own the way a zoned column has one, and that is S2's.
+        // A decimal's unscaled units go wherever they fit: a lane word
+        // to eighteen digits, and the sixteen byte plane above that,
+        // which is the one the hundred and twenty eight bit integer
+        // opened. Which of the two a column uses is the encoding and is
+        // not written here; what is written here is the declaration,
+        // and the bound on it is the widest an `i128` holds, since that
+        // is the carrier a value of one arrives in.
+        //
+        // The bound belongs here rather than one caller up because the
+        // declared form and the column form are one encoding for this
+        // type: a precision no column can hold is a precision no element
+        // type can name, and the refusal then lands at the declaration,
+        // where the user wrote it, rather than at the first insert.
         LogicalType::Decimal { precision, scale } => {
-            lane_width(ty)?;
+            if *precision > zu_common::decimal::MAX_DIGITS {
+                return None;
+            }
             let mut out = vec![EXTENDED_CODE, EXT_DECIMAL];
             out.extend(precision.to_le_bytes());
             out.extend(scale.to_le_bytes());
@@ -1145,20 +1156,23 @@ impl PropValues<'_> {
     pub fn none_of(ty: &LogicalType) -> Option<PropValues<'_>> {
         Some(match ty {
             LogicalType::Bool => PropValues::Bool(&[]),
-            // A decimal column is a lane of unscaled units, so what an
-            // empty one holds none of is integers. The scale that makes
-            // them a number is in the declared type beside them, which
-            // is why this can be the same empty lane an integer column
-            // gets without the two columns being the same column.
-            // And a hundred and twenty eight bit integer holds none of
-            // sixteen byte runs, because it is on the blob side. The two
-            // integer arms are two arms for the same reason a `BINARY`
-            // column and an `INT64` one are: what an empty column holds
-            // none of is whatever its rows would have been.
+            // A narrow decimal column is a lane of unscaled units, so
+            // what an empty one holds none of is integers. The scale
+            // that makes them a number is in the declared type beside
+            // them, which is why this can be the same empty lane an
+            // integer column gets without the two columns being the same
+            // column. A wide one holds none of sixteen byte runs, and so
+            // does a hundred and twenty eight bit integer, because both
+            // are on the blob side. The arms are arms for the same reason
+            // a `BINARY` column and an `INT64` one are: what an empty
+            // column holds none of is whatever its rows would have been,
+            // and for a decimal that is the precision's answer and not
+            // the family's.
             LogicalType::Int {
                 bits: IntBits::B128,
                 ..
             } => PropValues::Bytes(&[]),
+            LogicalType::Decimal { .. } if fixed_octets(ty).is_some() => PropValues::Bytes(&[]),
             LogicalType::Int { .. } | LogicalType::Decimal { .. } => PropValues::Int(&[]),
             LogicalType::Float { .. } => PropValues::Float(&[]),
             LogicalType::Str { .. } => PropValues::Str(&[]),
@@ -1962,14 +1976,20 @@ fn write_props(
 /// fixes is a width in a unit the storage does not count in. A bound on
 /// characters is a check; a bound on octets is a layout.
 ///
-/// A hundred and twenty eight bit integer is one of these, and it is the
-/// only one that is not a byte string. The lane is sixty four bits and
-/// this is twice that, so the number goes on the blob side of the store
-/// as sixteen little endian bytes, which is where a `BINARY(16)` already
-/// goes and by the same layout: one width, no offsets. What tells the
-/// two apart afterwards is the column's own type, the way it tells a
-/// byte string from a character string.
-pub(crate) fn fixed_octets(ty: &LogicalType) -> Option<u32> {
+/// Two of these are numbers rather than byte strings. The lane is sixty
+/// four bits, so a hundred and twenty eight bit integer and a decimal
+/// whose unscaled units want more than a word both go on the blob side
+/// of the store as sixteen little endian bytes, which is where a
+/// `BINARY(16)` already goes and by the same layout: one width, no
+/// offsets. What tells the three apart afterwards is the column's own
+/// type, the way it tells a byte string from a character string.
+///
+/// The decimal is the one whose answer here depends on an argument
+/// rather than on the type, and that is the declared and encoding split
+/// at its plainest: `DECIMAL(9,2)` and `DECIMAL(29,2)` are one declared
+/// type family stored two ways, and the reader is told which by the
+/// precision it was declared with.
+pub fn fixed_octets(ty: &LogicalType) -> Option<u32> {
     match ty {
         LogicalType::Bytes {
             min: Some(min),
@@ -1980,6 +2000,7 @@ pub(crate) fn fixed_octets(ty: &LogicalType) -> Option<u32> {
             bits: IntBits::B128,
             ..
         } => Some(16),
+        LogicalType::Decimal { .. } if lane_width(ty).is_none() => Some(16),
         _ => None,
     }
 }
@@ -2090,6 +2111,35 @@ fn check_declared(
         // type says is not there. The scale is not checked because the
         // lane cannot disagree with it: a unit is whatever the declared
         // scale says a unit is.
+        // A wide decimal is the same promise checked over the other
+        // plane. Its unscaled units are sixteen bytes a row rather than
+        // a lane word, so the width is checked first, for the reason the
+        // integer above checks one, and then the digit count, which is
+        // the declaration's own promise and is the same question either
+        // way.
+        (LogicalType::Decimal { precision, scale }, PropValues::Bytes(rows))
+            if fixed_octets(ty).is_some() =>
+        {
+            for (row, bytes) in rows.iter().enumerate() {
+                if !column.holds(row) {
+                    continue;
+                }
+                let Ok(word) = <[u8; 16]>::try_from(*bytes) else {
+                    return Err(ZuError::InvalidArgument(format!(
+                        "column '{name}' is declared {ty} and row {row} holds {} octets",
+                        bytes.len()
+                    )));
+                };
+                let held = Decimal::new(i128::from_le_bytes(word), *scale);
+                if held.digits() <= *precision {
+                    continue;
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "column '{name}' is declared {ty} and row {row} holds {held}"
+                )));
+            }
+            return Ok(());
+        }
         (LogicalType::Decimal { precision, scale }, PropValues::Int(words)) => {
             for (row, &word) in words.iter().enumerate() {
                 if !column.holds(row) {
@@ -6006,12 +6056,14 @@ mod tests {
         };
         assert_eq!(column_type_bytes(&fixed), declared_type_bytes(&fixed));
         // A decimal is the first type whose storability turns on an
-        // argument rather than on the type. It rides the lane as a whole
-        // number of unscaled units, so the question is whether the units
-        // fit a lane word, and eighteen digits is the last precision
-        // that does. Both forms answer alike, so a decimal a graph type
-        // names is a decimal a column holds and there is no gap between
-        // them for a declaration to fall into.
+        // argument rather than on the type, and now the first stored two
+        // ways. Its unscaled units ride a lane word to eighteen digits
+        // and sixteen bytes on the blob side above that, so where it
+        // stops is where an `i128` stops, which is where the value that
+        // carries one stops. Both forms answer alike at every precision,
+        // so a decimal a graph type names is a decimal a column holds
+        // and there is no gap between them for a declaration to fall
+        // into.
         let decimal = |precision| LogicalType::Decimal {
             precision,
             scale: 2,
@@ -6020,8 +6072,15 @@ mod tests {
             let ty = decimal(precision);
             assert_eq!(column_type_bytes(&ty), declared_type_bytes(&ty), "{ty}");
             assert!(storable(&ty), "{ty}");
+            assert!(fixed_octets(&ty).is_none(), "{ty} is on the lane");
         }
         for precision in [19, 38] {
+            let ty = decimal(precision);
+            assert_eq!(column_type_bytes(&ty), declared_type_bytes(&ty), "{ty}");
+            assert!(storable(&ty), "{ty}");
+            assert_eq!(fixed_octets(&ty), Some(16), "{ty}");
+        }
+        for precision in [39, 76] {
             let ty = decimal(precision);
             assert!(declared_type_bytes(&ty).is_none(), "{ty}");
             assert!(column_type_bytes(&ty).is_none(), "{ty}");
@@ -6229,13 +6288,22 @@ mod tests {
             ),
             (bounded_list(LogicalType::float(FloatBits::B32), 768), true),
             (list_of(list_of(LogicalType::string())), true),
-            // A decimal whose unscaled units fit the lane. This is the
-            // one row of the table whose sibling is on the other side of
-            // it: the type is storable and an argument to it is what
-            // decides, which no other row here can say.
+            // Both decimals, which are one type stored two ways: twelve
+            // digits of unscaled units are a lane word and thirty eight
+            // are sixteen bytes on the blob side. The row above the
+            // frontier and the row below it used to be these two, and
+            // now the frontier for this type is where an `i128` ends,
+            // which is where the value carrier ends.
             (
                 LogicalType::Decimal {
                     precision: 12,
+                    scale: 2,
+                },
+                true,
+            ),
+            (
+                LogicalType::Decimal {
+                    precision: 38,
                     scale: 2,
                 },
                 true,
@@ -6245,7 +6313,7 @@ mod tests {
             // schema/06 section 6, and S2 turns them true one at a time.
             (
                 LogicalType::Decimal {
-                    precision: 38,
+                    precision: 39,
                     scale: 2,
                 },
                 false,

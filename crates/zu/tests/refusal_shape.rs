@@ -70,7 +70,7 @@ const REFUSALS: &[(&str, &str)] = &[
     ),
     (
         "a type this file cannot write",
-        "CREATE GRAPH TYPE t6 { (:Probe {total :: DECIMAL(38,2)}) }",
+        "CREATE GRAPH TYPE t6 { (:Probe {total :: INT256}) }",
     ),
     (
         "one property declared twice",

@@ -1015,6 +1015,19 @@ impl Log {
     /// Already resident, because a null slot is a page somebody chose to
     /// let go of and mapping it would quietly take the memory back.
     ///
+    /// There is a fourth condition and it is not checked here because
+    /// nothing can violate it from inside this function. A settled page
+    /// is only read from, which is what makes `PROT_READ` the right
+    /// protection, and the one thing in the engine that writes into a
+    /// page it did not just append to is recovery, which repairs a hash
+    /// chain through `RecordRef::relink`. That runs on the open path and
+    /// finishes before the flusher is spawned, and the flusher is the
+    /// only caller of this. Anything that moves the spawn above
+    /// `recover::replay`, or gives a live compaction pass the ability to
+    /// rewrite a record header in place, breaks this and the symptom is
+    /// a fault rather than a wrong byte, which is the reason for
+    /// `PROT_READ` rather than a writable mapping.
+    ///
     /// Off by default. The read of a mapped page is a fault where the
     /// read of a heap page is a load, and what that costs has not been
     /// measured on any host of record yet.

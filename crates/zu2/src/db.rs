@@ -1015,6 +1015,18 @@ impl Db {
         // Async never waits on the flusher, but it still wants one:
         // without it the log would grow in memory forever and eviction
         // would have nothing durable to evict.
+        //
+        // This spawn stays below `recover::replay` and the ordering is
+        // load bearing rather than tidy. Recovery repairs a chain by
+        // writing into a record that is already in a page, through
+        // `RecordRef::relink`, and its own safety note says the page is
+        // one that can be written back. The flusher is what runs
+        // `evict_settled`, and under `Options::map_settled` that turns a
+        // settled page into a `PROT_READ` mapping. A flusher running
+        // beside recovery could therefore map a page out from under a
+        // repair, and the repair would take a fault rather than write a
+        // wrong byte, but a fault in the middle of opening a database is
+        // not better. #757.
         let background = Arc::clone(&core);
         let flusher = std::thread::Builder::new()
             .name("zu2-flush".into())

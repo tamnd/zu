@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use zu_common::gqlstatus::{Subject, codes};
-use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
+use zu_common::{Decimal, FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::deleted::Deleted;
@@ -715,6 +715,36 @@ pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
             match bits {
                 FloatBits::B32 => Cell::Int(u64::from((f as f32).to_bits())),
                 _ => Cell::Int(f.to_bits()),
+            }
+        }
+        // A decimal column is a column of unscaled units, so a value
+        // goes in written at the column's scale. A value the column
+        // cannot write there exactly is refused rather than rounded:
+        // rounding a price on the way into a ledger is the mistake this
+        // whole type exists to stop, and a caller who wants two places
+        // out of three digits says so with a cast.
+        //
+        // An integer is an exact number of scale nought, so it goes in
+        // the same way a whole number goes into a float column.
+        (LogicalType::Decimal { precision, scale }, Value::Decimal(_) | Value::Int(_)) => {
+            let given = match value {
+                Value::Decimal(d) => *d,
+                Value::Int(n) => Decimal::new(i128::from(*n), 0),
+                _ => unreachable!("matched just above"),
+            };
+            let at = given
+                .rescale(*scale)
+                .filter(|at| at.digits() <= *precision)
+                .and_then(|at| i64::try_from(at.unscaled()).ok());
+            match at {
+                Some(units) => Cell::Int(units as u64),
+                None => {
+                    return Err(ZuError::gql(
+                        codes::C22003,
+                        format!("property '{key}' holds {ty}, and {given} is not a value of it"),
+                    )
+                    .about(Subject::Property(key.to_string())));
+                }
             }
         }
         // A length bound counts two different things on the two sides.

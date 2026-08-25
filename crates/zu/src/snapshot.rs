@@ -466,14 +466,17 @@ fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
             reader.columns().len()
         )));
     }
-    // A zoned column rides the lane and is not a lane the vector layer
-    // has: what the words hold is instants, and the offsets that make
-    // them zoned are a plane a vector has no room for. `vector_col`
-    // already keeps one out of a plan, and this is the same rule said
-    // where the read happens, so a caller that reached here another way
-    // is refused rather than handed instants dressed as integers.
+    // Two column types ride the lane and are not lanes the vector layer
+    // has. A zoned column's words are instants, and the offsets that
+    // make them zoned are a plane a vector has no room for. A decimal
+    // column's words are unscaled units, and the scale that makes them
+    // a number is in the declared type, which a vector does not carry.
+    // `vector_col` already keeps both out of a plan, and this is the
+    // same rule said where the read happens, so a caller that reached
+    // here another way is refused rather than handed words dressed as
+    // integers.
     let column = &reader.columns()[ix];
-    if zoned(&column.ty) {
+    if zoned(&column.ty) || matches!(column.ty, LogicalType::Decimal { .. }) {
         return Err(ZuError::InvalidArgument(format!(
             "column '{}' holds {}, which the vector layer has no lane for",
             column.name, column.ty

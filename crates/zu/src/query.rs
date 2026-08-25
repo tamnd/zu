@@ -24,7 +24,7 @@ use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::props::{
     ListElement, PropsReader, list_elements, load_props, load_props_at, zoned,
 };
-use zu_common::{FloatBits, LogicalType, Temporal};
+use zu_common::{Decimal, FloatBits, LogicalType, Temporal};
 
 /// The same rows read down their columns, which is the shape every
 /// client that hands a result to Arrow, pandas or polars needs.
@@ -257,6 +257,14 @@ fn word_value(ty: &LogicalType, word: u64, key: &str) -> Result<Value> {
     Ok(match ty {
         LogicalType::Bool => Value::Bool(word != 0),
         LogicalType::Int { .. } => Value::Int(word as i64),
+        // The lane holds unscaled units and the declared type holds the
+        // scale, which is the declared versus encoding split of
+        // schema/06 §2 at its plainest: a column of DECIMAL(12,2) is a
+        // column of pence, and the type is what makes a word of them
+        // into one pound twenty.
+        LogicalType::Decimal { scale, .. } => {
+            Value::Decimal(Decimal::new(i128::from(word as i64), *scale))
+        }
         LogicalType::Float { bits, .. } => match bits {
             FloatBits::B32 => Value::Float(f64::from(f32::from_bits(word as u32))),
             _ => Value::Float(f64::from_bits(word)),

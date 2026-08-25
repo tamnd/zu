@@ -1206,6 +1206,77 @@ mod tests {
         assert!(catalog.node_in(graph, "event").is_none());
     }
 
+    /// A decimal column is the first one whose declaration is part of
+    /// reading it back. The lane holds a whole number of units and the
+    /// scale in the declared type says how large a unit is, so a column
+    /// of `DECIMAL(12,2)` is a column of pence and the type is what
+    /// turns a hundred and twenty of them into 1.20.
+    ///
+    /// The scale binds on the way in as well as on the way out. A value
+    /// the column cannot hold exactly is refused rather than rounded:
+    /// rounding a price on the way into a ledger is the mistake this
+    /// type exists to stop, and a caller who wants it rounded has
+    /// `ROUND` to ask with.
+    #[test]
+    fn a_declared_decimal_column_keeps_its_scale_in_and_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("decimal.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:purchase {total :: DECIMAL(12,2)}) }",
+            "CREATE GRAPH g TYPED t",
+            // One at the column's own scale, one coarser, and a plain
+            // integer. All three are exact at two places, so all three
+            // are values this column holds.
+            "USE g INSERT (p:purchase {total: CAST('1.20' AS DECIMAL(5,2))})",
+            "USE g INSERT (p:purchase {total: CAST('0.5' AS DECIMAL(5,1))})",
+            "USE g INSERT (p:purchase {total: 7})",
+        ] {
+            session
+                .run(stmt, &[])
+                .expect("the graph, its type, its rows");
+        }
+
+        // The column stores 120, 50 and 700 units and the declared scale
+        // is what turns them back into the numbers written. The second
+        // place on 0.50 is the column's rather than the literal's, which
+        // is the whole point of keeping the scale in the catalog.
+        let rows = session
+            .run(
+                "USE g MATCH (p:purchase) RETURN p.total AS total ORDER BY total",
+                &[],
+            )
+            .expect("the rows read back");
+        let read: Vec<String> = rows
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Decimal(d) => d.to_string(),
+                other => panic!("expected an exact decimal, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, ["0.50", "1.20", "7.00"]);
+
+        // A third place is not something this column holds, and 22003 is
+        // the condition for a value outside a numeric type's range.
+        let err = session
+            .run(
+                "USE g INSERT (p:purchase {total: CAST('1.234' AS DECIMAL(6,3))})",
+                &[],
+            )
+            .expect_err("the column has two places and this has three");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
+
+        // So is a number wider than the declared precision, which is the
+        // other half of what `DECIMAL(12,2)` promised: eleven digits and
+        // two places is thirteen, and twelve is the whole of it.
+        let err = session
+            .run("USE g INSERT (p:purchase {total: 12345678901})", &[])
+            .expect_err("thirteen digits do not fit twelve");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22003"));
+    }
+
     /// A refusal is asked once whether this module can do anything for
     /// it, and the answer is held with it, so the second send of the
     /// same bad statement does not parse it again to find out. What

@@ -96,25 +96,35 @@ fn probe() -> Vec<(&'static str, Answer)> {
         // so a declaration is still all they are.
         ("LIST<FLOAT32 NOT NULL>[768]", Answer::Declared),
         ("LIST<LIST<STRING>>", Answer::Declared),
+        // A decimal a 64 bit lane holds. The column stores unscaled
+        // units and the declared scale is what makes them a number, so
+        // twelve digits of them fit a word and this is a column a
+        // statement can fill.
+        ("DECIMAL(12,2)", Answer::Declared),
         // Spelled and not stored. This is the list S2 works through.
         // The condition is 42000 for all of them, which is what S1
         // replaced the sentence about corruption with.
-        ("DECIMAL(12,2)", cannot_write(26)),
-        ("INT128", cannot_write(27)),
-        ("INT256", cannot_write(28)),
-        ("UINT128", cannot_write(29)),
-        ("FLOAT16", cannot_write(30)),
-        ("FLOAT128", cannot_write(31)),
-        ("FLOAT256", cannot_write(32)),
-        ("ANY", cannot_write(33)),
-        ("ANY PROPERTY VALUE", cannot_write(34)),
-        ("PATH", cannot_write(35)),
-        ("NODE", cannot_write(36)),
-        ("EDGE", cannot_write(37)),
-        ("GRAPH", cannot_write(38)),
-        ("BINDING TABLE", cannot_write(39)),
-        ("NULL", cannot_write(40)),
-        ("NOTHING", cannot_write(41)),
+        //
+        // The wide decimal is here for the same reason INT128 is: its
+        // unscaled units want more than a lane word, and the lane is
+        // sixty four bits. It is the one row on this list whose sibling
+        // is on the list above.
+        ("DECIMAL(38,2)", cannot_write(27)),
+        ("INT128", cannot_write(28)),
+        ("INT256", cannot_write(29)),
+        ("UINT128", cannot_write(30)),
+        ("FLOAT16", cannot_write(31)),
+        ("FLOAT128", cannot_write(32)),
+        ("FLOAT256", cannot_write(33)),
+        ("ANY", cannot_write(34)),
+        ("ANY PROPERTY VALUE", cannot_write(35)),
+        ("PATH", cannot_write(36)),
+        ("NODE", cannot_write(37)),
+        ("EDGE", cannot_write(38)),
+        ("GRAPH", cannot_write(39)),
+        ("BINDING TABLE", cannot_write(40)),
+        ("NULL", cannot_write(41)),
+        ("NOTHING", cannot_write(42)),
         // Not spelled at all. The year month duration is the one type a
         // column already holds that no declaration can ask for.
         ("YEAR MONTH DURATION", Answer::NotSpelled),
@@ -135,7 +145,7 @@ fn a_graph_type_declares_the_types_the_frontier_says_it_can() {
             declared += 1;
         }
     }
-    assert_eq!(declared, 25, "the declarable set changed");
+    assert_eq!(declared, 26, "the declarable set changed");
 }
 
 /// The frontier has a far side, and one type is on it.
@@ -176,7 +186,7 @@ fn the_year_month_duration_is_stored_and_cannot_be_declared() {
 /// Every refusal above carries a condition and none of them says
 /// corrupt, which is what S1 changed.
 ///
-/// A user who writes `DECIMAL(12,2)` has written a legal GQL statement
+/// A user who writes `DECIMAL(38,2)` has written a legal GQL statement
 /// that this engine will not perform. Before S1 they were told their
 /// file was damaged, with no condition to catch on. Now it is 42000,
 /// syntax error or access rule violation, which is the class the
@@ -184,12 +194,16 @@ fn the_year_month_duration_is_stored_and_cannot_be_declared() {
 /// two data exception codes that say invalid value type, 22G03 and
 /// 22G12, are class 22 and are about a value at run time; a type in a
 /// declaration is not a value.
+///
+/// The example is the wide decimal rather than the narrow one because
+/// the narrow one now stores. Thirty eight digits of unscaled units do
+/// not fit a lane word, so this is where the same sentence still holds.
 #[test]
 fn a_type_the_catalog_will_not_write_is_refused_with_a_condition() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    let source = "CREATE GRAPH TYPE money { (:Purchase {total :: DECIMAL(12,2)}) }";
-    let err = run(source, &mut db, &[]).expect_err("a decimal is not storable");
+    let source = "CREATE GRAPH TYPE money { (:Purchase {total :: DECIMAL(38,2)}) }";
+    let err = run(source, &mut db, &[]).expect_err("a wide decimal is not storable");
     assert_eq!(err.gqlstatus().map(|s| s.to_string()), Some("42000".into()));
     assert!(!err.to_string().contains("corrupt"), "{err}");
     assert!(

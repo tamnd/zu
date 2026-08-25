@@ -70,7 +70,7 @@ fn refusals() -> Vec<Refusal> {
         Refusal {
             asks: "a type no column holds",
             setup: &[],
-            source: "CREATE GRAPH TYPE v1 { (:P {v :: DECIMAL(12,2)}) }",
+            source: "CREATE GRAPH TYPE v1 { (:P {v :: DECIMAL(38,2)}) }",
             says_corrupt: false,
             status: Some("42000"),
         },

@@ -49,7 +49,7 @@
                                                             ^
 
 # a type this file cannot write
-  statement CREATE GRAPH TYPE t6 { (:Probe {total :: DECIMAL(12,2)}) }
+  statement CREATE GRAPH TYPE t6 { (:Probe {total :: DECIMAL(38,2)}) }
   gqlstatus 42000
   condition syntax error or access rule violation
   severity  X

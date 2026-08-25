@@ -2126,19 +2126,22 @@ mod tests {
         ))
         .expect("a list of lists is declarable");
         // A type the declared form has no shape for at all is still
-        // refused where it is written and not where it is encoded.
+        // refused where it is written and not where it is encoded. A
+        // narrow decimal is no longer one of those, since its unscaled
+        // units ride a lane word, so the example is one whose units do
+        // not: thirty eight digits want more than sixty four bits.
         let err = c
             .add_graph_type(GraphType::open("money").with(
                 ElementType::node("Purchase", vec![person]).with_property(
                     "total",
                     LogicalType::Decimal {
-                        precision: 12,
+                        precision: 38,
                         scale: 2,
                     },
                     true,
                 ),
             ))
-            .expect_err("a decimal has no declared form")
+            .expect_err("a wide decimal has no declared form")
             .to_string();
         assert!(err.contains("a type this file cannot write"), "{err}");
     }

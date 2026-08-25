@@ -41,10 +41,13 @@ fn options() -> Options {
     Options {
         durability: Durability::Async,
         index_buckets: 1 << 8,
-        // Room for four writers to be ahead of the compactor. At 16 a
-        // long run ends in `LogFull` rather than in an answer, because
-        // the pass is migrating pages while four threads fill them.
-        max_pages: 64,
+        // Four writers ahead of one compactor, over a live set of a
+        // few megabytes. It only fits because a re-add of an edge that
+        // is there no longer goes on the log: before #784 the rest of
+        // these pages were duplicate add records that no pass could
+        // reclaim, and a long run ended in `LogFull` rather than in an
+        // answer.
+        max_pages: 16,
         mutable_pages: 1,
         max_nodes: 1 << 12,
         // Low enough that the background thread is always passing over

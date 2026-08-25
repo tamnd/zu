@@ -765,6 +765,29 @@ impl Session<'_> {
             // not a thread a flush is waiting for, and dropped before
             // the commit so that the device is never waited on under it.
             let order = core.graph().order_edges(src);
+            // A write that changes nothing does not go on the log. An
+            // add of an edge that is there and a remove of one that is
+            // not both leave the adjacency exactly as it was, and the
+            // add's record would then be live for as long as the edge
+            // is, because `compact::keep_edge` asks whether the
+            // adjacency has the edge and never whether it got it from
+            // this record or from the two hundred below it. So a
+            // workload that re-asserts its edges, which is what every
+            // `MERGE` shaped write does, left a live record per
+            // operation over a graph that was not growing, every pass
+            // copied all of them forward, and the log ran out. #784.
+            //
+            // Under `order`, so this and the append are one step
+            // against another writer on the same node, and inside the
+            // epoch, because reading the neighbours walks a block a
+            // grow may be retiring.
+            self.slot.protect();
+            let same = self.neighbours(Direction::Out, src, |n| n.binary_search(&dst).is_ok());
+            self.slot.unprotect();
+            if same == add {
+                drop(order);
+                return Ok(());
+            }
             // Inside the epoch, and this is not optional. The flusher decides
             // that a page is complete by publishing its target and waiting
             // for every announced session to leave, so an append that

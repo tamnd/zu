@@ -207,6 +207,20 @@ typedef struct zu2_options {
    * compressed, so turning it off stops new records being compressed
    * and leaves everything already written readable. */
   uint32_t no_cold_compression;
+  /* Holds a settled log page as a mapping of the file rather than as
+   * heap. Zero, the default, keeps it on the heap.
+   *
+   * A page below the mutable window is read only and identical to the
+   * bytes of the file underneath it, so the private copy of it is
+   * anonymous memory the kernel can do nothing with but swap while the
+   * same bytes sit in its own cache. Mapping gives the copy back and
+   * turns the resident set into page cache the kernel can drop and
+   * fault back.
+   *
+   * It does not change how many pages are resident, only what kind of
+   * memory they are, and the read of a mapped page is a fault where the
+   * read of a heap page is a load. Off until that has been measured. */
+  uint32_t map_settled;
 } zu2_options;
 
 typedef struct zu2_db zu2_db;

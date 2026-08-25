@@ -1108,6 +1108,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
         ("uint32_t", "no_promote_reads"),
         ("uint64_t", "memory_pages"),
         ("uint32_t", "no_cold_compression"),
+        ("uint32_t", "map_settled"),
     ];
     let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/zu2.h"))
         .expect("the header ships with the crate");
@@ -1186,6 +1187,7 @@ fn the_header_and_the_options_struct_declare_the_same_fields() {
             "no_promote_reads" => std::mem::offset_of!(Zu2Options, no_promote_reads),
             "memory_pages" => std::mem::offset_of!(Zu2Options, memory_pages),
             "no_cold_compression" => std::mem::offset_of!(Zu2Options, no_cold_compression),
+            "map_settled" => std::mem::offset_of!(Zu2Options, map_settled),
             other => panic!("{other} is in the header and this test does not know it"),
         };
         assert_eq!(

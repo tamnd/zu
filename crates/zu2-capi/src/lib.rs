@@ -146,6 +146,22 @@ pub struct Zu2Options {
     /// is compressed, so turning it off stops new records being
     /// compressed and leaves everything already written readable.
     pub no_cold_compression: u32,
+    /// Holds a settled log page as a mapping of the file rather than as
+    /// heap. Zero, the default, keeps it on the heap.
+    ///
+    /// A page below the mutable window is read only and identical to the
+    /// bytes of the file underneath it, so the private copy of it is
+    /// anonymous memory the kernel can do nothing with but swap while
+    /// the same bytes sit in its own cache. Mapping gives the copy back
+    /// and turns the resident set into page cache the kernel can drop
+    /// and fault back, which is what every mapping engine this is
+    /// measured against already has.
+    ///
+    /// It does not change how many pages are resident, only what kind of
+    /// memory they are, and the read of a mapped page is a fault where
+    /// the read of a heap page is a load. Off until that has been
+    /// measured on a host that publishes numbers. #757.
+    pub map_settled: u32,
 }
 
 /// A database and the two things a C caller needs beside it: the flag
@@ -444,6 +460,9 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     }
     if given.no_cold_compression != 0 {
         options.compress_cold = false;
+    }
+    if given.map_settled != 0 {
+        options.map_settled = true;
     }
     options.compact_below = match given.compact_below {
         0 => options.compact_below,

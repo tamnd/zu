@@ -373,6 +373,90 @@ fn the_page_bound_holds_after_the_writing_stops() {
     }
 }
 
+/// A settled page becomes a mapping of the file, and reading through one
+/// gives back what was written.
+///
+/// The point of #757 is that the resident set stops being anonymous
+/// memory, so the assertion is on the split rather than on the total:
+/// most of what is resident should be mapped, the window should not be,
+/// and every record should read back the same either way. Compaction runs
+/// beside it, because a pass that reclaims a page has to give a mapping
+/// back with `munmap` and not with `dealloc`, and getting that wrong is
+/// the kind of thing that shows up as a crash here or nowhere.
+#[test]
+fn a_settled_page_becomes_a_mapping_of_the_file() {
+    if !cfg!(unix) {
+        // No mapping call on this platform, so the pages stay on the
+        // heap and there is nothing to assert. See `file::map_read`.
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Db::create(
+        &dir.path().join("p.zu2"),
+        Options {
+            durability: Durability::Async,
+            mutable_pages: 1,
+            map_settled: true,
+            max_pages: 64,
+            index_buckets: 1 << 12,
+            // No eviction, so what is resident stays resident and the
+            // only thing that can change about it is its kind.
+            memory_pages: usize::MAX,
+            compact_below: 0,
+            ..Options::default()
+        },
+    )
+    .expect("create");
+
+    let mut s = db.session();
+    let big = vec![b'm'; 8192];
+    for i in 0..10_000u32 {
+        s.upsert(&key(i), &big).expect("upsert");
+    }
+    drop(s);
+    db.sync().expect("sync");
+
+    // The maintainer converts a page after the flush that settles it, so
+    // this waits for a thread to notice rather than for any work.
+    let mut mapped = db.mapped_pages();
+    let mut resident = db.resident_pages();
+    for _ in 0..100 {
+        if mapped * 4 >= resident * 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mapped = db.mapped_pages();
+        resident = db.resident_pages();
+    }
+    assert!(
+        mapped > 0,
+        "{resident} pages resident and not one of them was mapped"
+    );
+    assert!(
+        mapped * 4 >= resident * 3,
+        "only {mapped} of {resident} resident pages are mapped, so most of \
+         the resident set is still anonymous"
+    );
+
+    // Reading through a mapping is the whole point and it is also the
+    // thing that faults, so read every key rather than a sample.
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in 0..10_000u32 {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost key {i}");
+        assert_eq!(out.len(), big.len(), "key {i} came back short");
+        assert_eq!(out[0], b'm', "key {i} came back as something else");
+    }
+    drop(s);
+
+    // And a pass that takes the pages back has to unmap them.
+    db.compact().expect("compact");
+    let mut s = db.session();
+    for i in (0..10_000u32).step_by(89) {
+        assert!(s.read(&key(i), &mut out).expect("read"), "lost key {i}");
+    }
+}
+
 #[test]
 fn an_overflowing_bucket_keeps_every_key_through_updates() {
     // Sixteen buckets, eight entries each, so 128 slots hold 4000 keys.

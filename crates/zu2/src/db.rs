@@ -144,6 +144,15 @@ pub struct Options {
     pub mutable_pages: usize,
     /// Pages kept in memory. `usize::MAX` never evicts.
     pub memory_pages: usize,
+    /// Whether a page that has settled is held as a mapping of the file
+    /// rather than as heap.
+    ///
+    /// It does not change how much is resident, it changes what kind of
+    /// memory that is: anonymous pages the kernel can only swap become
+    /// page cache it can drop and fault back. Off by default until the
+    /// cost of the fault has been measured against the load it replaces
+    /// on a host that publishes numbers. #757.
+    pub map_settled: bool,
     /// Concurrent sessions the epoch table has room for.
     pub sessions: usize,
     /// Nodes the graph plane is sized for. Only the array of chunk
@@ -289,6 +298,7 @@ impl Default for Options {
             max_pages: 1 << 16,
             mutable_pages: 4,
             memory_pages: usize::MAX,
+            map_settled: false,
             sessions: 128,
             max_nodes: 1 << 26,
             compact_below: 128 << 20,
@@ -965,6 +975,7 @@ impl Db {
                 options.memory_pages,
                 options.sessions,
                 options.provision_bytes,
+                options.map_settled,
             ),
             index: Index::new(options.index_buckets, !options.grow_index),
             graph: Graph::new(options.max_nodes),
@@ -1095,6 +1106,17 @@ impl Db {
     /// of what [`Db::disk_bytes`] answers for the filesystem.
     pub fn resident_pages(&self) -> usize {
         self.core.log.resident_pages()
+    }
+
+    /// Of those, the ones held as a mapping of the file rather than as
+    /// heap. Zero unless [`Options::map_settled`] is on.
+    ///
+    /// The remainder is anonymous memory, and the split is the whole of
+    /// what #757 is about: the same number of resident pages costs the
+    /// system a different thing depending which side of this they are
+    /// on.
+    pub fn mapped_pages(&self) -> usize {
+        self.core.log.mapped_pages()
     }
 
     /// Bytes the file occupies on the device, holes excluded. This is

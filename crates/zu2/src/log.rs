@@ -34,7 +34,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::addr::{Address, FIRST, MAX_PAGES, PAGE_SIZE, page_of, page_start};
@@ -124,6 +124,36 @@ pub fn checkpoint_path_beside(path: &Path) -> (PathBuf, PathBuf) {
 /// enough that neither is worth a decision: the fixed 128 KiB is a
 /// thirtieth of one page, and a chunk arrives once per 16 GiB.
 const CHUNK: usize = 1 << 12;
+
+/// The bit a page slot carries when its page is a mapping of the file
+/// rather than an allocation of the heap.
+///
+/// The two kinds have to be told apart at exactly one place, the free,
+/// where one is a `dealloc` and the other a `munmap`, and the low bit is
+/// the cheapest way to carry which. A heap page is 64 byte aligned and a
+/// mapping is aligned to whatever the kernel maps at, so the bit is free
+/// in both. Everything that reads a page goes through [`Log::page_ptr`],
+/// which masks it off, and everything that publishes a mapping tags it
+/// there and nowhere else. #757.
+const MAPPED: usize = 1;
+
+/// Tags a mapping so the free side knows what it is holding.
+#[inline]
+fn tag_mapped(at: *mut u8) -> *mut u8 {
+    at.map_addr(|address| address | MAPPED)
+}
+
+/// Whether a page slot is holding a mapping.
+#[inline]
+fn is_mapped(at: *mut u8) -> bool {
+    at.addr() & MAPPED != 0
+}
+
+/// The page a slot points at, whichever kind it is.
+#[inline]
+fn page_base(at: *mut u8) -> *mut u8 {
+    at.map_addr(|address| address & !MAPPED)
+}
 
 /// The chunk layout. Written as a slice rather than an array so the
 /// free side can rebuild the same `Box<[_]>` it came from.
@@ -273,6 +303,16 @@ pub struct Log {
     mutable_pages: usize,
     /// Pages kept in memory at all. `usize::MAX` means never evict.
     memory_pages: usize,
+    /// Whether a page that has settled becomes a mapping of the file
+    /// instead of staying on the heap. See [`Log::remap_settled`], #757.
+    map_settled: bool,
+    /// The lowest page [`Log::remap_settled`] has not looked at.
+    ///
+    /// A cursor and not a scan, because the conversion is one way and a
+    /// page only has to be considered once. Without it every call would
+    /// walk from the head to the boundary, which with no eviction floor
+    /// set is the whole log and grows without bound.
+    remap_from: AtomicUsize,
     /// How far past the write frontier the blocks are reserved. Zero
     /// never reserves.
     provision_bytes: u64,
@@ -290,6 +330,10 @@ pub struct Log {
 }
 
 impl Log {
+    // Eight settings from `Options`, all of them independent and all of
+    // them stored flat. Grouping them into a struct would put a second
+    // name on the same fields and buy nothing but a shorter signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file: File,
         path: &Path,
@@ -298,6 +342,7 @@ impl Log {
         memory_pages: usize,
         sessions: usize,
         provision_bytes: u64,
+        map_settled: bool,
     ) -> Self {
         Self {
             chunks: (0..MAX_PAGES / CHUNK)
@@ -346,6 +391,8 @@ impl Log {
             mutable_pages: mutable_pages.min(max_pages.saturating_sub(2)),
             memory_pages: memory_pages
                 .max(mutable_pages.min(max_pages.saturating_sub(2)).max(1) + 1),
+            map_settled,
+            remap_from: AtomicUsize::new(0),
             epochs: Epochs::new(sessions),
         }
     }
@@ -580,16 +627,7 @@ impl Log {
             let Some(slot) = self.page_slot(page) else {
                 continue;
             };
-            let stale = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !stale.is_null() {
-                let retired = stale as usize;
-                self.epochs.defer(Box::new(move || {
-                    // SAFETY: the epoch has passed, so no session that
-                    // could have loaded this pointer is still running,
-                    // and it was allocated with exactly this layout.
-                    unsafe { dealloc(retired as *mut u8, page_layout()) };
-                }));
-            }
+            self.release_page(slot.swap(std::ptr::null_mut(), Ordering::AcqRel));
         }
         self.release_chunks(page_of(upto));
         self.retire_pages();
@@ -706,9 +744,39 @@ impl Log {
     #[inline]
     fn page_ptr(&self, page: usize) -> *mut u8 {
         match self.page_slot(page) {
-            Some(slot) => slot.load(Ordering::Acquire),
+            // Masked here so that everything above this can treat a
+            // mapped page and a heap page as the same thing, which they
+            // are for every purpose except the free. See [`MAPPED`].
+            Some(slot) => page_base(slot.load(Ordering::Acquire)),
             None => std::ptr::null_mut(),
         }
+    }
+
+    /// Hands a page back through the epoch, whichever kind it is.
+    ///
+    /// Deferred rather than freed: a reader that loaded the pointer
+    /// before it left the slot is still inside its epoch and is entitled
+    /// to the bytes. That is as true of a mapping as of an allocation,
+    /// and a `munmap` under a reader is a segmentation fault where a
+    /// `dealloc` under one is merely undefined.
+    fn release_page(&self, stale: *mut u8) {
+        if stale.is_null() {
+            return;
+        }
+        let mapped = is_mapped(stale);
+        let retired = page_base(stale) as usize;
+        self.epochs.defer(Box::new(move || {
+            // SAFETY: the epoch has passed, so no session that could
+            // have loaded this pointer is still running, and the tag
+            // says which of the two ways it was made.
+            unsafe {
+                if mapped {
+                    crate::file::unmap(retired as *mut u8, PAGE_SIZE);
+                } else {
+                    dealloc(retired as *mut u8, page_layout());
+                }
+            }
+        }));
     }
 
     /// The slot for a page, allocating the chunk under it if this is the
@@ -901,11 +969,112 @@ impl Log {
     ///
     /// [`opened_page`]: Log::opened_page
     pub fn evict_settled(&self) {
+        self.remap_settled();
         if self.memory_pages == usize::MAX {
             return;
         }
         self.evict_behind(page_of(self.tail()));
         self.retire_pages();
+    }
+
+    /// Turns the pages that have settled from heap into mappings of the
+    /// file they are already identical to.
+    ///
+    /// A page below the read-only boundary and below the flushed
+    /// frontier is finished: nothing will write to it again, and its
+    /// bytes on the device are its bytes in memory. Holding a private
+    /// copy of it is holding anonymous memory the kernel can do nothing
+    /// with but swap, and the same bytes are sitting in the page cache
+    /// underneath it. Mapping the file over the top gives the copy back
+    /// and leaves the read a load rather than a `pread`.
+    ///
+    /// What this is worth is a fact about the kind of memory and not its
+    /// size. Measured on server2 at a million records, zu2 held 1152 MiB
+    /// of anonymous memory against lmdb's 17.6, and lmdb's resident set
+    /// is page cache the kernel drops when it wants it back. #757.
+    ///
+    /// Three conditions, and each one is load bearing. Below the
+    /// boundary, because a page in the mutable window is still being
+    /// appended to and the mapping is read only. Below the flushed
+    /// frontier, because a mapping shows what the file says and the file
+    /// does not say anything yet about bytes that have not been written.
+    /// Already resident, because a null slot is a page somebody chose to
+    /// let go of and mapping it would quietly take the memory back.
+    ///
+    /// Off by default. The read of a mapped page is a fault where the
+    /// read of a heap page is a load, and what that costs has not been
+    /// measured on any host of record yet.
+    fn remap_settled(&self) {
+        if !self.map_settled {
+            return;
+        }
+        let boundary = page_of(self.read_only());
+        let flushed = self.flushed();
+        let mut page = self
+            .remap_from
+            .load(Ordering::Acquire)
+            .max(page_of(self.head()));
+        let mut mapped = false;
+        while page < boundary && page_start(page + 1) <= flushed {
+            // The same lock the allocating path takes, so a page cannot
+            // be published by one thread while another is replacing it.
+            let guard = self.allocating.lock().expect("zu2 page allocation");
+            let Some(slot) = self.page_slot(page) else {
+                drop(guard);
+                page += 1;
+                continue;
+            };
+            let stale = slot.load(Ordering::Acquire);
+            if stale.is_null() || is_mapped(stale) {
+                drop(guard);
+                page += 1;
+                continue;
+            }
+            match crate::file::map_read(&self.file, page_start(page), PAGE_SIZE) {
+                Some(at) => {
+                    slot.store(tag_mapped(at), Ordering::Release);
+                    drop(guard);
+                    self.release_page(stale);
+                    mapped = true;
+                }
+                None => {
+                    // The platform has no mapping call or the kernel
+                    // refused this one. Neither is an error: the page
+                    // stays where it is and the cursor moves on, so a
+                    // refusal costs one syscall a page and not a retry
+                    // loop.
+                    drop(guard);
+                }
+            }
+            page += 1;
+        }
+        self.remap_from.fetch_max(page, Ordering::AcqRel);
+        if mapped {
+            self.retire_pages();
+        }
+    }
+
+    /// Pages held as a mapping of the file rather than as heap.
+    ///
+    /// The rest of [`Log::resident_pages`] is anonymous memory, so the
+    /// difference between the two is what a memory column is actually
+    /// measuring.
+    pub fn mapped_pages(&self) -> usize {
+        let mut total = 0;
+        for chunk in &self.chunks {
+            let base = chunk.load(Ordering::Acquire);
+            if base.is_null() {
+                continue;
+            }
+            for i in 0..CHUNK {
+                // SAFETY: a non-null chunk holds CHUNK initialised slots
+                // and its memory is freed through the epoch.
+                if is_mapped(unsafe { &*base.add(i) }.load(Ordering::Acquire)) {
+                    total += 1;
+                }
+            }
+        }
+        total
     }
 
     /// Drops the pages that have fallen out of memory, given the page
@@ -938,18 +1107,7 @@ impl Log {
                 Some(slot) => slot.swap(std::ptr::null_mut(), Ordering::AcqRel),
                 None => std::ptr::null_mut(),
             };
-            if !stale.is_null() {
-                // The pointer is retired rather than freed: a reader
-                // that loaded it before the swap is still inside its
-                // epoch and is entitled to the bytes.
-                let retired = stale as usize;
-                self.epochs.defer(Box::new(move || {
-                    // SAFETY: the epoch has passed, so no session that
-                    // could have loaded this pointer is still running,
-                    // and it was allocated with exactly this layout.
-                    unsafe { dealloc(retired as *mut u8, page_layout()) };
-                }));
-            }
+            self.release_page(stale);
         }
     }
 
@@ -1603,9 +1761,16 @@ impl Drop for Log {
                 // slots and nothing is running at drop time.
                 let page = unsafe { &*base.add(i) }.swap(std::ptr::null_mut(), Ordering::AcqRel);
                 if !page.is_null() {
-                    // SAFETY: allocated by ensure_page with this layout,
-                    // and no session can exist at drop time.
-                    unsafe { dealloc(page, page_layout()) };
+                    // SAFETY: made by ensure_page or by remap_settled,
+                    // the tag says which, and no session can exist at
+                    // drop time.
+                    unsafe {
+                        if is_mapped(page) {
+                            crate::file::unmap(page_base(page), PAGE_SIZE);
+                        } else {
+                            dealloc(page, page_layout());
+                        }
+                    }
                 }
             }
             // SAFETY: allocated by ensure_slot with this layout.
@@ -1633,7 +1798,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("z.log");
         let file = file::create_new(&path).expect("create");
-        let log = Log::new(file, &path, 4096, 2, memory_pages, 8, PROVISION_CHUNK);
+        let log = Log::new(
+            file,
+            &path,
+            4096,
+            2,
+            memory_pages,
+            8,
+            PROVISION_CHUNK,
+            false,
+        );
         (dir, log)
     }
 
@@ -1715,7 +1889,7 @@ mod tests {
                     .truncate(true)
                     .open(&path)
                     .expect("open");
-                let log = Log::new(file, &path, max_pages, asked, 8, 8, PROVISION_CHUNK);
+                let log = Log::new(file, &path, max_pages, asked, 8, 8, PROVISION_CHUNK, false);
                 assert!(
                     log.mutable_pages + 2 <= max_pages.max(2),
                     "a cap of {max_pages} pages took a window of {} from an asked for {asked}",

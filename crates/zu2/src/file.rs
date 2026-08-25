@@ -467,6 +467,110 @@ pub fn advise_random(_file: &File) -> bool {
     false
 }
 
+/// Maps `[offset, offset + len)` of the file read only and shared, and
+/// answers where it landed.
+///
+/// This is how a settled log page stops being heap and starts being page
+/// cache. The bytes of such a page are read only, flushed, and identical
+/// to the region of the file underneath them, which is exactly what a
+/// shared mapping describes, and the difference it makes is not the size
+/// of the resident set but its kind: heap the kernel can only swap
+/// becomes cache the kernel can drop and fault back. #757.
+///
+/// Read only on purpose rather than out of caution. Nothing in the engine
+/// writes to a page below the mutable window, so a mapping that faults on
+/// a write is a mapping that says loudly in a test what would otherwise
+/// be a silent corruption of a file.
+///
+/// `offset` has to be a multiple of the page size the kernel maps at, and
+/// every caller here passes a 4 MiB log page start, so it is. A refusal
+/// is not an error, the same reading [`punch`] and [`preallocate`] get:
+/// the caller keeps the heap page it already had.
+///
+/// # Safety
+///
+/// The returned pointer is valid until it is passed to [`unmap`] with the
+/// same length, and the file must not be shortened below the mapped range
+/// while it lives. Nothing here does: the only truncation is `trim_tail`,
+/// which never goes below the write frontier, and a mapped page is always
+/// below it.
+#[cfg(unix)]
+pub fn map_read(file: &File, offset: u64, len: usize) -> Option<*mut u8> {
+    use std::os::fd::AsRawFd;
+
+    /// `PROT_READ` from `sys/mman.h`, the same value on Linux and macOS.
+    const PROT_READ: i32 = 1;
+    /// `MAP_SHARED`, likewise.
+    const MAP_SHARED: i32 = 1;
+
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut core::ffi::c_void;
+    }
+    // SAFETY: the descriptor is owned by `file` and open for reading, and
+    // a null hint asks the kernel to choose the address.
+    let at = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            offset as i64,
+        )
+    };
+    // MAP_FAILED is (void *) -1 and is the only failure this reports.
+    if at as isize == -1 {
+        return None;
+    }
+    Some(at.cast::<u8>())
+}
+
+/// Nowhere to ask, so a settled page stays on the heap.
+///
+/// Windows has the call under a different name and a different shape, a
+/// file mapping object and then a view of it, and the view has to be
+/// unmapped before the object is closed. It is worth having and it is not
+/// worth guessing at: the benchmark host that runs Windows runs these
+/// through WSL, which is this file's Linux path, so nothing measured is
+/// waiting on it.
+#[cfg(not(unix))]
+pub fn map_read(_file: &File, _offset: u64, _len: usize) -> Option<*mut u8> {
+    None
+}
+
+/// Gives back a mapping [`map_read`] handed out.
+///
+/// # Safety
+///
+/// `at` came from [`map_read`] with this same `len` and nothing is
+/// reading through it any more.
+#[cfg(unix)]
+pub unsafe fn unmap(at: *mut u8, len: usize) {
+    unsafe extern "C" {
+        fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+    }
+    // SAFETY: the caller promises the range is one this handed out and
+    // that nothing is inside it.
+    unsafe {
+        munmap(at.cast::<core::ffi::c_void>(), len);
+    }
+}
+
+/// Nothing is ever mapped, so nothing is ever given back.
+///
+/// # Safety
+///
+/// Unreachable: [`map_read`] never answers on this platform.
+#[cfg(not(unix))]
+pub unsafe fn unmap(_at: *mut u8, _len: usize) {}
+
 /// Drops the file's length back to `len`, giving up whatever was
 /// provisioned above it.
 ///

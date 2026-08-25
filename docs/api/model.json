@@ -1097,6 +1097,14 @@
       "doc": "The narrowest width that holds `digits` decimal digits, which is\nwhat `INT(p)` (GV09) asks for. `None` when no width in the tower\nis wide enough.\n\nThe bound is the count of decimal digits a width holds in full:\nan i64 reaches 9_223_372_036_854_775_807, so it holds every 18\ndigit number and only some 19 digit ones, and a type that\npromised 19 would be promising a range it does not have."
     },
     {
+      "id": "zu::IntBits::holds",
+      "kind": "method",
+      "name": "holds",
+      "of": "zu::IntBits",
+      "signature": "fn holds(self, word: u64, signed: bool) -> bool",
+      "doc": "Whether a 64 bit lane word is a value of an integer type this\nwide.\n\nThe word is two's complement for a signed type and plain for an\nunsigned one, which is the reading the lane gives it, so this\nasks about the value rather than about the bits. A type 64 bits\nor wider holds every word there is, since a word is all a lane\ncarries and the wide towers have no lane of their own."
+    },
+    {
       "id": "zu::Interrupt",
       "kind": "struct",
       "name": "Interrupt",
@@ -10101,6 +10109,22 @@
       "name": "PropColumn"
     },
     {
+      "id": "zu::zu1::props::PropColumn::fixed_len",
+      "kind": "field",
+      "name": "fixed_len",
+      "of": "zu::zu1::props::PropColumn",
+      "signature": "Option<u32>",
+      "doc": "The element count every row of this list column holds, where the\nrows do not carry one themselves. `None` is every other column,\nand a list column whose rows say their own count.\n\nThis is the encoding half of schema/06 §2 written down: the type\nabove is the declaration, `LIST<FLOAT32>(768)`, and this says\nthat this column was written whole at exactly the bound, so the\nblock may drop what the declaration already gives. It cannot be\nworked out from the bytes, which is why it is a field: a bounded\n`LIST<INT32>(768)` column of 767 counted elements a row is the\nsame 3072 bytes a row as one of 768 uncounted ones."
+    },
+    {
+      "id": "zu::zu1::props::PropColumn::fixed_list",
+      "kind": "method",
+      "name": "fixed_list",
+      "of": "zu::zu1::props::PropColumn",
+      "signature": "fn fixed_list(&self) -> Option<usize>",
+      "doc": "The count to read a row of this column at, which is what\n[`list_elements`] wants and `None` for every row that says its\nown."
+    },
+    {
       "id": "zu::zu1::props::PropColumn::is_lane",
       "kind": "method",
       "name": "is_lane",
@@ -10144,6 +10168,14 @@
       "doc": "One column at store time: what it is called, the value of every row\nof it, and which of those rows hold one."
     },
     {
+      "id": "zu::zu1::props::PropInput::declared",
+      "kind": "field",
+      "name": "declared",
+      "of": "zu::zu1::props::PropInput",
+      "signature": "Option<&zu_common::LogicalType>",
+      "doc": "The type the catalog says this column has, where that is\nnarrower than the type the values arrive in. `None` is a column\nwhose declaration is exactly what its values imply.\n\nThis is the split of schema/06 §2 at the point it starts: the\ndeclaration comes from the catalog, the values come from the\nbatch, and the encoding is chosen here from both. A caller with\nno catalog to consult passes `None` and gets what it always got.\nWhat the declaration may say is checked against every value\nbefore anything is written, because a column that is declared\n`BINARY(16)` and holds a row of 15 octets is a column whose own\ntype is a lie, and the first reader to trust it reads the next\nrow's bytes."
+    },
+    {
       "id": "zu::zu1::props::PropInput::dense",
       "kind": "method",
       "name": "dense",
@@ -10157,6 +10189,14 @@
       "name": "name",
       "of": "zu::zu1::props::PropInput",
       "signature": "&str"
+    },
+    {
+      "id": "zu::zu1::props::PropInput::typed",
+      "kind": "method",
+      "name": "typed",
+      "of": "zu::zu1::props::PropInput",
+      "signature": "fn typed(name: &str, values: PropValues, declared: &LogicalType) -> Self",
+      "doc": "A column with a value in every row, of the type the catalog says\nit has rather than the type its values imply."
     },
     {
       "id": "zu::zu1::props::PropInput::validity",
@@ -10270,6 +10310,14 @@
       "doc": "Rows this column carries."
     },
     {
+      "id": "zu::zu1::props::PropValues::none_of",
+      "kind": "method",
+      "name": "none_of",
+      "of": "zu::zu1::props::PropValues",
+      "signature": "fn none_of(ty: &LogicalType) -> Option<PropValues>",
+      "doc": "No values at all, in the arm a column declared `ty` holds them\nin, and `None` for a type no column holds.\n\nThis is [`PropValues::ty`] read the other way, and it is not its\ninverse. The other direction widens: a run of bytes says only\nthat it is a run of bytes, so `BINARY(16)` and `BYTES` both\nanswer the blob arm here and only the second of them comes back\nout of `ty`. What a caller wants from this is the arm, since the\narm is which side of the store the column is on, and the\ndeclaration it passes beside it is the rest of the answer.\n\nA table being made has no rows in it yet, which is why what\ncomes back holds none."
+    },
+    {
       "id": "zu::zu1::props::PropValues::ty",
       "kind": "method",
       "name": "ty",
@@ -10339,6 +10387,14 @@
       "name": "columns",
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn columns(&self) -> &[PropColumn]"
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::fixed_list",
+      "kind": "method",
+      "name": "fixed_list",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn fixed_list(&self, col: usize) -> Option<usize>",
+      "doc": "The element count to read a row of `col` at, which is what\n[`list_elements`] wants beside the bytes."
     },
     {
       "id": "zu::zu1::props::PropsReader::gather_int",
@@ -10561,8 +10617,8 @@
       "id": "zu::zu1::props::list_elements",
       "kind": "function",
       "name": "list_elements",
-      "signature": "fn list_elements(elem: &zu_common::LogicalType, bytes: &[u8]) -> zu_common::Result<Vec<ListElement>>",
-      "doc": "Reads back a row written by `encode_list_row`.\n\nThe elements borrow the buffer they came out of, so a read of a list\ncolumn is the blob read and a walk over it, with no allocation per\nelement."
+      "signature": "fn list_elements(elem: &zu_common::LogicalType, bytes: &[u8], fixed: Option<usize>) -> zu_common::Result<Vec<ListElement>>",
+      "doc": "Reads back a row written by `encode_list_row`.\n\n`fixed` is the element count a column whose rows do not carry one\nholds, which is [`PropColumn::fixed_list`], and `None` is every row\nthat says its own count. Which of the two a row is cannot be settled\nfrom the bytes the way the element width can: a bounded\n`LIST<INT32>(768)` row of 767 counted elements is the same length as\none of 768 uncounted ones. So the directory says, and this takes the\nanswer rather than guessing at it.\n\nThe elements borrow the buffer they came out of, so a read of a list\ncolumn is the blob read and a walk over it, with no allocation per\nelement."
     },
     {
       "id": "zu::zu1::props::load_props",
@@ -10584,6 +10640,13 @@
       "name": "load_rel_props",
       "signature": "fn load_rel_props(db: &mut zu_zu1::file::Zu1File, rel_id: u32) -> zu_common::Result<Option<PropsDirectory>>",
       "doc": "Loads the edge property directory of a rel table, `None` when the\ntable stores no edge properties."
+    },
+    {
+      "id": "zu::zu1::props::storable",
+      "kind": "function",
+      "name": "storable",
+      "signature": "fn storable(ty: &zu_common::LogicalType) -> bool",
+      "doc": "Whether a column may be declared this type at all.\n\nA graph type may name a type no column holds, because naming one is\na promise about values and holding one is a layout. So the caller\nthat turns a declaration into a table asks this first, and refuses\nthe statement naming the property, rather than letting the store\nrefuse a column halfway through making the table."
     },
     {
       "id": "zu::zu1::props::store_labels",

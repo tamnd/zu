@@ -13,7 +13,7 @@
 //! and the two eight-byte lanes are read where they lie, so a scan of a
 //! frame should run at memory speed rather than at decode speed.
 //!
-//! Run: cargo bench -p zu --bench frames
+//! Run: cargo bench -p zudb --bench frames
 
 use std::any::Any;
 use std::hint::black_box;
@@ -21,10 +21,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Column, Database, FloatBits, Frame, IntBits, Layout, LogicalType};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Column, Database, FloatBits, Frame, IntBits, Layout, LogicalType};
 
 const ROWS: usize = 10_000_000;
 

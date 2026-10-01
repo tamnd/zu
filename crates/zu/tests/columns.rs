@@ -10,12 +10,12 @@
 
 use std::path::{Path, PathBuf};
 
-use zu::dataset::{NodeFile, RelFile, load_dataset};
-use zu::query::column::{ColumnData, ColumnType};
-use zu::query::{QueryResult, run, run_with};
-use zu::{Engine, Options};
 use zu_query::exec::Value;
 use zu_zu1::file::Zu1File;
+use zudb::dataset::{NodeFile, RelFile, load_dataset};
+use zudb::query::column::{ColumnData, ColumnType};
+use zudb::query::{QueryResult, run, run_with};
+use zudb::{Engine, Options};
 
 /// Three accounts with a name and a balance, and three people two of
 /// whom own one, so the third owns nothing and an OPTIONAL MATCH over

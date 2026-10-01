@@ -7,7 +7,7 @@
 //! the slowest gate machine; the spec targets are printed next to each
 //! measurement for the roofline picture.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-vector
+//! Run: ZU_GATE=1 cargo bench -p zudb-vector
 
 use std::hint::black_box;
 use std::sync::Arc;

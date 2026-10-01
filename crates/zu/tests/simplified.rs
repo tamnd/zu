@@ -18,9 +18,9 @@
 //! as the pattern written as many ways as it has terms, which is what
 //! the bar between two whole path patterns is read as.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 5;
 
@@ -44,7 +44,7 @@ fn seeded_with_a_second_type(path: &std::path::Path) {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {

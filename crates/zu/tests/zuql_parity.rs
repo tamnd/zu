@@ -7,13 +7,13 @@
 //! the dense row contract, node offsets from zero, so ids compare
 //! verbatim with no translation.
 
-use zu::query::run as run_zu1;
-use zu::sqlite::run as run_sqlite;
 use zu_query::exec::Value;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 use zu_zu1::props::{PropValues, store_props};
+use zudb::query::run as run_zu1;
+use zudb::sqlite::run as run_sqlite;
 
 /// splitmix64: deterministic, seedable, dependency-free.
 struct Rng(u64);

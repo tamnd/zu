@@ -9,9 +9,9 @@
 //! rather than refusing the statement, which is what zu did until this
 //! file existed.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 5;
 
@@ -36,7 +36,7 @@ fn seeded(path: &std::path::Path) {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {
@@ -136,7 +136,7 @@ fn the_plan_names_the_mode() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("simple-plan.zu1");
     seeded(&path);
-    let mut session = zu::session::Session::open(&path).expect("open");
+    let mut session = zudb::session::Session::open(&path).expect("open");
     let plan = session
         .explain("MATCH SIMPLE (a:person {id: 0})-[:knows*1..3]->(b) RETURN b.id AS id")
         .expect("a plan");

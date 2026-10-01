@@ -121,7 +121,16 @@ cargo xtask grammar [--table PATH] [--root DIR] [--check] [--list] [--queries DI
 /// `pub use`. rustdoc documents one crate at a time, so each of these
 /// has to be generated as well or a third of the API is a name with
 /// nothing behind it.
-const REEXPORTED: [&str; 4] = ["zu-common", "zu-storage", "zu-zu1", "zu-query"];
+///
+/// Each is the package cargo is asked for and the library rustdoc
+/// writes. They differ because the packages are published as `zudb-*`,
+/// `zu` being taken on crates.io, while the libraries kept their names.
+const REEXPORTED: [(&str, &str); 4] = [
+    ("zudb-common", "zu_common"),
+    ("zudb-storage", "zu_storage"),
+    ("zudb-zu1", "zu_zu1"),
+    ("zudb-query", "zu_query"),
+];
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -181,8 +190,14 @@ fn model_command(args: &[String]) -> Result<ExitCode, String> {
     }
 
     let mut docs = Vec::with_capacity(REEXPORTED.len() + 1);
-    for package in std::iter::once("zu").chain(REEXPORTED) {
-        docs.push(rustdoc::generate(package, &toolchain)?);
+    // The engine crate is `zudb` to cargo and to its users, and the
+    // model goes on calling it `zu`, so the bindings that read the model
+    // do not see every path in it move because of a registry name.
+    let mut engine = rustdoc::generate("zudb", "zudb", &toolchain)?;
+    engine.name = "zu".to_string();
+    docs.push(engine);
+    for (package, lib) in REEXPORTED {
+        docs.push(rustdoc::generate(package, lib, &toolchain)?);
     }
     let model = model::build(&docs, "zu")?;
     let text = model.to_json().to_pretty();

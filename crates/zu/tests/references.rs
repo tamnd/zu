@@ -16,11 +16,11 @@
 //! binding table is written as the query whose rows it holds. What is
 //! checked of those is that they answer what the parameter answers.
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
 use zu_query::refs::{BindingTable, GraphHandle};
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 /// Two people with a name, one edge, so that a row can hold an
 /// element and a later statement has a column to write into.
@@ -30,10 +30,10 @@ fn opened(name: &str) -> (tempfile::TempDir, Session) {
     let mut db = Zu1File::create(&path).expect("create");
     bulk_load_as(&mut db, "person", "knows", 2, &[(0, 1)]).expect("load");
     let names: Vec<&[u8]> = vec![b"ada", b"kay"];
-    zu::zu1::props::store_props(
+    zudb::zu1::props::store_props(
         &mut db,
         "person",
-        &[("name", zu::zu1::props::PropValues::Str(&names))],
+        &[("name", zudb::zu1::props::PropValues::Str(&names))],
     )
     .expect("props");
     drop(db);
@@ -148,7 +148,7 @@ fn two_tables_over_the_same_rows_are_two_references() {
     assert_eq!(first, first.clone());
 }
 
-fn session_run(session: &mut Session, source: &str) -> zu::query::QueryResult {
+fn session_run(session: &mut Session, source: &str) -> zudb::query::QueryResult {
     session.run(source, &[]).expect("rows")
 }
 

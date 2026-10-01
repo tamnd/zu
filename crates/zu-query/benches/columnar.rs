@@ -12,7 +12,7 @@
 //! Informational, with no gate floor. The floor that matters is the one
 //! in the client, against DuckDB, and it is published with the release.
 //!
-//! Run: cargo bench -p zu-query --bench columnar
+//! Run: cargo bench -p zudb-query --bench columnar
 
 use std::hint::black_box;
 use std::time::Instant;

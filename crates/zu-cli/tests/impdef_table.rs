@@ -94,7 +94,7 @@ fn render(rows: &[Row]) -> String {
          //! and `gql-implementation-dependent.xml`, the two ISO/IEC\n\
          //! 39075:2024 artifacts that list what the standard leaves to the\n\
          //! implementation. Do not edit by hand: run\n\
-         //! `ZU_UPDATE_IMPDEF=1 cargo test -p zu-cli --test impdef_table`.\n\
+         //! `ZU_UPDATE_IMPDEF=1 cargo test -p zudb-cli --test impdef_table`.\n\
          //!\n\
          //! Codes and descriptions are the standard's, verbatim, with runs\n\
          //! of whitespace folded to one space so a description is one line.\n\
@@ -177,7 +177,7 @@ fn generated_table_matches_the_artifacts() {
         have.trim_end(),
         rendered.trim_end(),
         "src/impdef/generated.rs is stale; run \
-         ZU_UPDATE_IMPDEF=1 cargo test -p zu-cli --test impdef_table"
+         ZU_UPDATE_IMPDEF=1 cargo test -p zudb-cli --test impdef_table"
     );
 }
 

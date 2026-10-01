@@ -14,7 +14,7 @@
 //! and not gated: it runs on a developer machine or in a codegen job,
 //! and putting a floor on a build tool buys a flaky check.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-json
+//! Run: ZU_GATE=1 cargo bench -p zudb-json
 
 use std::hint::black_box;
 use std::time::Instant;

@@ -26,14 +26,14 @@
 //! exec_project_mrows_s_core floors the summed expression, the shape
 //! with no row build in the way of the arithmetic.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench project
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench project
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -86,7 +86,7 @@ fn value_of(i: u64) -> i64 {
 
 /// Rows returned and the total of the last column, which is the only
 /// crosscheck all three shapes share.
-fn shape(r: &zu::query::QueryResult) -> (usize, i64) {
+fn shape(r: &zudb::query::QueryResult) -> (usize, i64) {
     let last = r.columns.len() - 1;
     let total = r
         .rows

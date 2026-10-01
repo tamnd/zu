@@ -18,7 +18,7 @@ Discipline rule (SoK arXiv:2404.00766): publish only reproducible, spec-complian
 | B10 | s3 monthly bill, T9 scenario replay | < $40 ±10% | simulated from request log |
 | B11 | cardinality q-error, generated graphs | p50 ≤ 2, p90 ≤ 10, p99 ≤ 100 | runs in CI, any bound violation fails |
 
-B11 is `cargo bench -p zu --bench cardinality`. It builds its own uniform, hub, and funnel graphs rather than reading a dataset, which is why it runs in CI where the LDBC gate cannot. The same q-errors over LDBC SF1 come out of the `ldbc` bench on the gate machines. A bound violation, meaning an operator that produced more rows than the optimizer's pessimistic ceiling allowed, fails the run gated or not: the join order DP is built on those ceilings holding.
+B11 is `cargo bench -p zudb --bench cardinality`. It builds its own uniform, hub, and funnel graphs rather than reading a dataset, which is why it runs in CI where the LDBC gate cannot. The same q-errors over LDBC SF1 come out of the `ldbc` bench on the gate machines. A bound violation, meaning an operator that produced more rows than the optimizer's pessimistic ceiling allowed, fails the run gated or not: the join order DP is built on those ceilings holding.
 
 ## 2. Macro benchmarks
 

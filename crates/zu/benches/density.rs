@@ -27,11 +27,11 @@
 //! rather than gated, because a ceiling on a ratio fails when the good
 //! side of it improves.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench density
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench density
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -148,7 +148,7 @@ fn build(dir: &std::path::Path, shape: Shape) -> (std::path::PathBuf, u64) {
     sq.checkpoint().expect("checkpoint");
 
     let out = dir.join(format!("{name}.zu1"));
-    zu::convert::sqlite_to_zu1(&staging, &out).expect("convert");
+    zudb::convert::sqlite_to_zu1(&staging, &out).expect("convert");
     if shape == Shape::Closed {
         // The closed side is closed: the file gets a graph type naming
         // the element types its tables hold, which is the object the
@@ -156,7 +156,7 @@ fn build(dir: &std::path::Path, shape: Shape) -> (std::path::PathBuf, u64) {
         // is inside the closed figure, since a type nobody paid for is
         // not a comparison.
         let mut db = Zu1File::open(&out).expect("open closed");
-        zu::query::run("CREATE GRAPH TYPE social LIKE home", &mut db, &[]).expect("graph type");
+        zudb::query::run("CREATE GRAPH TYPE social LIKE home", &mut db, &[]).expect("graph type");
     }
     let bytes = std::fs::metadata(&out).expect("metadata").len();
     (out, bytes)
@@ -169,7 +169,7 @@ fn build(dir: &std::path::Path, shape: Shape) -> (std::path::PathBuf, u64) {
 fn check(path: &std::path::Path, shape: Shape) {
     let mut db = Zu1File::open(path).expect("open");
     let one = |db: &mut Zu1File, source: &str| -> Value {
-        let r = zu::query::run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"));
+        let r = zudb::query::run(source, db, &[]).unwrap_or_else(|e| panic!("{source}: {e}"));
         r.rows
             .first()
             .and_then(|row| row.first())

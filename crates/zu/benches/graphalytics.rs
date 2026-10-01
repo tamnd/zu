@@ -32,17 +32,17 @@
 //! Get the data: curl -sO https://datasets.ldbcouncil.org/graphalytics/kgs.tar.zst
 //! && tar --zstd -xf kgs.tar.zst under ZU_DATA.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu --bench graphalytics
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zudb --bench graphalytics
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use zu::zu1::algo;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::{
+use zu_query::exec::Value;
+use zudb::zu1::algo;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::{
     GraphReader, bulk_load_keyed, densify_keyed, read_key_edge_list, read_key_list,
 };
-use zu_query::exec::Value;
 
 /// The marker Graphalytics reference files use for an unreachable
 /// vertex in BFS output.
@@ -214,7 +214,7 @@ fn main() {
     println!("kgs louvain: {count} communities in {louvain_s:.3} s, deterministic across two runs");
 
     let t = Instant::now();
-    let r = zu::query::run(
+    let r = zudb::query::run(
         "CALL wcc('e') YIELD node, component RETURN count(DISTINCT component) AS c",
         &mut db,
         &[],

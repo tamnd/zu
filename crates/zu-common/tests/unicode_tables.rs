@@ -1,6 +1,6 @@
 //! Regenerates `src/unicode/generated.rs` from the Unicode Character
 //! Database and fails on drift, the same way the GQLSTATUS table test
-//! works. Run with `ZU_UPDATE_UNICODE=1 cargo test -p zu-common --test
+//! works. Run with `ZU_UPDATE_UNICODE=1 cargo test -p zudb-common --test
 //! unicode_tables` after the artifacts change.
 //!
 //! The artifacts are checked in at `artifacts/UnicodeData.txt` and
@@ -309,7 +309,7 @@ fn render(tables: &Tables) -> String {
         "//! Generated from `artifacts/UnicodeData.txt` and\n\
          //! `artifacts/CompositionExclusions.txt`, the Unicode Character\n\
          //! Database. Do not edit by hand: run\n\
-         //! `ZU_UPDATE_UNICODE=1 cargo test -p zu-common --test unicode_tables`.\n\
+         //! `ZU_UPDATE_UNICODE=1 cargo test -p zudb-common --test unicode_tables`.\n\
          //!\n\
          //! The decompositions are fully expanded and the composition\n\
          //! pairs already have the exclusions taken out of them, so every\n\
@@ -515,7 +515,7 @@ fn generated_tables_match_the_artifacts() {
     assert_eq!(
         on_disk.replace("\r\n", "\n"),
         rendered,
-        "src/unicode/generated.rs is stale; run ZU_UPDATE_UNICODE=1 cargo test -p zu-common --test unicode_tables"
+        "src/unicode/generated.rs is stale; run ZU_UPDATE_UNICODE=1 cargo test -p zudb-common --test unicode_tables"
     );
 }
 

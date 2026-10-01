@@ -21,14 +21,14 @@
 //! and the final sort of the groups together, because that is what a
 //! user waits for.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench groupby
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench groupby
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -78,7 +78,7 @@ fn build(path: &std::path::Path) {
 
 /// Rows returned and the total of the count column, which must be every
 /// scanned row whatever the key was.
-fn shape(r: &zu::query::QueryResult) -> (usize, i64) {
+fn shape(r: &zudb::query::QueryResult) -> (usize, i64) {
     let total = r
         .rows
         .iter()

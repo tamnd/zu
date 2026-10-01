@@ -2,7 +2,7 @@
 //! and `gql-implementation-dependent.xml`, the two ISO/IEC
 //! 39075:2024 artifacts that list what the standard leaves to the
 //! implementation. Do not edit by hand: run
-//! `ZU_UPDATE_IMPDEF=1 cargo test -p zu-cli --test impdef_table`.
+//! `ZU_UPDATE_IMPDEF=1 cargo test -p zudb-cli --test impdef_table`.
 //!
 //! Codes and descriptions are the standard's, verbatim, with runs
 //! of whitespace folded to one space so a description is one line.

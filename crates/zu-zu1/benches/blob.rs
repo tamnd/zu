@@ -10,7 +10,7 @@
 //! against the source rows. With ZU_GATE=1 the process exits nonzero
 //! when a floor or ceiling in bench/budgets.toml is missed.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu-zu1 --bench blob
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zudb-zu1 --bench blob
 
 use std::io::BufRead;
 use std::time::Instant;

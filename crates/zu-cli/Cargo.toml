@@ -1,13 +1,15 @@
 [package]
-name = "zu-cli"
+name = "zudb-cli"
 description = "Command-line interface for zu"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["database", "graph", "gql", "cli"]
+categories = ["command-line-utilities", "database-implementations"]
 
 [[bin]]
 name = "zu"

@@ -1,13 +1,17 @@
 [package]
-name = "zu-sqlite"
+name = "zudb-sqlite"
 description = "SQLite-backed storage engine for zu"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# Published as zudb-*, because zu is taken on crates.io, but the
+# library keeps the name every crate in this workspace already uses.
+[lib]
+name = "zu_sqlite"
 
 [dependencies]
 zu-common.workspace = true

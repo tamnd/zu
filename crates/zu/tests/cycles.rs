@@ -13,9 +13,9 @@
 //! which is what a query joining a cycle to further patterns compiles
 //! to, and about the two of them each reading their own answer.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{bulk_load_as, bulk_load_keyed};
+use zudb::query::{Value, run};
 
 /// The count one query answers.
 fn count(db: &mut Zu1File, source: &str) -> i64 {

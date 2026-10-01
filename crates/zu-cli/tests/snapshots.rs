@@ -13,7 +13,7 @@
 //! the hundred lines here is a file format and a diff, and the thing
 //! this suite actually needs is the scrubbing below, which is what
 //! separates a snapshot from a clock. `ZU_UPDATE_SNAPSHOTS=1 cargo test
-//! -p zu-cli --test snapshots` rewrites every file, and the diff on the
+//! -p zudb-cli --test snapshots` rewrites every file, and the diff on the
 //! way into the commit is the review.
 //!
 //! Nothing here holds text an operating system wrote. A missing file
@@ -543,7 +543,7 @@ fn snapshot(name: &str, actual: &str) {
     }
     panic!(
         "{} is not what the CLI prints. Read the difference, and if the new output is the \
-         intended one, `ZU_UPDATE_SNAPSHOTS=1 cargo test -p zu-cli --test snapshots` writes \
+         intended one, `ZU_UPDATE_SNAPSHOTS=1 cargo test -p zudb-cli --test snapshots` writes \
          it.\n\n--- committed\n{committed}\n--- printed\n{actual}",
         path.display()
     );

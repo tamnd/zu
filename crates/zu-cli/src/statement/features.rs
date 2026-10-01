@@ -1,7 +1,7 @@
 //! Generated from `crates/zu-common/artifacts/gql-features.xml`, the
 //! ISO/IEC 39075:2024 artifact that lists every optional language
 //! feature the standard defines. Do not edit by hand: run
-//! `ZU_UPDATE_STATEMENT=1 cargo test -p zu-cli --test statement`.
+//! `ZU_UPDATE_STATEMENT=1 cargo test -p zudb-cli --test statement`.
 //!
 //! Codes and descriptions are the standard's, verbatim, with runs of
 //! whitespace folded to one space so a description is one line.

@@ -21,15 +21,15 @@
 //! of the warm point read through a connection to the same read through
 //! a session, and it is the number that says this API is free.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench connect
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench connect
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Config, Database};
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Config, Database};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -76,7 +76,7 @@ fn build(path: &std::path::Path) -> Vec<i64> {
     degree
 }
 
-fn count_of(r: &zu::query::QueryResult) -> i64 {
+fn count_of(r: &zudb::query::QueryResult) -> i64 {
     match r.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,
         other => panic!("expected one count, got {other:?}"),

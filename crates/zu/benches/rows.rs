@@ -24,14 +24,14 @@
 //! measures about five times the read by index, which is the number
 //! that tells a caller to hoist `column_index` out of its loop.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench rows
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench rows
 
 use std::time::Instant;
 
-use zu::query::{QueryResult, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Config, Database, params};
+use zudb::query::{QueryResult, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Config, Database, params};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");

@@ -22,14 +22,14 @@
 //! card_gen_qerror_p90 and card_gen_qerror_max are ceilings on the
 //! pooled q-errors across all three shapes.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench cardinality
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench cardinality
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -119,7 +119,7 @@ fn build(path: &std::path::Path, edges: &[(u32, u32)]) {
         ],
     )
     .expect("props");
-    zu::zu1::colors::analyze(&mut db).expect("analyze");
+    zudb::zu1::colors::analyze(&mut db).expect("analyze");
 }
 
 /// One entry of the corpus: a name for the printout, the query text,

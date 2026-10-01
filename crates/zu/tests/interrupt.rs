@@ -10,9 +10,9 @@
 //! the same handle and it is what a shell paints while a person waits.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use zu::{Database, ZuError};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::{Database, ZuError};
 
 /// A graph big enough that the join below cannot finish while the
 /// watcher thread is waking up, and small enough to load in a moment.

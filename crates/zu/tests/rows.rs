@@ -8,10 +8,10 @@
 //! copied out of it, and a parameter written with `params!` binds
 //! without the caller ever spelling a `Value`.
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Database, params};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Database, params};
 
 const NODES: u32 = 200;
 
@@ -103,7 +103,7 @@ fn asking_a_column_for_the_wrong_type_names_the_column_and_the_two_types() {
         .expect("query");
     let row = rows.row(0).expect("a row");
     let err = row.get_at::<&str>(0).expect_err("an int is not a string");
-    assert_eq!(err.gqlstatus(), Some(zu::gqlstatus::codes::C22G03));
+    assert_eq!(err.gqlstatus(), Some(zudb::gqlstatus::codes::C22G03));
     let message = err.to_string();
     assert!(message.contains("column 'id'"), "{message}");
     assert!(message.contains("STRING"), "{message}");

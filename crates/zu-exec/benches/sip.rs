@@ -27,7 +27,7 @@
 //! exec_sip_select_mrows_s floors the bloom select, the general case
 //! and the slower of the two filters.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-exec --bench sip
+//! Run: ZU_GATE=1 cargo bench -p zudb-exec --bench sip
 
 use std::hint::black_box;
 use std::time::Instant;

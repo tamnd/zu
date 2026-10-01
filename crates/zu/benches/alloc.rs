@@ -29,15 +29,15 @@
 //! The counter is off except during the counted runs, so nothing here
 //! is measuring the warmup or the graph build.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench alloc
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench alloc
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -148,7 +148,7 @@ fn build(path: &std::path::Path) -> Vec<i64> {
     degree
 }
 
-fn count_of(r: &zu::query::QueryResult) -> i64 {
+fn count_of(r: &zudb::query::QueryResult) -> i64 {
     match r.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,
         other => panic!("expected one count, got {other:?}"),

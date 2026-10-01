@@ -6,13 +6,13 @@
 //! whole way: written as a literal, stored in a lane, read back by the
 //! executor, and compared against the literal it was written from.
 
-use zu::convert::sqlite_to_zu1;
-use zu::query::{Value, run};
 use zu_common::{DurationKind, Temporal};
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 use zu_zu1::props::{PropValues, store_props};
+use zudb::convert::sqlite_to_zu1;
+use zudb::query::{Value, run};
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("temporal.zu1")).unwrap();

@@ -8,14 +8,14 @@
 # drops a loop back to scalar shows up here, not three releases later
 # in a bench regression.
 #
-# Usage: cargo bench -p zu-vector --no-run && bench/check_asm.sh
+# Usage: cargo bench -p zudb-vector --no-run && bench/check_asm.sh
 set -eu
 
 cd "$(dirname "$0")/.."
 
 bin=$(ls -t target/release/deps/kernels-* 2>/dev/null | grep -v '\.d$' | head -1 || true)
 if [ -z "$bin" ]; then
-    echo "check_asm: no kernels bench binary; run cargo bench -p zu-vector --no-run first" >&2
+    echo "check_asm: no kernels bench binary; run cargo bench -p zudb-vector --no-run first" >&2
     exit 1
 fi
 

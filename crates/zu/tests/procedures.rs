@@ -10,10 +10,10 @@
 //! while a binding table is read when the call runs and may be
 //! anything a query answered.
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 5;
 
@@ -30,10 +30,10 @@ fn opened(name: &str) -> (tempfile::TempDir, Session) {
     // A property column, because an INSERT adds a row to the columns
     // the table has and a table with none has nowhere to put one.
     let ids: Vec<u64> = (0..NODES.into()).collect();
-    zu::zu1::props::store_props(
+    zudb::zu1::props::store_props(
         &mut db,
         "person",
-        &[("id", zu::zu1::props::PropValues::Int(&ids))],
+        &[("id", zudb::zu1::props::PropValues::Int(&ids))],
     )
     .expect("props");
     drop(db);

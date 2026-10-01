@@ -47,7 +47,7 @@ jobs:
         with:
           repository: tamnd/gql-compat
           path: gql-compat
-      - run: cargo build --release -p zu-cli
+      - run: cargo build --release -p zudb-cli
       - name: Build the harness
         run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
         working-directory: gql-compat
@@ -90,7 +90,7 @@ jobs:
         with:
           repository: tamnd/gql-compat
           path: gql-compat
-      - run: cargo build --release -p zu-cli
+      - run: cargo build --release -p zudb-cli
       - name: Build the harness
         run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
         working-directory: gql-compat
@@ -125,7 +125,7 @@ jobs:
         with:
           repository: tamnd/gql-compat
           path: gql-compat
-      - run: cargo build --release -p zu-cli
+      - run: cargo build --release -p zudb-cli
       - name: Build the harness
         run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
         working-directory: gql-compat

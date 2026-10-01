@@ -24,7 +24,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 zu-common.workspace = true
-zudb = { package = "zu", path = "../zu" }
+zudb = { path = "../zu" }
 # The Arrow export, which is a feature rather than a dependency because
 # it is the one part of this library that costs a megabyte to link. On
 # by default, since a shipped libzu is what every binding's Arrow path

@@ -12,12 +12,12 @@
 //! have it first.
 //!
 //! ```no_run
-//! use zu::Database;
+//! use zudb::Database;
 //!
 //! let db = Database::open("social.zu1")?;
 //! let mut conn = db.connect()?;
 //! let rows = conn.query("MATCH (p:Person) RETURN p.name")?;
-//! # Ok::<(), zu::ZuError>(())
+//! # Ok::<(), zudb::ZuError>(())
 //! ```
 //!
 //! [`Database::open`] takes a path and nothing else, because a
@@ -373,7 +373,7 @@ impl Connection {
     /// anything past it copies what it wants out.
     ///
     /// ```no_run
-    /// use zu::{Database, Flow};
+    /// use zudb::{Database, Flow};
     ///
     /// let db = Database::open("social.zu1")?;
     /// let mut conn = db.connect()?;
@@ -384,7 +384,7 @@ impl Connection {
     ///     }
     ///     Ok(Flow::More)
     /// })?;
-    /// # Ok::<(), zu::ZuError>(())
+    /// # Ok::<(), zudb::ZuError>(())
     /// ```
     pub fn query_stream(
         &mut self,
@@ -463,7 +463,7 @@ impl Connection {
     /// two ways rather than two renderings that can drift.
     ///
     /// ```no_run
-    /// use zu::Database;
+    /// use zudb::Database;
     ///
     /// let db = Database::open("social.zu1")?;
     /// let mut conn = db.connect()?;
@@ -471,7 +471,7 @@ impl Connection {
     /// let root = plan.root.as_ref().expect("a statement with operators");
     /// assert_eq!(root.op, "Project");
     /// assert_eq!(plan.columns, ["id"]);
-    /// # Ok::<(), zu::ZuError>(())
+    /// # Ok::<(), zudb::ZuError>(())
     /// ```
     pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
         let out = self.session.explain_plan(source);
@@ -587,7 +587,7 @@ impl Connection {
     /// a trap.
     ///
     /// ```no_run
-    /// use zu::Database;
+    /// use zudb::Database;
     ///
     /// let db = Database::memory()?;
     /// let mut conn = db.connect()?;

@@ -7,11 +7,11 @@
 //! a wrong one, and that the two conditions the corpus asks for come
 //! back with their gqlstatus codes attached.
 
-use zu::query::{Value, run, run_with};
-use zu::{Engine, Options};
 use zu_common::Decimal;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run, run_with};
+use zudb::{Engine, Options};
 
 /// The smallest graph a query can run against: the executor needs a
 /// catalog, and no case here reads a property from it.
@@ -40,7 +40,7 @@ fn status(db: &mut Zu1File, source: &str) -> String {
 /// rather than a variable in the environment: the environment belongs
 /// to the process and this binary runs its tests in parallel, so
 /// setting it here set it for whichever test was between plans (#513).
-fn on_rows(db: &mut Zu1File, source: &str) -> zu::query::QueryResult {
+fn on_rows(db: &mut Zu1File, source: &str) -> zudb::query::QueryResult {
     let options = Options {
         engine: Engine::Rows,
         ..Options::default()

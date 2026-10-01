@@ -23,15 +23,15 @@
 //! ast, which is a change to a shared type and its own piece of work.
 //! The count at the bottom is what makes that debt a number.
 //!
-//! `ZU_UPDATE_SNAPSHOTS=1 cargo test --release -p zu --test refusal_shape`
+//! `ZU_UPDATE_SNAPSHOTS=1 cargo test --release -p zudb --test refusal_shape`
 //! rewrites the file, and the diff on the way into the commit is the
 //! review.
 
 use std::path::PathBuf;
 
-use zu::query::run;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::run;
 
 /// A file this test wrote itself, so every refusal below is about the
 /// statement rather than about the file.
@@ -173,7 +173,7 @@ fn snapshot(name: &str, actual: &str) {
     }
     panic!(
         "{} is not what a refused declaration says. Read the difference, and if the new \
-         wording is the intended one, `ZU_UPDATE_SNAPSHOTS=1 cargo test --release -p zu \
+         wording is the intended one, `ZU_UPDATE_SNAPSHOTS=1 cargo test --release -p zudb \
          --test refusal_shape` writes it.\n\n--- committed\n{committed}\n--- printed\n{actual}",
         path.display()
     );

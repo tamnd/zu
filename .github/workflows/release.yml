@@ -5,8 +5,9 @@ name: release
 # it, and what is real here is deliberate. The build is the same matrix
 # every pull request runs, the assemble step gathers exactly the rows of
 # artifacts.toml, and the verify step reads the directory back against
-# the same table. Every publish step is a no-op that says what it would
-# do.
+# the same table. Two of the publishes are real, crates.io and the
+# GitHub release, and only on a tag. Every other publish step is a
+# no-op that says what it would do.
 #
 # The ordering is the part worth having this early, because it is the
 # part that is expensive to discover late: crates.io lands before the
@@ -37,11 +38,102 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Read only unless a job says otherwise. The one job that writes to the
+# repository is the GitHub release, and the one that holds a credential
+# is crates.io, which reads it from an environment rather than from the
+# repository so no other job can.
+permissions:
+  contents: read
+
 jobs:
+  # A tag that does not pass this does not become a release. Everything
+  # here is cheaper to find out before the first upload than after it,
+  # because a version on crates.io cannot be taken back, only yanked.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - name: The tag is the workspace version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          have=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "zudb") | .version')
+          if [ "${tag#v}" != "$have" ]; then
+            echo "the tag $tag says ${tag#v} and Cargo.toml says $have"
+            exit 1
+          fi
+      # The release notes are this section, so a tag without one is a
+      # release with nothing to say about itself.
+      - name: The changelog has the version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.version || github.ref_name }}"
+          if [ "${{ github.event_name }}" = push ] && ! grep -qx "## ${tag#v}" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for ${tag#v}"
+            exit 1
+          fi
+      # Every crate packaged and built from its own tarball, the way
+      # crates.io will see it, before any of them is uploaded. The upload
+      # verifies each crate too, but only as it reaches it, and a crate
+      # that fails there leaves the ones before it published at a version
+      # the rest will never join.
+      - name: Every crate builds as published
+        run: cargo publish --workspace --locked --dry-run
+
   # The seven tier 1 platforms, called rather than repeated, so a
   # release ships the artifacts CI has been building all along.
   libzu:
+    needs: verify
     uses: ./.github/workflows/libzu.yml
+
+  # Every crate without `publish = false`, in dependency order, which is
+  # zudb and the zudb-* crates under it and zudb-cli. They go first of
+  # the registries because everything else builds against them, and the
+  # GitHub release waits for them so that a release which exists is one
+  # `cargo add zudb` can get.
+  #
+  # The token is a secret of the crates-io environment, which only a
+  # `v*` tag can deploy to, so a branch, a pull request or a rehearsal
+  # never sees it. It is in the environment of one step and nothing
+  # prints it. No cache step: this job compiles each crate once, inside
+  # `cargo publish`, and never again.
+  #
+  # The first release is fourteen crates crates.io has never seen, at
+  # one every ten minutes after a burst of five, so the timeout is set
+  # for that. If it runs out nothing is lost: the script asks the index
+  # what is up and re-running the job carries on from there.
+  crates-io:
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zudb
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      # Current tokens are `cio` and 32 characters. Anything else is a
+      # token revoked in 2020 or a value that picked up a quote or a
+      # newline on its way into the secret, and either is worth finding
+      # before the first upload. Only the verdict is printed.
+      - name: The token is shaped like a token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          if ! printf '%s' "${CARGO_REGISTRY_TOKEN:-}" | grep -Eq '^(cio)?[A-Za-z0-9]{32}$'; then
+            echo "CARGO_REGISTRY_TOKEN on the crates-io environment is missing or malformed"
+            exit 1
+          fi
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: scripts/publish-crates.sh
 
   assemble:
     needs: libzu
@@ -99,9 +191,19 @@ jobs:
     with:
       version: ${{ inputs.version || github.ref_name }}
 
+  # A rehearsal skips crates.io, and a job whose needs were skipped is
+  # skipped with them unless it says otherwise, so this says run when
+  # nothing failed. The steps that publish check for a tag themselves.
   publish:
-    needs: [assemble, conductor]
+    needs: [assemble, conductor, crates-io]
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Provenance, so a downloaded archive can be checked against the
+      # workflow run and the commit that built it.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
@@ -115,12 +217,38 @@ jobs:
       # will run, doing nothing. They are separate steps rather than one
       # loop because the run's own step list is then the ordering, which
       # is what a person reads when a release stops half way through.
+      - name: Attest the archives
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+      # The notes are the changelog section, written by hand, with
+      # GitHub's list of merged pull requests after it. Created once and
+      # uploaded over on a re-run, so running this job again ends where
+      # the first run would have.
       - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          echo "no-op: upload dist/ to the release for ${{ github.ref_name }}, signed and attested (dx/14 section 8, DX5)"
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          awk -v want="## ${tag#v}" '
+            $0 == want { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --verify-tag --title "$tag" \
+              --notes-file notes.md --generate-notes
+          fi
       - name: crates.io
         run: |
-          echo "no-op: publish zudb, zudb-async and zu-cli, first because everything else builds against them"
+          echo "done in the crates-io job before this one: zudb, the zudb-* crates under it, and zudb-cli"
       - name: PyPI
         run: |
           echo "no-op: publish the wheels zu-python built against these artifacts"
@@ -142,4 +270,5 @@ jobs:
       - name: What this run did not do
         run: |
           echo "The dispatches to the eight repositories ran and did nothing, because none of them has a release workflow yet."
+          echo "What is real is crates.io and the GitHub release, and only on a tag."
           echo "Every publish above is idempotent when it is real, so a partial release is resumed and not restarted."

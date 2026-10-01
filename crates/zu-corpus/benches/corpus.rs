@@ -22,7 +22,7 @@
 //! database-per-case rule is the only thing that would ever need
 //! revisiting, at around four seconds for a thousand cases.
 //!
-//! Run: cargo bench -p zu-corpus --bench corpus
+//! Run: cargo bench -p zudb-corpus --bench corpus
 
 use std::hint::black_box;
 use std::path::Path;

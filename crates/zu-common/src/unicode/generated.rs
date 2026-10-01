@@ -1,7 +1,7 @@
 //! Generated from `artifacts/UnicodeData.txt` and
 //! `artifacts/CompositionExclusions.txt`, the Unicode Character
 //! Database. Do not edit by hand: run
-//! `ZU_UPDATE_UNICODE=1 cargo test -p zu-common --test unicode_tables`.
+//! `ZU_UPDATE_UNICODE=1 cargo test -p zudb-common --test unicode_tables`.
 //!
 //! The decompositions are fully expanded and the composition
 //! pairs already have the exclusions taken out of them, so every

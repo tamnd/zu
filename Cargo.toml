@@ -12,19 +12,19 @@ repository = "https://github.com/tamnd/zu"
 authors = ["Tam Nguyen <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
-zu-common = { path = "crates/zu-common" }
-zu-encoding = { path = "crates/zu-encoding" }
-zu-json = { path = "crates/zu-json" }
-zu-vector = { path = "crates/zu-vector" }
-zu-storage = { path = "crates/zu-storage" }
-zu-zu1 = { path = "crates/zu-zu1" }
-zu-sqlite = { path = "crates/zu-sqlite" }
-zu-s3 = { path = "crates/zu-s3" }
-zu-query = { path = "crates/zu-query" }
-zu-exec = { path = "crates/zu-exec" }
-zu = { path = "crates/zu" }
-zu-arrow = { path = "crates/zu-arrow" }
-zu-corpus = { path = "crates/zu-corpus" }
+zu-common = { package = "zudb-common", path = "crates/zu-common", version = "=0.0.1" }
+zu-encoding = { package = "zudb-encoding", path = "crates/zu-encoding", version = "=0.0.1" }
+zu-json = { package = "zudb-json", path = "crates/zu-json", version = "=0.0.1" }
+zu-vector = { package = "zudb-vector", path = "crates/zu-vector", version = "=0.0.1" }
+zu-storage = { package = "zudb-storage", path = "crates/zu-storage", version = "=0.0.1" }
+zu-zu1 = { package = "zudb-zu1", path = "crates/zu-zu1", version = "=0.0.1" }
+zu-sqlite = { package = "zudb-sqlite", path = "crates/zu-sqlite", version = "=0.0.1" }
+zu-s3 = { package = "zudb-s3", path = "crates/zu-s3", version = "=0.0.1" }
+zu-query = { package = "zudb-query", path = "crates/zu-query", version = "=0.0.1" }
+zu-exec = { package = "zudb-exec", path = "crates/zu-exec", version = "=0.0.1" }
+zu = { package = "zudb", path = "crates/zu", version = "=0.0.1" }
+zu-arrow = { package = "zudb-arrow", path = "crates/zu-arrow", version = "=0.0.1" }
+zu-corpus = { package = "zudb-corpus", path = "crates/zu-corpus", version = "=0.0.1" }
 
 thiserror = "2"
 crc32c = "0.6"

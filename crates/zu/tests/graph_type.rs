@@ -11,9 +11,9 @@
 //! frontier itself, which is S2's work, and it is pinned below so that
 //! a type crossing it is a change somebody is measuring.
 
-use zu::query::run;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::run;
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("graph_type.zu1")).unwrap();

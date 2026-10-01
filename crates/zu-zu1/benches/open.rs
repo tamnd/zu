@@ -17,7 +17,7 @@
 //! overrides the target for local smoke runs; the gate only applies at
 //! the full 10 GB on real data.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu ZU_B7=1 cargo bench -p zu-zu1 --bench open
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu ZU_B7=1 cargo bench -p zudb-zu1 --bench open
 
 use std::hint::black_box;
 use std::time::Instant;

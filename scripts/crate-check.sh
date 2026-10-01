@@ -28,9 +28,8 @@
 # outside the workspace.
 #
 # The dependency is written in the git form rather than as a version,
-# because zu is publish = false and there is nothing on crates.io yet.
-# The day there is, this is the line that changes and the rest of the
-# program stays as it is.
+# because what is being checked is a revision, and a revision is on
+# crates.io only once it has been released.
 
 set -eu
 
@@ -68,7 +67,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-zudb = { package = "zu", git = "$repository", rev = "$revision" }
+zudb = { git = "$repository", rev = "$revision" }
 EOF
 
 cd "$crate"

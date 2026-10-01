@@ -27,7 +27,7 @@
 //! exec_join_build_mrows_s floors the build, which every worker waits
 //! on before it probes anything.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-exec --bench join
+//! Run: ZU_GATE=1 cargo bench -p zudb-exec --bench join
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;

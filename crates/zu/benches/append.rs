@@ -14,15 +14,15 @@
 //! back through a query and compares them against what went in, so a
 //! run that got faster by writing less fails instead of scoring.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench append
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench append
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
-use zu::{Config, Database};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
+use zudb::{Config, Database};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -68,7 +68,7 @@ fn build(path: &std::path::Path) {
     .expect("props");
 }
 
-fn people(conn: &mut zu::Connection) -> i64 {
+fn people(conn: &mut zudb::Connection) -> i64 {
     let r = conn
         .query("MATCH (p:person) RETURN count(p) AS n")
         .expect("count");

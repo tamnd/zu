@@ -18,7 +18,7 @@
 //! With ZU_GATE=1 the process exits nonzero when a keystroke misses the
 //! ceiling in bench/budgets.toml.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-cli --bench editor
+//! Run: ZU_GATE=1 cargo bench -p zudb-cli --bench editor
 
 // The editor's source is compiled whole, tests and all, and only the
 // typing path is measured, so the parts a terminal loop would call are

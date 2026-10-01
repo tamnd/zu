@@ -12,7 +12,7 @@
 //! carries ten rows or ten million.
 //!
 //! ```no_run
-//! use zu::Database;
+//! use zudb::Database;
 //!
 //! let db = Database::open("social.zu1")?;
 //! let mut conn = db.connect()?;
@@ -20,7 +20,7 @@
 //! app.append_row((1i64, "ada"))?;
 //! app.append_row((2i64, "grace"))?;
 //! app.close()?;
-//! # Ok::<(), zu::ZuError>(())
+//! # Ok::<(), zudb::ZuError>(())
 //! ```
 //!
 //! A row is every column of the table, in the order the table declares

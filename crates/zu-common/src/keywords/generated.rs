@@ -1,6 +1,6 @@
 //! Generated from `artifacts/gql-bnf.xml`, the ISO/IEC
 //! 39075:2024 grammar artifact. Do not edit by hand: run
-//! `ZU_UPDATE_KEYWORDS=1 cargo test -p zu-common --test keyword_table`.
+//! `ZU_UPDATE_KEYWORDS=1 cargo test -p zudb-common --test keyword_table`.
 //!
 //! Every list is sorted, so the lookups are a binary search.
 

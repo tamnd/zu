@@ -6,7 +6,7 @@
 //! With ZU_GATE=1 the process exits nonzero if any encoding decodes below
 //! its floor in bench/budgets.toml, measured as decoded output bytes/s.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu-encoding
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zudb-encoding
 
 use std::time::Instant;
 

@@ -8,7 +8,7 @@
       "id": "zu::Appender",
       "kind": "struct",
       "name": "Appender",
-      "source": "zu::append::Appender",
+      "source": "zudb::append::Appender",
       "doc": "A bulk load in progress: rows buffered in memory, written to the\ndatabase when you flush.\n\nTake one with [`crate::Connection::appender`], append rows to it,\nand call [`Appender::close`]. Dropping it without closing flushes\ntoo, because a loader that forgot is better served by its data\narriving than by it vanishing, but a drop has nowhere to put an\nerror and so cannot tell you whether the flush worked. That is the\none footgun dx/04 §6 accepts, and `#[must_use]` is what points a\ncaller at the version that reports. The drop does not panic on a\nbuffer it is handed, in debug builds either: a loader that hits an\nerror between rows and returns is exactly the case where an\nappender is dropped with rows in it, and turning that into an abort\non the way out of an unwind would be the worse failure.\n\nTwo things a table can be that an appender will not append to, both\nrefused when the appender opens rather than at the flush that would\nhave failed. A column that holds a null has no way in this API to\nsay which rows the appended values are for, so the write statements\nof G3 are what answers it. A table whose row domain a rel table's\nkey index is built over cannot grow without that index being\nreallocated, so the fold refuses it, and this refuses it earlier,\nbefore a load is buffered against it."
     },
     {
@@ -170,7 +170,7 @@
       "id": "zu::Config",
       "kind": "struct",
       "name": "Config",
-      "source": "zu::db::Config",
+      "source": "zudb::db::Config",
       "doc": "How a database is opened and what its statements are allowed to do.\n\nEvery field has a default that works, so a caller sets the one thing\nit cares about and nothing else. The builder takes `self` and gives\nit back, so the whole configuration is one expression and a\nhalf-built `Config` is never a thing anybody holds."
     },
     {
@@ -217,7 +217,7 @@
       "id": "zu::Connection",
       "kind": "struct",
       "name": "Connection",
-      "source": "zu::db::Connection",
+      "source": "zudb::db::Connection",
       "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of the statement it is running.\nEvery connection to one file shares the write side, and a statement\npicks up what that side has published before it compiles anything,\nso a commit on another connection is visible to the next statement\nhere without reconnecting. Nothing moves under a statement that has\nstarted: what it took at the top is what it reads to the end, which\nis the snapshot isolation of docs/08 §1.\n\nWrites queue. One connection at a time holds the write side of a\nfile, for the length of a write statement or of an explicit\ntransaction, and the rest wait in the order they asked."
     },
     {
@@ -242,7 +242,7 @@
       "name": "duplicate",
       "of": "zu::Connection",
       "signature": "fn duplicate(&self) -> Result<Connection>",
-      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
+      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
     },
     {
       "id": "zu::Connection::execute",
@@ -274,7 +274,7 @@
       "name": "explain_plan",
       "of": "zu::Connection",
       "signature": "fn explain_plan(&mut self, source: &str) -> Result<QueryPlan>",
-      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zu::ZuError>(())\n```"
+      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zudb::ZuError>(())\n```"
     },
     {
       "id": "zu::Connection::interrupt",
@@ -322,7 +322,7 @@
       "name": "query_stream",
       "of": "zu::Connection",
       "signature": "fn query_stream(&mut self, source: &str, params: &[(&str, Value)], sink: impl FnMut) -> Result<Streamed>",
-      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zu::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zu::ZuError>(())\n```"
+      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zudb::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zudb::ZuError>(())\n```"
     },
     {
       "id": "zu::Connection::query_stream_batched",
@@ -384,7 +384,7 @@
       "id": "zu::Database",
       "kind": "struct",
       "name": "Database",
-      "source": "zu::db::Database",
+      "source": "zudb::db::Database",
       "doc": "An open database: a path, a configuration, and the fact that both\nhave been checked against a real file.\n\nIt is `Send + Sync` and holds no file descriptor and no cache, which\nis what makes it shareable without a lock. The state that cannot be\nshared, the seek position of a handle and the plans compiled against\na catalog, lives on the connections instead, one set per connection,\nwhich is the same division the C ABI and every binding above it use."
     },
     {
@@ -664,7 +664,7 @@
       "id": "zu::Field",
       "kind": "enum",
       "name": "Field",
-      "source": "zu::append::Field",
+      "source": "zudb::append::Field",
       "doc": "One value on its way into a column.\n\nThis is deliberately not [`crate::query::Value`]. A value coming out\nof a query owns its string, because it outlives the row it was read\nfrom; a value going into a column borrows one, because the caller\nalready has it and the appender is about to copy it into a buffer\neither way. On a string column that is the difference between one\ncopy per row and two.\n\nThere is no null. A column that holds a null cannot be appended to\nat all, for the reason [`Appender`] gives, so a null here could only\never be refused, and refusing it in the type is better than\nrefusing it at flush."
     },
     {
@@ -2576,7 +2576,7 @@
       "id": "zu::append",
       "kind": "module",
       "name": "append",
-      "doc": "The bulk-load appender of dx/04 §6.\n\nA row at a time through a write statement is the wrong shape for\nloading data: every row would be parsed, bound, planned, and\ncommitted, and the commit is the expensive part, so a million rows\nwould be a million commits and the load would be dominated by\ndurability work nobody asked for. The appender is the other shape.\nRows go into per-column buffers in memory, and a flush turns the\nwhole buffer into sealed segments in the data file with one\n`IngestRef` frame in the log, which is the WAL bypass docs/08 §6\ndescribes: the log stays a handful of bytes whether the flush\ncarries ten rows or ten million.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut app = conn.appender(\"person\")?;\napp.append_row((1i64, \"ada\"))?;\napp.append_row((2i64, \"grace\"))?;\napp.close()?;\n# Ok::<(), zu::ZuError>(())\n```\n\nA row is every column of the table, in the order the table declares\nthem, and a column is a position rather than a name: naming the\ncolumns per row would cost a lookup per value on the one path where\nper-value cost is the whole story, and a loader knows its own\ncolumn order.\n\nA flush is one commit. When it returns the rows are durable and\nevery later query sees them, and before it returns nothing sees\nanything, because a flush ends by folding the sealed segments into\nthe base the query path reads. That fold costs time proportional to\nthe table rather than to the batch, which is the whole reason the\nappender buffers: flush once per load, not once per row."
+      "doc": "The bulk-load appender of dx/04 §6.\n\nA row at a time through a write statement is the wrong shape for\nloading data: every row would be parsed, bound, planned, and\ncommitted, and the commit is the expensive part, so a million rows\nwould be a million commits and the load would be dominated by\ndurability work nobody asked for. The appender is the other shape.\nRows go into per-column buffers in memory, and a flush turns the\nwhole buffer into sealed segments in the data file with one\n`IngestRef` frame in the log, which is the WAL bypass docs/08 §6\ndescribes: the log stays a handful of bytes whether the flush\ncarries ten rows or ten million.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut app = conn.appender(\"person\")?;\napp.append_row((1i64, \"ada\"))?;\napp.append_row((2i64, \"grace\"))?;\napp.close()?;\n# Ok::<(), zudb::ZuError>(())\n```\n\nA row is every column of the table, in the order the table declares\nthem, and a column is a position rather than a name: naming the\ncolumns per row would cost a lookup per value on the one path where\nper-value cost is the whole story, and a loader knows its own\ncolumn order.\n\nA flush is one commit. When it returns the rows are durable and\nevery later query sees them, and before it returns nothing sees\nanything, because a flush ends by folding the sealed segments into\nthe base the query path reads. That fold costs time proportional to\nthe table rather than to the batch, which is the whole reason the\nappender buffers: flush once per load, not once per row."
     },
     {
       "id": "zu::append::AppendRow",
@@ -2912,7 +2912,7 @@
       "id": "zu::db",
       "kind": "module",
       "name": "db",
-      "doc": "The public Rust API: a [`Database`] you open once and share, and a\n[`Connection`] you take one of per thread.\n\n[`crate::session::Session`] is the engine's own entry point and it\nis one object doing both jobs, which works exactly as long as a\nprocess wants one. The moment two threads want to read the same\ngraph, or a pool wants to hand a connection out and take it back,\nthe two jobs come apart: the database is the thing that is shared\nand immutable, and the connection is the thing that is cheap,\nserial, and owned by whoever is using it. Every binding on the C ABI\ninherits this split (`dx/02` §3), so it is the Rust API that has to\nhave it first.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet rows = conn.query(\"MATCH (p:Person) RETURN p.name\")?;\n# Ok::<(), zu::ZuError>(())\n```\n\n[`Database::open`] takes a path and nothing else, because a\nconfiguration argument every caller has to write is a tax on every\ncaller to serve the few who set anything; [`Database::open_with`] is\nfor those few. Opening reads 12 KiB and pages the rest lazily, so\nconnecting is an open and a catalog load rather than a copy of the\nfile, and a connection is genuinely cheap to take."
+      "doc": "The public Rust API: a [`Database`] you open once and share, and a\n[`Connection`] you take one of per thread.\n\n[`crate::session::Session`] is the engine's own entry point and it\nis one object doing both jobs, which works exactly as long as a\nprocess wants one. The moment two threads want to read the same\ngraph, or a pool wants to hand a connection out and take it back,\nthe two jobs come apart: the database is the thing that is shared\nand immutable, and the connection is the thing that is cheap,\nserial, and owned by whoever is using it. Every binding on the C ABI\ninherits this split (`dx/02` §3), so it is the Rust API that has to\nhave it first.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet rows = conn.query(\"MATCH (p:Person) RETURN p.name\")?;\n# Ok::<(), zudb::ZuError>(())\n```\n\n[`Database::open`] takes a path and nothing else, because a\nconfiguration argument every caller has to write is a tax on every\ncaller to serve the few who set anything; [`Database::open_with`] is\nfor those few. Opening reads 12 KiB and pages the rest lazily, so\nconnecting is an open and a catalog load rather than a copy of the\nfile, and a connection is genuinely cheap to take."
     },
     {
       "id": "zu::db::Config",
@@ -2988,7 +2988,7 @@
       "name": "duplicate",
       "of": "zu::db::Connection",
       "signature": "fn duplicate(&self) -> Result<Connection>",
-      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
+      "doc": "Another connection to the same database, made from this one\nrather than from the path.\n\nThis is how a pool is written. [`Database::connect`] opens the\nfile and looks up the write side under its path; this forks a\ndescriptor off the side this connection already holds, so it\ncosts a schema load and no lookup, and it works on a database\nin memory, which has no path to look up.\n\nThe two are connections in every sense, not two names for one:\neach has its own plan cache, its own readers, its own interrupt\nand its own transaction. What they share is the write side, so\nthey queue behind each other to write and each sees what the\nother has committed, exactly as two connections from the same\n[`Database`] do. The switches and the read-only setting are\ncarried across, because a pool that handed out connections\nconfigured differently from the one it was seeded with would be\na trap.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::memory()?;\nlet mut conn = db.connect()?;\nconn.query(\"INSERT (p:person {id: 1, name: 'ada'})\")?;\nlet mut other = conn.duplicate()?;\nlet rows = other.query(\"MATCH (p:person) RETURN p.name AS name\")?;\nassert_eq!(rows.rows.len(), 1);\n# Ok::<(), zu_common::ZuError>(())\n```"
     },
     {
       "id": "zu::db::Connection::execute",
@@ -3020,7 +3020,7 @@
       "name": "explain_plan",
       "of": "zu::db::Connection",
       "signature": "fn explain_plan(&mut self, source: &str) -> Result<QueryPlan>",
-      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zu::ZuError>(())\n```"
+      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zudb::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zudb::ZuError>(())\n```"
     },
     {
       "id": "zu::db::Connection::interrupt",
@@ -3068,7 +3068,7 @@
       "name": "query_stream",
       "of": "zu::db::Connection",
       "signature": "fn query_stream(&mut self, source: &str, params: &[(&str, Value)], sink: impl FnMut) -> Result<Streamed>",
-      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zu::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zu::ZuError>(())\n```"
+      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zudb::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zudb::ZuError>(())\n```"
     },
     {
       "id": "zu::db::Connection::query_stream_batched",
@@ -10690,6 +10690,13 @@
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn settable(&self, col: usize, row: u64) -> bool",
       "doc": "Whether [`Self::set`] would take a write of `col` on row `row`,\nwhich a writer asks before it takes the commit that would make\none. It has to be asked rather than tried, because a commit that\ncannot be patched has to fold whole and nothing of it may reach\nthe patch first."
+    },
+    {
+      "id": "zu::zu1::props::fixed_octets",
+      "kind": "function",
+      "name": "fixed_octets",
+      "signature": "fn fixed_octets(ty: &zu_common::LogicalType) -> Option<u32>",
+      "doc": "The octet count every row of a column of this type holds, for a\ndeclaration that fixes one. `None` is a column whose rows may differ\nin length.\n\nA character bound is not one of these. `STRING(5,5)` is five\ncharacters and a character is one to four octets, so the width it\nfixes is a width in a unit the storage does not count in. A bound on\ncharacters is a check; a bound on octets is a layout.\n\nTwo of these are numbers rather than byte strings. The lane is sixty\nfour bits, so a hundred and twenty eight bit integer and a decimal\nwhose unscaled units want more than a word both go on the blob side\nof the store as sixteen little endian bytes, which is where a\n`BINARY(16)` already goes and by the same layout: one width, no\noffsets. What tells the three apart afterwards is the column's own\ntype, the way it tells a byte string from a character string.\n\nThe decimal is the one whose answer here depends on an argument\nrather than on the type, and that is the declared and encoding split\nat its plainest: `DECIMAL(9,2)` and `DECIMAL(29,2)` are one declared\ntype family stored two ways, and the reader is told which by the\nprecision it was declared with."
     },
     {
       "id": "zu::zu1::props::list_elements",

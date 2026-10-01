@@ -17,15 +17,15 @@
 //! the whole thing, which is the case that turns a full scan into a
 //! bounded one and should measure near zero.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench stream
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench stream
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Config, Connection, Database, Flow};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Config, Connection, Database, Flow};
 
 /// Live bytes above the last reset, and the highest that ever got.
 ///

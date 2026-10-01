@@ -17,8 +17,8 @@
 //! than in front of the statement, and the having clause, which the
 //! other form has no word for at all.
 
-use zu::Database;
-use zu::query::Value;
+use zudb::Database;
+use zudb::query::Value;
 
 /// Five people in three cities, and one company, which is the second
 /// label a graph match list needs to have two matches to list.

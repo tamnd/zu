@@ -33,16 +33,16 @@
 //! and seven tenths. fold_over_list_x is set to catch that and not to
 //! catch a tenth.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench fold
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench fold
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");

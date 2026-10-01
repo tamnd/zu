@@ -22,16 +22,16 @@
 //! Everything runs at one worker, so the rate is per core and the
 //! fleet's core counts stay out of the number.
 //!
-//! Run: cargo bench -p zu --bench columns
+//! Run: cargo bench -p zudb --bench columns
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use zu::query::column::ColumnData;
-use zu::query::{self, QueryResult, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::column::ColumnData;
+use zudb::query::{self, QueryResult, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 const NODES: u64 = 1_000_000;
 const RUNS: usize = 5;

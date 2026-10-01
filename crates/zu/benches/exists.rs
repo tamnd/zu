@@ -55,14 +55,14 @@
 //! exec_exists_mrows_s_core floors the counted semi in millions of
 //! outer rows a second.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench exists
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench exists
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");

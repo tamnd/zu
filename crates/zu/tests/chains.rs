@@ -6,9 +6,9 @@
 //! it answers: three statements over a real store, each one reading the
 //! result the one before it returned, and nothing else of it.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 200;
 
@@ -131,7 +131,7 @@ fn a_chain_plans_as_one_pipeline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("fuse.zu1");
     seeded(&path);
-    let mut session = zu::session::Session::open(&path).expect("open");
+    let mut session = zudb::session::Session::open(&path).expect("open");
     let chained = session
         .explain(
             "MATCH (p:person) WHERE p.id < 3 RETURN p AS p \

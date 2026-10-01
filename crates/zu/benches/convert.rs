@@ -24,13 +24,13 @@
 //! wrote, so a conversion that got faster by writing less fails here
 //! instead of scoring.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench convert
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench convert
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -84,7 +84,7 @@ fn stage(path: &std::path::Path) {
 fn check(path: &std::path::Path) {
     let mut db = Zu1File::open(path).expect("open converted");
     let count = |db: &mut Zu1File, source: &str| -> i64 {
-        let r = zu::query::run(source, db, &[]).expect(source);
+        let r = zudb::query::run(source, db, &[]).expect(source);
         match r.rows.first().and_then(|row| row.first()) {
             Some(Value::Int(n)) => *n,
             other => panic!("{source}: expected a count, got {other:?}"),
@@ -105,7 +105,7 @@ fn check(path: &std::path::Path) {
     );
     // A property read of the last row, which is the row a conversion
     // that stopped early would be missing.
-    let r = zu::query::run(
+    let r = zudb::query::run(
         "MATCH (p:person) WHERE p.id = 999999 RETURN p.name AS name",
         &mut db,
         &[],
@@ -132,7 +132,7 @@ fn main() {
 
     let out = dir.path().join("converted.zu1");
     let t = Instant::now();
-    zu::convert::sqlite_to_zu1(&staging, &out).expect("convert");
+    zudb::convert::sqlite_to_zu1(&staging, &out).expect("convert");
     let secs = t.elapsed().as_secs_f64();
     check(&out);
     let nodes_s = NODES as f64 / secs;

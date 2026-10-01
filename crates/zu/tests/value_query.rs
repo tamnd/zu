@@ -13,10 +13,10 @@
 //! with a warning saying so: the rows are right either way, and what
 //! is wrong with the statement is what it costs.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
 use zu_query::exec::Value;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 5;
 
@@ -30,7 +30,7 @@ fn seeded(path: &std::path::Path) {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {
@@ -59,11 +59,11 @@ impl Fixture {
 
 /// The same fixture opened as a session, which is the way in that
 /// hands back the warnings a statement raised beside its rows.
-fn opened(name: &str) -> (tempfile::TempDir, zu::session::Session) {
+fn opened(name: &str) -> (tempfile::TempDir, zudb::session::Session) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
     seeded(&path);
-    let session = zu::session::Session::open(&path).expect("open");
+    let session = zudb::session::Session::open(&path).expect("open");
     (dir, session)
 }
 

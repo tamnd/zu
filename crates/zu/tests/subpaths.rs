@@ -7,9 +7,9 @@
 //! variable bound outside the brackets, which is what makes it a non
 //! local predicate.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run};
 
 /// A chain with a way back from the middle:
 ///

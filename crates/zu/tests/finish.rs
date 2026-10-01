@@ -9,15 +9,15 @@
 //! that it answers no columns and no rows, and that the words which
 //! read a result are refused behind it.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 4;
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {
@@ -135,7 +135,7 @@ fn a_write_in_front_of_it_wrote() {
 fn it_reports_the_omitted_result() {
     let mut fx = Fixture::open("finish-status.zu1");
     let finished = fx.conn.query("MATCH (p:person) FINISH").expect("query");
-    assert_eq!(finished.status(), zu::gqlstatus::codes::C00001);
+    assert_eq!(finished.status(), zudb::gqlstatus::codes::C00001);
     let empty = fx
         .conn
         .query("MATCH (p:person) FILTER p.id > 1000 RETURN p.id AS id")

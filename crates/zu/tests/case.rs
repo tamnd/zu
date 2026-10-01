@@ -9,7 +9,7 @@
 //! are the abbreviations ISO writes for two shapes that come up often
 //! enough to have a spelling of their own.
 
-use zu::Database;
+use zudb::Database;
 
 /// Four people of three ages, and a pet for two of them, which is where
 /// the nulls come from: an OPTIONAL MATCH that found nothing leaves the

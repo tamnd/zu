@@ -12,9 +12,9 @@
 //! the two runs below are two connections and neither can be disturbed
 //! by a test running beside it (#513).
 
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Database, Engine, Options};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Database, Engine, Options};
 
 const NODES: u32 = 6;
 

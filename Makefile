@@ -12,10 +12,10 @@ check-artifacts:
 	cd crates/zu-common/artifacts && shasum -a 256 -c SHA256SUMS
 
 bench:
-	cargo bench -p zu-encoding --bench decode
+	cargo bench -p zudb-encoding --bench decode
 
 gate:
-	ZU_GATE=1 cargo bench -p zu-encoding --bench decode
+	ZU_GATE=1 cargo bench -p zudb-encoding --bench decode
 
 build:
 	cargo build --workspace --all-features

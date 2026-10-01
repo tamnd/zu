@@ -10,7 +10,7 @@
 //! B6 scale check: the same COPY path over the 117 M edge com-Orkut
 //! graph, since B6 is defined at 100 M edges and LiveJournal is 69 M.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu ZU_B6=1 cargo bench -p zu-zu1
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu ZU_B6=1 cargo bench -p zudb-zu1
 
 use std::time::Instant;
 

@@ -10,9 +10,9 @@
 //! one answers the list of the properties, and an aggregate around one
 //! folds that row's group rather than the rows.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run};
 
 /// A chain of five, so a stretch repeated twice has somewhere to go and
 /// a stretch repeated three times still has:

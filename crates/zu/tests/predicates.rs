@@ -11,10 +11,10 @@
 //! its ends, a node carries its table, and which properties a table has
 //! is a question about the table.
 
-use zu::Database;
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{bulk_load_as, bulk_load_undirected_as};
+use zudb::Database;
+use zudb::query::{Value, run};
 
 /// One directed edge, the graph where the direction predicate has
 /// something to say yes about.

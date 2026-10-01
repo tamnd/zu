@@ -26,11 +26,14 @@ pub struct CrateDoc {
 
 /// Runs `cargo rustdoc` for one package and reads what it wrote.
 ///
+/// `lib` is the library the package builds, which is what rustdoc
+/// names its file after and need not be the package name.
+///
 /// `toolchain` is passed to cargo as `+name`. The caller supplies it
 /// rather than this function hard-coding `+nightly`, so CI can pin the
 /// exact nightly from the toolchain table and get the same bytes on
 /// every run, which is the whole point of committing the model.
-pub fn generate(package: &str, toolchain: &str) -> Result<CrateDoc, String> {
+pub fn generate(package: &str, lib: &str, toolchain: &str) -> Result<CrateDoc, String> {
     let target = target_dir()?;
     let mut cmd = Command::new("cargo");
     cmd.arg(format!("+{toolchain}"))
@@ -48,9 +51,8 @@ pub fn generate(package: &str, toolchain: &str) -> Result<CrateDoc, String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let name = package.replace('-', "_");
-    let path = target.join("doc").join(format!("{name}.json"));
-    read(&path, &name)
+    let path = target.join("doc").join(format!("{lib}.json"));
+    read(&path, lib)
 }
 
 /// Reads one rustdoc JSON file that is already on disk.

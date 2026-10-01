@@ -14,10 +14,10 @@
 //! what holds it. The oracle is a connection that has not seen the
 //! text before, which compiles it from nothing.
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Connection, Database};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Connection, Database};
 
 const NODES: u32 = 200;
 

@@ -11,12 +11,12 @@
 //! a statement that answers no rows: the only way to see that it did
 //! anything is to run a second statement and read what it says.
 
-use zu::query::Value;
-use zu::session::{Session, Stale};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
 use zu_common::Temporal;
 use zu_common::gqlstatus::codes;
+use zudb::query::Value;
+use zudb::session::{Session, Stale};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 /// The same four people the binding variable tests use, so a number
 /// here can be checked against a number there.
@@ -26,12 +26,12 @@ fn opened(name: &str) -> (tempfile::TempDir, Session) {
     let mut db = Zu1File::create(&path).expect("create");
     bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (3, 3)]).expect("load");
     let names: Vec<&[u8]> = vec![b"ann", b"bo", b"cy", b"di"];
-    zu::zu1::props::store_props(
+    zudb::zu1::props::store_props(
         &mut db,
         "person",
         &[
-            ("name", zu::zu1::props::PropValues::Str(&names)),
-            ("age", zu::zu1::props::PropValues::Int(&[30, 40, 50, 40])),
+            ("name", zudb::zu1::props::PropValues::Str(&names)),
+            ("age", zudb::zu1::props::PropValues::Int(&[30, 40, 50, 40])),
         ],
     )
     .expect("props");

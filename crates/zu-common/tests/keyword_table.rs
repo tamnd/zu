@@ -54,7 +54,7 @@ fn render(reserved: &[String], pre: &[String], non: &[String]) -> String {
     out.push_str(
         "//! Generated from `artifacts/gql-bnf.xml`, the ISO/IEC\n\
          //! 39075:2024 grammar artifact. Do not edit by hand: run\n\
-         //! `ZU_UPDATE_KEYWORDS=1 cargo test -p zu-common --test keyword_table`.\n\
+         //! `ZU_UPDATE_KEYWORDS=1 cargo test -p zudb-common --test keyword_table`.\n\
          //!\n\
          //! Every list is sorted, so the lookups are a binary search.\n\
          \n",

@@ -19,14 +19,14 @@
 //! column off the node the edge lands on, which is the same walk and
 //! the same number of column reads with the ordinal lookup taken out.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench relprops
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench relprops
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_keyed;
-use zu::zu1::props::{PropValues, store_props, store_rel_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_keyed;
+use zudb::zu1::props::{PropValues, store_props, store_rel_props};
 
 const NODES: u32 = 200_000;
 const DEGREE: u32 = 10;

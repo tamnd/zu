@@ -21,9 +21,9 @@
 //! argument is worth nothing if an `ALTER` quietly appears one release
 //! later, so a list of the things zu is not is pinned at the bottom.
 
-use zu::query::run;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::run;
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("catalog.zu1")).unwrap();

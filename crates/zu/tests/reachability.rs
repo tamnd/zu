@@ -11,9 +11,9 @@
 //! person id, and it is the difference between a walk over the
 //! reachable set and a walk over every path through it.
 
-use zu::query::{Value, explain_analyze, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, explain_analyze, run};
 
 const NODES: u32 = 24;
 

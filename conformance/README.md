@@ -9,7 +9,7 @@ The cases live in this repository because they are versioned with the engine and
 ## Running it
 
 ```
-cargo test -p zu-corpus                       # the reader, the runner, and the cases
+cargo test -p zudb-corpus                       # the reader, the runner, and the cases
 zu corpus conformance/cases                   # the same cases through the shipped binary
 zu corpus conformance/cases --strict          # and no case may be ahead of the engine
 ```

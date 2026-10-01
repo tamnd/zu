@@ -20,12 +20,12 @@
 //! honest: the line says which functions are kernels and this file
 //! says which ones are not and why.
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
-use zu::{Engine, Options};
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
+use zudb::{Engine, Options};
 
 /// Four people in a ring of `knows`, each with a whole number, a
 /// number with a fraction and a name. Every height is above nought and

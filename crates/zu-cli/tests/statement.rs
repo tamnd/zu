@@ -90,7 +90,7 @@ fn render(rows: &[Row]) -> String {
         "//! Generated from `crates/zu-common/artifacts/gql-features.xml`, the\n\
          //! ISO/IEC 39075:2024 artifact that lists every optional language\n\
          //! feature the standard defines. Do not edit by hand: run\n\
-         //! `ZU_UPDATE_STATEMENT=1 cargo test -p zu-cli --test statement`.\n\
+         //! `ZU_UPDATE_STATEMENT=1 cargo test -p zudb-cli --test statement`.\n\
          //!\n\
          //! Codes and descriptions are the standard's, verbatim, with runs of\n\
          //! whitespace folded to one space so a description is one line.\n\
@@ -158,7 +158,7 @@ fn generated_table_matches_the_artifact() {
         have.trim_end(),
         rendered.trim_end(),
         "src/statement/features.rs is stale; run \
-         ZU_UPDATE_STATEMENT=1 cargo test -p zu-cli --test statement"
+         ZU_UPDATE_STATEMENT=1 cargo test -p zudb-cli --test statement"
     );
 }
 

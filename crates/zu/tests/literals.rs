@@ -7,9 +7,9 @@
 //! matters is that the engine reads the words rather than stopping at
 //! them.
 
-use zu::query::{Value, run};
 use zu_common::{DurationKind, Temporal};
 use zu_zu1::file::Zu1File;
+use zudb::query::{Value, run};
 
 fn db(dir: &std::path::Path) -> Zu1File {
     Zu1File::create(&dir.join("literals.zu1")).unwrap()

@@ -9,10 +9,10 @@
 //! the pipeline sort's own null handling is covered where it lives, in
 //! the sink's tests.
 
-use zu::convert::sqlite_to_zu1;
-use zu::query::run;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
+use zudb::convert::sqlite_to_zu1;
+use zudb::query::run;
 
 /// Five people, three of whom have an age. The two without are the
 /// rows every case here is about, and the names are distinct so a tie

@@ -17,11 +17,11 @@
 //! the general path still answers, since a null orders outside the
 //! direction and the fast path declines it.
 
-use zu::query::run;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropInput, PropValues, store_props_nullable};
 use zu_query::exec::Value;
+use zudb::query::run;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropInput, PropValues, store_props_nullable};
 
 const NODES: u64 = 5_000;
 

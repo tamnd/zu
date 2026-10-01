@@ -27,14 +27,14 @@
 //! in fifty, and that is exactly the regression these gates exist to
 //! catch.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench session
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench session
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -89,7 +89,7 @@ fn build(path: &std::path::Path) -> Vec<i64> {
     degree
 }
 
-fn count_of(r: &zu::query::QueryResult) -> i64 {
+fn count_of(r: &zudb::query::QueryResult) -> i64 {
     match r.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,
         other => panic!("expected one count, got {other:?}"),
@@ -186,7 +186,7 @@ fn run_one_shot_point(path: &std::path::Path, degree: &[i64]) -> (f64, f64) {
         let src = (xorshift(&mut rng) % u64::from(NODES)) as i64;
         let start = Instant::now();
         let mut db = Zu1File::open(path).expect("open");
-        let r = zu::query::run(POINT_Q, &mut db, &[("src", Value::Int(src))]).expect("one shot");
+        let r = zudb::query::run(POINT_Q, &mut db, &[("src", Value::Int(src))]).expect("one shot");
         lat.push(start.elapsed().as_nanos() as u64);
         assert_eq!(count_of(&r), degree[src as usize], "src {src}");
     }

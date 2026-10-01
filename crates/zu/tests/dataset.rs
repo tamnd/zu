@@ -8,10 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
-use zu::dataset::{NodeFile, RelFile, load_dataset};
-use zu::query::run;
 use zu_query::exec::Value;
 use zu_zu1::file::Zu1File;
+use zudb::dataset::{NodeFile, RelFile, load_dataset};
+use zudb::query::run;
 
 /// Accounts 10, 11 and 12; people 100 and 101. Neither range starts at
 /// zero and neither is a row number, so a load that answers with the
@@ -259,7 +259,7 @@ fn a_key_the_table_already_holds_is_refused_rather_than_written() {
     let (nodes, rels) = write(dir.path());
     let path = dir.path().join("keys.zu1");
     load_dataset(&nodes, &rels, &path).expect("load");
-    let mut session = zu::session::Session::open(&path).expect("open");
+    let mut session = zudb::session::Session::open(&path).expect("open");
     let err = session
         .run("INSERT (:Account {id: 11, name: 'again', balance: 0})", &[])
         .expect_err("11 is an account the file already holds");
@@ -290,7 +290,7 @@ fn a_key_the_table_already_holds_is_refused_rather_than_written() {
     );
     drop(db);
     // And a fold has nothing to choke on, which is the whole point.
-    let mut session = zu::session::Session::open(&path).expect("reopen");
+    let mut session = zudb::session::Session::open(&path).expect("reopen");
     session
         .run("INSERT (:Account {id: 21, name: 'next', balance: 0})", &[])
         .expect("21 is free");

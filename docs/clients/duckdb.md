@@ -67,7 +67,7 @@ That part is fixed. `zu::query::column` does the transpose once, in the engine, 
 | execute and Arrow table | 148 ms | 73 ms |
 | execute and pandas | 148 ms | 79 ms |
 
-The statement itself is 45 ms of each of those, so the export went from 103 ms to 26 ms. Of the 26 that are left, 22 are the transpose, which `cargo bench -p zu-query --bench columnar` times on its own. The Arrow half is about four milliseconds and there is not much left in it.
+The statement itself is 45 ms of each of those, so the export went from 103 ms to 26 ms. Of the 26 that are left, 22 are the transpose, which `cargo bench -p zudb-query --bench columnar` times on its own. The Arrow half is about four milliseconds and there is not much left in it.
 
 So the remaining gap was no longer a client problem. It was the sink, and it was one number: 22 ms to read a result whose rows the executor built out of vectors it then threw away. Section 4 is where that number went. `record_batches` is fixed alongside it, having been worse rather than better than its name promised: it built every batch into a `Vec<RecordBatch>` before handing back a reader, and a batch is a slice of a finished column now.
 
@@ -87,7 +87,7 @@ That sentence was the work this page asked for, and it is done. `crates/zu-exec/
 
 The types are known before the first row, which is what makes it simpler than the walk it replaces rather than harder. A projected item is a stored column with a declared type, a node, a row id or a constant, so there is no inference pass and no column that changes its mind halfway. One consequence is worth writing down: a result with no rows now reports the types the plan declared where the walk reported a column of nulls, which is what DuckDB does and is more use to a client building a schema.
 
-`cargo bench -p zu --bench columns` measures it end to end on the same million rows of `INT64`, `DOUBLE` and a short `VARCHAR`, at one worker, with `ZU_SINK=rows` pinning the row build so the two sinks are timed on the same engine on the same machine in one sitting:
+`cargo bench -p zudb --bench columns` measures it end to end on the same million rows of `INT64`, `DOUBLE` and a short `VARCHAR`, at one worker, with `ZU_SINK=rows` pinning the row build so the two sinks are timed on the same engine on the same machine in one sitting:
 
 | path | rows, as was | columns |
 |---|---|---|

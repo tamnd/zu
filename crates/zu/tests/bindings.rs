@@ -12,10 +12,10 @@
 //! the only way to be sure the filling happened, in the right order
 //! and before the first row, is to run a statement and read the rows.
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 /// Four people with a name and an age, three edges, which is the
 /// fixture the conformance suite uses so that a number here can be
@@ -26,12 +26,12 @@ fn opened(name: &str) -> (tempfile::TempDir, Session) {
     let mut db = Zu1File::create(&path).expect("create");
     bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (3, 3)]).expect("load");
     let names: Vec<&[u8]> = vec![b"ann", b"bo", b"cy", b"di"];
-    zu::zu1::props::store_props(
+    zudb::zu1::props::store_props(
         &mut db,
         "person",
         &[
-            ("name", zu::zu1::props::PropValues::Str(&names)),
-            ("age", zu::zu1::props::PropValues::Int(&[30, 40, 50, 40])),
+            ("name", zudb::zu1::props::PropValues::Str(&names)),
+            ("age", zudb::zu1::props::PropValues::Int(&[30, 40, 50, 40])),
         ],
     )
     .expect("props");

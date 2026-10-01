@@ -6,10 +6,10 @@
 //! the types with structure in them parse where a name would do, and
 //! that a value type predicate is a boolean in a real row.
 
-use zu::query::{Value, run, run_with};
-use zu::{Engine, Options};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run, run_with};
+use zudb::{Engine, Options};
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("typed.zu1")).unwrap();
@@ -39,7 +39,7 @@ fn no(db: &mut Zu1File, predicate: &str) {
 /// rather than a variable in the environment: the environment belongs
 /// to the process and this binary runs its tests in parallel, so
 /// setting it here set it for whichever test was between plans (#513).
-fn on_rows(db: &mut Zu1File, source: &str) -> zu::query::QueryResult {
+fn on_rows(db: &mut Zu1File, source: &str) -> zudb::query::QueryResult {
     let options = Options {
         engine: Engine::Rows,
         ..Options::default()

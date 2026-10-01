@@ -18,9 +18,9 @@
 //! is a lie, and the same line is right in one caller and wrong in the
 //! other.
 
-use zu::query::run;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::run;
 
 /// A file this test wrote itself, so nothing in it is damaged and any
 /// sentence about damage is about something else.

@@ -7,11 +7,11 @@
 //! here, end to end through the parser rather than against the lattice
 //! directly, because the spellings are half of GV50.
 
-use zu::query::{Value, run};
 use zu_common::{IntBits, LogicalType};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 use zu_zu1::props::{ListElement, PropValues, store_props};
+use zudb::query::{Value, run};
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("lists.zu1")).unwrap();

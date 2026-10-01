@@ -947,7 +947,7 @@ mod tests {
     }
 
     /// Not a gate, a manual probe for the T4 ingest target. Run with
-    /// `cargo test -q -p zu-zu1 --release ingest_throughput -- --ignored --nocapture`.
+    /// `cargo test -q -p zudb-zu1 --release ingest_throughput -- --ignored --nocapture`.
     #[test]
     #[ignore = "manual throughput probe"]
     fn ingest_throughput_probe() {

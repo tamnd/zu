@@ -392,7 +392,7 @@ It is also a claim about one build on one machine on one day. Both are printed a
 The full report behind the tally is a megabyte of per-case timings, host readings and a wall clock, none of it the same twice, so it is not checked in anywhere. What is checked in is the tally this page is rendered from, and the four commands that regenerate the whole chain from an engine binary:
 
 ```
-cargo build --release -p zu-cli
+cargo build --release -p zudb-cli
 gql-compat run -adapter zu -binary target/release/zu -fail-on none -out reports/zu
 zu conformance --tally reports/zu/zu.json > docs/conformance/zu.json
 zu conformance --statement docs/conformance/zu.json > docs/gql-conformance-statement.md

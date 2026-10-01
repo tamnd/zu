@@ -10,9 +10,9 @@
 //! reasonable engine makes quietly: answering false where the standard
 //! says raise, and answering about the wrong field.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run};
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("records.zu1")).unwrap();

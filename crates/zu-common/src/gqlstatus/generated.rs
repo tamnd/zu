@@ -1,6 +1,6 @@
 //! Generated from `artifacts/gql-conditions.xml`, the ISO/IEC
 //! 39075:2024 conditions artifact. Do not edit by hand: run
-//! `ZU_UPDATE_GQLSTATUS=1 cargo test -p zu-common --test gqlstatus_table`.
+//! `ZU_UPDATE_GQLSTATUS=1 cargo test -p zudb-common --test gqlstatus_table`.
 //!
 //! Codes and natural-language names are the standard's, verbatim.
 

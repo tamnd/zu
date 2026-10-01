@@ -7,7 +7,7 @@
 //! non local predicate: the node just reached can be compared with the
 //! node the walk came from.
 
-use zu::Database;
+use zudb::Database;
 
 /// A chain of four steps carrying the numbers that let a predicate
 /// compare one node with another:

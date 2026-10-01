@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use zu::dataset::{NodeFile, RelFile, load_dataset};
-use zu::session::Session;
+use zudb::dataset::{NodeFile, RelFile, load_dataset};
+use zudb::session::Session;
 
 /// Accounts 10, 11 and 12, keyed, with two transfers between them.
 fn fixture(dir: &Path) -> std::path::PathBuf {

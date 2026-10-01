@@ -7,10 +7,10 @@
 //! where the condition is written up, and whether running the same
 //! statement again could get anywhere.
 
-use zu::gqlstatus::Severity;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Database, ZuError};
+use zudb::gqlstatus::Severity;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Database, ZuError};
 
 const NODES: u32 = 8;
 

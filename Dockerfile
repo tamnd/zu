@@ -35,7 +35,7 @@ COPY . .
 # usual dependency-caching dance needs a stub per crate and this
 # workspace has seventeen of them, so it buys a warm cache at the price
 # of a build that silently succeeds against stubs when a crate is added.
-RUN cargo build --release --locked -p zu-cli
+RUN cargo build --release --locked -p zudb-cli
 
 FROM alpine:${alpine}
 

@@ -7,9 +7,9 @@
 //! when the two agree, and that a projection the grouping cannot
 //! explain is refused rather than answered with a row per input.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 9;
 
@@ -24,7 +24,7 @@ fn seeded(path: &std::path::Path) {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {

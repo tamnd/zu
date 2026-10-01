@@ -8,9 +8,9 @@
 //! measure one, and 22G0Z refuse a sequence that is shaped like one and
 //! describes a walk nobody can take.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zudb::query::{Value, run};
 
 /// A chain, 0 to 1 to 2 to 3, so a path has hops to have and the two
 /// ends of one are different nodes.

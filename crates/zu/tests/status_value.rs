@@ -7,10 +7,10 @@
 //! the five characters, the words for them, and the diagnostic records
 //! under that.
 
-use zu::Database;
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 4;
 
@@ -44,7 +44,7 @@ fn text(value: &Value, name: &str) -> String {
     }
 }
 
-fn status(conn: &mut zu::Connection) -> Value {
+fn status(conn: &mut zudb::Connection) -> Value {
     let result = conn
         .query("RETURN current_status() AS s")
         .expect("the status of the statement before this one");

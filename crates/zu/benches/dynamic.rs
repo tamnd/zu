@@ -44,15 +44,15 @@
 //! the row engine would be a promise about a path this milestone is
 //! explicitly not making fast.
 //!
-//! Run: cargo bench -p zu --bench dynamic
+//! Run: cargo bench -p zudb --bench dynamic
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 const NODES: u64 = 2_000_000;
 
@@ -69,7 +69,7 @@ fn build(path: &std::path::Path) {
     store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).expect("props");
 }
 
-fn count(r: &zu::query::QueryResult) -> i64 {
+fn count(r: &zudb::query::QueryResult) -> i64 {
     assert_eq!(r.rows.len(), 1, "a counting query returns one row");
     match r.rows[0][0] {
         Value::Int(n) => n,

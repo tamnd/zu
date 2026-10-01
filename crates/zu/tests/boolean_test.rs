@@ -15,9 +15,9 @@
 //! at once. That looks wrong until you read it as what it says, which
 //! is that a value nobody knows is not known to be either one.
 
-use zu::query::{Value, run};
-use zu::{Database, Engine, Options};
 use zu_zu1::file::Zu1File;
+use zudb::query::{Value, run};
+use zudb::{Database, Engine, Options};
 
 fn db(dir: &std::path::Path) -> Zu1File {
     Zu1File::create(&dir.join("boolean_test.zu1")).unwrap()

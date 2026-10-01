@@ -23,7 +23,7 @@
 //! undirected, the shape that keeps the binary probe and so runs the
 //! semijoin folded into the expand, p50 in ms. IS is the IS1-shaped
 //! profile read by original
-//! id, all eight properties through zu::query::run, gated at the T2 1
+//! id, all eight properties through zudb::query::run, gated at the T2 1
 //! ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
 //! ORDER BY, and LIMIT, p50 in ms. Distinct two-hop is the same
@@ -43,17 +43,17 @@
 //! nonzero when a ceiling in bench/budgets.toml is missed, and missing
 //! data fails the gate instead of skipping it.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu --bench ldbc
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zudb --bench ldbc
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::{
+use zu_query::exec::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::{
     Direction, GraphReader, bulk_load_keyed, densify_keyed, read_key_edge_list, read_key_list,
 };
-use zu::zu1::props::{PropValues, store_props};
-use zu_query::exec::Value;
+use zudb::zu1::props::{PropValues, store_props};
 
 /// The tail of `struct rusage` this bench does not read, sized so the
 /// kernel writes inside the allocation rather than past it.
@@ -268,7 +268,7 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>, Profi
     )
     .expect("store props");
     let analyze_started = Instant::now();
-    zu::zu1::colors::analyze(&mut db).expect("analyze");
+    zudb::zu1::colors::analyze(&mut db).expect("analyze");
     println!(
         "sf1: {} persons, {} knows edges, 9 props columns, parse {:.2}s, load {:.2}s, analyze {:.2}s",
         by_row.len(),
@@ -439,12 +439,12 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     let source = Q_TWO_HOP;
     let runs = 50usize;
     for _ in 0..5 {
-        zu::query::run(source, &mut db, &[]).expect("warmup run");
+        zudb::query::run(source, &mut db, &[]).expect("warmup run");
     }
     let mut lat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("two-hop count");
+        let r = zudb::query::run(source, &mut db, &[]).expect("two-hop count");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -485,12 +485,12 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
     let source = Q_TRIANGLE;
     let runs = 15usize;
     for _ in 0..3 {
-        zu::query::run(source, &mut db, &[]).expect("warmup run");
+        zudb::query::run(source, &mut db, &[]).expect("warmup run");
     }
     let mut lat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("triangle count");
+        let r = zudb::query::run(source, &mut db, &[]).expect("triangle count");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -513,12 +513,12 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
     // the process-global variable is safe.
     unsafe { std::env::set_var("ZU_WCOJ", "0") };
     for _ in 0..3 {
-        zu::query::run(source, &mut db, &[]).expect("binary warmup run");
+        zudb::query::run(source, &mut db, &[]).expect("binary warmup run");
     }
     let mut blat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("binary triangle count");
+        let r = zudb::query::run(source, &mut db, &[]).expect("binary triangle count");
         blat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -574,12 +574,12 @@ fn run_ordered_triangle(
     let source = Q_ORDERED;
     let runs = 15usize;
     for _ in 0..3 {
-        zu::query::run(source, &mut db, &[]).expect("warmup run");
+        zudb::query::run(source, &mut db, &[]).expect("warmup run");
     }
     let mut lat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("ordered triangle");
+        let r = zudb::query::run(source, &mut db, &[]).expect("ordered triangle");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -633,12 +633,12 @@ fn run_undirected_close(
     let source = Q_CLOSE;
     let runs = 15usize;
     for _ in 0..3 {
-        zu::query::run(source, &mut db, &[]).expect("warmup run");
+        zudb::query::run(source, &mut db, &[]).expect("warmup run");
     }
     let mut lat = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[]).expect("undirected close");
+        let r = zudb::query::run(source, &mut db, &[]).expect("undirected close");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -657,7 +657,7 @@ fn run_undirected_close(
 }
 
 /// IS: the IS1-shaped profile read, all eight person properties by
-/// original id through zu::query::run, parse to result. Every measured
+/// original id through zudb::query::run, parse to result. Every measured
 /// run is asserted field by field against the raw props file, so the
 /// number cannot come from a reader that returns the wrong row or a
 /// column stored out of order.
@@ -669,7 +669,7 @@ fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) 
     for _ in 0..200 {
         let row = (xorshift(&mut rng) % n) as usize;
         let id = Value::Int(by_row[row] as i64);
-        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup profile read");
+        zudb::query::run(source, &mut db, &[("id", id)]).expect("warmup profile read");
     }
     let runs = 2_000usize;
     let mut lat = Vec::with_capacity(runs);
@@ -677,7 +677,7 @@ fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) 
         let row = (xorshift(&mut rng) % n) as usize;
         let id = Value::Int(by_row[row] as i64);
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("profile read");
+        let r = zudb::query::run(source, &mut db, &[("id", id)]).expect("profile read");
         lat.push(t.elapsed());
         let p = &profiles[row];
         let want = vec![
@@ -738,7 +738,7 @@ fn run_distinct_two_hop(
     for _ in 0..50 {
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
         let id = Value::Int(by_row[seed] as i64);
-        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup distinct two-hop");
+        zudb::query::run(source, &mut db, &[("id", id)]).expect("warmup distinct two-hop");
     }
     let runs = 500usize;
     let mut lat = Vec::with_capacity(runs);
@@ -746,7 +746,7 @@ fn run_distinct_two_hop(
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
         let id = Value::Int(by_row[seed] as i64);
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("distinct two-hop");
+        let r = zudb::query::run(source, &mut db, &[("id", id)]).expect("distinct two-hop");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -805,7 +805,7 @@ fn run_ic_friends_of_friends(
     for _ in 0..50 {
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
         let id = Value::Int(by_row[seed] as i64);
-        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup fof read");
+        zudb::query::run(source, &mut db, &[("id", id)]).expect("warmup fof read");
     }
     let runs = 500usize;
     let mut lat = Vec::with_capacity(runs);
@@ -813,7 +813,7 @@ fn run_ic_friends_of_friends(
         let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
         let id = Value::Int(by_row[seed] as i64);
         let t = Instant::now();
-        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("fof read");
+        let r = zudb::query::run(source, &mut db, &[("id", id)]).expect("fof read");
         lat.push(t.elapsed());
         assert_eq!(
             r.rows,
@@ -936,7 +936,7 @@ fn run_cardinality(
     let mut violations = 0usize;
     for (name, source, params) in &corpus {
         let borrowed: Vec<(&str, Value)> = params.iter().map(|(k, v)| (*k, v.clone())).collect();
-        let profile = zu::query::profile(source, &mut db, &borrowed).expect("profile");
+        let profile = zudb::query::profile(source, &mut db, &borrowed).expect("profile");
         let mut worst: Option<(f64, String, f64, u64)> = None;
         for stage in &profile.stages {
             for op in &stage.ops {
@@ -987,7 +987,7 @@ fn run_table_functions(
     by_row: &[u64],
     node_count: u64,
 ) -> (f64, f64, f64, f64) {
-    use zu::zu1::algo;
+    use zudb::zu1::algo;
     let n = node_count as usize;
     let mut db = Zu1File::open(path).expect("open");
     let mut reader = GraphReader::load_table(&mut db, "knows").expect("reader");
@@ -1112,7 +1112,7 @@ fn run_table_functions(
     println!("sf1 louvain: {count} communities in {louvain_s:.3} s, deterministic across two runs");
 
     let t = Instant::now();
-    let r = zu::query::run(
+    let r = zudb::query::run(
         "CALL pagerank('knows') YIELD node, rank RETURN count(node) AS n, sum(rank) AS total",
         &mut db,
         &[],
@@ -1162,12 +1162,12 @@ fn attribute(path: &std::path::Path, label: &str, source: &str, seed: Option<u64
         .map(|id| vec![("id", Value::Int(id as i64))])
         .unwrap_or_default();
     for _ in 0..3 {
-        if let Err(e) = zu::query::run(source, &mut db, &params) {
+        if let Err(e) = zudb::query::run(source, &mut db, &params) {
             println!("attribution for {label}: query failed, {e}");
             return;
         }
     }
-    match zu::query::profile(source, &mut db, &params) {
+    match zudb::query::profile(source, &mut db, &params) {
         Ok(profile) => {
             let seeded = match seed {
                 Some(id) => format!(", one run seeded with person {id}"),
@@ -1249,7 +1249,7 @@ fn main() {
         "sf1 memory: {:.1} MiB memory_limit, {:.1} MiB resident after the load, \
          {:.1} MiB highest between phases, {:.1} MiB peak \
          (the peak includes the load and the crosscheck references)",
-        mib(zu::zu1::file::DEFAULT_MEMORY_LIMIT as u64),
+        mib(zudb::zu1::file::DEFAULT_MEMORY_LIMIT as u64),
         mib(resting),
         mib(between),
         mib(peak)

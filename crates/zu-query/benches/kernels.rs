@@ -8,7 +8,7 @@
 //! sides of the hybrid morsel switch at a spread of source counts.
 //! No gate floors yet: the numbers are informational.
 //!
-//! Run: ZU_DATA=~/data/zu cargo bench -p zu-query
+//! Run: ZU_DATA=~/data/zu cargo bench -p zudb-query
 
 use std::time::Instant;
 

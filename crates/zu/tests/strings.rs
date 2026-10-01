@@ -7,8 +7,8 @@
 //! company on anything that is not ASCII, and a number written where a
 //! string belongs is refused rather than measured by its spelling.
 
-use zu::Database;
-use zu::query::Value;
+use zudb::Database;
+use zudb::query::Value;
 
 /// Three names with spaces around one of them, and one word that is not
 /// ASCII, which is the only thing that tells the two lengths apart.

@@ -4,9 +4,6 @@
 //! and adjacency list survives, and a query answers identically on
 //! the original and the twice-converted store.
 
-use zu::convert::{sqlite_to_zu1, zu1_to_sqlite};
-use zu::query::run as run_zu1;
-use zu::sqlite::run as run_sqlite;
 use zu_query::exec::Value as QValue;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_storage::Direction;
@@ -14,6 +11,9 @@ use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
 use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+use zudb::convert::{sqlite_to_zu1, zu1_to_sqlite};
+use zudb::query::run as run_zu1;
+use zudb::sqlite::run as run_sqlite;
 
 const NAMES: [&str; 6] = ["ada", "bob", "cat", "dan", "eve", "fay"];
 const AGES: [u64; 6] = [20, 30, 30, 40, 50, 25];
@@ -484,7 +484,7 @@ fn float_and_byte_columns_survive_both_hops() {
         .rows
         .iter()
         .map(|r| match r[0] {
-            zu::query::Value::Float(f) => f,
+            zudb::query::Value::Float(f) => f,
             ref other => panic!("expected a float, got {other:?}"),
         })
         .collect();
@@ -549,7 +549,7 @@ fn a_boolean_column_survives_the_sqlite_hop_on_its_declaration() {
         .rows
         .iter()
         .map(|r| match r[0] {
-            zu::query::Value::Bool(v) => v,
+            zudb::query::Value::Bool(v) => v,
             ref other => panic!("expected a boolean, got {other:?}"),
         })
         .collect();
@@ -648,7 +648,7 @@ fn a_list_column_survives_both_hops_with_its_element_type() {
         .rows
         .iter()
         .map(|r| match r[0] {
-            zu::query::Value::Int(v) => v,
+            zudb::query::Value::Int(v) => v,
             ref other => panic!("expected a count, got {other:?}"),
         })
         .collect();
@@ -661,9 +661,9 @@ fn a_list_column_survives_both_hops_with_its_element_type() {
     .unwrap();
     assert_eq!(
         got.rows[0][0],
-        zu::query::Value::List(vec![
-            zu::query::Value::Str("say \"hi\"".into()),
-            zu::query::Value::Str("back\\slash".into()),
+        zudb::query::Value::List(vec![
+            zudb::query::Value::Str("say \"hi\"".into()),
+            zudb::query::Value::Str("back\\slash".into()),
         ])
     );
 
@@ -912,14 +912,14 @@ fn a_duplicated_edge_carries_both_values_across_the_hop() {
     drop(sq);
 
     sqlite_to_zu1(&a, &b).unwrap();
-    let mut db = zu::zu1::file::Zu1File::open(&b).unwrap();
-    let mut graph = zu::zu1::graph::GraphReader::load_table(&mut db, "knows").unwrap();
+    let mut db = zudb::zu1::file::Zu1File::open(&b).unwrap();
+    let mut graph = zudb::zu1::graph::GraphReader::load_table(&mut db, "knows").unwrap();
     let (nbrs, base) = graph.out_neighbors_from(&mut db, 0).unwrap();
     assert_eq!(nbrs, [1, 1], "both edges are stored");
     let base = base as usize;
     let root = graph.directory().props;
     let mut props =
-        zu::zu1::props::PropsReader::new(zu::zu1::props::load_props_at(&mut db, root).unwrap());
+        zudb::zu1::props::PropsReader::new(zudb::zu1::props::load_props_at(&mut db, root).unwrap());
     let col = props.col("weight").unwrap();
     let mut values = Vec::new();
     props.read_int_column(&mut db, col, &mut values).unwrap();

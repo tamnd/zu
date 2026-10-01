@@ -16,7 +16,7 @@
 //! line is untimed and is the other half of the point, since the copy is
 //! not only time but a second whole answer resident while both exist.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-arrow --bench export
+//! Run: ZU_GATE=1 cargo bench -p zudb-arrow --bench export
 
 use std::time::Instant;
 

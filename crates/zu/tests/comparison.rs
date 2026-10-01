@@ -8,8 +8,8 @@
 //! order `ORDER BY x` produces are read from the same table, and a
 //! query can rely on the two agreeing.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
+use zudb::query::{Value, run};
 
 fn db(dir: &std::path::Path) -> Zu1File {
     Zu1File::create(&dir.join("comparison.zu1")).unwrap()

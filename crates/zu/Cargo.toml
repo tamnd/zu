@@ -1,13 +1,15 @@
 [package]
-name = "zu"
+name = "zudb"
 description = "Embedded property-graph database: columnar, factorized, three storage engines"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["database", "graph", "embedded", "gql", "columnar"]
+categories = ["database-implementations"]
 
 [dependencies]
 zu-common.workspace = true

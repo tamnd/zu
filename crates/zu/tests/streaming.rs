@@ -8,10 +8,10 @@
 //! for, that a caller can stop early and that the statements which
 //! cannot stream still arrive through the same loop.
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Database, Engine, Flow, Options};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Database, Engine, Flow, Options};
 
 const NODES: u32 = 500;
 
@@ -49,7 +49,7 @@ fn opened_with(name: &str, nodes: u32) -> (tempfile::TempDir, Database) {
 /// parallel, so setting it here was setting it for whichever test was
 /// between plans (#513). The interrupt handle survives the swap, which
 /// is what lets the stop test hold one across both engines.
-fn pin(conn: &mut zu::Connection, engine: Engine) {
+fn pin(conn: &mut zudb::Connection, engine: Engine) {
     let options = Options {
         engine,
         ..conn.session_mut().options().clone()
@@ -57,7 +57,7 @@ fn pin(conn: &mut zu::Connection, engine: Engine) {
     conn.session_mut().set_options(options);
 }
 
-fn buffered(conn: &mut zu::Connection, source: &str) -> Vec<i64> {
+fn buffered(conn: &mut zudb::Connection, source: &str) -> Vec<i64> {
     conn.query(source)
         .expect("query")
         .iter()
@@ -221,7 +221,7 @@ fn the_two_executors_stream_the_same_rows_in_the_same_order() {
         "MATCH (p:person) RETURN p.id AS id SKIP 33 LIMIT 111",
         "MATCH (p:person)-[:knows]->(f) RETURN f.id AS id LIMIT 250",
     ];
-    let read = |conn: &mut zu::Connection, source: &str| {
+    let read = |conn: &mut zudb::Connection, source: &str| {
         let mut got = Vec::new();
         let out = conn
             .query_stream_batched(source, &[], 48, |batch| {
@@ -260,7 +260,7 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
     let mut conn = db.connect().expect("connect");
     let interrupt = conn.session_mut().interrupt();
 
-    let stopping = |conn: &mut zu::Connection| {
+    let stopping = |conn: &mut zudb::Connection| {
         let mut rows = 0u64;
         let out =
             conn.query_stream_batched("MATCH (p:person) RETURN p.id AS id", &[], 16, |batch| {
@@ -278,7 +278,10 @@ fn a_statement_interrupted_partway_through_a_stream_says_so() {
         pin(&mut conn, engine);
         let (rows, out) = stopping(&mut conn);
         let err = out.expect_err("the statement was interrupted");
-        assert!(matches!(err, zu::ZuError::Interrupted), "{engine:?}: {err}");
+        assert!(
+            matches!(err, zudb::ZuError::Interrupted),
+            "{engine:?}: {err}"
+        );
         assert!(
             rows < u64::from(MANY),
             "{engine:?}: {rows} rows is the whole scan"
@@ -319,7 +322,7 @@ fn a_streamed_statement_takes_parameters_and_a_failing_sink_fails_the_call() {
     // own condition back rather than one the engine invented for it.
     let err = conn
         .query_stream("MATCH (p:person) RETURN p.id AS id", &[], |_| {
-            Err(zu::ZuError::InvalidArgument(
+            Err(zudb::ZuError::InvalidArgument(
                 "the writer is full".to_string(),
             ))
         })

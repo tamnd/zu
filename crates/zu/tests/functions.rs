@@ -9,10 +9,10 @@
 //! answered while the statement is bound rather than once per row it
 //! would have reached.
 
-use zu::Database;
-use zu::query::Value;
 use zu_common::temporal::NANOS_PER_DAY;
 use zu_common::{DurationKind, Temporal};
+use zudb::Database;
+use zudb::query::Value;
 
 fn opened(dir: &std::path::Path) -> Database {
     let db = Database::create(dir.join("functions.zu1")).expect("create");
@@ -114,7 +114,7 @@ fn the_numeric_library_answers_over_a_column() {
     let rows = conn
         .query(source)
         .unwrap_or_else(|e| panic!("{source}: {e}"));
-    let read = |rows: &zu::query::QueryResult, name: &str| -> Vec<f64> {
+    let read = |rows: &zudb::query::QueryResult, name: &str| -> Vec<f64> {
         rows.iter()
             .map(|row| row.get_by_name::<f64>(name).expect(name))
             .collect()
@@ -626,9 +626,9 @@ fn the_set_functions_answer_over_a_graph() {
     // through the merge and not out of one accumulator.
     const NODES: u32 = 50_000;
     {
-        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let mut file = zudb::zu1::file::Zu1File::create(&path).expect("create");
         let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
-        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+        zudb::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
             .expect("load");
     }
     let db = Database::open(&path).expect("open");
@@ -643,7 +643,7 @@ fn the_set_functions_answer_over_a_graph() {
     let population = (squares / f64::from(NODES)).sqrt();
     let sample = (squares / f64::from(NODES - 1)).sqrt();
 
-    let float = |conn: &mut zu::Connection, source: &str| -> f64 {
+    let float = |conn: &mut zudb::Connection, source: &str| -> f64 {
         let rows = conn
             .query(source)
             .unwrap_or_else(|e| panic!("{source}: {e}"));
@@ -723,9 +723,9 @@ fn the_percentiles_answer_over_a_graph() {
     let path = dir.path().join("percentiles.zu1");
     const NODES: u32 = 100_000;
     {
-        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let mut file = zudb::zu1::file::Zu1File::create(&path).expect("create");
         let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
-        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+        zudb::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
             .expect("load");
     }
     let db = Database::open(&path).expect("open");
@@ -758,7 +758,7 @@ fn the_percentiles_answer_over_a_graph() {
     let rows = conn
         .query_with(
             "MATCH (p:person) WHERE p.id < 4 RETURN percentile_cont(p.id, $p) AS v",
-            &[("p", zu::query::Value::Float(0.5))],
+            &[("p", zudb::query::Value::Float(0.5))],
         )
         .expect("query");
     let rows: Vec<_> = rows.iter().collect();
@@ -804,7 +804,7 @@ fn the_percentiles_answer_over_a_graph() {
     let path = dir.path().join("weighted.zu1");
     const REACH: u32 = 300;
     {
-        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let mut file = zudb::zu1::file::Zu1File::create(&path).expect("create");
         let mut edges: Vec<(u32, u32)> = Vec::new();
         for i in 0..REACH {
             edges.push((i, (i + 1) % REACH));
@@ -816,7 +816,7 @@ fn the_percentiles_answer_over_a_graph() {
             }
         }
         edges.sort_unstable();
-        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", REACH.into(), &edges)
+        zudb::zu1::graph::bulk_load_as(&mut file, "person", "knows", REACH.into(), &edges)
             .expect("load");
     }
     let db = Database::open(&path).expect("open");
@@ -866,9 +866,9 @@ fn the_cardinality_of_a_walk_is_what_it_holds() {
     let path = dir.path().join("cardinality.zu1");
     const NODES: u32 = 20_000;
     {
-        let mut file = zu::zu1::file::Zu1File::create(&path).expect("create");
+        let mut file = zudb::zu1::file::Zu1File::create(&path).expect("create");
         let edges: Vec<(u32, u32)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
-        zu::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
+        zudb::zu1::graph::bulk_load_as(&mut file, "person", "knows", NODES.into(), &edges)
             .expect("load");
     }
     let db = Database::open(&path).expect("open");

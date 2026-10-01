@@ -27,7 +27,7 @@ stage="dist/libzu-$target"
 # the CLI's feature and not the library's: the C ABI loads columns a
 # caller already has in memory, so an Arrow reader behind it would be
 # weight every embedder pays and nobody calls.
-cargo build --release --target "$target" -p zu-capi -p zu-cli --features zu-cli/arrow
+cargo build --release --target "$target" -p zu-capi -p zudb-cli --features zu-cli/arrow
 
 # The dx/14 section 4 ceilings, from the same table as the matrix. Size
 # is a real adoption factor for serverless and mobile targets and it

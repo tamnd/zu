@@ -17,7 +17,7 @@
 //! With ZU_GATE=1 the process exits nonzero if any shape encodes below
 //! its floor in bench/budgets.toml.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-encoding --bench encode
+//! Run: ZU_GATE=1 cargo bench -p zudb-encoding --bench encode
 
 use std::time::Instant;
 

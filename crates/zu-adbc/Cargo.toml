@@ -19,7 +19,7 @@ name = "zu_adbc"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-zudb = { package = "zu", path = "../zu" }
+zudb = { path = "../zu" }
 # No features: what ADBC wants back is a `RecordBatchReader`, and the
 # driver exporter is what turns one into a C stream. `zu-arrow`'s own
 # `ffi` would be a second way to do the same thing.

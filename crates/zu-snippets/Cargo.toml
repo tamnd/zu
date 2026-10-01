@@ -17,7 +17,7 @@ path = "src/lib.rs"
 # after `cargo add zudb` and therefore the name the printed snippet has
 # to use. A crate cannot depend on itself under another name, which is
 # the whole reason the snippets are a package of their own.
-zudb = { package = "zu", path = "../zu" }
+zudb = { path = "../zu" }
 
 [dev-dependencies]
 tempfile.workspace = true

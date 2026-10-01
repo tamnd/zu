@@ -13,11 +13,11 @@
 //! between accounts, each stamped with a time, and a question that only
 //! wants the transfers inside a window.
 
-use zu::convert::sqlite_to_zu1;
-use zu::query::run;
 use zu_query::exec::Value;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
+use zudb::convert::sqlite_to_zu1;
+use zudb::query::run;
 
 /// Four accounts and the transfers between them, each with a time.
 ///
@@ -174,12 +174,12 @@ fn the_plan_text_shows_the_gate_on_the_expansion() {
     let source = "MATCH (a:account)-[t:transfer*1..3 WHERE t.ts >= 5]->(b:account) \
          RETURN b.id AS id";
     let catalog = zu_zu1::catalog::Catalog::load(&mut db).expect("catalog");
-    let logical = zu::query::explain(source, &catalog).expect("explain");
+    let logical = zudb::query::explain(source, &catalog).expect("explain");
     assert!(
         logical.contains("[t:transfer*1..3 WHERE t.ts >= 5]"),
         "the gate belongs inside the brackets: {logical}"
     );
-    let physical = zu::query::explain_analyze(source, &mut db, &[]).expect("explain analyze");
+    let physical = zudb::query::explain_analyze(source, &mut db, &[]).expect("explain analyze");
     assert!(
         physical.contains("VarExpand") && physical.contains("where t.ts >= 5"),
         "the gate belongs on the expansion: {physical}"

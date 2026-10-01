@@ -26,14 +26,14 @@
 //! Both are crosschecked against the closed form, so a run that got
 //! fast by answering the wrong number fails instead of scoring.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench paths
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench paths
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");

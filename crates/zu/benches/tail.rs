@@ -36,15 +36,15 @@
 //! tail_p99_p50_uniform_x and tail_p99_p50_power_x are the ceilings, on
 //! the friend list shape on each graph.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench tail
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench tail
 
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -169,7 +169,7 @@ fn stream(
     source: &str,
     seeds: &[i64],
     want: impl Fn(i64) -> u64,
-    rows_of: impl Fn(&zu::query::QueryResult) -> u64,
+    rows_of: impl Fn(&zudb::query::QueryResult) -> u64,
 ) -> Tail {
     // A warm pass over the same seeds: the plan compiles once, the
     // catalog and the readers land, and what is timed below is the
@@ -200,14 +200,14 @@ fn stream(
     }
 }
 
-fn count_rows(r: &zu::query::QueryResult) -> u64 {
+fn count_rows(r: &zudb::query::QueryResult) -> u64 {
     match r.rows.first().map(|row| &row[0]) {
         Some(&Value::Int(n)) => n as u64,
         other => panic!("expected a count, got {other:?}"),
     }
 }
 
-fn returned_rows(r: &zu::query::QueryResult) -> u64 {
+fn returned_rows(r: &zudb::query::QueryResult) -> u64 {
     r.rows.len() as u64
 }
 

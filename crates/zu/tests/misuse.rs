@@ -29,8 +29,8 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
-use zu::query::Value;
-use zu::{Config, Database, ZuError, params};
+use zudb::query::Value;
+use zudb::{Config, Database, ZuError, params};
 
 /// The statement every case is followed by, on the database it just
 /// failed against.
@@ -65,7 +65,7 @@ struct Misuse {
     what: &'static str,
     /// Runs it against a database that is already there. Returning
     /// `Ok` fails the test: every program in the table is wrong.
-    run: fn(&Database) -> zu::Result<()>,
+    run: fn(&Database) -> zudb::Result<()>,
     /// Every phrase the message has to carry. These are the engine's
     /// own words, not the operating system's, so they are the same on
     /// every platform; the three failures that are the operating

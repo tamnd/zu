@@ -8,9 +8,9 @@
 //! pattern half: `~[]~` walks it from either end, the arrows refuse it,
 //! and the two mixed spellings take it either way round.
 
-use zu::query::{Value, run};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{bulk_load_as, bulk_load_undirected_as};
+use zudb::query::{Value, run};
 
 /// One undirected edge between two peers, which is the smallest graph
 /// where the way round matters.

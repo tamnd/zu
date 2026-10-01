@@ -84,18 +84,18 @@
 //! counted and read back after the loop, so a write path that got
 //! faster by writing less fails instead of scoring.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench write
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench write
 
 use std::path::Path;
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::session::Session;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_labels, store_props, store_rel_props};
-use zu::zu1::txn::Cell;
-use zu::{Config, Database};
+use zudb::query::Value;
+use zudb::session::Session;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_labels, store_props, store_rel_props};
+use zudb::zu1::txn::Cell;
+use zudb::{Config, Database};
 
 /// The small table, where the fold is cheap enough that the statement
 /// itself is most of the number.
@@ -152,7 +152,7 @@ const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 /// The store's block, which is the granularity everything the fold
 /// takes and gives back is counted in.
-const BLOCK: u32 = zu::zu1::BLOCK_SIZE;
+const BLOCK: u32 = zudb::zu1::BLOCK_SIZE;
 
 /// How many rows the store [`calibrate`] reads holds.
 ///
@@ -243,7 +243,7 @@ fn calibrate() -> f64 {
         CALIBRATION_ROWS,
         &ring(CALIBRATION_ROWS),
     );
-    let read = |conn: &mut zu::Connection, age: u64| {
+    let read = |conn: &mut zudb::Connection, age: u64| {
         one(
             conn,
             &format!("MATCH (p:person) WHERE p.age = {age} RETURN count(p) AS n"),
@@ -691,7 +691,7 @@ fn seed(db: &mut Zu1File, rows: u64, edges: &[(u32, u32)]) {
     .expect("props");
 }
 
-fn one(conn: &mut zu::Connection, text: &str) -> i64 {
+fn one(conn: &mut zudb::Connection, text: &str) -> i64 {
     let r = conn.query(text).expect("query");
     match r.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,
@@ -1388,7 +1388,7 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
 /// The statement both sustained runs make. It writes one cell over a
 /// row the store already holds and touches nothing else, so what the
 /// run costs above the cell is the housekeeping.
-fn set(conn: &mut zu::Connection, age: u64) {
+fn set(conn: &mut zudb::Connection, age: u64) {
     conn.query(&format!(
         "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
     ))
@@ -1447,7 +1447,7 @@ fn fold_every(rows: u64) -> u64 {
 ///
 /// Asking costs the writer lock and gives it straight back, so it is
 /// something to do between windows rather than inside one.
-fn folds_so_far(conn: &mut zu::Connection) -> u64 {
+fn folds_so_far(conn: &mut zudb::Connection) -> u64 {
     conn.session_mut().fold_count().expect("fold count")
 }
 
@@ -1855,7 +1855,7 @@ fn main() {
     // Half a block of headroom on top, for the fold that crosses the
     // threshold: the check fires at the commit after, so the last fold
     // is over the line by whatever it took.
-    let slack = zu::write::checkpoint_slack_bytes(sustained.opened) + BLOCK as u64 / 2;
+    let slack = zudb::write::checkpoint_slack_bytes(sustained.opened) + BLOCK as u64 / 2;
     let allowed = sustained.opened + slack;
     println!(
         "sustained_window_slack: {:.1} MB grown against the {:.1} MB the checkpoint rule \
@@ -1867,7 +1867,7 @@ fn main() {
     // measured window, and the one that is gated. The ramp folds too,
     // so the file is already carrying churn when the window opens and
     // a bound on the window alone would not see it.
-    let run_slack = zu::write::checkpoint_slack_bytes(sustained.loaded);
+    let run_slack = zudb::write::checkpoint_slack_bytes(sustained.loaded);
     let slack_x = (sustained.peak - sustained.loaded) as f64 / run_slack as f64;
     println!(
         "sustained_slack_x: {slack_x:.2}x the checkpoint slack, {:.1} MB loaded to {:.1} MB at \

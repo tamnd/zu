@@ -3,7 +3,7 @@
 //! can reorder, exhausting every interleaving of the writer publishing
 //! commits, readers pinning snapshots, and the checkpoint computing
 //! its fold horizon. Run with
-//! `RUSTFLAGS="--cfg loom" cargo test -q -p zu-zu1 --test loom --release`.
+//! `RUSTFLAGS="--cfg loom" cargo test -q -p zudb-zu1 --test loom --release`.
 #![cfg(loom)]
 
 use loom::sync::Arc;

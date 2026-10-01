@@ -99,11 +99,12 @@ irm https://raw.githubusercontent.com/tamnd/zu/main/install.ps1 | iex          #
 brew install tamnd/tap/zu
 scoop install zu
 docker run --rm -v "$PWD:/data" ghcr.io/tamnd/zu stat graph.zu1
+cargo install zudb-cli                                                          # from source, anywhere Rust builds
 ```
 
 Each of these lands the same thing: the release archive for your platform, unpacked as an install prefix, so `bin/zu` arrives with `include/zu.h`, both library forms, the pkg-config file and the CMake package config beside it. Every one of them fetches the release's `SHA256SUMS` first and refuses to unpack an archive that is not what it says it is.
 
-There is no release yet, so none of these fetch anything today. They are here, tested and held to the platform table, because the install path is the first thing a user runs and the last thing anybody wants to be writing on release day.
+The Homebrew tap, the Scoop bucket and the container image are not published yet, so those three fetch nothing today; the install scripts and `cargo install` work from the first release. They are here, tested and held to the platform table, because the install path is the first thing a user runs and the last thing anybody wants to be writing on release day.
 
 ## Building
 

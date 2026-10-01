@@ -8,7 +8,7 @@
 //! keeps single-group scans sequential because forking snapshots
 //! costs more than the scan, so the parallel path needs a table that
 //! actually earns it. Two queries run at 1, 2, 4, and 8 threads
-//! through the public zu::query::run path, a scan-filter-count and an
+//! through the public zudb::query::run path, a scan-filter-count and an
 //! expand-filter-count whose per-row gathers give workers real work
 //! beyond memory bandwidth. The intermediate counts separate executor
 //! scaling from the host ceiling: a machine with four fast cores and
@@ -21,14 +21,14 @@
 //! one. The gate only arms on hosts with at least 8 cores; server1
 //! has 4 and prints information numbers.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench scale
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench scale
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zudb::query::{self, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");
@@ -78,7 +78,7 @@ fn build(path: &std::path::Path) -> Vec<(u32, u32)> {
     edges
 }
 
-fn count_of(r: &zu::query::QueryResult) -> i64 {
+fn count_of(r: &zudb::query::QueryResult) -> i64 {
     match r.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,
         other => panic!("expected one count, got {other:?}"),

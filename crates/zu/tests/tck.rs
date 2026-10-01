@@ -13,13 +13,13 @@
 //! ages 20, 30, 30, 40, 50, 25, and knows edges (0,1) (0,2) (1,3)
 //! (2,3) (2,5) (3,4) (4,0).
 
-use zu::query::run as run_zu1;
-use zu::sqlite::run as run_sqlite;
 use zu_query::exec::Value;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
 use zu_zu1::props::{PropValues, store_props};
+use zudb::query::run as run_zu1;
+use zudb::sqlite::run as run_sqlite;
 
 const NAMES: [&str; 6] = ["ada", "bob", "cat", "dan", "eve", "fay"];
 const AGES: [u64; 6] = [20, 30, 30, 40, 50, 25];

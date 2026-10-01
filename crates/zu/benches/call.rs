@@ -37,14 +37,14 @@
 //! exec_call_mrows_s_core floors the count case in millions of yielded
 //! rows a second, end to end.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench call
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench call
 
 use std::time::Instant;
 
-use zu::query::{self, Value};
-use zu::zu1::algo;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::{GraphReader, bulk_load_as};
+use zudb::query::{self, Value};
+use zudb::zu1::algo;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::{GraphReader, bulk_load_as};
 
 fn budget(key: &str) -> Option<f64> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/budgets.toml");

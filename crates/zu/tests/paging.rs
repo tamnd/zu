@@ -6,9 +6,9 @@
 //! ends is the window it looks like, and that a page of an ordered
 //! result is a page rather than an arbitrary handful of rows.
 
-use zu::Database;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
+use zudb::Database;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
 
 const NODES: u32 = 8;
 
@@ -21,7 +21,7 @@ fn seeded(path: &std::path::Path) {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    conn: zu::Connection,
+    conn: zudb::Connection,
 }
 
 impl Fixture {

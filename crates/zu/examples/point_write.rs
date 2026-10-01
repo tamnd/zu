@@ -15,10 +15,10 @@
 
 use std::path::Path;
 
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
-use zu::{Config, Database};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
+use zudb::{Config, Database};
 
 const ROWS: u64 = 100_000;
 

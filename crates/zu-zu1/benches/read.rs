@@ -16,7 +16,7 @@
 //! chunks. gather reads random row batches through the props gather,
 //! one decode per touched chunk.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-zu1 --bench read
+//! Run: ZU_GATE=1 cargo bench -p zudb-zu1 --bench read
 
 use std::time::Instant;
 

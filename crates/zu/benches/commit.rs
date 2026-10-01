@@ -89,17 +89,17 @@
 //! needs more than a couple of hundred of them before which
 //! percentile it lands in stops being luck.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu --bench commit
+//! Run: ZU_GATE=1 cargo bench -p zudb --bench commit
 
 use std::path::Path;
 use std::time::Instant;
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
-use zu::zu1::wal::commit_counters;
-use zu::{Config, Database};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::zu1::props::{PropValues, store_props};
+use zudb::zu1::wal::commit_counters;
+use zudb::{Config, Database};
 
 /// The table the writers write into. Small, because what is measured is
 /// the commit and not the table: an `INSERT` adds a row past the end of

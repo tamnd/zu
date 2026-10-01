@@ -18,7 +18,7 @@
 //! With ZU_GATE=1 the process exits nonzero when startup misses the
 //! ceiling in bench/budgets.toml.
 //!
-//! Run: ZU_GATE=1 cargo bench -p zu-cli
+//! Run: ZU_GATE=1 cargo bench -p zudb-cli
 
 use std::path::Path;
 use std::process::{Command, Stdio};

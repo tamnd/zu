@@ -15,10 +15,10 @@ use std::any::Any;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use zu::query::Value;
-use zu::zu1::file::Zu1File;
-use zu::zu1::graph::bulk_load_as;
-use zu::{Column, Database, FloatBits, Frame, IntBits, Layout, LogicalType};
+use zudb::query::Value;
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_as;
+use zudb::{Column, Database, FloatBits, Frame, IntBits, Layout, LogicalType};
 
 /// The arrays a test registers, kept alive exactly as a caller's would
 /// be: the frame holds this and the columns point into it.
@@ -131,7 +131,7 @@ fn seeded(path: &std::path::Path) {
     bulk_load_as(&mut db, "person", "knows", 8, &edges).expect("load");
 }
 
-fn open(dir: &std::path::Path) -> zu::Connection {
+fn open(dir: &std::path::Path) -> zudb::Connection {
     let path = dir.join("frames.zu1");
     seeded(&path);
     Database::open(&path)
@@ -307,6 +307,6 @@ fn a_frame_id_and_a_catalog_id_share_one_space() {
     // widens its id, this is what says the frame side has to widen too.
     assert_eq!(
         zu_query::frame::TOP_TABLE_ID,
-        zu::zu1::catalog::MAX_TABLE_ID
+        zudb::zu1::catalog::MAX_TABLE_ID
     );
 }

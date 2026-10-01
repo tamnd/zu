@@ -10,10 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tempfile = "3"
-zu-encoding = { path = "../crates/zu-encoding", features = ["zstd"] }
-zu-query = { path = "../crates/zu-query" }
-zu-vector = { path = "../crates/zu-vector" }
-zu-zu1 = { path = "../crates/zu-zu1" }
+zu-encoding = { package = "zudb-encoding", path = "../crates/zu-encoding", features = ["zstd"] }
+zu-query = { package = "zudb-query", path = "../crates/zu-query" }
+zu-vector = { package = "zudb-vector", path = "../crates/zu-vector" }
+zu-zu1 = { package = "zudb-zu1", path = "../crates/zu-zu1" }
 
 [[bin]]
 name = "decode_for_bitpack"

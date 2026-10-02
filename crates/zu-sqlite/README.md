@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This crate has no query language. To run zuQL against a SQLite file, `zudb` has `zudb::sqlite::run(statement, &store, params)`, which uses the same parser, planner and executor as the `zu1` engine. To move a graph between the two engines, use `zudb::convert::zu1_to_sqlite` and `zudb::convert::sqlite_to_zu1`, or `zu convert graph.zu1 graph.db` from the CLI.
+This crate has no query language. To run zuQL against a SQLite file, `zudb` has `zudb::sqlite::run(statement, &store, params)`, which uses the same parser, optimizer and executor as the `zu1` engine. To move a graph between the two engines, use `zudb::convert::zu1_to_sqlite` and `zudb::convert::sqlite_to_zu1`, or `zu convert graph.zu1 graph.db` from the CLI.
 
 SQLite is bundled through `rusqlite`, so nothing needs to be installed on the system.
 

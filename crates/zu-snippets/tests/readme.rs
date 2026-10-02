@@ -69,28 +69,35 @@ fn example(name: &str) -> PathBuf {
     built
 }
 
+/// The READMEs that print the snippets: the repository's, and the one
+/// crates.io shows on the `zudb` page, which is a second copy of the
+/// same quickstart and would drift the same way.
+const READMES: [&str; 2] = ["README.md", "crates/zu/README.md"];
+
 #[test]
 fn the_readme_prints_the_program_this_repository_compiles() {
-    let readme = std::fs::read_to_string(root().join("README.md")).expect("a README");
-    let printed = blocks(&readme, "rust");
-    assert_eq!(
-        printed.len(),
-        zu_snippets::SNIPPETS.len(),
-        "the README prints {} Rust blocks and this package holds {} snippets",
-        printed.len(),
-        zu_snippets::SNIPPETS.len()
-    );
-    for (block, name) in printed.iter().zip(zu_snippets::SNIPPETS) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples")
-            .join(format!("{name}.rs"));
-        let source = std::fs::read_to_string(&path).expect("the example is there");
+    for file in READMES {
+        let readme = std::fs::read_to_string(root().join(file)).expect("a README");
+        let printed = blocks(&readme, "rust");
         assert_eq!(
-            block,
-            &source,
-            "the README block and {} have drifted apart",
-            path.display()
+            printed.len(),
+            zu_snippets::SNIPPETS.len(),
+            "{file} prints {} Rust blocks and this package holds {} snippets",
+            printed.len(),
+            zu_snippets::SNIPPETS.len()
         );
+        for (block, name) in printed.iter().zip(zu_snippets::SNIPPETS) {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples")
+                .join(format!("{name}.rs"));
+            let source = std::fs::read_to_string(&path).expect("the example is there");
+            assert_eq!(
+                block,
+                &source,
+                "the block in {file} and {} have drifted apart",
+                path.display()
+            );
+        }
     }
 }
 

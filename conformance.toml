@@ -9,7 +9,7 @@
 
 [engine]
 name = "zu"
-version = "0.0.1"
+version = "0.0.2"
 
 # What the storage can hold.
 [data]

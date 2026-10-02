@@ -5,6 +5,14 @@ the release workflow refuses a tag without one and copies it onto the
 GitHub release. The crates are versioned together, so one number is the
 version of all of them.
 
+## 0.0.2
+
+Every crate now has its own README, so its page on crates.io says what it is. In 0.0.1 only `zudb` and `zudb-cli` had one, and both showed the repository README. There are no code changes in this release.
+
+- Each `zudb-*` crate has a short README saying what it does, that it is published for `zudb` to depend on, and that the import keeps the workspace name (`use zu_query` for `zudb-query`).
+- `zudb` has a README of its own with the quickstart, and the snippet test now checks that copy against the example program too.
+- `zudb-cli` has a README listing the commands of the `zu` binary.
+
 ## 0.0.1
 
 The first release, and the first time zu is on crates.io. It is early:

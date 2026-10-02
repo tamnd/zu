@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "The cross-client conformance corpus and its Rust runner"
 
 # Published as zudb-*, because zu is taken on crates.io, but the

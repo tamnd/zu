@@ -69,28 +69,39 @@ fn example(name: &str) -> PathBuf {
     built
 }
 
+/// The READMEs that print the snippets, each with the examples it
+/// prints in order: the repository's, and the one crates.io shows on
+/// the `zudb` page, which starts with the same quickstart and would
+/// drift the same way.
+const READMES: [(&str, &[&str]); 2] = [
+    ("README.md", zu_snippets::SNIPPETS),
+    ("crates/zu/README.md", zu_snippets::ZUDB_SNIPPETS),
+];
+
 #[test]
 fn the_readme_prints_the_program_this_repository_compiles() {
-    let readme = std::fs::read_to_string(root().join("README.md")).expect("a README");
-    let printed = blocks(&readme, "rust");
-    assert_eq!(
-        printed.len(),
-        zu_snippets::SNIPPETS.len(),
-        "the README prints {} Rust blocks and this package holds {} snippets",
-        printed.len(),
-        zu_snippets::SNIPPETS.len()
-    );
-    for (block, name) in printed.iter().zip(zu_snippets::SNIPPETS) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples")
-            .join(format!("{name}.rs"));
-        let source = std::fs::read_to_string(&path).expect("the example is there");
+    for (file, snippets) in READMES {
+        let readme = std::fs::read_to_string(root().join(file)).expect("a README");
+        let printed = blocks(&readme, "rust");
         assert_eq!(
-            block,
-            &source,
-            "the README block and {} have drifted apart",
-            path.display()
+            printed.len(),
+            snippets.len(),
+            "{file} prints {} Rust blocks and lists {} snippets",
+            printed.len(),
+            snippets.len()
         );
+        for (block, name) in printed.iter().zip(snippets) {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples")
+                .join(format!("{name}.rs"));
+            let source = std::fs::read_to_string(&path).expect("the example is there");
+            assert_eq!(
+                block,
+                &source,
+                "the block in {file} and {} have drifted apart",
+                path.display()
+            );
+        }
     }
 }
 
@@ -110,4 +121,37 @@ fn the_sixty_second_program_runs_and_prints_what_the_readme_says() {
     // The reader's copy writes into the directory they ran it from,
     // which is the part of the story a compile check cannot see.
     assert!(dir.path().join("social.zu1").is_file());
+}
+
+/// Runs an example in a directory of its own and hands back what it
+/// printed, failing the test if it did not exit cleanly.
+fn run(name: &str) -> String {
+    let dir = tempfile::tempdir().expect("a directory of its own");
+    let run = Command::new(example(name))
+        .current_dir(dir.path())
+        .output()
+        .expect("the example runs");
+    assert!(
+        run.status.success(),
+        "{name} failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+#[test]
+fn the_transactions_program_keeps_the_commit_and_drops_the_rollback() {
+    assert_eq!(
+        run("transactions"),
+        "ada knows charles since 1843\n2 people\n"
+    );
+}
+
+#[test]
+fn the_bulk_program_loads_streams_and_explains() {
+    assert_eq!(
+        run("bulk-and-stream"),
+        "appended 10000\nsum 50005000\n\
+         Project p.name AS name\n  Filter p.uid > 9000\n    ScanNodes p: person\n\n"
+    );
 }

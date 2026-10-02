@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 
 # Published as zudb-*, because zu is taken on crates.io, but the
 # library keeps the name every crate in this workspace already uses.

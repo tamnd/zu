@@ -23,3 +23,8 @@
 /// The examples this package holds, in the order the README prints
 /// them, and the name of the fenced block each one has to match.
 pub const SNIPPETS: &[&str] = &["sixty-seconds"];
+
+/// The examples the `zudb` README prints, which is the page crates.io
+/// shows. It opens with the same quickstart and then goes further,
+/// so it has a list of its own.
+pub const ZUDB_SNIPPETS: &[&str] = &["sixty-seconds", "transactions", "bulk-and-stream"];

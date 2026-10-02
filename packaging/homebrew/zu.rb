@@ -8,27 +8,27 @@
 class Zu < Formula
   desc "Embedded property graph database with a GQL engine"
   homepage "https://github.com/tamnd/zu"
-  version "0.0.1"
+  version "0.0.2"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/tamnd/zu/releases/download/v0.0.1/libzu-aarch64-apple-darwin.tar.zst"
+      url "https://github.com/tamnd/zu/releases/download/v0.0.2/libzu-aarch64-apple-darwin.tar.zst"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/tamnd/zu/releases/download/v0.0.1/libzu-x86_64-apple-darwin.tar.zst"
+      url "https://github.com/tamnd/zu/releases/download/v0.0.2/libzu-x86_64-apple-darwin.tar.zst"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/tamnd/zu/releases/download/v0.0.1/libzu-aarch64-unknown-linux-gnu.tar.zst"
+      url "https://github.com/tamnd/zu/releases/download/v0.0.2/libzu-aarch64-unknown-linux-gnu.tar.zst"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/tamnd/zu/releases/download/v0.0.1/libzu-x86_64-unknown-linux-gnu.tar.zst"
+      url "https://github.com/tamnd/zu/releases/download/v0.0.2/libzu-x86_64-unknown-linux-gnu.tar.zst"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end

@@ -9,9 +9,9 @@ version of all of them.
 
 Every crate now has its own README, so its page on crates.io says what it is. In 0.0.1 only `zudb` and `zudb-cli` had one, and both showed the repository README. There are no code changes in this release.
 
-- Each `zudb-*` crate has a short README saying what it does, that it is published for `zudb` to depend on, and that the import keeps the workspace name (`use zu_query` for `zudb-query`).
-- `zudb` has a README of its own with the quickstart, and the snippet test now checks that copy against the example program too.
-- `zudb-cli` has a README listing the commands of the `zu` binary.
+- Each `zudb-*` crate has a README covering what it does, how it is put together, and a short example against its real API. Each also says the crate is published for `zudb` to depend on, and that the import keeps the workspace name (`use zu_query` for `zudb-query`).
+- `zudb` has a README of its own with the quickstart, databases and connections, statements, transactions, bulk loading, errors, and the storage engines. Its Rust examples are programs in `crates/zu-snippets`, and the snippet test compiles and runs them against the README.
+- `zudb-cli` has a README covering the commands of the `zu` binary, the shell, output formats, and exit codes.
 
 ## 0.0.1
 
